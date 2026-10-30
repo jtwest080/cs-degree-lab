@@ -1,0 +1,591 @@
+id: u1-translation
+title: From Code to Instructions, Compilers and Interpreters
+minutes: 50
+objective: |
+  Understand how code written in a human-friendly language becomes instructions a CPU can run: **assembly**, **compilers**, **interpreters**, and how **Python** itself runs your code using **bytecode** and a **virtual machine**.
+outcomes:
+  - Describe the levels from machine code to high-level languages, and why abstraction matters
+  - Explain what a compiler does in stages (tokens, syntax tree, code generation)
+  - Compare compilers and interpreters and their trade-offs
+  - Translate a simple expression into register-machine and stack-machine instructions by hand
+  - Explain how Python runs a program, from source code to bytecode to execution
+
+prelude: |
+  # TOY: a tiny simulated CPU with four registers (A, B, C, D).
+  def run_cpu(program, show=False):
+      regs = {"A": 0, "B": 0, "C": 0, "D": 0}
+      pc = 0
+      steps = 0
+      while True:
+          if not 0 <= pc < len(program):
+              raise RuntimeError(f"The program counter is {pc}, which is outside the program. Did you forget a HALT?")
+          instr = program[pc]
+          steps += 1
+          if steps > 10_000:
+              raise RuntimeError("The CPU ran more than 10,000 steps. Your program probably loops forever.")
+          if not isinstance(instr, tuple) or not instr:
+              raise ValueError(f"Instruction {pc} should look like (\"SET\", \"A\", 5), but it is {instr!r}")
+          op = instr[0]
+          here = pc
+          pc += 1
+          if op == "SET":
+              regs[instr[1]] = instr[2]
+          elif op == "ADD":
+              regs[instr[1]] = regs[instr[1]] + regs[instr[2]]
+          elif op == "SUB":
+              regs[instr[1]] = regs[instr[1]] - regs[instr[2]]
+          elif op == "JUMP":
+              pc = instr[1]
+          elif op == "JZ":
+              if regs[instr[1]] == 0:
+                  pc = instr[2]
+          elif op == "PRINT":
+              print(regs[instr[1]])
+          elif op != "HALT":
+              raise ValueError(f"Unknown instruction {op!r} at position {here}")
+          if show:
+              state = " ".join(f"{r}={v}" for r, v in regs.items())
+              args = " ".join(str(x) for x in instr[1:])
+              print(f"step {steps:>2} | PC={here:>2} | {op:<5} {args:<8} | {state}")
+          if op == "HALT":
+              break
+      regs["steps"] = steps
+      return regs
+
+  # A tiny stack machine, like the one inside Python's virtual machine.
+  def run_stack(program, show=False):
+      stack = []
+      for step, instr in enumerate(program):
+          if not isinstance(instr, tuple) or not instr:
+              raise ValueError(f"Instruction {step} should look like (\"PUSH\", 5) or (\"ADD\",), but it is {instr!r}")
+          op = instr[0]
+          if op == "PUSH":
+              stack.append(instr[1])
+          elif op in ("ADD", "SUB", "MUL"):
+              if len(stack) < 2:
+                  raise RuntimeError(f"Instruction {step} ({op}) needs two values on the stack, but the stack is {stack}")
+              right = stack.pop()
+              left = stack.pop()
+              if op == "ADD":
+                  stack.append(left + right)
+              elif op == "SUB":
+                  stack.append(left - right)
+              else:
+                  stack.append(left * right)
+          elif op == "PRINT":
+              if not stack:
+                  raise RuntimeError(f"Instruction {step} (PRINT) found an empty stack")
+              print(stack[-1])
+          else:
+              raise ValueError(f"Unknown instruction {op!r} at position {step}")
+          if show:
+              label = f"{op} {instr[1]}" if op == "PUSH" else op
+              print(f"{step}: {label:<9} stack: {stack}")
+      return stack
+
+sections:
+  - heading: The language gap
+    body: |
+      You now know that a CPU only understands **machine code**: bit patterns for simple instructions like "add register B to register A". Writing real software that way would be unbearable. A web browser contains tens of millions of lines of code; imagine writing that as raw numbers.
+
+      So computer scientists built **layers of languages**, each one easier for humans and each one translated into the layer below:
+
+      | Level | Example | Who reads it |
+      |---|---|---|
+      | High-level language | `total = price * 3 + tax` | Humans (easily) |
+      | Assembly language | `imul eax, 3` / `add eax, ebx` | Humans (with effort) |
+      | Machine code | `6B C0 03 01 D8` | The CPU |
+
+      > **Key idea:** This is **abstraction**, the most important idea in computer science. Each layer hides the messy details of the layer beneath, so you can think about *what* you want without worrying about *how* the transistors do it. You've just climbed the whole tower: transistors → gates → adders → CPU → machine code → assembly → high-level languages.
+
+  - heading: Assembly language
+    body: |
+      **Assembly language** gives each machine instruction a short readable name called a **mnemonic** (like `ADD`, `MOV`, `JMP`) and lets you name registers instead of using bit patterns. There's a near one-to-one match between assembly instructions and machine code instructions, so translating is straightforward. The program that does it is called an **assembler**.
+
+      Your TOY programs from Lesson 1.4 were essentially assembly. Here's what similar code looks like in real x86-64 assembly:
+
+      ```asm
+      mov  eax, 7        ; put 7 in register eax
+      mov  ebx, 3        ; put 3 in register ebx
+      add  eax, ebx      ; eax = eax + ebx
+      ```
+
+      Assembly is still used where every instruction counts: parts of operating systems, device drivers, and speed-critical code. Because it's tied to one instruction set, x86 assembly won't run on an ARM chip. You'll read and write some assembly in Unit 9.
+
+  - heading: Compilers
+    body: |
+      A **compiler** translates an entire program written in a high-level language into machine code (or another lower-level language) **before** it runs. The output is an **executable** file you can run again and again without the compiler. C, C++, Rust, Go and Swift are usually compiled.
+
+      A compiler works in stages, a bit like how you'd translate a sentence from French:
+
+      1. **Lexing (tokenizing).** Break the text into **tokens**, the "words" of the language. `total = price * 3 + tax` becomes 7 tokens: `total`, `=`, `price`, `*`, `3`, `+`, `tax`.
+      2. **Parsing.** Check the grammar and build a **syntax tree** that shows how the pieces fit together. Because `*` binds tighter than `+`, `price * 3` is grouped first:
+
+         ```text
+                =
+              /   \
+          total    +
+                 /   \
+                *     tax
+               / \
+           price   3
+         ```
+
+         If the grammar is wrong (say you wrote `total = price * + tax`), the parser stops with a **syntax error**.
+      3. **Analysis and optimisation.** Check meanings (does `price` exist?) and improve the code: for example, `x = 60 * 60 * 24` can be computed once by the compiler as `86400`, so the CPU never has to.
+      4. **Code generation.** Walk the tree and emit instructions: load `price`, multiply by 3, add `tax`, store in `total`.
+
+      > **Note:** The first compiler for a popular language was built by **Grace Hopper**'s team in the 1950s. Many people at the time didn't believe a computer could write programs. Today's compilers produce code that's usually faster than what an expert would write by hand in assembly.
+
+  - heading: Interpreters
+    body: |
+      An **interpreter** takes a different approach: instead of translating the whole program first, it reads the program and **carries it out directly**, statement by statement, as it goes.
+
+      > **Analogy:** A compiler is like translating a whole book into English and then handing over the translation; readers never need the translator again. An interpreter is like a live interpreter at a conference, translating each sentence as it's spoken; nothing is written down, and the interpreter must be there every time.
+
+      | | Compiled | Interpreted |
+      |---|---|---|
+      | When translation happens | Once, before running | Continuously, while running |
+      | Speed when running | Usually faster | Usually slower |
+      | Runs on another CPU type? | Must recompile | Yes, if the interpreter exists there |
+      | When errors are found | Many at compile time | When that line is reached |
+      | Edit → run cycle | Must recompile each time | Run immediately |
+
+      In practice the line is blurry. Most modern "interpreted" languages first compile to an in-between form, and many use a **JIT** (*just-in-time*) compiler that compiles the busiest parts of a program to machine code *while it runs*. JavaScript engines in web browsers do this, which is why JavaScript became fast enough to run full applications.
+
+  - heading: Stack machines
+    body: |
+      Your TOY CPU stored values in named registers. Another popular design for an instruction set uses a **stack** instead.
+
+      A stack works like a pile of plates: you can only **push** a new plate onto the top, or **pop** the top plate off. A stack machine's arithmetic instructions pop the top two values, combine them, and push the result back.
+
+      Computing `(2 + 3) * 4`:
+
+      | Instruction | Stack afterwards (top on the right) |
+      |---|---|
+      | `PUSH 2` | 2 |
+      | `PUSH 3` | 2, 3 |
+      | `ADD` | 5 |
+      | `PUSH 4` | 5, 4 |
+      | `MUL` | 20 |
+
+      No registers are named at all; everything happens at the top of the stack. That makes stack instructions short and easy for a compiler to generate: just walk the syntax tree, pushing values and then applying the operator *after* both its operands. For subtraction, the value pushed first is the left side: `PUSH 10, PUSH 4, SUB` gives 10 − 4 = 6.
+
+      In this lesson's exercises, `run_stack(program)` runs stack programs using `("PUSH", n)`, `("ADD",)`, `("SUB",)`, `("MUL",)` and `("PRINT",)` (print the top value), and `show=True` prints the stack after each step. The register CPU `run_cpu` from Lesson 1.4 is also available.
+
+  - heading: How Python runs your code
+    body: |
+      So is Python compiled or interpreted? Both! When you run a Python program with the standard Python (called **CPython**, because it's written in C):
+
+      1. Python **compiles** your source code into **bytecode**: compact instructions for an imaginary computer, not for any real CPU.
+      2. The Python **virtual machine** (VM), an interpreter loop written in C, then runs the bytecode one instruction at a time, in its own fetch-decode-execute cycle.
+
+      The Python VM is a **stack machine**, just like the one above. And the VM itself is a C program that was compiled into machine code for your actual CPU. In this app, there's one more layer: that C code was compiled to **WebAssembly**, a portable instruction set that your web browser translates into your device's machine code. Layers on layers, each one hiding the one below.
+
+      Python's `dis` module ("disassemble") lets you see the bytecode Python makes. You'll see instructions like `LOAD_NAME` (push a variable's value), `BINARY_OP` (pop two, compute, push the result) and `STORE_NAME` (pop into a variable): the same push, compute, pop pattern as our stack machine.
+
+      > **Why:** Bytecode makes Python **portable**: the same bytecode runs anywhere the VM has been built, on Windows, Mac, Linux, phones, or a browser. The cost is speed: simulating a CPU in software adds overhead, so pure Python is often 10 to 100 times slower than compiled C. For most programs, being quick to write matters far more than that difference, and libraries written in C handle the heavy number-crunching.
+
+  - heading: Errors at different times
+    body: |
+      Understanding translation explains the two kinds of error you'll meet constantly in Unit 2:
+
+      - A **syntax error** is found while Python is *compiling* your code into bytecode, before any of it runs. Nothing runs at all, not even the lines above the mistake.
+      - A **runtime error** (an *exception*) happens while the program is *running*, when a line does something impossible, like dividing by zero. Lines before it have already run.
+
+      Try both in the playground below. Seeing *when* an error happens tells you a lot about what's wrong.
+
+examples:
+  - title: Tokens, the words of a program
+    intro: Python's own `tokenize` module shows how Python splits a line into tokens, the first stage of compiling.
+    code: |
+      import io
+      import tokenize
+
+      line = "total = price * 3 + tax"
+      for tok in tokenize.generate_tokens(io.StringIO(line).readline):
+          if tok.string.strip():
+              print(tokenize.tok_name[tok.type], repr(tok.string))
+    output: |
+      NAME 'total'
+      OP '='
+      NAME 'price'
+      OP '*'
+      NUMBER '3'
+      OP '+'
+      NAME 'tax'
+    lines:
+      - line: 1-2
+        note: "`import` loads extra tools that come with Python. You'll learn about imports, loops and more in Unit 2; for now, focus on the output."
+      - line: 4
+        note: "The code we want to tokenize, stored as text."
+      - line: 5-7
+        note: "Go through each token Python finds and print its kind and its text, skipping invisible ones like the end-of-line marker."
+    after: |
+      Each token has a kind: NAME (a name like `price`), OP (an operator), or NUMBER. Spaces aren't tokens at all; they just separate them.
+  - title: Compiling an expression to stack code by hand
+    intro: Here is `(10 - 4) * (2 + 5)` translated to stack instructions, the way a compiler would walk the syntax tree.
+    code: |
+      program = [
+          ("PUSH", 10),
+          ("PUSH", 4),
+          ("SUB",),       # 10 - 4 = 6
+          ("PUSH", 2),
+          ("PUSH", 5),
+          ("ADD",),       # 2 + 5 = 7
+          ("MUL",),       # 6 * 7 = 42
+          ("PRINT",),
+      ]
+      run_stack(program, show=True)
+    output: |
+      0: PUSH 10   stack: [10]
+      1: PUSH 4    stack: [10, 4]
+      2: SUB       stack: [6]
+      3: PUSH 2    stack: [6, 2]
+      4: PUSH 5    stack: [6, 2, 5]
+      5: ADD       stack: [6, 7]
+      6: MUL       stack: [42]
+      42
+      7: PRINT     stack: [42]
+    lines:
+      - line: 2-4
+        note: "The left bracket first: push both operands, then SUB pops them and pushes 10 − 4."
+      - line: 5-7
+        note: "Then the right bracket. The 6 waits patiently underneath on the stack."
+      - line: 8
+        note: "MUL pops 7 and 6 and pushes 42. Notice the operator always comes *after* its two operands."
+      - line: 9
+        note: "PRINT shows the top of the stack without removing it."
+  - title: Peeking at Python's bytecode
+    intro: |
+      `dis` shows the bytecode CPython creates. The exact instruction names vary a little between Python versions, so your output may differ slightly from a friend's. Press "Run and modify" to see it.
+    code: |
+      import dis
+      dis.dis("total = price * 3 + tax")
+    lines:
+      - line: 1
+        note: "Load Python's disassembler module."
+      - line: 2
+        note: "Ask it to compile the line and show the bytecode. Look for `LOAD_NAME price`, `LOAD_CONST 3`, `BINARY_OP` (multiply), `LOAD_NAME tax`, `BINARY_OP` (add) and `STORE_NAME total`: a stack machine program, exactly like the one above."
+
+playground:
+  prompt: |
+    See the two kinds of error for yourself. Run this as it is: the first line prints, then a **runtime error** stops the program. Then add a syntax error on the *last* line (for example `print("oops"`, with the bracket missing) and run again. Does the first line still print? Why not?
+  code: |
+    print("This line runs first")
+    print(10 / 0)
+    print("This line never runs")
+
+exercises:
+  - id: count-tokens
+    title: Count the tokens
+    difficulty: 1
+    prompt: |
+      How many **tokens** does the lexer produce for this line? (Spaces are not tokens.)
+
+      ```python
+      area = width * (height - 2)
+      ```
+
+      Set `answer` to the count.
+    starter: |
+      answer = 0
+    tests:
+      - name: answer is the number of tokens
+        code: |
+          import io, tokenize
+          line = "area = width * (height - 2)"
+          real = [t for t in tokenize.generate_tokens(io.StringIO(line).readline) if t.string.strip()]
+          assert answer != 5, "Each bracket and each operator is its own token too."
+          assert answer == len(real), f"You said {answer}. List them: area, =, width, ... and don't forget the brackets."
+    hints:
+      - "Every name, number, operator and bracket is one token."
+      - "area, =, width, *, (, height, -, 2, ) ..."
+    solution: |
+      answer = 9   # area = width * ( height - 2 )
+    explanation: |
+      The tokens are `area`, `=`, `width`, `*`, `(`, `height`, `-`, `2`, `)`: **9** in all. The brackets don't compute anything, but the parser needs them to build the right tree.
+
+  - id: compiled-or-interpreted
+    title: Compiler or interpreter?
+    difficulty: 1
+    prompt: |
+      For each situation, set the name to the text `"compiler"` or `"interpreter"`, whichever approach fits best.
+
+      - `game_release`: A games studio wants to ship the fastest possible program to players, who should not need any extra software installed.
+      - `quick_experiment`: A data scientist wants to try an idea, change a line, and see the result instantly, over and over.
+      - `same_file_everywhere`: A teacher wants to give students a single program file that runs unchanged on Windows, Mac and Linux, as long as the language is installed.
+    starter: |
+      game_release = ""
+      quick_experiment = ""
+      same_file_everywhere = ""
+    tests:
+      - name: answers use the words "compiler" or "interpreter"
+        code: |
+          for name, v in [("game_release", game_release), ("quick_experiment", quick_experiment), ("same_file_everywhere", same_file_everywhere)]:
+              assert v.strip().lower() in ("compiler", "interpreter"), f"{name} should be \"compiler\" or \"interpreter\", but it is {v!r}."
+      - name: game_release
+        code: |
+          assert game_release.strip().lower() == "compiler", "Speed when running, and no extra software for the players: which approach produces a standalone executable?"
+      - name: quick_experiment
+        code: |
+          assert quick_experiment.strip().lower() == "interpreter", "Which approach lets you run a change immediately with no separate build step?"
+      - name: same_file_everywhere
+        code: |
+          assert same_file_everywhere.strip().lower() == "interpreter", "A compiled executable is tied to one CPU and operating system. Which approach runs the same source anywhere the language is installed?"
+    hints:
+      - "Look at the trade-offs table: running speed, portability, and the edit-run cycle."
+      - "Compiled programs are fast and standalone but tied to one platform. Interpreted programs run instantly after an edit and run anywhere the interpreter exists."
+    solution: |
+      game_release = "compiler"
+      quick_experiment = "interpreter"
+      same_file_everywhere = "interpreter"
+    explanation: |
+      Games are compiled to native machine code for speed and so players don't need extra software. Experimenting rewards the interpreter's instant edit-and-run loop (this app works that way). Portability of a single source file is the interpreter's strength, because the interpreter, not your program, deals with each platform's machine code.
+
+  - id: compile-to-toy
+    title: Be the compiler (register machine)
+    difficulty: 2
+    prompt: |
+      Compile this line into a **TOY** program (from Lesson 1.4; `run_cpu` is loaded for you), where `a = 15`, `b = 6` and `c = 4`:
+
+      ```python
+      result = (a - b) + c
+      ```
+
+      Your program should leave the result in register **A**, print it, and halt. Don't compute the answer yourself: load the three values with SET and use SUB and ADD.
+    starter: |
+      program = [
+          ("SET", "A", 15),   # a
+          ("SET", "B", 6),    # b
+          ("SET", "C", 4),    # c
+          # compute (a - b) + c into A
+          ("HALT",),
+      ]
+      run_cpu(program, show=True)
+    tests:
+      - name: A ends up as (15 - 6) + 4
+        code: |
+          final = run_cpu(program)
+          assert final["A"] == 13, f"A ended as {final['A']}."
+      - name: prints the result
+        code: |
+          out, _ = capture(run_cpu, program)
+          assert "13" in out.split(), f"Your program printed {out!r}. PRINT register A before HALT."
+      - name: computes rather than setting the answer
+        code: |
+          ops = [i[0] for i in program]
+          assert "SUB" in ops and "ADD" in ops, "Use SUB for a - b and ADD for + c."
+          assert not any(i[0] == "SET" and i[2] in (9, 13) for i in program), "Don't SET the result; let the CPU compute it."
+    hints:
+      - "The brackets come first: `(\"SUB\", \"A\", \"B\")` makes A = 15 − 6."
+      - "Then `(\"ADD\", \"A\", \"C\")`, then `(\"PRINT\", \"A\")`."
+    solution: |
+      program = [
+          ("SET", "A", 15),   # a
+          ("SET", "B", 6),    # b
+          ("SET", "C", 4),    # c
+          ("SUB", "A", "B"),  # A = a - b
+          ("ADD", "A", "C"),  # A = (a - b) + c
+          ("PRINT", "A"),
+          ("HALT",),
+      ]
+      run_cpu(program, show=True)
+    explanation: |
+      A compiler does exactly this: load the variables into registers, then emit one instruction per operator in the order the syntax tree dictates (the bracketed part first). Real compilers also have to decide *which* registers to use when there are more values than registers, a hard problem called **register allocation**.
+
+  - id: trace-stack
+    title: Trace a stack machine
+    difficulty: 2
+    prompt: |
+      Without running it, trace this stack program by hand, writing down the stack after each step.
+
+      ```text
+      PUSH 8
+      PUSH 3
+      PUSH 2
+      MUL
+      SUB
+      PUSH 5
+      ADD
+      ```
+
+      1. Set `final_value` to the single value left on the stack at the end.
+      2. Set `max_height` to the **largest number of values** that were on the stack at any moment.
+      3. Set `expression` to the Python expression this computes, as text with brackets, like `"(1 + 2) * 3"`. The test will evaluate your text and check it matches.
+    starter: |
+      final_value = 0
+      max_height = 0
+      expression = ""
+    tests:
+      - name: final_value is correct
+        code: |
+          assert final_value == 7, f"final_value is {final_value}. After MUL the stack is [8, 6]; SUB pops 6 and 8 and pushes 8 - 6."
+      - name: max_height is correct
+        code: |
+          assert max_height == 3, f"max_height is {max_height}. After the three PUSHes, how many values are on the stack?"
+      - name: expression computes the same thing in the same order
+        code: |
+          assert isinstance(expression, str) and expression.strip(), "Write the expression as text in quotes."
+          assert eval(expression) == 7, f"{expression!r} evaluates to {eval(expression)}, not 7."
+          import re
+          assert re.findall(r"\d+", expression) == ["8", "3", "2", "5"], "Use the numbers 8, 3, 2 and 5 in the order they were pushed."
+    hints:
+      - "After PUSH 8, 3, 2 the stack is [8, 3, 2]. MUL pops 2 and 3 and pushes 6."
+      - "SUB pops 6 (right side) then 8 (left side), and pushes 8 − 6 = 2. Then PUSH 5 and ADD."
+      - "The expression is 8 minus (3 times 2), plus 5."
+    solution: |
+      final_value = 7
+      max_height = 3
+      expression = "(8 - 3 * 2) + 5"
+    explanation: |
+      The stack goes [8] → [8, 3] → [8, 3, 2] → [8, 6] → [2] → [2, 5] → [7]. It reached a height of **3**, and the program computes **(8 − 3 × 2) + 5 = 7**. Notice how `3 * 2` happened first, just as multiplication binds tighter in the expression. Python's virtual machine evaluates your expressions in exactly this way.
+
+  - id: compile-to-stack
+    title: Be the compiler (stack machine)
+    difficulty: 3
+    prompt: |
+      Translate this expression into a stack program for `run_stack`, then print the result:
+
+      ```python
+      (9 - 2) * (3 + 1) - 8
+      ```
+
+      Push only the numbers that appear in the expression (9, 2, 3, 1, 8), in that order, and use `ADD`, `SUB`, `MUL` and `PRINT`. At the end, the stack must hold just the answer.
+    starter: |
+      program = [
+          ("PUSH", 9),
+          # ...
+          ("PRINT",),
+      ]
+      run_stack(program, show=True)
+    tests:
+      - name: computes the right value
+        code: |
+          out, stack = capture(run_stack, program)
+          assert stack == [20], f"At the end the stack is {stack}, but it should be [20]."
+      - name: printed the result
+        code: |
+          out, stack = capture(run_stack, program)
+          assert out.strip().split("\n")[-1] == "20", f"Your program printed {out!r}."
+      - name: pushes only 9, 2, 3, 1, 8 in order
+        code: |
+          pushed = [i[1] for i in program if i[0] == "PUSH"]
+          assert pushed == [9, 2, 3, 1, 8], f"You pushed {pushed}. Push the numbers from the expression, left to right, and let the operators do the work."
+    hints:
+      - "Do `(9 - 2)` first: PUSH 9, PUSH 2, SUB. Then `(3 + 1)`: PUSH 3, PUSH 1, ADD."
+      - "Now the stack is [7, 4]. MUL gives [28]."
+      - "Finally PUSH 8 and SUB to get 28 − 8, then PRINT."
+    solution: |
+      program = [
+          ("PUSH", 9),
+          ("PUSH", 2),
+          ("SUB",),      # 7
+          ("PUSH", 3),
+          ("PUSH", 1),
+          ("ADD",),      # 4
+          ("MUL",),      # 28
+          ("PUSH", 8),
+          ("SUB",),      # 20
+          ("PRINT",),
+      ]
+      run_stack(program, show=True)
+    explanation: |
+      Translate each part *operands first, operator last*, working from the innermost brackets outward. This ordering, called **postfix** or **reverse Polish notation**, is what you get when you walk a syntax tree visiting both children before their parent. You've just done by hand what Python does every time you run a line of code.
+
+commonMistakes:
+  - title: Thinking "Python is interpreted, so it's never compiled"
+    explanation: |
+      CPython compiles your code to bytecode first, then interprets the bytecode. "Compiled versus interpreted" is really a description of a language's usual *implementation*, not of the language itself, and many implementations mix both.
+  - title: Getting operand order wrong in stack code
+    explanation: |
+      For `SUB`, the value pushed **first** is the left side. `PUSH 4, PUSH 10, SUB` computes 4 − 10 = −6, not 10 − 4. Addition and multiplication don't care about order, which hides this bug until you subtract or divide.
+  - title: Expecting lines before a syntax error to run
+    explanation: |
+      Python compiles the whole file before running anything, so a syntax error on line 50 means line 1 never runs either. A runtime error on line 50, by contrast, happens after lines 1 to 49 have already run. Knowing which kind you have narrows down the search.
+  - title: Assuming assembly is portable
+    explanation: |
+      Assembly is a readable form of one CPU family's machine code. x86 assembly means nothing to an ARM processor. Portability is one of the main reasons high-level languages exist.
+
+summary:
+  - "Languages form layers: **machine code** (bits) → **assembly** (readable mnemonics, translated by an **assembler**) → **high-level languages**. Each layer is an **abstraction** over the one below."
+  - "A **compiler** translates a whole program ahead of time: **tokens** → **syntax tree** → optimisation → machine code."
+  - "An **interpreter** carries out a program directly as it reads it. Compiled code runs faster; interpreted code is quicker to change and more portable. **JIT** compilers mix both."
+  - "**Stack machines** push operands and apply operators to the top of the stack; operators come after their operands (postfix)."
+  - "**CPython** compiles source to **bytecode**, then a **virtual machine** (a stack machine written in C) runs it."
+  - "**Syntax errors** are found before anything runs; **runtime errors** happen partway through."
+next: |
+  That completes the hardware story: from a single bit to a running program. Before moving on, tackle the **Unit 1 project**, where you'll build a working 4-bit adding circuit out of logic gates.
+
+  Then, in **Unit 2**, you'll learn to program properly. You've already used `print`, names like `answer = 13`, arithmetic, and tiny functions. Unit 2 explains all of these from first principles, then adds decisions, loops and debugging, so you can write real programs of your own.
+
+quiz:
+  - type: mcq
+    question: What does an assembler do?
+    options:
+      - Translates a high-level language like Python into bytecode
+      - Translates assembly language mnemonics into machine code
+      - Runs Python programs line by line
+      - Physically assembles CPUs in a factory
+    answer: 1
+    explanation: Assembly maps almost one-to-one onto machine code, and the assembler performs that translation.
+  - type: mcq
+    question: What is the first stage of compiling, which breaks the source text into words like names, numbers and operators?
+    options: [Code generation, Optimisation, Lexing (tokenizing), Linking]
+    answer: 2
+    explanation: The lexer turns raw text into tokens, which the parser then arranges into a syntax tree.
+  - type: mcq
+    question: Which statement best describes how CPython runs a program?
+    options:
+      - It translates Python directly into x86 machine code
+      - It compiles the source to bytecode, which a virtual machine then interprets
+      - It sends the code to a server to run
+      - It interprets the source text character by character with no compiling at all
+    answer: 1
+    explanation: CPython compiles to bytecode for its stack-based virtual machine, and the VM (a C program) executes the bytecode.
+  - type: mcq
+    question: What value is on top of the stack after `PUSH 6`, `PUSH 2`, `SUB`?
+    options: ["4", "−4", "8", "12"]
+    answer: 0
+    explanation: SUB pops 2 (the right side) and then 6 (the left side), and pushes 6 − 2 = 4.
+  - type: mcq
+    question: A Python file has a typo that causes a syntax error on its last line. What happens when you run it?
+    options:
+      - All lines run except the last one
+      - The first line runs, then it stops
+      - Nothing runs; Python reports the syntax error before running any code
+      - Python skips the bad line and runs the rest
+    answer: 2
+    explanation: Python compiles the whole file to bytecode first, so a syntax error anywhere stops everything before any line runs.
+  - type: mcq
+    question: What is the main advantage of compiling to bytecode for a virtual machine, rather than to machine code?
+    options:
+      - The program runs faster than native machine code
+      - The same compiled program can run on any platform that has the virtual machine
+      - It makes syntax errors impossible
+      - It removes the need for a CPU
+    answer: 1
+    explanation: Bytecode targets an imaginary machine, so it runs anywhere the VM has been ported. The trade-off is usually some speed.
+  - type: code
+    question: |
+      Write a stack program for `run_stack` that computes `(4 + 6) * 3` and prints it. Push only 4, 6 and 3, in that order.
+    starter: |
+      program = [
+          ("PRINT",),
+      ]
+    tests:
+      - name: computes 30 using only 4, 6, 3
+        code: |
+          out, stack = capture(run_stack, program)
+          assert stack == [30], f"At the end the stack is {stack}."
+          assert [i[1] for i in program if i[0] == "PUSH"] == [4, 6, 3], "Push 4, 6 and 3 in order."
+          assert "30" in out.split(), "PRINT the result."
+    solution: |
+      program = [
+          ("PUSH", 4),
+          ("PUSH", 6),
+          ("ADD",),
+          ("PUSH", 3),
+          ("MUL",),
+          ("PRINT",),
+      ]
