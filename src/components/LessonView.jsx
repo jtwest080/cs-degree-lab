@@ -4,6 +4,8 @@ import CodeBlock from './CodeBlock.jsx';
 import CodeEditor from './CodeEditor.jsx';
 import Exercise from './Exercise.jsx';
 import Quiz from './Quiz.jsx';
+import AskClaude from './AskClaude.jsx';
+import ListenPlayer from './ListenPlayer.jsx';
 import { allLessons, languageOf, lessonById, unitByNumber, useLesson } from '../lib/content.js';
 import { href } from '../lib/router.js';
 import { isLessonUnlocked, isUnitComplete, lessonProgress, useProgress } from '../lib/progress.js';
@@ -147,6 +149,7 @@ export default function LessonView({ lessonId }) {
           <div className="eyebrow">Unit {unit.number} · Lesson {lesson.number} · about {lesson.minutes || 30} min</div>
           <h1>{lesson.title}</h1>
           {lp.quizPassed && <span className="done-tag big">✓ Mastered ({Math.round(lp.quizBest * 100)}%)</span>}
+          <div><ListenPlayer lessonId={lesson.id} /></div>
         </header>
 
         <section id="objective" className="objective card">
@@ -245,6 +248,7 @@ export default function LessonView({ lessonId }) {
           ) : <span />}
         </nav>
       </article>
+      <AskClaude key={lesson.id} lesson={lesson} unit={unit} />
     </div>
   );
 }
