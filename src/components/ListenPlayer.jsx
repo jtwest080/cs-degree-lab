@@ -46,7 +46,13 @@ export default function ListenPlayer({ lessonId }) {
     return () => document.body.classList.remove('listening');
   }, [active]);
 
-  if (!speechSupported) return null;
+  if (!speechSupported) {
+    return (
+      <button className="btn listen-btn" disabled title="This browser has no built-in speech voices">
+        🔊 Listen isn't available in this browser
+      </button>
+    );
+  }
 
   const mark = (i) => {
     document.querySelectorAll('.reading-now').forEach((el) => el.classList.remove('reading-now'));
