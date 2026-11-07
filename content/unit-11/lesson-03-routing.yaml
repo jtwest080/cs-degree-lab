@@ -1,0 +1,752 @@
+id: u11-routing
+title: "Routing: Finding the Way"
+minutes: 60
+objective: |
+  Learn how routers build their forwarding tables. Distinguish forwarding from routing, see how link-state routing runs Dijkstra on a map every router shares, how distance-vector routing computes the same thing with only neighbour-to-neighbour gossip, why loops and "counting to infinity" happen, and how the internet links thousands of independently run networks with BGP.
+outcomes:
+  - Distinguish forwarding (per packet) from routing (building the tables)
+  - Compute next hops with a link-state calculation (Dijkstra) over a network graph
+  - Simulate distance-vector routing, including the Bellman-Ford update rule and convergence
+  - Explain routing loops, TTL, counting to infinity and split horizon
+  - Describe autonomous systems and how BGP chooses routes using policy and path length
+
+sections:
+  - heading: Forwarding versus routing
+    body: |
+      Two jobs are easily confused. **Forwarding** is what a router does to every packet: look at the destination address, find the longest matching prefix in the forwarding table (Lesson 11.2) and send the packet out of the right link. It must happen in nanoseconds. **Routing** is the slower job of *building* that table: working out which neighbour leads to each destination, and keeping the answer current when links break or appear.
+
+      We can model a network as a **weighted graph** (Unit 6 and Unit 8): routers are nodes, links are edges, and each link has a **cost** (distance, delay, or a number the operator chooses). The goal of routing is each router's **next hop** for every destination, such that following the next hops from router to router gives the cheapest path. The two classic approaches differ in what each router knows.
+
+  - heading: Link-state routing
+    body: |
+      In **link-state** routing (OSPF, IS-IS), every router learns the **whole map**:
+
+      1. Each router discovers its neighbours and the cost of the links to them.
+      2. It **floods** this *link-state advertisement* to every other router. Each router passes on a new advertisement to all neighbours except the one it came from, and remembers the latest sequence number so that each advertisement is flooded once.
+      3. Now every router holds the same graph, and runs **Dijkstra's algorithm** (Lesson 8.8) from itself. Instead of storing the whole path to each destination, it records only the **first hop**.
+
+      Because everyone computes from identical data, the tables are consistent. When a link fails, its neighbours flood a new advertisement and every router recomputes. The price is memory and CPU proportional to the whole network, so link-state is used inside one organisation, not across the whole internet.
+
+      One practical detail: when two paths cost the same (**equal-cost multipath**), all routers must break ties the same way (or deliberately split traffic) or packets may loop. Our exercises always pick the lexicographically smallest path.
+
+  - heading: Distance-vector routing
+    body: |
+      In **distance-vector** routing (RIP and the classic Bellman-Ford approach), a router does **not** know the map. It only knows its neighbours and what they tell it. Each router keeps a table of `destination → (cost, next hop)` and periodically sends its **vector of costs** to its neighbours. On receiving neighbour *N*'s vector, with *c* the link cost to *N*, the router applies the **Bellman-Ford update** for each destination *d*:
+
+      > `cost(d) = min(cost(d), c + N's cost(d))`
+
+      A cheaper route replaces the old one, with *N* as the new next hop. Repeating this, good news spreads one hop per round, and after at most (number of routers − 1) rounds every table is correct. No router needs the map, which makes distance-vector simple and cheap. But there is a famous weakness.
+
+      **Counting to infinity.** Suppose A reaches C through B, and the link B–C breaks. B now has no route to C, but A still advertises "I can reach C at cost 2", so B decides to route through A, at cost 3. A then hears B's new cost and updates to 4, then B to 5, and so on: the two routers keep adding to each other's cost, each stuck in a **routing loop** in which packets bounce between them. Bad news travels slowly. Protocols mitigate this with:
+
+      - a small maximum that counts as **infinity** (RIP uses 16), so the counting stops;
+      - **split horizon**: never advertise a route back to the neighbour it came through (and **poison reverse**: advertise it with cost infinity);
+      - **triggered updates**: send news of a change immediately instead of waiting for the next periodic update.
+
+      Split horizon cures the two-router loop but not all loops, which is one reason large networks prefer link-state.
+
+  - heading: TTL, loops and traceroute
+    body: |
+      Routing tables can be briefly inconsistent while news propagates, so packets may travel in circles. To stop a looping packet from living forever, every IP packet carries a **TTL** (time to live), a counter that each router **decrements**. When it reaches zero the router drops the packet and sends back an error message (ICMP "time exceeded").
+
+      The `traceroute` tool turns this into a map: it sends probes with TTL 1, 2, 3, ... and each router along the path reports itself when it discards the packet that expired there. Seeing the list of routers (and the delay to each) shows where a slow link is.
+
+  - heading: The internet is a network of networks
+    body: |
+      No single protocol can run the whole internet: it is too large for link-state, and different organisations want to keep their internals private and apply their own policies. The internet is divided into about 100,000 **autonomous systems (AS)**: networks under one administration, such as an ISP, a university or a cloud provider, each with an AS number.
+
+      - Inside an AS, an **interior gateway protocol** (OSPF, RIP) finds the best paths by cost.
+      - Between ASes, **BGP** (Border Gateway Protocol) exchanges *reachability*. A BGP router tells its neighbours: "I can reach this prefix, via this **AS path**" such as `AS 64500 → AS 64510 → AS 64520`. Receivers **prepend** their own AS number before passing the route on.
+
+      BGP is a **path-vector** protocol. Seeing the whole AS path has two benefits. It prevents loops: a router discards any route whose AS path already contains its own AS number. And it lets operators apply **policy**: ASes prefer routes through customers (who pay them) over peers over providers, and often choose by business reasons, not shortest path. Among otherwise equal routes, the shorter AS path wins.
+
+      Because BGP is built on trust, a mistaken or malicious announcement can divert the traffic of the world: in 2008 a Pakistani ISP's attempt to block YouTube accidentally took it offline globally, and similar leaks still happen. Securing BGP is an ongoing effort (Unit 16).
+
+examples:
+  - title: "Link-state: Dijkstra from each router"
+    intro: "Every router has the same map. Each runs Dijkstra and keeps only the first hop toward every destination."
+    code: |
+      import heapq
+
+      graph = {
+          "A": {"B": 1, "C": 4},
+          "B": {"A": 1, "C": 2, "D": 5},
+          "C": {"A": 4, "B": 2, "D": 1},
+          "D": {"B": 5, "C": 1, "E": 3},
+          "E": {"D": 3},
+      }
+
+
+      def next_hops(graph, source):
+          settled = {}
+          heap = [(0, (source,))]
+          while heap:
+              cost, path = heapq.heappop(heap)
+              node = path[-1]
+              if node in settled:
+                  continue
+              settled[node] = (cost, path[1] if len(path) > 1 else None)
+              for neighbour, weight in graph[node].items():
+                  if neighbour not in settled:
+                      heapq.heappush(heap, (cost + weight, path + (neighbour,)))
+          return settled
+
+
+      for router in ("A", "E"):
+          print("forwarding table of", router)
+          for dest, (cost, hop) in sorted(next_hops(graph, router).items()):
+              if dest != router:
+                  print(f"   to {dest}: cost {cost}, send to {hop}")
+    output: |
+      forwarding table of A
+         to B: cost 1, send to B
+         to C: cost 3, send to B
+         to D: cost 4, send to B
+         to E: cost 7, send to B
+      forwarding table of E
+         to A: cost 7, send to D
+         to B: cost 6, send to D
+         to C: cost 4, send to D
+         to D: cost 3, send to D
+    lines:
+      - line: 15
+        note: "The heap holds (cost, whole path). Ties on cost are broken by comparing the paths, so the result is always the same."
+      - line: 21
+        note: "A router only keeps the first step, the next hop, not the whole path."
+  - title: "Distance-vector: gossip until nothing changes"
+    intro: "Each round, every router looks at its neighbours' tables from the last round. News travels one hop per round."
+    code: |
+      graph = {"A": {"B": 1}, "B": {"A": 1, "C": 2}, "C": {"B": 2, "D": 1}, "D": {"C": 1}}
+
+      tables = {n: {n: 0} for n in graph}
+      rounds = 0
+      while True:
+          old = {n: dict(t) for n, t in tables.items()}
+          changed = False
+          for node, links in graph.items():
+              for neighbour, cost in links.items():
+                  for dest, ncost in old[neighbour].items():
+                      if cost + ncost < tables[node].get(dest, float("inf")):
+                          tables[node][dest] = cost + ncost
+                          changed = True
+          if not changed:
+              break
+          rounds += 1
+          print(f"after round {rounds}: A knows", dict(sorted(tables["A"].items())))
+
+      print("converged; tables:")
+      for node in sorted(tables):
+          print(" ", node, dict(sorted(tables[node].items())))
+    output: |
+      after round 1: A knows {'A': 0, 'B': 1}
+      after round 2: A knows {'A': 0, 'B': 1, 'C': 3}
+      after round 3: A knows {'A': 0, 'B': 1, 'C': 3, 'D': 4}
+      converged; tables:
+        A {'A': 0, 'B': 1, 'C': 3, 'D': 4}
+        B {'A': 1, 'B': 0, 'C': 2, 'D': 3}
+        C {'A': 3, 'B': 2, 'C': 0, 'D': 1}
+        D {'A': 4, 'B': 3, 'C': 1, 'D': 0}
+    lines:
+      - line: 6
+        note: "Snapshot the tables first, so all routers in a round use last round's information."
+      - line: 11
+        note: "The Bellman-Ford update: a route through a neighbour costs the link plus the neighbour's advertised cost."
+      - line: 16
+        note: "A learns about D, three hops away, only in the third round."
+  - title: Counting to infinity
+    intro: "After the B–C link breaks, A and B keep feeding each other stale news. Infinity is capped at 16, as in RIP."
+    code: |
+      INF = 16
+      # Before the failure: A reaches C through B at cost 2, and B reaches C directly at cost 1.
+      # Now the link B-C breaks. B has lost its direct route; A has not noticed yet.
+
+
+      def simulate(split_horizon):
+          a, b = 2, INF
+          history = [(a, b)]
+          for _ in range(40):
+              # each router uses what the other advertised last round
+              adv_a = INF if split_horizon else a      # A learned C from B, so split horizon hides it from B
+              adv_b = b
+              new_b = min(INF, adv_a + 1)
+              new_a = min(INF, adv_b + 1)
+              if (new_a, new_b) == (a, b):
+                  break
+              a, b = new_a, new_b
+              history.append((a, b))
+              if a == INF and b == INF:
+                  break
+          return history
+
+
+      plain = simulate(False)
+      print("without split horizon (A's cost, B's cost to C):")
+      print(plain[:9], "...")
+      print("rounds until both give up:", len(plain) - 1)
+      guarded = simulate(True)
+      print("with split horizon:", guarded)
+    output: |
+      without split horizon (A's cost, B's cost to C):
+      [(2, 16), (16, 3), (4, 16), (16, 5), (6, 16), (16, 7), (8, 16), (16, 9), (10, 16)] ...
+      rounds until both give up: 14
+      with split horizon: [(2, 16), (16, 16)]
+    lines:
+      - line: 9
+        note: "A starts with a stale route to C at cost 2; B has already lost its link."
+      - line: 12
+        note: "With split horizon, A never advertises to B the route it learned from B."
+      - line: 25
+        note: "The costs climb in steps until they reach the cap. Packets for C bounce between A and B the whole time."
+  - title: A forwarding loop and TTL
+    intro: "Two routers with inconsistent tables each think the other is the way. The TTL ends the loop."
+    code: |
+      tables = {
+          "A": {"C": "B"},
+          "B": {"C": "A"},       # after a failure, B's table points back at A
+      }
+
+
+      def forward(tables, src, dst, ttl):
+          path, here = [src], src
+          while here != dst:
+              if ttl == 0:
+                  return path, "TTL expired"
+              hop = tables.get(here, {}).get(dst)
+              if hop is None:
+                  return path, "no route"
+              ttl -= 1
+              here = hop
+              path.append(here)
+          return path, "delivered"
+
+
+      print(forward(tables, "A", "C", 6))
+      print(forward(tables, "A", "A", 6))
+      print(forward(tables, "C", "A", 6))
+    output: |
+      (['A', 'B', 'A', 'B', 'A', 'B', 'A'], 'TTL expired')
+      (['A'], 'delivered')
+      (['C'], 'no route')
+    lines:
+      - line: 10
+        note: "A packet with TTL zero that has not arrived is discarded."
+      - line: 14
+        note: "Each router decrements the TTL before passing the packet on."
+      - line: 20
+        note: "C has no table at all, so there is no route."
+  - title: Choosing a BGP route
+    intro: "Routes carry the list of ASes they cross. Discard routes that already contain your own AS, then prefer the shortest."
+    code: |
+      def choose(my_as, routes):
+          usable = [(n, path) for n, path in routes if my_as not in path]
+          if not usable:
+              return None
+          return min(usable, key=lambda r: (len(r[1]), r[1]))
+
+
+      routes = [
+          (64510, [64510, 64530, 64540]),
+          (64520, [64520, 64540]),
+          (64550, [64550, 64500, 64540]),     # passes through us
+      ]
+      print(choose(64500, routes))
+      print(choose(64500, [(64550, [64550, 64500, 64540])]))
+      print(choose(64500, []))
+      advertised = [64500] + choose(64500, routes)[1]
+      print("what we tell our neighbours:", advertised)
+    output: |
+      (64520, [64520, 64540])
+      None
+      None
+      what we tell our neighbours: [64500, 64520, 64540]
+    lines:
+      - line: 2
+        note: "Loop prevention: a route through our own AS would come straight back to us."
+      - line: 5
+        note: "Shorter AS path wins; equal lengths fall back to comparing the paths so the choice is deterministic."
+      - line: 17
+        note: "Before passing a route on, we prepend our own AS number."
+
+playground:
+  prompt: |
+    Change the link cost of B–C in the distance-vector example from 2 to 10 and see which routers change their next hop. Add a new router F attached to E in the link-state example and print its forwarding table.
+  code: |
+    graph = {"A": {"B": 1}, "B": {"A": 1}}
+    print(graph)
+
+exercises:
+  - id: next-hops
+    title: Link-state next hops
+    difficulty: 3
+    prompt: |
+      Write `next_hops(graph, source)`. `graph` is `{router: {neighbour: cost}}` with positive integer costs (links are listed in both directions). Return `{destination: (cost, first_hop)}` for every router reachable from `source`, **excluding the source itself**. `first_hop` is the neighbour of `source` that the cheapest path starts with. When several paths have the same cost, choose the one whose list of router names is **lexicographically smallest** (compare the lists of names from `source` onward, so `["A","B","D"]` beats `["A","C","D"]`). Unreachable routers are left out; a source with no links returns `{}`. Raise `KeyError` if `source` is not in the graph.
+    starter: |
+      import heapq
+
+
+      def next_hops(graph, source):
+          pass
+    tests:
+      - name: small network
+        code: |
+          g = {"A": {"B": 1, "C": 4}, "B": {"A": 1, "C": 2, "D": 5}, "C": {"A": 4, "B": 2, "D": 1}, "D": {"B": 5, "C": 1, "E": 3}, "E": {"D": 3}}
+          assert next_hops(g, "A") == {"B": (1, "B"), "C": (3, "B"), "D": (4, "B"), "E": (7, "B")}
+          assert next_hops(g, "E") == {"D": (3, "D"), "C": (4, "D"), "B": (6, "D"), "A": (7, "D")}
+      - name: ties and unreachable
+        code: |
+          g = {"A": {"B": 1, "C": 1}, "B": {"A": 1, "D": 1}, "C": {"A": 1, "D": 1}, "D": {"B": 1, "C": 1, "E": 2}, "E": {"D": 2}, "Z": {}}
+          assert next_hops(g, "A") == {"B": (1, "B"), "C": (1, "C"), "D": (2, "B"), "E": (4, "B")}
+          assert next_hops(g, "D") == {"B": (1, "B"), "C": (1, "C"), "E": (2, "E"), "A": (2, "B")}
+          assert next_hops(g, "Z") == {}
+          assert "Z" not in next_hops(g, "A")
+          try:
+              next_hops(g, "Q")
+              assert False
+          except KeyError:
+              pass
+      - name: cost agrees with brute force
+        code: |
+          import random, itertools
+          rng = random.Random(12)
+          for _ in range(60):
+              n = rng.randint(2, 7)
+              names = [chr(65 + i) for i in range(n)]
+              g = {x: {} for x in names}
+              for a, b in itertools.combinations(names, 2):
+                  if rng.random() < 0.5:
+                      w = rng.randint(1, 5)
+                      g[a][b] = g[b][a] = w
+              # Floyd-Warshall as an oracle
+              INF = float("inf")
+              d = {a: {b: (0 if a == b else g[a].get(b, INF)) for b in names} for a in names}
+              for k in names:
+                  for i in names:
+                      for j in names:
+                          if d[i][k] + d[k][j] < d[i][j]:
+                              d[i][j] = d[i][k] + d[k][j]
+              src = rng.choice(names)
+              got = next_hops(g, src)
+              expected = {b: d[src][b] for b in names if b != src and d[src][b] < INF}
+              assert {k: v[0] for k, v in got.items()} == expected
+              for dest, (cost, hop) in got.items():
+                  assert hop in g[src] and g[src][hop] + d[hop][dest] == cost
+    hints:
+      - "This is Dijkstra from Lesson 8.8. Put `(cost, path)` tuples on the heap, where `path` is a tuple of router names."
+      - "Python compares tuples element by element, so the heap pops the cheapest cost first and, among equal costs, the smallest path."
+      - "Skip a popped entry whose last router is already settled. When you settle a router, record `(cost, path[1])` (the second router on the path is the first hop)."
+      - "Don't record the source. Push `(cost + weight, path + (neighbour,))` for each unsettled neighbour."
+    solution: |
+      import heapq
+
+
+      def next_hops(graph, source):
+          if source not in graph:
+              raise KeyError(source)
+          settled = {}
+          heap = [(0, (source,))]
+          while heap:
+              cost, path = heapq.heappop(heap)
+              node = path[-1]
+              if node in settled:
+                  continue
+              settled[node] = (cost, path[1] if len(path) > 1 else None)
+              for neighbour, weight in graph[node].items():
+                  if neighbour not in settled:
+                      heapq.heappush(heap, (cost + weight, path + (neighbour,)))
+          del settled[source]
+          return settled
+    explanation: |
+      Every router in an OSPF area runs essentially this code on the shared map. Carrying the entire path in the heap makes the tie-break trivial to state, at some cost in memory; production implementations keep a predecessor map and apply a deterministic rule (or deliberately keep all equal-cost next hops to share the load).
+
+  - id: dv-converge
+    title: Distance-vector convergence
+    difficulty: 3
+    prompt: |
+      Write `dv_converge(graph)` simulating synchronous distance-vector routing. `graph` is `{router: {neighbour: cost}}`. Each router starts knowing only itself at cost 0. In every round, **every** router updates its table using its neighbours' tables **as they were at the start of the round** (apply `cost = min(cost, link + neighbour's cost)` for every destination the neighbour knows). Stop when a round changes nothing. Return `(tables, rounds)` where `tables` is `{router: {destination: cost}}` (including the router itself at 0) and `rounds` is the number of rounds in which at least one table changed. An empty graph returns `({}, 0)`.
+    starter: |
+      def dv_converge(graph):
+          pass
+    tests:
+      - name: a line of routers
+        code: |
+          g = {"A": {"B": 1}, "B": {"A": 1, "C": 2}, "C": {"B": 2, "D": 1}, "D": {"C": 1}}
+          tables, rounds = dv_converge(g)
+          assert rounds == 3
+          assert tables["A"] == {"A": 0, "B": 1, "C": 3, "D": 4}
+          assert tables["D"] == {"D": 0, "C": 1, "B": 3, "A": 4}
+          assert tables["B"] == {"A": 1, "B": 0, "C": 2, "D": 3}
+      - name: shortcuts and isolated routers
+        code: |
+          g = {"A": {"B": 5, "C": 1}, "B": {"A": 5, "C": 1}, "C": {"A": 1, "B": 1}, "X": {}}
+          tables, rounds = dv_converge(g)
+          assert tables["A"]["B"] == 2 and tables["B"]["A"] == 2
+          assert tables["X"] == {"X": 0} and "X" not in tables["A"]
+          assert rounds == 2
+          assert dv_converge({}) == ({}, 0)
+          assert dv_converge({"A": {}}) == ({"A": {"A": 0}}, 0)
+      - name: matches shortest paths
+        code: |
+          import random, itertools
+          rng = random.Random(21)
+          for _ in range(60):
+              n = rng.randint(1, 7)
+              names = [chr(65 + i) for i in range(n)]
+              g = {x: {} for x in names}
+              for a, b in itertools.combinations(names, 2):
+                  if rng.random() < 0.45:
+                      g[a][b] = g[b][a] = rng.randint(1, 6)
+              INF = float("inf")
+              d = {a: {b: (0 if a == b else g[a].get(b, INF)) for b in names} for a in names}
+              for k in names:
+                  for i in names:
+                      for j in names:
+                          if d[i][k] + d[k][j] < d[i][j]:
+                              d[i][j] = d[i][k] + d[k][j]
+              tables, rounds = dv_converge(g)
+              for a in names:
+                  assert tables[a] == {b: d[a][b] for b in names if d[a][b] < INF}
+              assert rounds <= n
+    hints:
+      - "Start with `tables = {r: {r: 0} for r in graph}`."
+      - "Each round, take a snapshot `old = {r: dict(t) for r, t in tables.items()}` before changing anything."
+      - "For every router, every neighbour and every destination in `old[neighbour]`, offer `cost + old[neighbour][dest]` and keep it if it is lower than the current entry (or the entry is missing)."
+      - "Count the round only if something changed."
+    solution: |
+      def dv_converge(graph):
+          tables = {r: {r: 0} for r in graph}
+          rounds = 0
+          while True:
+              old = {r: dict(t) for r, t in tables.items()}
+              changed = False
+              for router, links in graph.items():
+                  for neighbour, cost in links.items():
+                      for dest, ncost in old[neighbour].items():
+                          if dest not in tables[router] or cost + ncost < tables[router][dest]:
+                              tables[router][dest] = cost + ncost
+                              changed = True
+              if not changed:
+                  return tables, rounds
+              rounds += 1
+    explanation: |
+      No router ever saw the map, yet every table equals the true shortest-path distances. The bound `rounds <= n` in the last test is the Bellman-Ford guarantee from Lesson 8.8: a shortest path has at most n-1 links, and each round extends the known distances by one more link.
+
+  - id: dv-update
+    title: One distance-vector update
+    difficulty: 3
+    prompt: |
+      Write `dv_update(table, neighbour, cost, advertised, infinity=16)`: how one router processes the vector it received from one neighbour. `table` is `{dest: (cost, next_hop)}` (the router's own entry has `next_hop` `None`), `cost` is the link cost to `neighbour`, and `advertised` is `{dest: cost}` from that neighbour. For each advertised destination compute `candidate = min(infinity, cost + advertised cost)`. Then: if the destination is **unknown**, add it as `(candidate, neighbour)` only if `candidate < infinity`; if the current next hop **is this neighbour**, always follow its news (set `(candidate, neighbour)` when the cost differs, even if it is worse); otherwise replace the entry only if `candidate` is **strictly lower** than the current cost. Return `(new_table, changed)` and do **not** modify the argument. A cost equal to `infinity` means unreachable and the entry is kept.
+    starter: |
+      def dv_update(table, neighbour, cost, advertised, infinity=16):
+          pass
+    tests:
+      - name: learning and improving
+        code: |
+          table = {"A": (0, None), "C": (5, "B")}
+          new, changed = dv_update(table, "N", 1, {"N": 0, "C": 2, "D": 4})
+          assert new == {"A": (0, None), "N": (1, "N"), "C": (3, "N"), "D": (5, "N")}
+          assert changed is True
+          assert table == {"A": (0, None), "C": (5, "B")}
+          new, changed = dv_update(new, "N", 1, {"N": 0, "C": 2, "D": 4})
+          assert changed is False
+      - name: following the next hop, good and bad news
+        code: |
+          table = {"A": (0, None), "C": (3, "B")}
+          new, changed = dv_update(table, "B", 1, {"C": 7})
+          assert new["C"] == (8, "B") and changed
+          new, changed = dv_update(table, "B", 1, {"C": 16})
+          assert new["C"] == (16, "B") and changed
+          # another neighbour with a worse route does not replace it
+          new, changed = dv_update(table, "X", 1, {"C": 5})
+          assert new["C"] == (3, "B") and not changed
+          new, changed = dv_update(table, "X", 1, {"C": 1})
+          assert new["C"] == (2, "X") and changed
+      - name: infinity
+        code: |
+          table = {"A": (0, None)}
+          new, changed = dv_update(table, "N", 1, {"Z": 15})
+          assert new == {"A": (0, None)} and not changed          # 16 is infinity: do not add
+          new, changed = dv_update(table, "N", 1, {"Z": 14})
+          assert new["Z"] == (15, "N")
+          new, changed = dv_update({"A": (0, None), "Z": (16, "N")}, "N", 1, {"Z": 16})
+          assert new["Z"] == (16, "N") and not changed
+          new, changed = dv_update(table, "N", 3, {"A": 0}, infinity=10)
+          assert new["A"] == (0, None) and not changed
+    hints:
+      - "Copy the table first: `new = dict(table)`."
+      - "Three cases for each destination: not in `new`; `new[dest][1] == neighbour`; otherwise. Handle them in that order."
+      - "Set `changed = True` only when you actually store a different value."
+    solution: |
+      def dv_update(table, neighbour, cost, advertised, infinity=16):
+          new = dict(table)
+          changed = False
+          for dest, adv in advertised.items():
+              candidate = min(infinity, cost + adv)
+              current = new.get(dest)
+              if current is None:
+                  if candidate < infinity:
+                      new[dest] = (candidate, neighbour)
+                      changed = True
+              elif current[1] == neighbour:
+                  if candidate != current[0]:
+                      new[dest] = (candidate, neighbour)
+                      changed = True
+              elif candidate < current[0]:
+                  new[dest] = (candidate, neighbour)
+                  changed = True
+          return new, changed
+    explanation: |
+      The middle case is the subtle one, and it is what makes counting to infinity possible: a router must believe its next hop even when the news gets worse, because the next hop is the only source of truth about the route's current cost. A router that ignored worse news from its next hop would keep forwarding into a broken path forever.
+
+  - id: forward
+    title: Following a packet
+    difficulty: 3
+    prompt: |
+      Write `forward(tables, src, dst, ttl=32)`. `tables` is `{router: {destination: next_hop}}`. The packet starts at `src`. While it is not at `dst`: if the TTL is 0 stop with status `"TTL expired"`; look up the next hop in the current router's table and stop with `"no route"` if there is none (or the router has no table); otherwise decrement the TTL and move to the next hop. Return `(path, status)` where `path` is the list of every router the packet visited, starting with `src`, and the status is `"delivered"` when it reaches `dst`. If `src == dst` the answer is `([src], "delivered")`. Also write `has_loop(tables, src, dst)` that returns `True` when following next hops from `src` towards `dst` revisits a router (use no TTL; stop on delivery or no route).
+    starter: |
+      def forward(tables, src, dst, ttl=32):
+          pass
+
+
+      def has_loop(tables, src, dst):
+          pass
+    tests:
+      - name: delivery and failures
+        code: |
+          t = {"A": {"D": "B"}, "B": {"D": "C"}, "C": {"D": "D"}}
+          assert forward(t, "A", "D") == (["A", "B", "C", "D"], "delivered")
+          assert forward(t, "A", "A") == (["A"], "delivered")
+          assert forward(t, "C", "D", 1) == (["C", "D"], "delivered")
+          assert forward(t, "B", "Z") == (["B"], "no route")
+          assert forward(t, "Q", "D") == (["Q"], "no route")
+      - name: ttl
+        code: |
+          t = {"A": {"D": "B"}, "B": {"D": "C"}, "C": {"D": "D"}}
+          assert forward(t, "A", "D", 3) == (["A", "B", "C", "D"], "delivered")
+          assert forward(t, "A", "D", 2) == (["A", "B", "C"], "TTL expired")
+          assert forward(t, "A", "D", 0) == (["A"], "TTL expired")
+          loop = {"A": {"C": "B"}, "B": {"C": "A"}}
+          assert forward(loop, "A", "C", 5) == (["A", "B", "A", "B", "A", "B"], "TTL expired")
+      - name: loops
+        code: |
+          loop = {"A": {"C": "B"}, "B": {"C": "A"}}
+          assert has_loop(loop, "A", "C") is True
+          ok = {"A": {"C": "B"}, "B": {"C": "C"}}
+          assert has_loop(ok, "A", "C") is False
+          assert has_loop(ok, "A", "A") is False
+          assert has_loop({"A": {"C": "A"}}, "A", "C") is True
+          assert has_loop({"A": {"C": "B"}}, "A", "C") is False
+    hints:
+      - "Keep `path = [src]` and `here = src`; loop `while here != dst`."
+      - "Check `ttl == 0` first, then the lookup `tables.get(here, {}).get(dst)`."
+      - "`has_loop`: keep a `seen` set of routers visited; if the next hop is already in it, return `True`."
+    solution: |
+      def forward(tables, src, dst, ttl=32):
+          path, here = [src], src
+          while here != dst:
+              if ttl == 0:
+                  return path, "TTL expired"
+              hop = tables.get(here, {}).get(dst)
+              if hop is None:
+                  return path, "no route"
+              ttl -= 1
+              here = hop
+              path.append(here)
+          return path, "delivered"
+
+
+      def has_loop(tables, src, dst):
+          seen = {src}
+          here = src
+          while here != dst:
+              hop = tables.get(here, {}).get(dst)
+              if hop is None:
+                  return False
+              if hop in seen:
+                  return True
+              seen.add(hop)
+              here = hop
+          return False
+    explanation: |
+      Notice the TTL check happens when the packet is *at* a router that is not the destination: a packet with TTL 1 can still be delivered one hop away, but not two. Real routers decrement and drop at the same point. The detection loop in `has_loop` is the cycle-detection pattern from Lesson 7.9, on a "functional graph" where every router has exactly one next hop.
+
+  - id: bgp
+    title: Choosing a BGP route
+    difficulty: 2
+    prompt: |
+      Write `choose_route(my_as, routes)`. `routes` is a list of `(neighbour_as, as_path)` where `as_path` is a list of AS numbers, starting with the neighbour. Discard any route whose path contains `my_as` (a loop). Among the rest, return the one with the **shortest** path; when lengths tie, the one whose `as_path` list is smaller when compared as lists. Return `None` if nothing is usable. Also write `advertise(my_as, route)` returning the AS path to pass on to neighbours: the route's path with `my_as` **prepended** (return a new list; do not change the route), and `prefer(customers, peers, providers, routes)` which, given sets of AS numbers, returns the best route using **policy first**: a route learned from a customer is preferred to one from a peer, and a peer to a provider (neighbours not in any set rank last); within the same class use `choose_route`'s rule of shortest path then smaller path. Returns `None` for an empty list.
+    starter: |
+      def choose_route(my_as, routes):
+          pass
+
+
+      def advertise(my_as, route):
+          pass
+
+
+      def prefer(customers, peers, providers, routes):
+          pass
+    tests:
+      - name: shortest path and loops
+        code: |
+          routes = [(1, [1, 5, 9]), (2, [2, 9]), (3, [3, 7, 100, 9])]
+          assert choose_route(100, routes) == (2, [2, 9])
+          assert choose_route(100, [(3, [3, 7, 100, 9])]) is None
+          assert choose_route(100, []) is None
+          assert choose_route(5, routes) == (2, [2, 9])
+          assert choose_route(9, [(1, [1, 5])]) == (1, [1, 5])
+      - name: ties
+        code: |
+          routes = [(7, [7, 20, 30]), (4, [4, 50, 30]), (8, [8, 1, 30, 31])]
+          assert choose_route(99, routes) == (4, [4, 50, 30])
+          assert choose_route(99, [(8, [8, 1]), (6, [6, 2])]) == (6, [6, 2])
+      - name: advertise
+        code: |
+          route = (2, [2, 9])
+          out = advertise(100, route)
+          assert out == [100, 2, 9] and route == (2, [2, 9])
+          assert advertise(5, (1, [])) == [5]
+      - name: policy
+        code: |
+          routes = [(10, [10, 99]), (20, [20, 5, 99]), (30, [30, 6, 7, 99]), (40, [40, 99])]
+          # customer 30 wins even though its path is longest
+          assert prefer({30}, {20}, {10, 40}, routes) == (30, [30, 6, 7, 99])
+          assert prefer(set(), {20}, {10, 40}, routes) == (20, [20, 5, 99])
+          assert prefer(set(), set(), {10, 40}, routes) == (10, [10, 99])
+          assert prefer(set(), set(), set(), routes) == (10, [10, 99])
+          assert prefer({1}, {2}, {3}, []) is None
+    hints:
+      - "`min(usable, key=lambda r: (len(r[1]), r[1]))` does shortest-then-smallest in one line."
+      - "`advertise` can be `[my_as] + route[1]`, which builds a new list."
+      - "For `prefer`, rank each route 0 (customer), 1 (peer), 2 (provider), 3 (other). Use `min` with the key `(rank, len(path), path)`."
+    solution: |
+      def choose_route(my_as, routes):
+          usable = [r for r in routes if my_as not in r[1]]
+          if not usable:
+              return None
+          return min(usable, key=lambda r: (len(r[1]), r[1]))
+
+
+      def advertise(my_as, route):
+          return [my_as] + route[1]
+
+
+      def prefer(customers, peers, providers, routes):
+          if not routes:
+              return None
+
+          def rank(route):
+              n = route[0]
+              if n in customers:
+                  return 0
+              if n in peers:
+                  return 1
+              if n in providers:
+                  return 2
+              return 3
+
+          return min(routes, key=lambda r: (rank(r), len(r[1]), r[1]))
+    explanation: |
+      Real BGP has about a dozen steps in its decision process, but the top ones are exactly these: local policy (money!) first, then AS path length. Notice that the policy rule means BGP does not find the *shortest* path. It finds the path the operators *prefer*, which is why internet routes are sometimes surprisingly roundabout.
+
+commonMistakes:
+  - title: Confusing routing with forwarding
+    explanation: |
+      Routing builds the table (slowly, occasionally). Forwarding uses it (for every packet, very fast).
+  - title: Using the map for distance-vector
+    explanation: |
+      A distance-vector router never sees the whole graph, only its neighbours' cost vectors. If your code needs the full graph to compute a router's table, it is link-state.
+  - title: Ignoring worse news from the next hop
+    explanation: |
+      If your next hop says the route got more expensive, believe it. Refusing bad news from the next hop leaves a stale, cheap-looking route in place.
+  - title: Forgetting the TTL
+    explanation: |
+      Without a TTL a looping packet would circulate forever and clog the links. Every router decrements it and drops the packet at zero.
+  - title: Believing BGP finds the shortest path
+    explanation: |
+      BGP follows business policy first. The path chosen may be longer in hops or in miles.
+  - title: Not breaking ties consistently
+    explanation: |
+      When two paths cost the same, routers that break the tie differently can create loops. Use one deterministic rule everywhere.
+
+summary:
+  - "**Forwarding** moves each packet using the table; **routing** builds the table. Costs make the network a weighted graph and routers compute next hops."
+  - "**Link-state** routing floods every link to every router, which then runs **Dijkstra** on the full map and keeps the first hop to each destination."
+  - "**Distance-vector** routing uses only neighbour gossip and the **Bellman-Ford update** `cost = min(cost, link + neighbour's cost)`, converging in at most n - 1 rounds."
+  - "Distance-vector can **count to infinity** after a failure. A small infinity (RIP's 16), **split horizon** and triggered updates limit the damage."
+  - "Each packet's **TTL** is decremented per hop and the packet is dropped at zero, ending loops and powering `traceroute`."
+  - "The internet is thousands of **autonomous systems**. **BGP** is a path-vector protocol: it carries AS paths, rejects routes containing its own AS, and chooses by **policy** first and path length second."
+next: |
+  Now packets can reach the right host. The next lesson covers what the hosts do with them: the **transport layer**, ports, UDP and the TCP connection.
+
+quiz:
+  - type: mcq
+    question: What is the difference between routing and forwarding?
+    options: [
+      "Routing builds the forwarding table; forwarding looks up the table for each packet",
+      "They are two names for the same thing",
+      "Forwarding builds the table; routing sends packets",
+      "Routing is for IPv6 and forwarding is for IPv4"
+    ]
+    answer: 0
+    explanation: "Routing is the slow control-plane computation; forwarding is the fast per-packet lookup."
+  - type: mcq
+    question: What does a link-state router do after it has flooded and received all advertisements?
+    options: [
+      "Runs Dijkstra on its copy of the whole network map",
+      "Asks its neighbours for their distance vectors",
+      "Sends test packets to every address",
+      "Waits for the TTL to expire"
+    ]
+    answer: 0
+    explanation: "Every router has the same map, so each can compute shortest paths locally."
+  - type: mcq
+    question: A distance-vector router with link cost 3 to neighbour N hears that N can reach D at cost 4. What cost does it offer for D via N?
+    options: ["7", "4", "3", "1"]
+    answer: 0
+    explanation: "Bellman-Ford: link cost plus the neighbour's advertised cost, 3 + 4."
+  - type: mcq
+    question: What does split horizon do?
+    options: [
+      "Stops a router advertising a route back to the neighbour it learned it from",
+      "Splits the network into two halves",
+      "Lowers the TTL by half",
+      "Encrypts routing updates"
+    ]
+    answer: 0
+    explanation: "This prevents the two-router bounce that causes counting to infinity."
+  - type: mcq
+    question: A packet arrives at a router with TTL 1 and the destination is not directly attached. What happens?
+    options: [
+      "The router decrements it to 0, drops the packet and sends back a time-exceeded message",
+      "It is forwarded with TTL 100",
+      "The destination is changed",
+      "Nothing; the TTL is only a hint"
+    ]
+    answer: 0
+    explanation: "A router decrements the TTL, and a packet whose TTL reaches zero is dropped, with an ICMP time-exceeded message sent back to the source."
+  - type: mcq
+    question: Why does a BGP router discard a route whose AS path already contains its own AS number?
+    options: [
+      "To prevent routing loops",
+      "To save memory",
+      "Because the path is too long",
+      "Because it would be encrypted"
+    ]
+    answer: 0
+    explanation: "A route through our own AS would lead back to us, so the AS path acts as a loop detector."
+  - type: code
+    question: |
+      Write `relax(dist_to_neighbour, link_cost, current)` implementing one Bellman-Ford offer: return the smaller of `current` and `link_cost + dist_to_neighbour`.
+    starter: |
+      def relax(dist_to_neighbour, link_cost, current):
+          pass
+    tests:
+      - name: offers
+        code: |
+          assert relax(4, 3, 10) == 7
+          assert relax(4, 3, 5) == 5
+          assert relax(0, 1, float("inf")) == 1
+          assert relax(2, 2, 4) == 4
+    solution: |
+      def relax(dist_to_neighbour, link_cost, current):
+          return min(current, link_cost + dist_to_neighbour)

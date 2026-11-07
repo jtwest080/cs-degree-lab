@@ -1,0 +1,1117 @@
+id: u11-sockets
+title: "Sockets, Clients and Servers"
+minutes: 65
+objective: |
+  Learn how programs actually use the network: the socket API with its bind, listen, accept, connect, send and receive calls. Understand why TCP gives you a stream with no message boundaries and how to frame messages, how a server handles many clients, and how to write clients that survive failures with timeouts, retries, backoff and rate limits. Everything is practised on a simulated network.
+outcomes:
+  - Describe the socket lifecycle for a TCP server and client
+  - Explain why a TCP stream has no message boundaries, and frame messages with length prefixes or delimiters
+  - Build and test an in-memory network with listening, connecting, sending, receiving and closing
+  - Design a simple line-based chat protocol as a state machine
+  - Write a client that retries with exponential backoff, and a token-bucket rate limiter
+  - Compare threads, event loops and asynchronous I/O for serving many clients
+
+sections:
+  - heading: The socket API
+    body: |
+      A **socket** is the operating system's handle for one end of a network conversation (Lesson 10.1 called such handles file descriptors; a socket is one). Every network program, from a browser to a game server, is built on this small API, which first appeared in Berkeley Unix in 1983.
+
+      **A TCP server** goes through these steps:
+
+      1. `socket()` creates a socket.
+      2. `bind(address, port)` attaches it to a local address and port, such as `("0.0.0.0", 8080)`, where `0.0.0.0` means "any of my addresses". If the port is already taken the call fails with "address already in use".
+      3. `listen()` turns it into a **listening socket** and starts a queue (the **backlog**) of connections waiting to be accepted.
+      4. `accept()` takes the next waiting connection and returns a **new socket** for it, plus the client's address. The listening socket keeps listening; each client gets its own connected socket.
+      5. `recv(n)` and `send(data)` move bytes. `close()` finishes.
+
+      **A TCP client** is shorter: `socket()`, `connect((host, port))` (which performs the three-way handshake of Lesson 11.4), then `send` and `recv`, then `close`. The client never calls `bind`: the OS picks an **ephemeral port** for it.
+
+      A **UDP** socket skips the connection: it uses `sendto(data, address)` and `recvfrom(n)`, and each call is one datagram.
+
+      Our browser-based Python cannot open real sockets, so in this lesson you will build a **simulated network** with the same shape of API. The code you write in the exercises has the same logic as the real thing.
+
+  - heading: A stream has no message boundaries
+    body: |
+      This is the most important fact about TCP programming. TCP delivers a **stream of bytes**, not messages. If a client calls `send(b"hello")` and then `send(b"world")`, the server's `recv(100)` might return `b"helloworld"`, or `b"hello"` then `b"world"`, or `b"hel"` then `b"loworld"`. The network may split and merge data in any way, and it can differ from run to run. Code that assumes "one send equals one recv" works on a developer's laptop and fails in production.
+
+      Two things follow.
+
+      - `recv(n)` returns **up to** `n` bytes: whatever has arrived, at least one byte. It returns an **empty** `b""` only when the other side has closed the connection (**end of file**). To read exactly `n` bytes you must loop.
+      - Your protocol must mark **where messages end**. The usual methods are:
+        - **Delimiter**: messages end with a special byte, typically a newline (`\n`), as in HTTP headers, SMTP and Redis. Simple to read and debug; the data cannot contain the delimiter without escaping.
+        - **Length prefix**: each message begins with its length, for example 4 bytes in network byte order, then that many bytes. Works for binary data; the reader needs to buffer partial messages.
+        - **Fixed size**, or closing the connection to mean "done" (HTTP/1.0 did that).
+
+      The receiving side keeps a **buffer**: append every `recv` result, and repeatedly extract any complete messages from the front, keeping the incomplete remainder for next time. Always **cap the length** you will accept: a hostile client can announce a four-gigabyte message to exhaust your memory.
+
+  - heading: Serving many clients
+    body: |
+      A basic server handles one client at a time: while it is talking to one connection, others wait in the backlog. Real servers need concurrency, and there are three classic designs (using ideas from Unit 10):
+
+      - **A thread (or process) per connection.** The simplest to write: each connection has its own code path that can block freely. It costs memory (a stack per thread) and scheduling overhead, so a few thousand connections is the limit.
+      - **An event loop with non-blocking sockets.** One thread asks the OS, with `select`, `poll` or `epoll`, "which of my sockets are ready to read or write?", and handles each ready one briefly without waiting. This is how nginx and Redis serve tens of thousands of connections on one thread. The cost is that the code is split into pieces driven by events.
+      - **Asynchronous I/O (`async`/`await`).** A language-level version of the event loop where `await conn.read()` suspends only that task. Python's `asyncio`, JavaScript's `await` and Rust's `tokio` are of this kind. This is the generator machinery from Lesson 10.4, with a loop that resumes tasks when their I/O is ready.
+
+      In our simulation `recv` returns `None` when nothing has arrived yet, instead of waiting: a non-blocking socket. The event-loop idea then becomes visible, since the program has to check again later.
+
+  - heading: Designing a protocol
+    body: |
+      A **protocol** is the agreement between client and server about what messages exist and what they mean. Text protocols (HTTP/1.1, SMTP, IRC) are easy to try by hand with `telnet` or `nc` and to debug. Binary protocols (DNS, TCP itself, gRPC) are compact and fast to parse. When you design one:
+
+      - Decide the **framing** first.
+      - Define every message and every error. A server must reply to nonsense with a clear error, never crash.
+      - Be **strict in what you send, careful in what you accept**: validate everything that arrives, since the bytes come from strangers (Unit 16).
+      - Include a **version** so the protocol can change.
+      - Think about **state**: what messages are legal now? (Lesson 11.4's TCP state machine, and the chat server in this lesson's exercises.)
+
+  - heading: Failure is normal
+    body: |
+      Networks fail constantly: connections are refused (nobody is listening), reset (the other side crashed), or simply go silent. A robust client assumes failure.
+
+      - Set a **timeout** on every network call. A call with no timeout can block forever.
+      - **Retry** failures that are likely to be temporary (timeouts, connection resets, 503 responses), but never retry blindly something that is not **idempotent** (Lesson 11.7).
+      - Use **exponential backoff**: wait 0.5 s, then 1 s, 2 s, 4 s, capped at some maximum, so that a recovering server is not buried under retries from thousands of clients at once. Add **random jitter** in real systems so that clients do not retry in lockstep.
+      - Give up after a bounded number of attempts and report the error.
+
+      Servers protect themselves with **rate limiting**. The classic algorithm is the **token bucket**: a bucket holds up to *capacity* tokens and is refilled at a steady *rate* per second; each request removes a token, and a request that finds the bucket empty is refused (HTTP 429 Too Many Requests). It allows short **bursts** up to the capacity while enforcing the long-run average rate.
+
+examples:
+  - title: A real TCP echo server and client
+    intro: "This is the genuine socket API in Python. It needs a real operating system, so read it here and run it on your own computer."
+    runnable: false
+    code: |
+      import socket
+
+
+      def serve(port=8080):
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+              server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+              server.bind(("0.0.0.0", port))
+              server.listen()
+              while True:
+                  conn, addr = server.accept()              # blocks until a client connects
+                  with conn:
+                      print("connection from", addr)
+                      while True:
+                          data = conn.recv(4096)            # up to 4096 bytes
+                          if not data:                      # b"" means the client closed
+                              break
+                          conn.sendall(data)                # send everything back
+
+
+      def client(host="127.0.0.1", port=8080):
+          with socket.create_connection((host, port), timeout=5) as conn:
+              conn.sendall(b"hello")
+              print(conn.recv(4096))
+    lines:
+      - line: 6
+        note: "AF_INET is IPv4 and SOCK_STREAM means TCP. A SOCK_DGRAM socket would be UDP."
+      - line: 7
+        note: "Allows restarting the server immediately without 'address already in use'."
+      - line: 10
+        note: "The backlog queue now holds clients that finished the handshake and are waiting for accept."
+      - line: 12
+        note: "accept returns a brand new socket for this client. The listening socket continues listening."
+      - line: 19
+        note: "sendall keeps sending until all the bytes are gone. A plain send may send only part."
+      - line: 24
+        note: "create_connection resolves the name (DNS, Lesson 11.6), connects (Lesson 11.4) and applies a timeout."
+  - title: A simulated network
+    intro: "The same lifecycle on an in-memory network. `recv` returns None when no data has arrived yet, standing in for blocking."
+    code: |
+      class Net:
+          def __init__(self):
+              self.listeners = {}
+              self.next_port = 49152
+
+          def listen(self, host, port):
+              if (host, port) in self.listeners:
+                  raise OSError("address already in use")
+              self.listeners[(host, port)] = []            # the backlog: connections waiting for accept
+              return (host, port)
+
+          def connect(self, client_host, host, port):
+              if (host, port) not in self.listeners:
+                  raise ConnectionRefusedError(f"nobody is listening on {host}:{port}")
+              client = Conn((client_host, self.next_port))
+              server = Conn((host, port))
+              self.next_port += 1
+              client.peer, server.peer = server, client
+              self.listeners[(host, port)].append(server)
+              return client
+
+          def accept(self, listener):
+              backlog = self.listeners[listener]
+              return backlog.pop(0) if backlog else None
+
+
+      class Conn:
+          def __init__(self, address):
+              self.address, self.peer, self.buffer, self.closed = address, None, b"", False
+
+          def send(self, data):
+              self.peer.buffer += data
+              return len(data)
+
+          def recv(self, n):
+              if self.buffer:
+                  data, self.buffer = self.buffer[:n], self.buffer[n:]
+                  return data
+              return b"" if self.peer.closed else None
+
+
+      net = Net()
+      server_addr = net.listen("10.0.0.1", 7)
+      client = net.connect("10.0.0.2", "10.0.0.1", 7)
+      print("client talks from", client.address)
+      conn = net.accept(server_addr)
+      print("server accepted a connection from", conn.peer.address)
+      print("nothing received yet:", conn.recv(100))
+      client.send(b"hello")
+      client.send(b"world")
+      print("one recv gets both sends:", conn.recv(100))
+      client.send(b"abcdef")
+      print("a short recv gets part:", conn.recv(3), conn.recv(3))
+      client.closed = True
+      print("after the client closes:", conn.recv(10))
+      try:
+          net.connect("10.0.0.2", "10.0.0.1", 8)
+      except ConnectionRefusedError as error:
+          print("refused:", error)
+    output: |
+      client talks from ('10.0.0.2', 49152)
+      server accepted a connection from ('10.0.0.2', 49152)
+      nothing received yet: None
+      one recv gets both sends: b'helloworld'
+      a short recv gets part: b'abc' b'def'
+      after the client closes: b''
+      refused: nobody is listening on 10.0.0.1:8
+    lines:
+      - line: 17
+        note: "The new connected socket is queued until the server calls accept."
+      - line: 41
+        note: "Two sends were merged: the stream has no memory of where each send ended."
+      - line: 49
+        note: "Once the buffer is empty and the peer has closed, recv returns b'' (end of file)."
+  - title: Framing messages
+    intro: "A delimiter and a length prefix, each with a receive buffer that copes with partial and merged data."
+    code: |
+      import struct
+
+
+      def split_lines(buffer):
+          *lines, rest = buffer.split(b"\n")
+          return lines, rest
+
+
+      buffer = b""
+      for chunk in (b"HEL", b"LO\nWOR", b"LD\nPING\nhalf a li"):
+          buffer += chunk
+          lines, buffer = split_lines(buffer)
+          print(f"received {chunk!r:22} -> complete messages {lines}, waiting with {buffer!r}")
+
+      print()
+
+
+      def frame(message):
+          return struct.pack(">I", len(message)) + message
+
+
+      stream = frame(b"first") + frame(b"") + frame(b"third message")
+      print(stream)
+      buffer, messages = b"", []
+      for i in range(0, len(stream), 5):                 # the network delivers 5 bytes at a time
+          buffer += stream[i:i + 5]
+          while len(buffer) >= 4:
+              (size,) = struct.unpack(">I", buffer[:4])
+              if len(buffer) < 4 + size:
+                  break
+              messages.append(buffer[4:4 + size])
+              buffer = buffer[4 + size:]
+      print(messages)
+    output: |
+      received b'HEL'                 -> complete messages [], waiting with b'HEL'
+      received b'LO\nWOR'             -> complete messages [b'HELLO'], waiting with b'WOR'
+      received b'LD\nPING\nhalf a li' -> complete messages [b'WORLD', b'PING'], waiting with b'half a li'
+
+      b'\x00\x00\x00\x05first\x00\x00\x00\x00\x00\x00\x00\rthird message'
+      [b'first', b'', b'third message']
+    lines:
+      - line: 5
+        note: "Splitting on the delimiter leaves the unfinished piece as the last item. Keep it for next time."
+      - line: 14
+        note: "Whatever the chunk sizes were, the same messages come out."
+      - line: 17
+        note: "4 bytes of length in network byte order, then the message."
+      - line: 28
+        note: "Wait until the whole message has arrived before cutting it out of the buffer."
+  - title: Retrying with exponential backoff
+    intro: "A flaky operation, a bounded number of attempts, and growing pauses between them. The pauses are recorded instead of slept."
+    code: |
+      def retry(op, attempts=4, base=0.5, factor=2, max_delay=4.0):
+          delays = []
+          for attempt in range(attempts):
+              try:
+                  return op(attempt), delays
+              except (TimeoutError, ConnectionError) as error:
+                  print(f"   attempt {attempt + 1} failed: {error}")
+                  if attempt == attempts - 1:
+                      raise
+                  delays.append(min(max_delay, base * factor ** attempt))
+
+
+      def flaky(fail_times):
+          def op(attempt):
+              if attempt < fail_times:
+                  raise TimeoutError("no reply")
+              return "OK"
+          return op
+
+
+      print(retry(flaky(0)))
+      print(retry(flaky(2)))
+      print(retry(flaky(3), attempts=6, base=1, max_delay=2))
+      try:
+          retry(flaky(10))
+      except TimeoutError:
+          print("gave up")
+    output: |
+      ('OK', [])
+         attempt 1 failed: no reply
+         attempt 2 failed: no reply
+      ('OK', [0.5, 1.0])
+         attempt 1 failed: no reply
+         attempt 2 failed: no reply
+         attempt 3 failed: no reply
+      ('OK', [1, 2, 2])
+         attempt 1 failed: no reply
+         attempt 2 failed: no reply
+         attempt 3 failed: no reply
+         attempt 4 failed: no reply
+      gave up
+    lines:
+      - line: 6
+        note: "Only errors that are likely to be temporary are retried. Any other exception passes straight through."
+      - line: 10
+        note: "The wait doubles each time, up to a ceiling: 0.5, 1, 2, 4, 4, ..."
+  - title: A token bucket
+    intro: "A steady refill, a burst allowance, and a refusal when the bucket is empty."
+    code: |
+      class TokenBucket:
+          def __init__(self, capacity, rate):
+              self.capacity, self.rate = capacity, rate
+              self.tokens, self.last = capacity, None
+
+          def allow(self, now):
+              if self.last is not None:
+                  self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+              self.last = now
+              if self.tokens >= 1:
+                  self.tokens -= 1
+                  return True
+              return False
+
+
+      bucket = TokenBucket(capacity=3, rate=1)           # a burst of 3, then 1 request per second
+      times = [0, 0, 0, 0, 0.5, 1, 1.5, 2, 10, 10, 10, 10]
+      print([int(bucket.allow(t)) for t in times])
+    output: |
+      [1, 1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 0]
+    lines:
+      - line: 7
+        note: "Add the tokens earned since the last request, but never beyond the capacity."
+      - line: 19
+        note: "At time 0 the burst of 3 passes and the 4th is refused. After a long quiet time the bucket is full again."
+
+playground:
+  prompt: |
+    In the simulated network, make the client send three messages and read them back with `recv(4)` calls until you get `None`. Then change the token bucket's capacity to 5 and see how the burst changes.
+  code: |
+    import struct
+    print(struct.pack(">I", 5))
+    print(b"a\nb\nc".split(b"\n"))
+
+exercises:
+  - id: net
+    title: A simulated network
+    difficulty: 5
+    prompt: |
+      Build the class `Network` with these methods. **`listen(host, port, backlog=5)`** starts listening and returns a `Listener`; if `(host, port)` is already listening raise `OSError`. **`connect(client_host, host, port)`** returns the client `Socket`: raise `ConnectionRefusedError` if nobody is listening there, or if the listener already has `backlog` connections waiting. Each connection gets the next ephemeral client port, starting at 49152 and increasing by 1 per successful connection. The matching server-side socket is queued on the listener. **`Listener`**: `accept()` returns the oldest queued server-side `Socket`, or `None` if there is none; `close()` stops listening (frees the port for a new `listen`, makes later connects refused, and closes every connection still waiting in the queue); `getsockname()` returns `(host, port)`. **`Socket`**: `send(data)` appends the bytes to the peer's incoming buffer and returns `len(data)`; it raises `BrokenPipeError` if this socket or the peer has been closed. `recv(n)` (raise `ValueError` if `n < 1`; `OSError` if this socket is closed) returns up to `n` bytes from the front of its buffer; if the buffer is empty it returns `b""` when the peer has closed (end of file) and `None` when the peer is still open. `close()` marks it closed (calling it twice is fine); data already sent to the peer stays readable. `getsockname()` returns this end's `(host, port)` and `getpeername()` the other end's.
+    starter: |
+      class Socket:
+          pass
+
+
+      class Listener:
+          pass
+
+
+      class Network:
+          def __init__(self):
+              pass
+
+          def listen(self, host, port, backlog=5):
+              pass
+
+          def connect(self, client_host, host, port):
+              pass
+    tests:
+      - name: echo conversation
+        code: |
+          net = Network()
+          lst = net.listen("10.0.0.1", 7)
+          assert lst.getsockname() == ("10.0.0.1", 7)
+          assert lst.accept() is None
+          client = net.connect("10.0.0.2", "10.0.0.1", 7)
+          assert client.getsockname() == ("10.0.0.2", 49152) and client.getpeername() == ("10.0.0.1", 7)
+          conn = lst.accept()
+          assert conn.getsockname() == ("10.0.0.1", 7) and conn.getpeername() == ("10.0.0.2", 49152)
+          assert lst.accept() is None
+          assert conn.recv(100) is None and client.recv(100) is None
+          assert client.send(b"hello") == 5
+          assert conn.recv(100) == b"hello"
+          assert conn.send(b"HELLO") == 5 and client.recv(100) == b"HELLO"
+          second = net.connect("10.0.0.3", "10.0.0.1", 7)
+          assert second.getsockname()[1] == 49153
+      - name: stream semantics
+        code: |
+          net = Network()
+          lst = net.listen("h", 1)
+          client = net.connect("c", "h", 1)
+          conn = lst.accept()
+          client.send(b"ab")
+          client.send(b"cd")
+          client.send(b"efg")
+          assert conn.recv(3) == b"abc"
+          assert conn.recv(1) == b"d"
+          assert conn.recv(100) == b"efg"
+          assert conn.recv(100) is None
+          for bad in (0, -1):
+              try:
+                  conn.recv(bad)
+                  assert False
+              except ValueError:
+                  pass
+      - name: closing
+        code: |
+          net = Network()
+          lst = net.listen("h", 1)
+          client = net.connect("c", "h", 1)
+          conn = lst.accept()
+          client.send(b"bye")
+          client.close()
+          client.close()
+          assert conn.recv(10) == b"bye"          # data sent before the close is still delivered
+          assert conn.recv(10) == b""             # then end of file
+          assert conn.recv(10) == b""
+          try:
+              conn.send(b"anyone?")
+              assert False
+          except BrokenPipeError:
+              pass
+          for call in (lambda: client.send(b"x"), lambda: client.recv(1)):
+              try:
+                  call()
+                  assert False
+              except OSError:
+                  pass
+      - name: refused and in use
+        code: |
+          net = Network()
+          try:
+              net.connect("c", "h", 1)
+              assert False
+          except ConnectionRefusedError:
+              pass
+          lst = net.listen("h", 1)
+          try:
+              net.listen("h", 1)
+              assert False
+          except OSError:
+              pass
+          net.listen("h", 2)                              # another port is fine
+          net.listen("other", 1)                          # another host is fine
+          lst.close()
+          try:
+              net.connect("c", "h", 1)
+              assert False
+          except ConnectionRefusedError:
+              pass
+          again = net.listen("h", 1)                      # the port is free again
+          assert again.accept() is None
+      - name: backlog
+        code: |
+          net = Network()
+          lst = net.listen("h", 1, backlog=2)
+          a = net.connect("c", "h", 1)
+          b = net.connect("c", "h", 1)
+          try:
+              net.connect("c", "h", 1)
+              assert False
+          except ConnectionRefusedError:
+              pass
+          first = lst.accept()
+          assert first.getpeername() == a.getsockname()
+          c = net.connect("c", "h", 1)                    # there is room again
+          assert c.getsockname()[1] == 49154              # the refused attempt did not use a port
+          assert lst.accept().getpeername() == b.getsockname()
+          assert lst.accept().getpeername() == c.getsockname()
+          assert lst.accept() is None
+      - name: closing a listener closes waiting connections
+        code: |
+          net = Network()
+          lst = net.listen("h", 1)
+          waiting = net.connect("c", "h", 1)
+          lst.close()
+          assert waiting.recv(10) == b""
+          try:
+              waiting.send(b"x")
+              assert False
+          except BrokenPipeError:
+              pass
+    hints:
+      - "Give `Socket` the fields `address`, `peer`, `buffer` (a `bytearray` or `bytes`) and `closed`. Make `Network` keep `self.listeners` (a dict from `(host, port)` to `Listener`) and `self.next_port = 49152`."
+      - "`connect`: look up the listener, check the backlog (`len(listener.queue) >= listener.backlog`), then create two sockets, link them as each other's `peer`, queue the server one, increment `next_port` and return the client."
+      - "`recv`: if the buffer has data, return a slice and drop it from the buffer. Otherwise return `b''` if `self.peer.closed` else `None`."
+      - "`Listener.close`: delete the entry from `network.listeners` and call `close()` on every queued socket. Closing the server-side socket makes the client's `recv` see `b''` and its `send` raise `BrokenPipeError`."
+    solution: |
+      class Socket:
+          def __init__(self, address):
+              self.address = address
+              self.peer = None
+              self.buffer = b""
+              self.closed = False
+
+          def getsockname(self):
+              return self.address
+
+          def getpeername(self):
+              return self.peer.address
+
+          def send(self, data):
+              if self.closed or self.peer.closed:
+                  raise BrokenPipeError("connection closed")
+              self.peer.buffer += data
+              return len(data)
+
+          def recv(self, n):
+              if n < 1:
+                  raise ValueError("n must be at least 1")
+              if self.closed:
+                  raise OSError("socket is closed")
+              if self.buffer:
+                  data, self.buffer = self.buffer[:n], self.buffer[n:]
+                  return data
+              return b"" if self.peer.closed else None
+
+          def close(self):
+              self.closed = True
+
+
+      class Listener:
+          def __init__(self, network, address, backlog):
+              self.network = network
+              self.address = address
+              self.backlog = backlog
+              self.queue = []
+
+          def getsockname(self):
+              return self.address
+
+          def accept(self):
+              return self.queue.pop(0) if self.queue else None
+
+          def close(self):
+              if self.network.listeners.get(self.address) is self:
+                  del self.network.listeners[self.address]
+              for sock in self.queue:
+                  sock.close()
+              self.queue = []
+
+
+      class Network:
+          def __init__(self):
+              self.listeners = {}
+              self.next_port = 49152
+
+          def listen(self, host, port, backlog=5):
+              if (host, port) in self.listeners:
+                  raise OSError("address already in use")
+              listener = Listener(self, (host, port), backlog)
+              self.listeners[(host, port)] = listener
+              return listener
+
+          def connect(self, client_host, host, port):
+              listener = self.listeners.get((host, port))
+              if listener is None:
+                  raise ConnectionRefusedError(f"nobody is listening on {host}:{port}")
+              if len(listener.queue) >= listener.backlog:
+                  raise ConnectionRefusedError("backlog full")
+              client = Socket((client_host, self.next_port))
+              server = Socket((host, port))
+              self.next_port += 1
+              client.peer, server.peer = server, client
+              listener.queue.append(server)
+              return client
+    explanation: |
+      You have just written the kernel's view of sockets. Notice how every behaviour in the lesson shows up as a line of code: the backlog limit, ephemeral ports, stream semantics, end-of-file as an empty read, and the difference between a listening socket and the connected sockets it produces. Real kernels add buffers with bounded size (so `send` can block or send part), timers, and the TCP machinery of Lessons 11.4 and 11.5 underneath.
+
+  - id: framing
+    title: Framing a byte stream
+    difficulty: 4
+    prompt: |
+      Write `split_lines(buffer)` returning `(lines, rest)` for a `bytes` buffer: split on `b"\n"`, remove a single trailing `b"\r"` from each complete line, and keep everything after the last newline as `rest` (which may be `b""`). Write `frame(message)` returning a 4-byte big-endian length followed by the message. Write the class `Deframer(max_size=1_000_000)` with `feed(data)`, which appends the bytes to an internal buffer and returns the list of **all complete messages** now available (possibly none, possibly several), and `pending()` returning the number of buffered bytes that have not yet been returned. `feed` raises `ValueError` as soon as a length header (the first 4 bytes) announces a size larger than `max_size`, **without** waiting for the body, and a `Deframer` that raised keeps its buffer unchanged.
+    starter: |
+      import struct
+
+
+      def split_lines(buffer):
+          pass
+
+
+      def frame(message):
+          pass
+
+
+      class Deframer:
+          def __init__(self, max_size=1_000_000):
+              pass
+
+          def feed(self, data):
+              pass
+
+          def pending(self):
+              pass
+    tests:
+      - name: lines
+        code: |
+          assert split_lines(b"") == ([], b"")
+          assert split_lines(b"HELLO") == ([], b"HELLO")
+          assert split_lines(b"A\nB\nC") == ([b"A", b"B"], b"C")
+          assert split_lines(b"A\r\nB\r\n") == ([b"A", b"B"], b"")
+          assert split_lines(b"\n\n") == ([b"", b""], b"")
+          assert split_lines(b"x\r\r\n") == ([b"x\r"], b"")
+          assert split_lines(b"half\r") == ([], b"half\r")
+      - name: frame
+        code: |
+          assert frame(b"abc") == b"\x00\x00\x00\x03abc"
+          assert frame(b"") == b"\x00\x00\x00\x00"
+          assert len(frame(b"x" * 300)) == 304 and frame(b"x" * 300)[:4] == b"\x00\x00\x01\x2c"
+      - name: any chunking works
+        code: |
+          import random
+          messages = [b"first", b"", b"third message", bytes(range(256)) * 3, b"z"]
+          stream = b"".join(frame(m) for m in messages)
+          rng = random.Random(11)
+          for _ in range(40):
+              d = Deframer()
+              got, i = [], 0
+              while i < len(stream):
+                  step = rng.randint(1, 20)
+                  got += d.feed(stream[i:i + step])
+                  i += step
+              assert got == messages and d.pending() == 0
+          d = Deframer()
+          assert d.feed(stream) == messages
+          d = Deframer()
+          assert d.feed(frame(b"a") + frame(b"b")[:3]) == [b"a"] and d.pending() == 3
+          assert d.feed(frame(b"b")[3:]) == [b"b"] and d.pending() == 0
+      - name: size limit
+        code: |
+          d = Deframer(max_size=10)
+          assert d.feed(frame(b"0123456789")) == [b"0123456789"]
+          try:
+              d.feed(b"\x00\x00\x00\x0b")                   # announces 11 bytes: refuse before any body arrives
+              assert False
+          except ValueError:
+              pass
+          assert d.pending() == 0
+          d2 = Deframer(max_size=10)
+          d2.feed(b"\x00\x00")
+          try:
+              d2.feed(b"\xff\xff\xff\xff")
+              assert False
+          except ValueError:
+              pass
+          assert d2.pending() == 2
+    hints:
+      - "`buffer.split(b'\\n')` gives the lines plus a last piece, which is the `rest` (an empty `bytes` when the buffer ended with a newline)."
+      - "Strip one `\\r` with `line[:-1] if line.endswith(b'\\r') else line`."
+      - "`Deframer`: keep a `bytearray`. In a loop: if fewer than 4 bytes, stop; read the size; if it exceeds `max_size` raise; if fewer than `4 + size` bytes are present, stop; otherwise slice out the message and delete those bytes."
+      - "To keep the buffer unchanged after an error, work on a copy: `buf = bytearray(self.buffer); buf += data`, process `buf`, and only assign `self.buffer = buf` at the end. If `ValueError` is raised on the way, `self.buffer` was never touched."
+    solution: |
+      import struct
+
+
+      def split_lines(buffer):
+          *lines, rest = buffer.split(b"\n")
+          lines = [line[:-1] if line.endswith(b"\r") else line for line in lines]
+          return lines, rest
+
+
+      def frame(message):
+          return struct.pack(">I", len(message)) + message
+
+
+      class Deframer:
+          def __init__(self, max_size=1_000_000):
+              self.max_size = max_size
+              self.buffer = bytearray()
+
+          def feed(self, data):
+              buf = bytearray(self.buffer)
+              buf += data
+              messages = []
+              while len(buf) >= 4:
+                  (size,) = struct.unpack(">I", bytes(buf[:4]))
+                  if size > self.max_size:
+                      raise ValueError("message too large")
+                  if len(buf) < 4 + size:
+                      break
+                  messages.append(bytes(buf[4:4 + size]))
+                  del buf[:4 + size]
+              self.buffer = buf
+              return messages
+
+          def pending(self):
+              return len(self.buffer)
+    explanation: |
+      Read the tests' chunking loop again: whatever sizes the network delivers, the same messages come out. That independence from packet boundaries is exactly what makes a protocol correct. The size limit is the other half of the job: a length prefix is a promise by an untrusted party, and accepting it blindly lets one client ask for four gigabytes of your memory.
+
+  - id: chat
+    title: A chat server protocol
+    difficulty: 4
+    prompt: |
+      Write the class `ChatServer`, the logic of a line-based chat protocol, independent of sockets. Every method returns a list of `(client_id, text)` messages to send. **`connect(client_id)`**: the new client is named `"guest<id>"` (for example `guest3`) and receives `"Welcome, guest3! Type /who to see who is here."`; every other client, in increasing id order, receives `"* guest3 joined"`. Return the welcome first, then the notices. Connecting an id that is already connected raises `ValueError`. **`handle(client_id, line)`** (raise `KeyError` for an unknown client). Strip the line; an empty line returns `[]`. Commands: **`/nick NAME`** — the name must be 1 to 12 letters, digits or underscores and not used by another client (ignoring case); on a bad name reply `[(id, "! invalid name")]`, on a duplicate `[(id, "! name taken")]`; on success everyone (including the sender), in increasing id order, receives `"* <old> is now <new>"`. **`/who`** — `[(id, "Online: " + names sorted alphabetically ignoring case, joined by ", ")]`. **`/msg NAME TEXT`** — with fewer than a name and some text reply `"! usage: /msg NAME TEXT"`; an unknown name `"! no such user: NAME"`; otherwise return the recipient's `"[private] <sender>: TEXT"` then the sender's `"[to <recipient>] TEXT"`. **`/quit`** — the client is removed; return `(id, "Goodbye!")` and then `"* <name> left"` to everyone else in id order. Any other line starting with `/` replies `"! unknown command: /xyz"` (the first word). A plain line is sent as `"<name>: <line>"` to every **other** client in increasing id order.
+    starter: |
+      class ChatServer:
+          def __init__(self):
+              pass
+
+          def connect(self, client_id):
+              pass
+
+          def handle(self, client_id, line):
+              pass
+    tests:
+      - name: joining
+        code: |
+          s = ChatServer()
+          assert s.connect(1) == [(1, "Welcome, guest1! Type /who to see who is here.")]
+          assert s.connect(2) == [(2, "Welcome, guest2! Type /who to see who is here."), (1, "* guest2 joined")]
+          out = s.connect(5)
+          assert out == [(5, "Welcome, guest5! Type /who to see who is here."), (1, "* guest5 joined"), (2, "* guest5 joined")]
+          try:
+              s.connect(2)
+              assert False
+          except ValueError:
+              pass
+      - name: talking
+        code: |
+          s = ChatServer()
+          for i in (1, 2, 3):
+              s.connect(i)
+          assert s.handle(2, "hello there") == [(1, "guest2: hello there"), (3, "guest2: hello there")]
+          assert s.handle(2, "   ") == [] and s.handle(1, "") == []
+          assert s.handle(1, "  hi  ") == [(2, "guest1: hi"), (3, "guest1: hi")]
+          assert s.handle(1, "/who") == [(1, "Online: guest1, guest2, guest3")]
+          try:
+              s.handle(9, "hi")
+              assert False
+          except KeyError:
+              pass
+      - name: nick
+        code: |
+          s = ChatServer()
+          for i in (1, 2):
+              s.connect(i)
+          assert s.handle(1, "/nick Maya") == [(1, "* guest1 is now Maya"), (2, "* guest1 is now Maya")]
+          assert s.handle(2, "/nick maya") == [(2, "! name taken")]
+          assert s.handle(2, "/nick bad name") == [(2, "! invalid name")]
+          assert s.handle(2, "/nick") == [(2, "! invalid name")]
+          assert s.handle(2, "/nick waytoolongnickname") == [(2, "! invalid name")]
+          assert s.handle(2, "/nick x-y") == [(2, "! invalid name")]
+          assert s.handle(2, "/nick Zed_9") == [(1, "* guest2 is now Zed_9"), (2, "* guest2 is now Zed_9")]
+          assert s.handle(1, "/who") == [(1, "Online: Maya, Zed_9")]
+          assert s.handle(1, "yo") == [(2, "Maya: yo")]
+      - name: private messages
+        code: |
+          s = ChatServer()
+          for i in (1, 2, 3):
+              s.connect(i)
+          s.handle(2, "/nick bob")
+          assert s.handle(1, "/msg BOB psst, meet at noon") == [(2, "[private] guest1: psst, meet at noon"), (1, "[to bob] psst, meet at noon")]
+          assert s.handle(1, "/msg nobody hi") == [(1, "! no such user: nobody")]
+          assert s.handle(1, "/msg bob") == [(1, "! usage: /msg NAME TEXT")]
+          assert s.handle(1, "/msg") == [(1, "! usage: /msg NAME TEXT")]
+      - name: leaving and unknown commands
+        code: |
+          s = ChatServer()
+          for i in (1, 2, 3):
+              s.connect(i)
+          assert s.handle(2, "/quit") == [(2, "Goodbye!"), (1, "* guest2 left"), (3, "* guest2 left")]
+          assert s.handle(1, "/who") == [(1, "Online: guest1, guest3")]
+          try:
+              s.handle(2, "hello")
+              assert False
+          except KeyError:
+              pass
+          assert s.handle(1, "/dance now") == [(1, "! unknown command: /dance")]
+          s.connect(2)                                    # an id can be reused after quitting
+          assert s.handle(3, "back?") == [(1, "guest3: back?"), (2, "guest3: back?")]
+    hints:
+      - "Keep `self.names = {client_id: name}`. A helper `_others(client_id)` returning `sorted(i for i in self.names if i != client_id)` shortens every broadcast."
+      - "Validate a nick with `re.fullmatch(r'[A-Za-z0-9_]{1,12}', name)` (import `re`), and look for duplicates with `name.lower() == other.lower()`."
+      - "`line.split(None, 1)` splits off the first word; for `/msg`, split the rest again with `split(None, 1)`."
+      - "In `handle`, look up the sender first so an unknown id raises `KeyError` before anything else happens."
+    solution: |
+      import re
+
+
+      class ChatServer:
+          def __init__(self):
+              self.names = {}
+
+          def _others(self, client_id):
+              return sorted(i for i in self.names if i != client_id)
+
+          def connect(self, client_id):
+              if client_id in self.names:
+                  raise ValueError("already connected")
+              self.names[client_id] = f"guest{client_id}"
+              name = self.names[client_id]
+              out = [(client_id, f"Welcome, {name}! Type /who to see who is here.")]
+              out += [(i, f"* {name} joined") for i in self._others(client_id)]
+              return out
+
+          def handle(self, client_id, line):
+              name = self.names[client_id]
+              line = line.strip()
+              if not line:
+                  return []
+              if not line.startswith("/"):
+                  return [(i, f"{name}: {line}") for i in self._others(client_id)]
+              parts = line.split(None, 1)
+              command = parts[0]
+              rest = parts[1] if len(parts) > 1 else ""
+              if command == "/nick":
+                  new = rest.strip()
+                  if not re.fullmatch(r"[A-Za-z0-9_]{1,12}", new):
+                      return [(client_id, "! invalid name")]
+                  if any(i != client_id and n.lower() == new.lower() for i, n in self.names.items()):
+                      return [(client_id, "! name taken")]
+                  self.names[client_id] = new
+                  return [(i, f"* {name} is now {new}") for i in sorted(self.names)]
+              if command == "/who":
+                  names = sorted(self.names.values(), key=str.lower)
+                  return [(client_id, "Online: " + ", ".join(names))]
+              if command == "/msg":
+                  pieces = rest.split(None, 1)
+                  if len(pieces) < 2:
+                      return [(client_id, "! usage: /msg NAME TEXT")]
+                  target, text = pieces
+                  for i, n in self.names.items():
+                      if n.lower() == target.lower():
+                          return [(i, f"[private] {name}: {text}"), (client_id, f"[to {n}] {text}")]
+                  return [(client_id, f"! no such user: {target}")]
+              if command == "/quit":
+                  del self.names[client_id]
+                  out = [(client_id, "Goodbye!")]
+                  out += [(i, f"* {name} left") for i in sorted(self.names)]
+                  return out
+              return [(client_id, f"! unknown command: {command}")]
+    explanation: |
+      A real chat server wraps this class in a socket loop: read bytes, `split_lines`, call `handle` for each line, and send each returned message to the right connection. Keeping the protocol logic pure (strings in, strings out) makes it trivially testable. This split between "protocol" and "I/O" is how well-built network software is organised.
+
+  - id: retry
+    title: Retry with backoff
+    difficulty: 3
+    prompt: |
+      Write `backoff_schedule(retries, base=0.5, factor=2, max_delay=4.0)` returning the list of waits before each retry: `min(max_delay, base * factor ** k)` for `k = 0 .. retries-1`. Write `retry(op, attempts=4, base=0.5, factor=2, max_delay=4.0)` which calls `op(attempt)` with the attempt number starting at 0. If it returns, give back `(result, delays)` where `delays` lists the waits that were needed before the successful call (do not actually sleep). If it raises `TimeoutError` or `ConnectionError` (including `ConnectionRefusedError` and `ConnectionResetError`), record a wait and try again; if the last attempt fails, **re-raise** that exception. Any other exception is raised immediately without a retry. Raise `ValueError` if `attempts < 1`.
+    starter: |
+      def backoff_schedule(retries, base=0.5, factor=2, max_delay=4.0):
+          pass
+
+
+      def retry(op, attempts=4, base=0.5, factor=2, max_delay=4.0):
+          pass
+    tests:
+      - name: schedule
+        code: |
+          assert backoff_schedule(0) == []
+          assert backoff_schedule(6) == [0.5, 1.0, 2.0, 4.0, 4.0, 4.0]
+          assert backoff_schedule(3, base=1, factor=3, max_delay=100) == [1, 3, 9]
+          assert backoff_schedule(3, base=10, max_delay=15) == [10, 15, 15]
+      - name: retry succeeds
+        code: |
+          def flaky(fail_times, error=TimeoutError):
+              calls = []
+              def op(attempt):
+                  calls.append(attempt)
+                  if attempt < fail_times:
+                      raise error("fail")
+                  return "OK"
+              op.calls = calls
+              return op
+          assert retry(flaky(0)) == ("OK", [])
+          op = flaky(2)
+          assert retry(op) == ("OK", [0.5, 1.0]) and op.calls == [0, 1, 2]
+          assert retry(flaky(3, ConnectionRefusedError), attempts=6, base=1, max_delay=2) == ("OK", [1, 2, 2])
+          assert retry(flaky(1, ConnectionResetError))[1] == [0.5]
+      - name: giving up and other errors
+        code: |
+          calls = []
+          def always(attempt):
+              calls.append(attempt)
+              raise TimeoutError("still nothing")
+          try:
+              retry(always, attempts=3)
+              assert False
+          except TimeoutError as e:
+              assert str(e) == "still nothing"
+          assert calls == [0, 1, 2]
+          calls.clear()
+          def bug(attempt):
+              calls.append(attempt)
+              raise KeyError("a real bug")
+          try:
+              retry(bug)
+              assert False
+          except KeyError:
+              pass
+          assert calls == [0]
+          try:
+              retry(always, attempts=0)
+              assert False
+          except ValueError:
+              pass
+          assert retry(lambda a: a, attempts=1) == (0, [])
+    hints:
+      - "`backoff_schedule` is a list comprehension over `range(retries)`."
+      - "In `retry`, loop `attempt` over `range(attempts)`. In `except (TimeoutError, ConnectionError):` re-raise on the last attempt, otherwise append the wait for this attempt."
+      - "The delay recorded after failed attempt `k` is `min(max_delay, base * factor ** k)`."
+    solution: |
+      def backoff_schedule(retries, base=0.5, factor=2, max_delay=4.0):
+          return [min(max_delay, base * factor ** k) for k in range(retries)]
+
+
+      def retry(op, attempts=4, base=0.5, factor=2, max_delay=4.0):
+          if attempts < 1:
+              raise ValueError("attempts must be at least 1")
+          delays = []
+          for attempt in range(attempts):
+              try:
+                  return op(attempt), delays
+              except (TimeoutError, ConnectionError):
+                  if attempt == attempts - 1:
+                      raise
+                  delays.append(min(max_delay, base * factor ** attempt))
+    explanation: |
+      Retry loops are a famous source of outages when written carelessly: without a ceiling or backoff, thousands of clients hammering a struggling server prevent it from recovering. Real implementations add random jitter to each wait so that clients spread out. Note also the other exceptions pass straight through: retrying a programming error only makes the same error happen again.
+
+  - id: bucket
+    title: A token-bucket rate limiter
+    difficulty: 3
+    prompt: |
+      Write the class `TokenBucket(capacity, rate)`. It starts full (`capacity` tokens) and earns `rate` tokens per second of elapsed time, never holding more than `capacity`. `allow(now, cost=1)` first adds the tokens earned since the previous call to `allow` or `wait_time` (the first call has nothing to add), records `now`, and then, if at least `cost` tokens are available, takes them and returns `True`; otherwise it takes nothing and returns `False`. `wait_time(now, cost=1)` also updates the tokens up to `now`, but takes nothing: it returns how many seconds must pass before `cost` tokens are available (`0` if they already are), or `None` if that can never happen (the cost is above the capacity, or the rate is 0 and tokens are missing). Time never goes backwards: if `now` is earlier than the previous time, raise `ValueError`. `capacity` must be positive and `rate` must not be negative, otherwise `ValueError`.
+    starter: |
+      class TokenBucket:
+          def __init__(self, capacity, rate):
+              pass
+
+          def allow(self, now, cost=1):
+              pass
+
+          def wait_time(self, now, cost=1):
+              pass
+    tests:
+      - name: bursts and refills
+        code: |
+          b = TokenBucket(3, 1)
+          assert [b.allow(0) for _ in range(4)] == [True, True, True, False]
+          assert b.allow(0.5) is False
+          assert b.allow(1) is True and b.allow(1) is False
+          assert b.allow(10) is True
+          assert [b.allow(10) for _ in range(3)] == [True, True, False]       # capped at 3, not 9
+      - name: costs
+        code: |
+          b = TokenBucket(10, 2)
+          assert b.allow(0, cost=7) is True
+          assert b.allow(0, cost=7) is False
+          assert b.allow(1, cost=7) is False          # 3 + 2 = 5 tokens
+          assert b.allow(2, cost=7) is True           # 5 + 2 = 7 tokens
+          assert b.allow(100, cost=11) is False       # more than the capacity can never succeed
+          assert b.allow(100, cost=10) is True
+      - name: wait time
+        code: |
+          b = TokenBucket(4, 2)
+          assert b.wait_time(0) == 0
+          for _ in range(4):
+              assert b.allow(0)
+          assert b.wait_time(0) == 0.5
+          assert b.wait_time(0, cost=3) == 1.5
+          assert b.wait_time(0.25) == 0.25
+          assert b.wait_time(0.25, cost=5) is None
+          z = TokenBucket(1, 0)
+          assert z.allow(0) is True and z.allow(5) is False and z.wait_time(5) is None
+      - name: time and arguments
+        code: |
+          b = TokenBucket(2, 1)
+          b.allow(5)
+          try:
+              b.allow(4)
+              assert False
+          except ValueError:
+              pass
+          try:
+              b.wait_time(1)
+              assert False
+          except ValueError:
+              pass
+          for args in ((0, 1), (-1, 1), (1, -1)):
+              try:
+                  TokenBucket(*args)
+                  assert False
+              except ValueError:
+                  pass
+    hints:
+      - "Keep `self.tokens = capacity` and `self.last = None`. A helper `_refill(now)` raises `ValueError` if `now < self.last`, adds `(now - self.last) * rate` (capped), and sets `self.last = now`."
+      - "`allow` calls `_refill` then compares `self.tokens >= cost`."
+      - "`wait_time`: after `_refill`, `needed = cost - self.tokens`. If `needed <= 0` return 0; if `cost > capacity` or `rate == 0` return `None`; otherwise `needed / rate`."
+    solution: |
+      class TokenBucket:
+          def __init__(self, capacity, rate):
+              if capacity <= 0 or rate < 0:
+                  raise ValueError("bad arguments")
+              self.capacity = capacity
+              self.rate = rate
+              self.tokens = capacity
+              self.last = None
+
+          def _refill(self, now):
+              if self.last is not None:
+                  if now < self.last:
+                      raise ValueError("time went backwards")
+                  self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+              self.last = now
+
+          def allow(self, now, cost=1):
+              self._refill(now)
+              if self.tokens >= cost:
+                  self.tokens -= cost
+                  return True
+              return False
+
+          def wait_time(self, now, cost=1):
+              self._refill(now)
+              needed = cost - self.tokens
+              if needed <= 0:
+                  return 0
+              if cost > self.capacity or self.rate == 0:
+                  return None
+              return needed / self.rate
+    explanation: |
+      The token bucket lets a well-behaved client burst up to `capacity` requests, and then holds it to `rate` per second on average. It is how API gateways, login throttles and network routers implement fair use. `wait_time` is where a server gets the number for the `Retry-After` header that goes with a 429 response, closing the loop with the retry logic that clients use.
+
+commonMistakes:
+  - title: Assuming one send is one recv
+    explanation: |
+      TCP has no message boundaries. Loop, buffer and frame your messages.
+  - title: Treating recv(n) as "exactly n bytes"
+    explanation: |
+      It returns up to n bytes. An empty result means the connection closed, not "no data yet".
+  - title: Trusting a length prefix
+    explanation: |
+      Cap it. A malicious or buggy peer can announce a gigantic message and exhaust your memory.
+  - title: No timeout
+    explanation: |
+      A network call without a timeout can block forever when the other side disappears. Set one on every socket.
+  - title: Retrying immediately and forever
+    explanation: |
+      Retries without backoff and a limit turn a small outage into a big one. Wait longer each time, add jitter, and give up eventually.
+  - title: Using send when you mean sendall
+    explanation: |
+      `send` may transmit only part of your data and returns how many bytes it took. `sendall` loops until everything has gone.
+
+summary:
+  - "A **socket** is the program's handle on a network endpoint. A TCP server does `socket`, `bind`, `listen` and `accept` (which returns a new socket per client); a client does `connect`. UDP uses `sendto` and `recvfrom`."
+  - "TCP is a **byte stream with no message boundaries**: `recv(n)` returns up to `n` bytes, and `b\"\"` means the peer closed. Protocols need **framing**: a delimiter such as a newline, or a length prefix, with a receive buffer and a size cap."
+  - "Servers handle many clients with a **thread per connection**, an **event loop** (`select`, `epoll`) with non-blocking sockets, or **async/await**."
+  - "A good **protocol** has framing, a defined message for every case including errors, validation of all input, a version number and clear state."
+  - "Networks fail: use **timeouts**, **retries with exponential backoff** (and jitter) for transient errors and idempotent operations, and a bounded number of attempts."
+  - "A **token bucket** rate limiter permits bursts up to its capacity and a steady average rate, and tells clients how long to wait (HTTP 429, `Retry-After`)."
+next: |
+  Everything so far assumed the network is honest. It is not: anyone on the path can read, change or fake packets. The last networking lesson covers **security**: encryption, TLS and certificates, firewalls and the attacks that target each layer.
+
+quiz:
+  - type: mcq
+    question: In which order does a TCP server normally call these socket functions?
+    options: [
+      "socket, bind, listen, accept",
+      "socket, accept, bind, listen",
+      "connect, bind, listen, accept",
+      "bind, socket, accept, listen"
+    ]
+    answer: 0
+    explanation: "Create the socket, attach it to an address and port, start listening, then accept connections."
+  - type: mcq
+    question: A client calls send(b"hello") and then send(b"world"). What might the server's single recv(100) return?
+    options: [
+      "b\"helloworld\", or b\"hello\", or b\"hel\" - any prefix of the stream",
+      "Always exactly b\"hello\"",
+      "Always b\"hello\" then b\"world\" in two calls",
+      "An error, since two sends need two receives"
+    ]
+    answer: 0
+    explanation: "TCP preserves the order of bytes but not the boundaries of the sends."
+  - type: mcq
+    question: What does recv() returning an empty bytes object mean on a TCP socket?
+    options: [
+      "The peer closed the connection (end of file)",
+      "No data has arrived yet",
+      "The timeout expired",
+      "The buffer is too small"
+    ]
+    answer: 0
+    explanation: "An empty result signals EOF. With a timeout or a non-blocking socket, 'no data yet' is reported differently, as an exception or None."
+  - type: mcq
+    question: Why must a server limit the size announced in a length prefix?
+    options: [
+      "A client could announce a huge message and make the server allocate or wait for enormous amounts of data",
+      "Because TCP segments are limited to 1500 bytes",
+      "Because the length field is only 4 bits",
+      "Because networks cannot carry large messages"
+    ]
+    answer: 0
+    explanation: "Untrusted input must be bounded. Otherwise one client can exhaust the server's memory."
+  - type: mcq
+    question: Which retry strategy is best for a client talking to an overloaded server?
+    options: [
+      "Wait longer after each failure (exponential backoff, ideally with jitter) and give up after a few tries",
+      "Retry immediately in a tight loop",
+      "Retry exactly once per second forever",
+      "Never retry"
+    ]
+    answer: 0
+    explanation: "Backing off gives the server room to recover; a fixed immediate retry multiplies the load."
+  - type: mcq
+    question: A token bucket has capacity 5 and refills 1 token per second. A client has been idle for a minute and now sends 10 requests at once. How many are allowed?
+    options: ["5", "10", "1", "60"]
+    answer: 0
+    explanation: "The bucket holds at most 5 tokens however long it was idle, so only 5 of the burst succeed."
+  - type: code
+    question: |
+      Write `backoff(attempt, base=1, cap=8)` returning the wait before retry number `attempt` (starting at 0): `base * 2 ** attempt`, but never more than `cap`.
+    starter: |
+      def backoff(attempt, base=1, cap=8):
+          pass
+    tests:
+      - name: waits
+        code: |
+          assert [backoff(i) for i in range(6)] == [1, 2, 4, 8, 8, 8]
+          assert backoff(0, base=0.5) == 0.5
+          assert backoff(3, base=3, cap=20) == 20
+          assert backoff(2, base=3, cap=100) == 12
+    solution: |
+      def backoff(attempt, base=1, cap=8):
+          return min(cap, base * 2 ** attempt)

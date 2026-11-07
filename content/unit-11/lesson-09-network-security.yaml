@@ -1,0 +1,939 @@
+id: u11-network-security
+title: "Network Security and TLS"
+minutes: 65
+objective: |
+  See why the network cannot be trusted and how we build trust on top of it anyway. Learn the main attacks at each layer, the ideas of encryption, hashing and message authentication, how two strangers agree a secret key in public (Diffie-Hellman), how TLS and certificates make HTTPS work, and how firewalls and monitoring defend a network.
+outcomes:
+  - Describe common network attacks (sniffing, spoofing, man-in-the-middle, replay, DNS poisoning, SYN flood, scanning) and where each happens
+  - Distinguish encryption, hashing, message authentication codes and digital signatures, and what each guarantees
+  - Carry out a Diffie-Hellman exchange and explain why an eavesdropper cannot easily break it
+  - Walk through a TLS handshake and validate a certificate chain
+  - Write firewall rules with first-match semantics and a stateful allowance for replies
+  - Detect port scans in a connection log
+
+sections:
+  - heading: The network is hostile
+    body: |
+      Everything in this unit so far assumed that packets arrive as sent. In reality a packet crosses a dozen networks owned by strangers: the coffee-shop Wi-Fi, your ISP, backbone carriers, the hosting company. Anyone on that path can try to **read** it, **change** it, **forge** one, **replay** an old one, or just **block** it. Security rests on three goals, the **CIA triad**:
+
+      - **Confidentiality**: only the intended parties can read the data.
+      - **Integrity**: the data cannot be altered without detection.
+      - **Authenticity** (and availability): you are talking to who you think you are, and the service works when needed.
+
+      Typical attacks, by where they happen:
+
+      | Attack | Layer | What happens | Main defence |
+      |---|---|---|---|
+      | **Sniffing** | link | read other people's traffic on shared Wi-Fi or a tapped cable | encryption |
+      | **ARP spoofing** | link | claim another host's address on the LAN so its traffic comes to you | switch security, encryption |
+      | **IP spoofing** | internet | forge the source address | ingress filtering, authenticated protocols |
+      | **SYN flood** | transport | send thousands of SYNs and never finish the handshake, filling the server's table of half-open connections | SYN cookies, rate limits |
+      | **Port scan** | transport | probe many ports to find services to attack | firewalls, monitoring |
+      | **DNS cache poisoning** | application | forge a DNS answer (Lesson 11.6) | random ports and IDs, DNSSEC |
+      | **Man-in-the-middle (MITM)** | any | sit between two parties, relaying and altering their messages | authenticated encryption with certificates |
+      | **Replay** | any | record a valid message and send it again later | nonces, timestamps |
+      | **DDoS** | any | overwhelm a service with traffic from thousands of machines | capacity, filtering, CDNs |
+
+      The lasting lesson: **security must be added deliberately**. The original internet protocols had none, and almost every defence is a layer built on top. The next Unit 16 goes deeper; here we study the networking part.
+
+  - heading: Hashes, MACs and signatures
+    body: |
+      Four building blocks do the work.
+
+      **Hash functions** (SHA-256) turn any data into a fixed-size fingerprint. They are one-way (you cannot recover the input), and any change to the input changes the output completely. A hash proves nothing about *who* made the data, though: anyone can hash anything.
+
+      **Symmetric encryption** (AES) uses one **shared secret key** to scramble and unscramble data, and is fast enough for gigabytes. Its problem is **key distribution**: how do two strangers agree on a key without already having a secure channel?
+
+      **A message authentication code (MAC)**, for example **HMAC-SHA256**, is a hash that also mixes in a shared secret key. Only someone holding the key can compute a valid tag, so a matching tag proves the message is **unmodified** and came from a key-holder. Compare tags in constant time (`hmac.compare_digest`) so that timing does not reveal how many leading characters matched.
+
+      **Asymmetric (public-key) cryptography** uses a **pair of keys**: what one key does the other undoes. Anyone can use the **public key**; only the owner has the **private key**. This provides two things: encryption to the owner (encrypt with the public key, decrypt with the private one), and **digital signatures** (sign with the private key, anyone verifies with the public key), which prove that a certain private-key owner produced a message. It is slow, so it is used only to set up a key for the fast symmetric cipher. Choosing a good algorithm and implementing it correctly is very hard: never invent your own cryptography; use a vetted library.
+
+      A MAC authenticates a message against replay only if the message includes something fresh. Signing "transfer 100 to Sam" lets an attacker replay the whole signed message on Tuesday that was valid on Monday. Defences are a **timestamp** (reject old ones), a **nonce** (a number used once, which the receiver remembers) and sequence numbers.
+
+  - heading: Agreeing on a secret in public
+    body: |
+      **Diffie-Hellman key exchange** (1976) lets two parties build a shared secret by talking over a channel that an eavesdropper can fully read. The idea uses a one-way function from modular arithmetic (Lesson 6.6):
+
+      1. Alice and Bob publicly agree on a large prime **p** and a base **g**.
+      2. Alice picks a secret number **a** and sends **A = gᵃ mod p**. Bob picks **b** and sends **B = gᵇ mod p**.
+      3. Alice computes **Bᵃ mod p**. Bob computes **Aᵇ mod p**. Both equal **gᵃᵇ mod p**: the shared secret.
+
+      The eavesdropper sees p, g, A and B, but computing a from A is the **discrete logarithm problem**, which for a prime of thousands of bits is infeasible, while computing `pow(g, a, p)` in the other direction is fast (square-and-multiply). With a tiny prime like 23 you can simply try every exponent, as one of the exercises shows.
+
+      Diffie-Hellman alone does not stop a **man in the middle**, who can run one exchange with Alice and another with Bob. The parties must also **authenticate** each other, which is the job of certificates.
+
+  - heading: TLS and certificates
+    body: |
+      **TLS** (Transport Layer Security, the successor of SSL) is the protocol that turns HTTP into **HTTPS**. It sits between the application and TCP (Lesson 11.4) and provides confidentiality, integrity and server authentication. A simplified TLS handshake:
+
+      1. **ClientHello**: the client lists the TLS version and ciphers it supports and sends a random number and its key-exchange share.
+      2. **ServerHello + Certificate**: the server picks a cipher, sends its own random value and key share, and its **certificate**: a document stating "this public key belongs to `www.example.com`", signed by a certificate authority.
+      3. Both compute the shared secret by key exchange (Diffie-Hellman) and derive the symmetric **session keys** from it. The server proves it holds the private key matching the certificate by signing the handshake.
+      4. Each side sends **Finished**, a MAC over the whole handshake, which detects any tampering. From now on all data is encrypted and authenticated with the session keys.
+
+      Where does trust come from? Your browser or operating system ships with a list of about 150 **root certificate authorities (CAs)** that it trusts. A website's certificate is rarely signed by a root directly. It is signed by an **intermediate CA**, which is certified by the root, forming a **chain of trust**: *leaf (the website) → intermediate → root*. The client checks, at the current time:
+
+      - every certificate is within its **validity period** (`not before` to `not after`),
+      - each certificate's **issuer** is the **subject** of the next one, and its **signature** verifies with the next certificate's public key,
+      - every certificate that signs another is allowed to be a **CA**,
+      - the chain ends at a **trusted root**,
+      - and the leaf certificate **names the host** the client is connecting to. A name may be exact (`www.example.com`) or a **wildcard** (`*.example.com`), which stands for exactly one label, so it covers `www.example.com` but neither `example.com` nor `a.b.example.com`.
+
+      If any check fails the browser shows a warning. Never click through it casually: that warning is the only sign of a man in the middle. Certificates expire (now at most about 13 months) to limit the damage of stolen keys. **Certificate Transparency** logs make every issued certificate publicly auditable. The lock icon means the connection is encrypted and the name matched a certificate, **not** that the site is honest.
+
+  - heading: Firewalls, VPNs and monitoring
+    body: |
+      A **firewall** filters traffic by rules. A **packet filter** examines each packet's protocol, addresses and ports and applies an ordered list of rules: the **first rule that matches** decides (allow or deny), and if none match a **default** applies. The safe default is **deny**: list what is permitted and block everything else. A **stateful** firewall also remembers connections: if an inside host opens a connection to a web server, the matching reply packets are allowed in automatically, though a fresh inbound packet to the same port would be blocked. This is much of what NAT (Lesson 11.2) gives a home router. Firewalls cannot stop an attack carried in traffic they allow (a malicious web page), which is why they are one layer among several, the idea of **defence in depth**.
+
+      A **VPN** (virtual private network) wraps your packets in an encrypted tunnel to a gateway, so that the local network sees only the tunnel. It protects against local eavesdropping, but then the VPN operator sees your traffic instead. **Intrusion detection** systems watch for suspicious patterns. One classic signal is a **port scan**: one source touching many different ports in a short time, which ordinary clients never do.
+
+      A closing note on **ethics and law**: probing networks you do not own is illegal in many places even if you "just look". Security practice means testing your own systems or having written permission; the exercises here detect scans in a log and never perform them.
+
+examples:
+  - title: "Diffie-Hellman: small numbers, then big ones"
+    intro: "Each side raises the public base to a private power. The two results meet in the middle."
+    code: |
+      # The classic textbook numbers
+      p, g = 23, 5
+      a, b = 6, 15
+      A, B = pow(g, a, p), pow(g, b, p)
+      print("public values:", A, B)
+      print("Alice computes", pow(B, a, p), "and Bob computes", pow(A, b, p))
+
+      # An eavesdropper who sees p, g, A and B can simply try every exponent
+      print("brute force finds a =", next(x for x in range(p) if pow(g, x, p) == A))
+
+      # With a real-sized prime this search is hopeless, yet the honest parties still compute quickly
+      p = 2 ** 127 - 1                       # a prime with 127 bits (real exchanges use 2000+ bits or elliptic curves)
+      g = 3
+      a, b = 123456789012345678901234567890, 987654321098765432109876543210
+      A, B = pow(g, a, p), pow(g, b, p)
+      shared_alice, shared_bob = pow(B, a, p), pow(A, b, p)
+      print("same secret:", shared_alice == shared_bob, "| size:", shared_alice.bit_length(), "bits")
+    output: |
+      public values: 8 19
+      Alice computes 2 and Bob computes 2
+      brute force finds a = 6
+      same secret: True | size: 127 bits
+    lines:
+      - line: 4
+        note: "pow(base, exponent, modulus) does fast modular exponentiation: the easy direction."
+      - line: 8
+        note: "Going the other way, finding the exponent, is the discrete logarithm. For p = 23 we just try them all."
+      - line: 12
+        note: "A 127-bit prime is already far too big to search, and real systems use much larger ones."
+  - title: Hashes and HMAC
+    intro: "A hash changes completely when one character changes. An HMAC does too, and needs the key."
+    code: |
+      import hashlib
+      import hmac
+
+      message = b"transfer 100 to Sam"
+      print(hashlib.sha256(message).hexdigest())
+      print(hashlib.sha256(b"transfer 900 to Sam").hexdigest())
+
+      key = b"shared-secret"
+      tag = hmac.new(key, message, hashlib.sha256).hexdigest()
+      print("tag:", tag[:32], "...")
+      forged = hmac.new(b"wrong-key", message, hashlib.sha256).hexdigest()
+      print("valid with the key :", hmac.compare_digest(tag, hmac.new(key, message, hashlib.sha256).hexdigest()))
+      print("valid with a forgery:", hmac.compare_digest(tag, forged))
+      print("tampered message    :", hmac.compare_digest(tag, hmac.new(key, b"transfer 900 to Sam", hashlib.sha256).hexdigest()))
+    output: |
+      ce40eeb7e4000672a89cf66b184982e7336101d743f5d258c1af929d728edf15
+      583ae70f1b8fe44dc536145d1c08854c41976854b8e735b4c8c94ee03f5cd141
+      tag: 5d8ac2d43aad206a60b55f7605b0ec22 ...
+      valid with the key : True
+      valid with a forgery: False
+      tampered message    : False
+    lines:
+      - line: 5
+        note: "A SHA-256 digest is always 64 hex characters, whatever the size of the input."
+      - line: 6
+        note: "Changing 100 to 900 gives an unrelated fingerprint. There is no 'close' hash."
+      - line: 10
+        note: "An HMAC mixes the secret key into the hash, so only key-holders can make a valid tag."
+      - line: 13
+        note: "compare_digest takes the same time wherever the strings differ, so timing leaks nothing."
+  - title: A TLS handshake, in outline
+    intro: "A simulation of the steps with real hashing but toy-sized numbers. It shows what is exchanged, not real security."
+    code: |
+      import hashlib
+
+      p, g = 2 ** 61 - 1, 7                   # toy-sized group, for readability only
+      client_secret, server_secret = 1111111, 2222222
+      client_random, server_random = "c0ffee", "5eed01"
+
+      print("1. client -> server : ClientHello    random =", client_random, "| key share =", pow(g, client_secret, p))
+      print("2. server -> client : ServerHello    random =", server_random, "| key share =", pow(g, server_secret, p))
+      print("                      Certificate    'www.example.com', signed by a trusted CA")
+      client_key = pow(pow(g, server_secret, p), client_secret, p)
+      server_key = pow(pow(g, client_secret, p), server_secret, p)
+      print("3. both sides compute the same shared secret:", client_key == server_key)
+
+      session_key = hashlib.sha256(f"{client_key}{client_random}{server_random}".encode()).hexdigest()
+      print("   session key (from the secret and both randoms):", session_key[:24], "...")
+
+      transcript = "ClientHello|ServerHello|Certificate"
+      finished = hashlib.sha256((session_key + transcript).encode()).hexdigest()[:16]
+      print("4. both send Finished =", finished, "(proves the handshake was not tampered with)")
+      print("5. application data now travels encrypted and authenticated with keys derived from", session_key[:8] + "...")
+    output: |
+      1. client -> server : ClientHello    random = c0ffee | key share = 830869882321720075
+      2. server -> client : ServerHello    random = 5eed01 | key share = 1535547050466193926
+                            Certificate    'www.example.com', signed by a trusted CA
+      3. both sides compute the same shared secret: True
+         session key (from the secret and both randoms): d343ac57646700c57a43e85a ...
+      4. both send Finished = f3799683a9df4465 (proves the handshake was not tampered with)
+      5. application data now travels encrypted and authenticated with keys derived from d343ac57...
+    lines:
+      - line: 6
+        note: "Real handshakes use 256-bit elliptic-curve exchanges and standard key-derivation functions."
+      - line: 12
+        note: "Neither private number ever crossed the network, yet both ends have the secret."
+      - line: 15
+        note: "Mixing in both random values means every connection gets a fresh key, so recorded traffic cannot be replayed."
+  - title: Walking a certificate chain
+    intro: "Each certificate names its issuer and is signed with the issuer's key. Follow the links up to a trusted root."
+    code: |
+      chain = [
+          {"subject": "www.example.com", "issuer": "Example Intermediate CA", "key": "K-leaf", "signed_by": "K-inter"},
+          {"subject": "Example Intermediate CA", "issuer": "Example Root CA", "key": "K-inter", "signed_by": "K-root"},
+          {"subject": "Example Root CA", "issuer": "Example Root CA", "key": "K-root", "signed_by": "K-root"},
+      ]
+      trusted_roots = {"Example Root CA": "K-root"}
+
+      for cert, parent in zip(chain, chain[1:]):
+          ok = cert["issuer"] == parent["subject"] and cert["signed_by"] == parent["key"]
+          print(f"{cert['subject']:26} is issued by {cert['issuer']:26} signature checks out: {ok}")
+
+      root = chain[-1]
+      print("root", root["subject"], "is in the trust store:", trusted_roots.get(root["subject"]) == root["key"])
+
+      chain[1]["signed_by"] = "K-attacker"                   # an attacker substitutes a certificate
+      cert, parent = chain[1], chain[2]
+      print("after tampering, intermediate verifies:", cert["issuer"] == parent["subject"] and cert["signed_by"] == parent["key"])
+    output: |
+      www.example.com            is issued by Example Intermediate CA    signature checks out: True
+      Example Intermediate CA    is issued by Example Root CA            signature checks out: True
+      root Example Root CA is in the trust store: True
+      after tampering, intermediate verifies: False
+    lines:
+      - line: 9
+        note: "Two things must agree: the named issuer is the next certificate's subject, and the signature key is the next certificate's key."
+      - line: 13
+        note: "The root is trusted because it came with the operating system, not because anything vouches for it."
+      - line: 16
+        note: "A single changed field breaks the chain, so a forged link is detected."
+  - title: Firewall rules, first match wins
+    intro: "An ordered list, a default, and the question every packet is asked."
+    code: |
+      RULES = [
+          ("allow", "tcp", 443),
+          ("allow", "tcp", 22, "10.0.0.5"),            # ssh only from one admin machine
+          ("deny", "tcp", 22),
+          ("allow", "udp", 53),
+          ("deny", "any", None),
+      ]
+
+
+      def decide(proto, port, src="198.51.100.9"):
+          for rule in RULES:
+              action, rule_proto, rule_port = rule[:3]
+              rule_src = rule[3] if len(rule) > 3 else None
+              if rule_proto not in (proto, "any"):
+                  continue
+              if rule_port is not None and rule_port != port:
+                  continue
+              if rule_src is not None and rule_src != src:
+                  continue
+              return action
+          return "deny"
+
+
+      for proto, port, src in (("tcp", 443, "203.0.113.1"), ("tcp", 22, "10.0.0.5"), ("tcp", 22, "203.0.113.1"),
+                               ("udp", 53, "203.0.113.1"), ("tcp", 3306, "203.0.113.1"), ("icmp", 0, "203.0.113.1")):
+          print(f"{proto:5} port {port:<5} from {src:12} -> {decide(proto, port, src)}")
+    output: |
+      tcp   port 443   from 203.0.113.1  -> allow
+      tcp   port 22    from 10.0.0.5     -> allow
+      tcp   port 22    from 203.0.113.1  -> deny
+      udp   port 53    from 203.0.113.1  -> allow
+      tcp   port 3306  from 203.0.113.1  -> deny
+      icmp  port 0     from 203.0.113.1  -> deny
+    lines:
+      - line: 3
+        note: "The specific allow comes before the broader deny. Reversing them would lock the administrator out."
+      - line: 6
+        note: "A final catch-all deny makes the policy 'default deny'."
+      - line: 20
+        note: "The first rule that matches decides, so rule order is part of the meaning."
+
+playground:
+  prompt: |
+    Try a Diffie-Hellman exchange with your own secrets and a prime like 101. Then change one character in the HMAC message and print whether the tag still matches. Reorder two of the firewall rules and see which decisions change.
+  code: |
+    import hashlib
+    print(hashlib.sha256(b"hello").hexdigest()[:16])
+    print(pow(5, 6, 23))
+
+exercises:
+  - id: dh
+    title: Diffie-Hellman
+    difficulty: 3
+    prompt: |
+      Write `dh_public(g, p, secret)` returning `g ** secret mod p` (use the three-argument `pow`), `dh_shared(other_public, secret, p)` returning the shared secret, and `discrete_log(g, p, public)` which plays the eavesdropper: return the **smallest** exponent `x` in `0 .. p-1` with `g ** x mod p == public`, or `None` if there is none. Raise `ValueError` if `p < 3`, or if a secret is not between 1 and `p - 2` inclusive. Also write `exchange(g, p, a, b)` returning `(A, B, shared_for_alice, shared_for_bob)`.
+    starter: |
+      def dh_public(g, p, secret):
+          pass
+
+
+      def dh_shared(other_public, secret, p):
+          pass
+
+
+      def discrete_log(g, p, public):
+          pass
+
+
+      def exchange(g, p, a, b):
+          pass
+    tests:
+      - name: textbook example
+        code: |
+          assert dh_public(5, 23, 6) == 8
+          assert dh_public(5, 23, 15) == 19
+          assert dh_shared(19, 6, 23) == 2 and dh_shared(8, 15, 23) == 2
+          assert exchange(5, 23, 6, 15) == (8, 19, 2, 2)
+      - name: both sides agree
+        code: |
+          import random
+          rng = random.Random(17)
+          p, g = 2 ** 61 - 1, 3
+          for _ in range(50):
+              a, b = rng.randrange(2, p - 2), rng.randrange(2, p - 2)
+              A, B, sa, sb = exchange(g, p, a, b)
+              assert sa == sb == pow(g, a * b, p)
+      - name: eavesdropper
+        code: |
+          assert discrete_log(5, 23, 8) == 6
+          assert discrete_log(5, 23, 19) == 15
+          assert discrete_log(5, 23, 1) == 0
+          assert discrete_log(2, 7, 3) is None            # powers of 2 mod 7 are 1, 2, 4
+          p = 1019
+          for x in (3, 100, 500, 1000):
+              y = pow(2, x, p)
+              found = discrete_log(2, p, y)
+              assert found is not None and pow(2, found, p) == y and found <= x
+          A, B, sa, sb = exchange(5, 23, 6, 15)
+          recovered = discrete_log(5, 23, A)
+          assert dh_shared(B, recovered, 23) == sa        # the small prime offers no protection
+      - name: errors
+        code: |
+          for call in (lambda: dh_public(5, 2, 1), lambda: dh_public(5, 23, 0), lambda: dh_public(5, 23, 22),
+                       lambda: dh_shared(8, 0, 23), lambda: dh_shared(8, 22, 23), lambda: exchange(5, 23, 0, 5)):
+              try:
+                  call()
+                  assert False
+              except ValueError:
+                  pass
+          assert dh_public(5, 23, 21) == pow(5, 21, 23)
+    hints:
+      - "`pow(g, secret, p)` computes the modular power efficiently."
+      - "Validate with `if p < 3 or not 1 <= secret <= p - 2: raise ValueError(...)`."
+      - "`discrete_log`: loop `x` from 0 to `p - 1`, keeping a running value `v = (v * g) % p` instead of calling `pow` each time."
+    solution: |
+      def _check(p, secret):
+          if p < 3 or not 1 <= secret <= p - 2:
+              raise ValueError("bad modulus or secret")
+
+
+      def dh_public(g, p, secret):
+          _check(p, secret)
+          return pow(g, secret, p)
+
+
+      def dh_shared(other_public, secret, p):
+          _check(p, secret)
+          return pow(other_public, secret, p)
+
+
+      def discrete_log(g, p, public):
+          value = 1 % p
+          for x in range(p):
+              if value == public % p:
+                  return x
+              value = (value * g) % p
+          return None
+
+
+      def exchange(g, p, a, b):
+          A = dh_public(g, p, a)
+          B = dh_public(g, p, b)
+          return A, B, dh_shared(B, a, p), dh_shared(A, b, p)
+    explanation: |
+      The asymmetry is the point: `pow` is fast even for 2000-bit numbers, while `discrete_log` has to try about `p` possibilities, which is impossible when `p` has hundreds of digits. (Cleverer algorithms exist, but not good enough to break well-chosen parameters.) Because quantum computers could break this, new key exchanges based on other problems are already being added to TLS.
+
+  - id: hmac
+    title: Signing requests against tampering and replay
+    difficulty: 4
+    prompt: |
+      Using `hmac` and `hashlib` (imported in the starter), write `sign_request(key, method, path, timestamp, body)` returning the lower-case hex HMAC-SHA256 tag of this canonical text: the upper-cased method, the path, the decimal timestamp and the hex SHA-256 digest of the body (encoded as UTF-8), joined by `"\n"` (no trailing newline). `key` is a `str` and is encoded as UTF-8 for the HMAC. Write `verify_request(key, method, path, timestamp, body, tag, now, max_age=300)` returning `True` only if the timestamp is within `max_age` seconds of `now` in **either direction** (`abs(now - timestamp) <= max_age`) **and** the tag is correct; compare tags with `hmac.compare_digest` and never raise for a wrong-looking tag. Write `NonceTracker(max_age)` with `accept(nonce, timestamp, now)` returning `True` the first time a nonce is seen with a fresh timestamp (`abs(now - timestamp) <= max_age`) and `False` for a repeated or stale one; it must forget nonces that are older than `max_age` (so its memory does not grow forever), judged by the `now` values it is given.
+    starter: |
+      import hashlib
+      import hmac
+
+
+      def sign_request(key, method, path, timestamp, body):
+          pass
+
+
+      def verify_request(key, method, path, timestamp, body, tag, now, max_age=300):
+          pass
+
+
+      class NonceTracker:
+          def __init__(self, max_age):
+              pass
+
+          def accept(self, nonce, timestamp, now):
+              pass
+    tests:
+      - name: signing
+        code: |
+          import hashlib, hmac
+          canonical = "POST\n/pay\n1700000000\n" + hashlib.sha256(b'{"amount": 5}').hexdigest()
+          expected = hmac.new(b"k3y", canonical.encode(), hashlib.sha256).hexdigest()
+          assert sign_request("k3y", "post", "/pay", 1700000000, '{"amount": 5}') == expected
+          assert len(expected) == 64 and expected == expected.lower()
+          assert sign_request("k3y", "POST", "/pay", 1700000001, '{"amount": 5}') != expected
+          assert sign_request("other", "POST", "/pay", 1700000000, '{"amount": 5}') != expected
+          assert sign_request("k3y", "POST", "/pay", 1700000000, '{"amount": 6}') != expected
+          assert sign_request("k3y", "POST", "/pay2", 1700000000, '{"amount": 5}') != expected
+          assert sign_request("k3y", "GET", "/pay", 1700000000, '{"amount": 5}') != expected
+      - name: verifying
+        code: |
+          tag = sign_request("k3y", "POST", "/pay", 1000, "body")
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", tag, now=1000) is True
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", tag, now=1300) is True
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", tag, now=1301) is False        # too old: replay
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", tag, now=700) is True
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", tag, now=699) is False         # from the future
+          assert verify_request("k3y", "POST", "/pay", 1000, "BODY", tag, now=1000) is False        # tampered body
+          assert verify_request("wrong", "POST", "/pay", 1000, "body", tag, now=1000) is False
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", "not a tag", now=1000) is False
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", "", now=1000) is False
+          assert verify_request("k3y", "POST", "/pay", 1000, "body", tag, now=1100, max_age=50) is False
+      - name: nonces
+        code: |
+          t = NonceTracker(max_age=60)
+          assert t.accept("n1", 100, 100) is True
+          assert t.accept("n1", 100, 101) is False          # replay
+          assert t.accept("n2", 100, 101) is True
+          assert t.accept("old", 10, 100) is False          # stale timestamp
+          assert t.accept("future", 500, 100) is False
+          assert t.accept("n1", 100, 161) is False          # too old now, rejected for staleness
+          assert t.accept("n1", 161, 161) is True           # a nonce reused after it expired is fresh again
+      - name: memory does not grow
+        code: |
+          t = NonceTracker(max_age=10)
+          for i in range(1000):
+              assert t.accept(f"n{i}", i, i) is True
+          assert len(t.seen) <= 12
+    hints:
+      - "Build the canonical text with `\"\\n\".join([method.upper(), path, str(timestamp), hashlib.sha256(body.encode()).hexdigest()])`."
+      - "`hmac.new(key.encode(), canonical.encode(), hashlib.sha256).hexdigest()` is the tag."
+      - "In `verify_request`, check the time window first, compute the expected tag, then `hmac.compare_digest(expected, tag)`. `compare_digest` accepts two `str` objects only if they are ASCII, so for odd input compare after encoding both with `.encode()`."
+      - "`NonceTracker`: store `self.seen = {nonce: timestamp}`. On every call first delete entries with `now - ts > max_age`, then check freshness and membership. The attribute must be called `seen`."
+    solution: |
+      import hashlib
+      import hmac
+
+
+      def sign_request(key, method, path, timestamp, body):
+          canonical = "\n".join([method.upper(), path, str(timestamp), hashlib.sha256(body.encode()).hexdigest()])
+          return hmac.new(key.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+
+
+      def verify_request(key, method, path, timestamp, body, tag, now, max_age=300):
+          if abs(now - timestamp) > max_age:
+              return False
+          expected = sign_request(key, method, path, timestamp, body)
+          return hmac.compare_digest(expected.encode(), str(tag).encode())
+
+
+      class NonceTracker:
+          def __init__(self, max_age):
+              self.max_age = max_age
+              self.seen = {}
+
+          def accept(self, nonce, timestamp, now):
+              self.seen = {n: ts for n, ts in self.seen.items() if now - ts <= self.max_age}
+              if abs(now - timestamp) > self.max_age:
+                  return False
+              if nonce in self.seen:
+                  return False
+              self.seen[nonce] = timestamp
+              return True
+    explanation: |
+      This is a simplified version of how API providers sign requests (AWS Signature, Stripe webhooks, and many others). The MAC stops anyone without the key from forging or modifying a request; the timestamp bounds how long a captured request can be replayed; and the nonce store closes the remaining window. The detail about forgetting old nonces matters: without it a long-running service would eventually run out of memory.
+
+  - id: firewall
+    title: A stateful firewall
+    difficulty: 4
+    prompt: |
+      The helper `in_cidr(ip, cidr)` is provided. Write the class `Firewall(rules, default="deny")`. Each rule is a dictionary with the keys `action` (`"allow"` or `"deny"`) and optional `proto` (`"tcp"`, `"udp"`, `"icmp"`; omitted means any), `src` (a CIDR string; omitted means any) and `port` (an integer, or a `(low, high)` tuple that includes both ends; omitted means any). `decide(proto, src_ip, dst_port)` returns the action of the **first** matching rule, or the default. `outbound(proto, local_ip, local_port, remote_ip, remote_port)` records an inside host's connection and returns `"allow"`. `inbound(proto, remote_ip, remote_port, local_ip, local_port)` returns `"allow"` if it is a **reply** to a recorded outbound connection (same protocol, and the endpoints match exactly in reverse) and otherwise returns `decide(proto, remote_ip, local_port)`. `flows()` returns the number of recorded connections. `close(proto, local_ip, local_port, remote_ip, remote_port)` forgets one (and is harmless if it is not recorded).
+    starter: |
+      def in_cidr(ip, cidr):
+          def to_int(text):
+              a, b, c, d = (int(x) for x in text.split("."))
+              return (a << 24) | (b << 16) | (c << 8) | d
+          prefix = int(cidr.split("/")[1])
+          mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+          return to_int(ip) & mask == to_int(cidr.split("/")[0]) & mask
+
+
+      class Firewall:
+          def __init__(self, rules, default="deny"):
+              pass
+
+          def decide(self, proto, src_ip, dst_port):
+              pass
+
+          def outbound(self, proto, local_ip, local_port, remote_ip, remote_port):
+              pass
+
+          def inbound(self, proto, remote_ip, remote_port, local_ip, local_port):
+              pass
+
+          def flows(self):
+              pass
+
+          def close(self, proto, local_ip, local_port, remote_ip, remote_port):
+              pass
+    tests:
+      - name: rule order
+        code: |
+          rules = [
+              {"action": "allow", "proto": "tcp", "port": 443},
+              {"action": "allow", "proto": "tcp", "port": 22, "src": "10.0.0.5/32"},
+              {"action": "deny", "proto": "tcp", "port": 22},
+              {"action": "allow", "proto": "udp", "port": 53},
+              {"action": "allow", "proto": "tcp", "port": (8000, 8100), "src": "192.168.0.0/16"},
+          ]
+          fw = Firewall(rules)
+          assert fw.decide("tcp", "203.0.113.1", 443) == "allow"
+          assert fw.decide("tcp", "10.0.0.5", 22) == "allow"
+          assert fw.decide("tcp", "203.0.113.1", 22) == "deny"
+          assert fw.decide("udp", "203.0.113.1", 53) == "allow"
+          assert fw.decide("tcp", "203.0.113.1", 3306) == "deny"             # default
+          assert fw.decide("tcp", "192.168.4.4", 8000) == "allow" and fw.decide("tcp", "192.168.4.4", 8100) == "allow"
+          assert fw.decide("tcp", "192.168.4.4", 8101) == "deny" and fw.decide("tcp", "172.16.0.1", 8050) == "deny"
+          assert fw.decide("icmp", "203.0.113.1", 0) == "deny"
+          assert Firewall(rules, default="allow").decide("tcp", "203.0.113.1", 3306) == "allow"
+          assert Firewall([]).decide("tcp", "1.1.1.1", 1) == "deny"
+      - name: wildcards
+        code: |
+          fw = Firewall([{"action": "deny", "src": "203.0.113.0/24"}, {"action": "allow"}], default="deny")
+          assert fw.decide("tcp", "203.0.113.50", 80) == "deny"
+          assert fw.decide("udp", "198.51.100.7", 9) == "allow"
+          assert fw.decide("icmp", "198.51.100.7", 0) == "allow"
+      - name: stateful replies
+        code: |
+          fw = Firewall([{"action": "allow", "proto": "tcp", "port": 443}])
+          assert fw.inbound("tcp", "93.184.216.34", 80, "10.0.0.7", 50000) == "deny"        # unsolicited
+          assert fw.outbound("tcp", "10.0.0.7", 50000, "93.184.216.34", 80) == "allow"
+          assert fw.flows() == 1
+          assert fw.inbound("tcp", "93.184.216.34", 80, "10.0.0.7", 50000) == "allow"        # the reply
+          assert fw.inbound("tcp", "93.184.216.34", 80, "10.0.0.7", 50001) == "deny"         # another port
+          assert fw.inbound("tcp", "93.184.216.35", 80, "10.0.0.7", 50000) == "deny"         # another server
+          assert fw.inbound("udp", "93.184.216.34", 80, "10.0.0.7", 50000) == "deny"         # another protocol
+          assert fw.inbound("tcp", "198.51.100.9", 1234, "10.0.0.7", 443) == "allow"         # rules still apply
+          fw.outbound("tcp", "10.0.0.7", 50000, "93.184.216.34", 80)
+          assert fw.flows() == 1
+          fw.close("tcp", "10.0.0.7", 50000, "93.184.216.34", 80)
+          fw.close("tcp", "10.0.0.7", 50000, "93.184.216.34", 80)
+          assert fw.flows() == 0
+          assert fw.inbound("tcp", "93.184.216.34", 80, "10.0.0.7", 50000) == "deny"
+    hints:
+      - "Write a helper `_matches(rule, proto, src_ip, dst_port)` that returns `False` at the first mismatching condition. A missing key means 'matches anything'."
+      - "A `port` that is a tuple means `low <= dst_port <= high`; an integer means equality."
+      - "Store flows in a set of tuples `(proto, local_ip, local_port, remote_ip, remote_port)`. An inbound packet is a reply if `(proto, local_ip, local_port, remote_ip, remote_port)` (the same endpoints seen from inside) is in the set."
+    solution: |
+      def in_cidr(ip, cidr):
+          def to_int(text):
+              a, b, c, d = (int(x) for x in text.split("."))
+              return (a << 24) | (b << 16) | (c << 8) | d
+          prefix = int(cidr.split("/")[1])
+          mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+          return to_int(ip) & mask == to_int(cidr.split("/")[0]) & mask
+
+
+      class Firewall:
+          def __init__(self, rules, default="deny"):
+              self.rules = list(rules)
+              self.default = default
+              self._flows = set()
+
+          @staticmethod
+          def _matches(rule, proto, src_ip, dst_port):
+              if "proto" in rule and rule["proto"] != proto:
+                  return False
+              if "src" in rule and not in_cidr(src_ip, rule["src"]):
+                  return False
+              if "port" in rule:
+                  port = rule["port"]
+                  if isinstance(port, tuple):
+                      if not port[0] <= dst_port <= port[1]:
+                          return False
+                  elif port != dst_port:
+                      return False
+              return True
+
+          def decide(self, proto, src_ip, dst_port):
+              for rule in self.rules:
+                  if self._matches(rule, proto, src_ip, dst_port):
+                      return rule["action"]
+              return self.default
+
+          def outbound(self, proto, local_ip, local_port, remote_ip, remote_port):
+              self._flows.add((proto, local_ip, local_port, remote_ip, remote_port))
+              return "allow"
+
+          def inbound(self, proto, remote_ip, remote_port, local_ip, local_port):
+              if (proto, local_ip, local_port, remote_ip, remote_port) in self._flows:
+                  return "allow"
+              return self.decide(proto, remote_ip, local_port)
+
+          def flows(self):
+              return len(self._flows)
+
+          def close(self, proto, local_ip, local_port, remote_ip, remote_port):
+              self._flows.discard((proto, local_ip, local_port, remote_ip, remote_port))
+    explanation: |
+      The flow table is why you can browse the web from behind a router that blocks everything inbound: your outgoing request creates the entry that lets the reply back in. Real implementations also expire flows after a timeout and track TCP state, so a flood of fake replies cannot slip through. Notice again that the rule order is part of the policy: swap the first two SSH rules and the administrator is locked out.
+
+  - id: certs
+    title: Validating a certificate chain
+    difficulty: 5
+    prompt: |
+      A certificate is a dictionary with `subject`, `names` (a list of host names it is valid for; may be empty for CA certificates), `issuer`, `key` (the certificate's own public-key id), `signed_by` (the key id that signed it), `ca` (bool: may it sign other certificates?), `not_before` and `not_after` (integers; a certificate is valid when `not_before <= now <= not_after`). Write `matches_hostname(names, host)`: case-insensitive, ignoring one trailing dot on `host`; an exact name matches; a name of the form `*.rest` (the wildcard must be the entire first label, and `rest` must contain at least one dot) matches `host` only when `host` has **exactly one** more label than `rest` (`*.example.com` matches `www.example.com`, not `example.com` or `a.b.example.com`). Then write `validate_chain(chain, trusted_roots, host, now)` returning `(True, "ok")` or `(False, reason)`. `chain` lists the leaf first and the root last; `trusted_roots` is a dictionary `{subject: key}`. Check in this order and report the first problem: (1) an empty chain: `"empty chain"`; (2) for each certificate from the leaf up, `now < not_before` gives `"not yet valid"` and `now > not_after` gives `"expired"`; (3) the leaf does not match the host: `"hostname mismatch"`; (4) for each consecutive pair (certificate, parent) from the leaf up: if `issuer` differs from the parent's `subject` give `"broken chain"`, else if `signed_by` differs from the parent's `key` give `"bad signature"`, else if the parent's `ca` is false give `"not a CA"`; (5) the last certificate must be a trusted root, meaning its `subject` is in `trusted_roots` with the same `key`, otherwise `"untrusted root"`.
+    starter: |
+      def matches_hostname(names, host):
+          pass
+
+
+      def validate_chain(chain, trusted_roots, host, now):
+          pass
+    tests:
+      - name: hostnames
+        code: |
+          assert matches_hostname(["www.example.com"], "WWW.Example.com.") is True
+          assert matches_hostname(["www.example.com"], "example.com") is False
+          assert matches_hostname(["*.example.com"], "www.example.com") is True
+          assert matches_hostname(["*.example.com"], "example.com") is False
+          assert matches_hostname(["*.example.com"], "a.b.example.com") is False
+          assert matches_hostname(["*.example.com"], "badexample.com") is False
+          assert matches_hostname(["*.com"], "example.com") is False                 # wildcard needs a dot in the rest
+          assert matches_hostname(["*"], "localhost") is False
+          assert matches_hostname(["w*.example.com"], "www.example.com") is False   # partial-label wildcards are refused
+          assert matches_hostname(["a.com", "*.b.com"], "x.b.com") is True
+          assert matches_hostname([], "a.com") is False
+          assert matches_hostname(["a.com"], "") is False
+      - name: a good chain
+        code: |
+          def make():
+              return [
+                  {"subject": "www.example.com", "names": ["www.example.com", "*.shop.example.com"], "issuer": "Inter CA", "key": "K-leaf",
+                   "signed_by": "K-inter", "ca": False, "not_before": 100, "not_after": 200},
+                  {"subject": "Inter CA", "names": [], "issuer": "Root CA", "key": "K-inter", "signed_by": "K-root", "ca": True,
+                   "not_before": 50, "not_after": 300},
+                  {"subject": "Root CA", "names": [], "issuer": "Root CA", "key": "K-root", "signed_by": "K-root", "ca": True,
+                   "not_before": 0, "not_after": 1000},
+              ]
+          roots = {"Root CA": "K-root"}
+          assert validate_chain(make(), roots, "www.example.com", 150) == (True, "ok")
+          assert validate_chain(make(), roots, "x.shop.example.com", 100) == (True, "ok")
+          assert validate_chain(make(), roots, "www.example.com", 200) == (True, "ok")
+          assert validate_chain([make()[2]], roots, "anything", 5) == (False, "hostname mismatch")
+      - name: each failure
+        code: |
+          def make():
+              return [
+                  {"subject": "www.example.com", "names": ["www.example.com"], "issuer": "Inter CA", "key": "K-leaf",
+                   "signed_by": "K-inter", "ca": False, "not_before": 100, "not_after": 200},
+                  {"subject": "Inter CA", "names": [], "issuer": "Root CA", "key": "K-inter", "signed_by": "K-root", "ca": True,
+                   "not_before": 50, "not_after": 300},
+                  {"subject": "Root CA", "names": [], "issuer": "Root CA", "key": "K-root", "signed_by": "K-root", "ca": True,
+                   "not_before": 0, "not_after": 1000},
+              ]
+          roots = {"Root CA": "K-root"}
+          h = "www.example.com"
+          assert validate_chain([], roots, h, 150) == (False, "empty chain")
+          assert validate_chain(make(), roots, h, 99) == (False, "not yet valid")
+          assert validate_chain(make(), roots, h, 201) == (False, "expired")
+          c = make(); c[1]["not_after"] = 120
+          assert validate_chain(c, roots, h, 150) == (False, "expired")
+          assert validate_chain(make(), roots, "evil.com", 150) == (False, "hostname mismatch")
+          c = make(); c[0]["issuer"] = "Other CA"
+          assert validate_chain(c, roots, h, 150) == (False, "broken chain")
+          c = make(); c[0]["signed_by"] = "K-attacker"
+          assert validate_chain(c, roots, h, 150) == (False, "bad signature")
+          c = make(); c[1]["ca"] = False
+          assert validate_chain(c, roots, h, 150) == (False, "not a CA")
+          assert validate_chain(make(), {"Root CA": "K-other"}, h, 150) == (False, "untrusted root")
+          assert validate_chain(make(), {}, h, 150) == (False, "untrusted root")
+      - name: order of checks
+        code: |
+          def make():
+              return [
+                  {"subject": "a.com", "names": ["a.com"], "issuer": "R", "key": "K1", "signed_by": "K2", "ca": False, "not_before": 0, "not_after": 10},
+                  {"subject": "R", "names": [], "issuer": "R", "key": "K2", "signed_by": "K2", "ca": True, "not_before": 0, "not_after": 10},
+              ]
+          c = make()
+          c[0]["signed_by"] = "bad"
+          assert validate_chain(c, {"R": "K2"}, "b.com", 99) == (False, "expired")             # dates before the hostname
+          assert validate_chain(c, {"R": "K2"}, "b.com", 5) == (False, "hostname mismatch")     # hostname before signatures
+          assert validate_chain(c, {"R": "K2"}, "a.com", 5) == (False, "bad signature")
+          c[0]["signed_by"] = "K2"
+          c[1]["ca"] = False
+          assert validate_chain(c, {"R": "K2"}, "a.com", 5) == (False, "not a CA")
+    hints:
+      - "`matches_hostname`: lower-case both, drop one trailing `.` from the host. For a name starting with `*.`, check `rest = name[2:]` contains a `.` (and no `*`), then `host.split('.', 1)` must give a non-empty first label whose remainder equals `rest`."
+      - "Reject any other use of `*` by requiring exact equality for non-wildcard names."
+      - "`validate_chain` is a sequence of loops in the order given in the prompt. Return as soon as a problem is found."
+      - "The final root check: `trusted_roots.get(chain[-1]['subject']) == chain[-1]['key']`, and make sure the key is not `None`."
+    solution: |
+      def matches_hostname(names, host):
+          host = host.lower()
+          if host.endswith("."):
+              host = host[:-1]
+          if not host:
+              return False
+          for name in names:
+              name = name.lower()
+              if name.startswith("*."):
+                  rest = name[2:]
+                  if "." not in rest or "*" in rest:
+                      continue
+                  first, dot, tail = host.partition(".")
+                  if first and dot and tail == rest:
+                      return True
+              elif "*" not in name and name == host:
+                  return True
+          return False
+
+
+      def validate_chain(chain, trusted_roots, host, now):
+          if not chain:
+              return False, "empty chain"
+          for cert in chain:
+              if now < cert["not_before"]:
+                  return False, "not yet valid"
+              if now > cert["not_after"]:
+                  return False, "expired"
+          if not matches_hostname(chain[0]["names"], host):
+              return False, "hostname mismatch"
+          for cert, parent in zip(chain, chain[1:]):
+              if cert["issuer"] != parent["subject"]:
+                  return False, "broken chain"
+              if cert["signed_by"] != parent["key"]:
+                  return False, "bad signature"
+              if not parent["ca"]:
+                  return False, "not a CA"
+          root = chain[-1]
+          if trusted_roots.get(root["subject"]) is None or trusted_roots[root["subject"]] != root["key"]:
+              return False, "untrusted root"
+          return True, "ok"
+    explanation: |
+      This is a simplified version of what every browser does on every HTTPS connection, and each check has a famous failure behind it. Skipping the hostname check lets any valid certificate impersonate any site. Skipping the `ca` flag check let attackers use an ordinary website certificate to mint certificates for others (a real bug in old browsers). Real verification also checks revocation, key usage, name constraints and, of course, the cryptographic signature itself.
+
+  - id: scanners
+    title: Spotting port scans
+    difficulty: 4
+    prompt: |
+      A connection log is a list of `(time, source_ip, destination_port)` entries, not necessarily in time order. Write `find_scanners(log, threshold, window)` returning the **sorted** list of source addresses that, at some moment, touched **at least `threshold` different destination ports** within a time span of at most `window` seconds, that is, there is a set of that source's entries whose times satisfy `max - min <= window` and whose ports include `threshold` distinct values. Repeated connections to the same port count once. Raise `ValueError` if `threshold < 1` or `window < 0`. Also write `busiest_ports(log, n)` returning the `n` most contacted destination ports as `(port, count)` pairs, highest count first, ties broken by the **smaller port number**.
+    starter: |
+      def find_scanners(log, threshold, window):
+          pass
+
+
+      def busiest_ports(log, n):
+          pass
+    tests:
+      - name: a simple log
+        code: |
+          log = [
+              (0, "198.51.100.9", 22), (1, "198.51.100.9", 23), (2, "198.51.100.9", 80), (3, "198.51.100.9", 443),
+              (0, "203.0.113.5", 443), (5, "203.0.113.5", 443), (9, "203.0.113.5", 443),
+              (0, "192.0.2.1", 80), (100, "192.0.2.1", 81), (200, "192.0.2.1", 82),
+          ]
+          assert find_scanners(log, 4, 10) == ["198.51.100.9"]
+          assert find_scanners(log, 4, 2) == []
+          assert find_scanners(log, 3, 3) == ["198.51.100.9"]
+          assert find_scanners(log, 3, 200) == ["192.0.2.1", "198.51.100.9"]
+          assert find_scanners(log, 1, 0) == ["192.0.2.1", "198.51.100.9", "203.0.113.5"]
+          assert find_scanners([], 3, 10) == []
+      - name: boundaries and order
+        code: |
+          log = [(10, "a", 3), (0, "a", 1), (5, "a", 2), (3, "b", 1), (13, "b", 2)]
+          assert find_scanners(log, 3, 10) == ["a"]
+          assert find_scanners(log, 3, 9) == []                    # span of the three is exactly 10
+          assert find_scanners(log, 2, 10) == ["a", "b"]
+          assert find_scanners(log, 2, 9) == ["a"]
+      - name: matches brute force
+        code: |
+          import random
+          rng = random.Random(23)
+          for _ in range(100):
+              log = [(rng.randint(0, 30), rng.choice("ABC"), rng.randint(1, 6)) for _ in range(rng.randint(0, 25))]
+              threshold, window = rng.randint(1, 5), rng.randint(0, 12)
+              expected = set()
+              for t0, src, _ in log:
+                  ports = {p for t, s, p in log if s == src and t0 <= t <= t0 + window}
+                  if len(ports) >= threshold:
+                      expected.add(src)
+              assert find_scanners(log, threshold, window) == sorted(expected)
+      - name: errors and busiest ports
+        code: |
+          for args in ((0, 5), (1, -1)):
+              try:
+                  find_scanners([], *args)
+                  assert False
+              except ValueError:
+                  pass
+          log = [(0, "a", 80), (1, "b", 443), (2, "c", 80), (3, "a", 22), (4, "a", 443), (5, "d", 8080)]
+          assert busiest_ports(log, 2) == [(80, 2), (443, 2)]
+          assert busiest_ports(log, 10) == [(80, 2), (443, 2), (22, 1), (8080, 1)]
+          assert busiest_ports(log, 0) == [] and busiest_ports([], 3) == []
+    hints:
+      - "Group the log by source: `by_source.setdefault(src, []).append((time, port))`, then sort each list."
+      - "Use a sliding window with two indexes over a source's sorted events and a dictionary counting how many events in the window hit each port. Move `right` forward, and move `left` forward while `time[right] - time[left] > window`."
+      - "A source is flagged as soon as the number of distinct ports in the window (the length of the counting dictionary) reaches `threshold`."
+      - "`busiest_ports`: count with a dictionary and sort by `(-count, port)`."
+    solution: |
+      def find_scanners(log, threshold, window):
+          if threshold < 1 or window < 0:
+              raise ValueError("bad parameters")
+          by_source = {}
+          for time, src, port in log:
+              by_source.setdefault(src, []).append((time, port))
+          flagged = []
+          for src, events in by_source.items():
+              events.sort()
+              counts = {}
+              left = 0
+              for right, (time, port) in enumerate(events):
+                  counts[port] = counts.get(port, 0) + 1
+                  while time - events[left][0] > window:
+                      old = events[left][1]
+                      counts[old] -= 1
+                      if counts[old] == 0:
+                          del counts[old]
+                      left += 1
+                  if len(counts) >= threshold:
+                      flagged.append(src)
+                      break
+          return sorted(flagged)
+
+
+      def busiest_ports(log, n):
+          counts = {}
+          for _, _, port in log:
+              counts[port] = counts.get(port, 0) + 1
+          ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+          return ranked[:max(n, 0)]
+    explanation: |
+      The sliding window with a running count is the pattern from Lesson 8.x, applied to security monitoring. Real intrusion detection systems use exactly this kind of rule, then tune the threshold so that ordinary busy clients (which contact few ports many times) are not flagged, while scanners (which touch many ports once each) are. Attackers respond by scanning slowly, which is why windows and thresholds are always a trade-off.
+
+commonMistakes:
+  - title: Inventing your own cryptography
+    explanation: |
+      Cryptography fails in subtle ways that testing does not reveal. Use vetted libraries and protocols such as TLS, never home-made ciphers.
+  - title: Thinking a hash is a signature
+    explanation: |
+      Anyone can compute a hash. A MAC needs a shared secret and a signature needs a private key; a bare hash proves only that the bytes match the hash.
+  - title: Ignoring replay
+    explanation: |
+      A correctly signed message can be sent again. Include a timestamp or nonce, and check it.
+  - title: Clicking through certificate warnings
+    explanation: |
+      An expired, mismatched or untrusted certificate is the visible symptom of a possible man in the middle.
+  - title: Putting the broad firewall rule first
+    explanation: |
+      The first matching rule wins. A general "deny" above a specific "allow" makes the allow unreachable.
+  - title: Believing the padlock means the site is safe
+    explanation: |
+      It means the connection is encrypted and the certificate matches the name. Phishing sites can have valid certificates too.
+
+summary:
+  - "Packets cross networks you do not control. Attackers can **read**, **change**, **forge**, **replay** or **block** them. The goals are confidentiality, integrity and authenticity."
+  - "**Hashes** fingerprint data; **symmetric ciphers** are fast but need a shared key; a **MAC (HMAC)** adds integrity and authenticity; **public-key** cryptography gives key exchange and **digital signatures**. Never invent your own."
+  - "**Diffie-Hellman** lets two parties build a shared secret in public: `gᵃᵇ mod p`. Breaking it means solving the **discrete logarithm**, infeasible for large primes."
+  - "**TLS** does a handshake (hello messages, certificate, key exchange, Finished) and then encrypts and authenticates the stream. A **certificate chain** (leaf, intermediate, root) is checked for dates, issuers, signatures, CA flags, a trusted root and a matching host name (wildcards cover one label)."
+  - "**Firewalls** apply ordered rules (first match wins, default deny), and **stateful** ones let replies back in. **Defence in depth** layers several controls."
+  - "Defenders watch logs for patterns such as **port scans**: one source touching many ports in a short window."
+next: |
+  That completes the tour from bits on a wire to secure web services. The Unit 11 project puts the pieces together: a **mini network toolkit** that handles addresses, a routing table, a DNS cache and an HTTP-style request processor, driven from a script file.
+
+quiz:
+  - type: mcq
+    question: Which property does an HMAC provide that a plain SHA-256 hash does not?
+    options: [
+      "Proof that the message came from someone holding the secret key and was not altered",
+      "Encryption of the message",
+      "A shorter output",
+      "Reversibility"
+    ]
+    answer: 0
+    explanation: "Anyone can compute a plain hash. An HMAC needs the key, so a valid tag shows the sender knew it."
+  - type: mcq
+    question: In a Diffie-Hellman exchange with p = 23 and g = 5, Alice has the secret 6. Bob sends B = 19. What shared secret does Alice compute?
+    options: ["2", "6", "19", "8"]
+    answer: 0
+    explanation: "19 to the power 6, mod 23, is 2, which is also what Bob gets from Alice's value 8 and his secret 15."
+  - type: mcq
+    question: What attack does an eavesdropper who can also modify traffic perform when they relay messages between two parties, pretending to each to be the other?
+    options: ["Man-in-the-middle", "SYN flood", "Port scan", "Cache hit"]
+    answer: 0
+    explanation: "Certificates exist to defeat this: they let the client confirm it is really talking to the named server."
+  - type: mcq
+    question: A wildcard certificate for *.example.com is presented for which of these hosts?
+    options: ["It is valid for www.example.com but not for example.com", "It is valid for example.com but not www.example.com", "It is valid for every subdomain at any depth, such as a.b.example.com", "It is valid for any website"]
+    answer: 0
+    explanation: "The wildcard stands for exactly one label, so it covers www.example.com but neither the bare domain nor deeper names."
+  - type: mcq
+    question: A firewall's rules are (1) deny tcp port 22 from anyone, then (2) allow tcp port 22 from 10.0.0.5. Can 10.0.0.5 connect by SSH?
+    options: ["No, because the first matching rule (deny) wins", "Yes, the more specific rule wins", "Yes, because allow beats deny", "It depends on the time"]
+    answer: 0
+    explanation: "Rule order is the policy: the broad deny matches first, so the specific allow is never reached."
+  - type: mcq
+    question: Why does a signed request include a timestamp or nonce?
+    options: [
+      "To stop an attacker replaying a captured valid request later",
+      "To make the signature shorter",
+      "To encrypt the request",
+      "To count the number of requests"
+    ]
+    answer: 0
+    explanation: "A signature proves who sent a message, not when. A fresh value limits how long a recording remains useful."
+  - type: code
+    question: |
+      Write `allowed(rules, port)` for a firewall that lists rules as `(action, port)` pairs, where `action` is `"allow"` or `"deny"`. The first rule whose port equals `port` decides. If no rule matches the answer is `False`. Return `True` for allow and `False` for deny.
+    starter: |
+      def allowed(rules, port):
+          pass
+    tests:
+      - name: first match
+        code: |
+          rules = [("deny", 22), ("allow", 22), ("allow", 443)]
+          assert allowed(rules, 22) is False
+          assert allowed(rules, 443) is True
+          assert allowed(rules, 80) is False
+          assert allowed([], 80) is False
+    solution: |
+      def allowed(rules, port):
+          for action, rule_port in rules:
+              if rule_port == port:
+                  return action == "allow"
+          return False

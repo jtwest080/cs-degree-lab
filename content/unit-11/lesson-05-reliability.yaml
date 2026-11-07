@@ -1,0 +1,758 @@
+id: u11-reliability
+title: "Reliability, Flow and Congestion Control"
+minutes: 65
+objective: |
+  Understand how TCP keeps its promise on a network that loses packets. Start with the simplest scheme, stop-and-wait, see why it wastes the link, and fix that with sliding windows (go-back-N and selective repeat). Then learn how TCP chooses its timeout, how fast retransmit reacts to duplicate acknowledgements, how flow control protects the receiver, and how congestion control (slow start and AIMD) protects the network.
+outcomes:
+  - Compute the bandwidth-delay product and the utilisation of stop-and-wait
+  - Simulate stop-and-wait, go-back-N and selective repeat under packet loss
+  - Explain cumulative acknowledgements, duplicate ACKs and fast retransmit
+  - Estimate round-trip time and the retransmission timeout with an exponentially weighted average
+  - Describe flow control (the receive window) and congestion control (slow start, congestion avoidance, AIMD)
+  - Trace how the congestion window evolves under Tahoe and Reno
+
+sections:
+  - heading: Making loss invisible
+    body: |
+      Packets are lost for several reasons: a router's queue is full and drops them, a bit error is caught by a checksum, a wireless signal fades. The sender cannot see this directly. All it can observe is the **absence of an acknowledgement**. The general technique is **ARQ** (automatic repeat request): the receiver acknowledges what it gets, and the sender **retransmits** whatever is not acknowledged within a **timeout**.
+
+      The simplest ARQ is **stop-and-wait**: send one packet, wait for its ACK, then send the next. If no ACK comes before the timeout, send the same packet again. Each packet carries a sequence number so that the receiver can recognise a **duplicate** (the ACK was lost, so the sender sent it twice) and ignore the extra copy while still acknowledging it. This works, and the protocol is easy to get right. But it is dreadfully slow on long links.
+
+  - heading: Why stop-and-wait wastes the link
+    body: |
+      Suppose a 100 Mbps link with a 40 ms round-trip time. A 1500-byte packet takes 12,000 bits / 100 Mbps = 0.12 ms to transmit, and then the sender sits idle for the 40 ms it takes the ACK to return. The link is busy 0.12 ms out of every 40.12 ms. That is a **utilisation** of 0.3%, or 300 kbps on a 100 Mbps link.
+
+      > utilisation = transmit time / (transmit time + round-trip time)
+
+      The cure is **pipelining**: allow several packets to be **in flight** (sent but not yet acknowledged). The amount of data needed to keep the pipe full is the **bandwidth-delay product (BDP)**: bandwidth × round-trip time. For our example, 100 Mbps × 40 ms = 4,000,000 bits = **500,000 bytes**, about 334 packets. That is the **window** the sender needs for full speed. Fast, long ("long fat") networks need huge windows, which is why TCP window sizes have grown over the years.
+
+  - heading: Sliding windows
+    body: |
+      A **sliding window** protocol lets the sender have up to *W* unacknowledged packets outstanding. The window covers sequence numbers from `base` (the oldest unacknowledged) to `base + W - 1`. As acknowledgements arrive the window **slides** forward and new packets become eligible. There are two classic ways to deal with loss inside a window.
+
+      **Go-back-N (GBN).** The receiver accepts packets only **in order** and discards any that arrive after a gap. It acknowledges cumulatively ("everything up to *k*"). When the sender times out on the oldest packet, it **goes back and resends the whole window** starting from `base`. It is simple (the receiver needs no buffer), but one loss makes the sender resend packets that had actually arrived.
+
+      **Selective repeat (SR).** The receiver **buffers** out-of-order packets and acknowledges each one individually. The sender retransmits **only the packets that were lost**. It uses the link more efficiently, at the price of a buffer and more bookkeeping at both ends.
+
+      TCP is a hybrid. Its acknowledgements are **cumulative** like go-back-N, but modern TCP adds **SACK** (selective acknowledgements) so the receiver can say "I also have bytes 5000 to 6000", letting the sender retransmit only what is missing, like selective repeat.
+
+  - heading: Fast retransmit and the timeout
+    body: |
+      Waiting for a timeout is slow. TCP has a faster signal. If segment 2 is lost but segments 3, 4 and 5 arrive, the receiver keeps acknowledging "I still want 2": it sends **duplicate ACKs**. When the sender sees **three duplicate ACKs** (four ACKs in a row for the same number) it concludes that the segment was lost, not merely delayed, and retransmits immediately without waiting for the timer. This is **fast retransmit**.
+
+      The timer still matters, and its value is a judgement call. Too short, and the sender retransmits packets that were merely slow (wasting bandwidth, and feeding congestion). Too long, and a loss stalls the connection. TCP measures the **round-trip time (RTT)** of each acknowledged segment and keeps a smoothed average with an **exponentially weighted moving average** (EWMA):
+
+      > `srtt   = 7/8 · srtt + 1/8 · sample`
+      > `rttvar = 3/4 · rttvar + 1/4 · |srtt − sample|`   (computed with the old `srtt`)
+      > `rto    = srtt + 4 · rttvar`
+
+      The first sample sets `srtt = sample` and `rttvar = sample / 2`. The variation term makes the timeout generous when the network is jittery. If a timeout does occur, the RTO is **doubled** (**exponential backoff**) each time until an ACK arrives, so a dead path is not hammered. Also, **Karn's rule**: never use the RTT of a retransmitted segment as a sample, since you cannot tell which transmission the ACK answers.
+
+  - heading: Flow control
+    body: |
+      A fast sender could overwhelm a slow receiver whose buffer is full. TCP's **flow control** prevents this: in every segment the receiver advertises its **receive window** (`rwnd`), the number of bytes it has room for. The sender never allows more than `rwnd` bytes to be unacknowledged. If the receiver's application is slow to read, `rwnd` shrinks, possibly to zero, and the sender pauses (and probes occasionally to see if space has opened up). Flow control protects the **receiver**.
+
+  - heading: Congestion control
+    body: |
+      A different danger is the **network** itself. If every sender transmits as fast as the receivers allow, routers' queues overflow and packets are dropped, causing retransmissions that add even more traffic: **congestion collapse**, which actually happened to the early internet in 1986. The fix, by Van Jacobson, was to make TCP **infer congestion from loss** and slow down.
+
+      Each sender keeps a **congestion window** (`cwnd`, measured here in segments), and may have at most `min(cwnd, rwnd)` unacknowledged. It adjusts `cwnd` like this:
+
+      1. **Slow start.** Start with `cwnd = 1` and **double it every RTT** (every ACK adds one segment) until it reaches a threshold `ssthresh`. Despite the name, this is exponential growth: the sender is quickly *probing* for the available capacity.
+      2. **Congestion avoidance.** Beyond `ssthresh`, grow **linearly**: add 1 segment per RTT.
+      3. **On loss**, reduce. **Tahoe**: set `ssthresh = cwnd / 2` and restart slow start from `cwnd = 1`. **Reno**: if the loss was signalled by three duplicate ACKs (the network is still delivering something), do **fast recovery**: set `ssthresh = cwnd / 2` and `cwnd = ssthresh`, staying in congestion avoidance. A timeout is a more serious sign and still resets `cwnd` to 1.
+
+      Increase by one, decrease by half: **additive increase, multiplicative decrease (AIMD)**. This rule has a lovely property: when several connections share a bottleneck, AIMD drives them to **fair, equal shares** of the link, with no central coordinator. The `cwnd` graph looks like a sawtooth. Newer algorithms (CUBIC, the Linux default, and BBR from Google, which measures bandwidth and RTT instead of waiting for loss) change the curve but not the idea.
+
+      A connection's throughput is bounded by `cwnd × MSS / RTT`. So distance (a larger RTT) directly reduces the speed of a single TCP connection, which is why content delivery networks put servers close to users.
+
+examples:
+  - title: Utilisation of stop-and-wait versus a window
+    intro: "The link is mostly idle waiting for acknowledgements. A window fills the pipe."
+    code: |
+      import math
+
+
+      def tx_ms(packet_bytes, mbps):
+          return packet_bytes * 8 / (mbps * 1000)
+
+
+      print(f"{'link':<9} {'RTT':<7} {'stop-and-wait':>15} {'BDP':>11} {'window needed':>14}")
+      for mbps, rtt in ((10, 1), (100, 40), (1000, 40), (1000, 150)):
+          t = tx_ms(1500, mbps)
+          utilisation = t / (t + rtt)
+          bdp = mbps * rtt * 125                          # bytes
+          window = math.ceil((t + rtt) / t - 1e-9)
+          print(f"{str(mbps) + ' Mbps':<9} {str(rtt) + ' ms':<7} {utilisation:>15.3%} {bdp:>9,} B {window:>10} pkts")
+    output: |
+      link      RTT       stop-and-wait         BDP  window needed
+      10 Mbps   1 ms            54.545%     1,250 B          2 pkts
+      100 Mbps  40 ms            0.299%   500,000 B        335 pkts
+      1000 Mbps 40 ms            0.030% 5,000,000 B       3335 pkts
+      1000 Mbps 150 ms           0.008% 18,750,000 B      12501 pkts
+    lines:
+      - line: 9
+        note: "Stop-and-wait keeps the link busy only for the transmit time out of each cycle."
+      - line: 10
+        note: "The bandwidth-delay product: bits per millisecond (mbps * 1000) times milliseconds, divided by 8 for bytes, simplifies to mbps * rtt * 125."
+      - line: 11
+        note: "How many packets must be in flight to keep the sender transmitting during the whole round trip."
+  - title: Go-back-N versus selective repeat
+    intro: "Packet 3 is lost once, and packet 6 twice. Count the transmissions each protocol needs."
+    code: |
+      def go_back_n(n, window, loss):
+          left = dict(loss)
+          base = sent = rounds = 0
+          while base < n:
+              rounds += 1
+              end = min(base + window, n)
+              first_lost = None
+              for seq in range(base, end):
+                  sent += 1
+                  if left.get(seq, 0) > 0:
+                      left[seq] -= 1
+                      if first_lost is None:
+                          first_lost = seq
+              base = end if first_lost is None else first_lost
+          return sent, rounds
+
+
+      def selective_repeat(n, window, loss):
+          left = dict(loss)
+          acked = set()
+          base = sent = rounds = 0
+          while base < n:
+              rounds += 1
+              for seq in range(base, min(base + window, n)):
+                  if seq in acked:
+                      continue
+                  sent += 1
+                  if left.get(seq, 0) > 0:
+                      left[seq] -= 1
+                  else:
+                      acked.add(seq)
+              while base in acked:
+                  base += 1
+          return sent, rounds
+
+
+      loss = {3: 1, 6: 2}
+      print("packets to deliver: 10, window 4, losses", loss)
+      print("go-back-N         (transmissions, rounds):", go_back_n(10, 4, loss))
+      print("selective repeat  (transmissions, rounds):", selective_repeat(10, 4, loss))
+      print("no loss, go-back-N:", go_back_n(10, 4, {}), " stop-and-wait would need 10 rounds")
+    output: |
+      packets to deliver: 10, window 4, losses {3: 1, 6: 2}
+      go-back-N         (transmissions, rounds): (16, 4)
+      selective repeat  (transmissions, rounds): (13, 4)
+      no loss, go-back-N: (10, 3)  stop-and-wait would need 10 rounds
+    lines:
+      - line: 11
+        note: "The receiver discards everything after the first gap, so the window restarts at the first lost packet."
+      - line: 31
+        note: "Selective repeat remembers what arrived. Only the lost packets are sent again."
+  - title: Duplicate ACKs trigger fast retransmit
+    intro: "Segment 2 is lost. Later segments keep arriving, so the receiver keeps asking for 2."
+    code: |
+      def receiver_acks(arrivals):
+          have, expected, acks = set(), 0, []
+          for seq in arrivals:
+              have.add(seq)
+              while expected in have:
+                  expected += 1
+              acks.append(expected)
+          return acks
+
+
+      arrivals = [0, 1, 3, 4, 5, 2]          # segment 2 is delayed or lost and then resent
+      acks = receiver_acks(arrivals)
+      print("segments arrive :", arrivals)
+      print("cumulative ACKs :", acks)
+
+      dup = 0
+      for i in range(1, len(acks)):
+          dup = dup + 1 if acks[i] == acks[i - 1] else 0
+          if dup == 3:
+              print(f"after ACK #{i + 1} the sender has seen 3 duplicates of {acks[i]}: fast retransmit of segment {acks[i]}")
+    output: |
+      segments arrive : [0, 1, 3, 4, 5, 2]
+      cumulative ACKs : [1, 2, 2, 2, 2, 6]
+      after ACK #5 the sender has seen 3 duplicates of 2: fast retransmit of segment 2
+    lines:
+      - line: 4
+        note: "The ACK is the next segment the receiver still needs: cumulative, so it stays at 2 until 2 arrives."
+      - line: 16
+        note: "Three duplicates say 'later data is getting through but this segment is missing', so resend at once."
+  - title: Estimating the timeout
+    intro: "A smoothed RTT and its variation. Samples jump around, and the timeout follows with a safety margin."
+    code: |
+      srtt = rttvar = None
+      print(f"{'sample':<7} {'srtt':>8} {'rttvar':>8} {'rto':>8}")
+      for sample in (100, 140, 90, 100, 400, 100, 100, 100):
+          if srtt is None:
+              srtt, rttvar = sample, sample / 2
+          else:
+              rttvar = 0.75 * rttvar + 0.25 * abs(srtt - sample)
+              srtt = 0.875 * srtt + 0.125 * sample
+          rto = srtt + 4 * rttvar
+          print(f"{sample:<7} {srtt:>8.2f} {rttvar:>8.2f} {rto:>8.2f}")
+
+      rto = 300
+      print("after timeouts, backing off:", [rto * 2 ** k for k in range(5)])
+    output: |
+      sample      srtt   rttvar      rto
+      100       100.00    50.00   300.00
+      140       105.00    47.50   295.00
+      90        103.12    39.38   260.62
+      100       102.73    30.31   223.98
+      400       139.89    97.05   528.10
+      100       134.91    82.76   465.95
+      100       130.54    70.80   413.73
+      100       126.72    60.73   369.66
+      after timeouts, backing off: [300, 600, 1200, 2400, 4800]
+    lines:
+      - line: 5
+        note: "The first sample initialises the estimate."
+      - line: 7
+        note: "Update the variation first, using the old average, then update the average."
+      - line: 9
+        note: "The margin is four times the variation, so a jittery path gets a more patient timer."
+      - line: 15
+        note: "Each timeout doubles the next one, so a broken path is not flooded with retries."
+  - title: The sawtooth of the congestion window
+    intro: "Slow start, then linear growth, then a loss halves the window. Tahoe restarts from one; Reno stays at the new threshold."
+    code: |
+      def cwnd_trace(rounds, ssthresh, loss_rounds, variant):
+          cwnd, trace = 1, []
+          for r in range(rounds):
+              trace.append(cwnd)
+              if r in loss_rounds:
+                  ssthresh = max(cwnd // 2, 2)
+                  cwnd = 1 if variant == "tahoe" else ssthresh
+              elif cwnd < ssthresh:
+                  cwnd = min(cwnd * 2, ssthresh)          # slow start
+              else:
+                  cwnd += 1                               # congestion avoidance
+          return trace
+
+
+      for variant in ("tahoe", "reno"):
+          print(f"{variant:5}", cwnd_trace(24, 16, {6, 14}, variant))
+    output: |
+      tahoe [1, 2, 4, 8, 16, 17, 18, 1, 2, 4, 8, 9, 10, 11, 12, 1, 2, 4, 6, 7, 8, 9, 10, 11]
+      reno  [1, 2, 4, 8, 16, 17, 18, 9, 10, 11, 12, 13, 14, 15, 16, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    lines:
+      - line: 5
+        note: "A loss halves the threshold (but never below two segments)."
+      - line: 6
+        note: "Tahoe starts again from one segment; Reno carries on from the halved window."
+      - line: 8
+        note: "Below the threshold: double each round, but stop exactly at the threshold."
+      - line: 10
+        note: "Above it: add one segment per round trip. Additive increase, multiplicative decrease."
+
+playground:
+  prompt: |
+    Change the loss pattern in the go-back-N example so that packet 0 is lost three times, or enlarge the window to 10. Then change `ssthresh` in the congestion example and watch where the sawtooth peaks move.
+  code: |
+    import math
+    print(math.ceil((0.12 + 40) / 0.12))
+    print(100 * 40 * 125)
+
+exercises:
+  - id: pipe
+    title: Filling the pipe
+    difficulty: 2
+    prompt: |
+      Write three functions. `bdp_bytes(mbps, rtt_ms)` is the bandwidth-delay product in bytes (one Mbps is one million bits per second, and there are 8 bits in a byte). `stop_and_wait_utilisation(packet_bytes, mbps, rtt_ms)` is `tx / (tx + rtt_ms)` where `tx` is the transmission time of the packet in milliseconds; return it rounded to 6 decimals. `window_for_full_pipe(packet_bytes, mbps, rtt_ms)` is the smallest whole number of packets that keeps the sender busy during a whole cycle, `ceil((tx + rtt_ms) / tx)`. Allow for floating-point error by subtracting `1e-9` before taking the ceiling. Raise `ValueError` if any argument is not positive (the round trip may be zero, but not negative).
+    starter: |
+      import math
+
+
+      def bdp_bytes(mbps, rtt_ms):
+          pass
+
+
+      def stop_and_wait_utilisation(packet_bytes, mbps, rtt_ms):
+          pass
+
+
+      def window_for_full_pipe(packet_bytes, mbps, rtt_ms):
+          pass
+    tests:
+      - name: bdp
+        code: |
+          assert bdp_bytes(100, 40) == 500000
+          assert bdp_bytes(8, 1) == 1000
+          assert bdp_bytes(1000, 150) == 18750000
+          assert bdp_bytes(1, 0) == 0
+      - name: utilisation
+        code: |
+          assert stop_and_wait_utilisation(1000, 8, 9) == 0.1
+          assert stop_and_wait_utilisation(1500, 100, 40) == 0.002991
+          assert stop_and_wait_utilisation(1500, 12, 0) == 1.0
+          assert stop_and_wait_utilisation(1500, 10, 1) == round(1.2 / 2.2, 6)
+      - name: window
+        code: |
+          assert window_for_full_pipe(1000, 8, 9) == 10
+          assert window_for_full_pipe(1500, 12, 19.5) == 21
+          assert window_for_full_pipe(1500, 100, 40) == 335
+          assert window_for_full_pipe(1500, 100, 0) == 1
+      - name: bad arguments
+        code: |
+          for call in (lambda: bdp_bytes(0, 10), lambda: bdp_bytes(10, -1), lambda: stop_and_wait_utilisation(0, 10, 10),
+                       lambda: window_for_full_pipe(100, -5, 1), lambda: window_for_full_pipe(100, 5, -1)):
+              try:
+                  call()
+                  assert False
+              except ValueError:
+                  pass
+    hints:
+      - "One Mbps is 1000 bits per millisecond, so `tx = packet_bytes * 8 / (mbps * 1000)`."
+      - "`bdp_bytes = mbps * 1_000_000 / 8 * rtt_ms / 1000`, which equals `mbps * rtt_ms * 125`. Return an `int` or a value that equals one."
+      - "Validate first: `mbps <= 0`, `packet_bytes <= 0` or `rtt_ms < 0` raises `ValueError`."
+    solution: |
+      import math
+
+
+      def _check(*, packet=1, mbps=1, rtt=0):
+          if packet <= 0 or mbps <= 0 or rtt < 0:
+              raise ValueError("arguments must be positive")
+
+
+      def _tx(packet_bytes, mbps):
+          return packet_bytes * 8 / (mbps * 1000)
+
+
+      def bdp_bytes(mbps, rtt_ms):
+          _check(mbps=mbps, rtt=rtt_ms)
+          return mbps * rtt_ms * 125
+
+
+      def stop_and_wait_utilisation(packet_bytes, mbps, rtt_ms):
+          _check(packet=packet_bytes, mbps=mbps, rtt=rtt_ms)
+          t = _tx(packet_bytes, mbps)
+          return round(t / (t + rtt_ms), 6)
+
+
+      def window_for_full_pipe(packet_bytes, mbps, rtt_ms):
+          _check(packet=packet_bytes, mbps=mbps, rtt=rtt_ms)
+          t = _tx(packet_bytes, mbps)
+          return math.ceil((t + rtt_ms) / t - 1e-9)
+    explanation: |
+      This is the calculation behind TCP tuning advice: a 1 Gbps link across an ocean (150 ms) needs 18.75 MB in flight to run at full speed. Older TCP limited the window to 64 KB, capping such a connection at about 3.5 Mbps; "window scaling" was added to fix that.
+
+  - id: stop-wait
+    title: Stop-and-wait with loss
+    difficulty: 2
+    prompt: |
+      Write `stop_and_wait(n, lost, timeout, rtt)`. The sender transmits `n` packets one at a time. Number every transmission attempt from 0 across the whole run (retransmissions count as new attempts). An attempt whose number is in the set `lost` is lost (the data or its ACK, it makes no difference): the sender waits `timeout` time units and tries the same packet again. Any other attempt succeeds after `rtt` time units, and the sender moves to the next packet. Return `(transmissions, total_time)`. For `n == 0` the answer is `(0, 0)`.
+    starter: |
+      def stop_and_wait(n, lost, timeout, rtt):
+          pass
+    tests:
+      - name: examples
+        code: |
+          assert stop_and_wait(3, {1}, 100, 20) == (4, 160)
+          assert stop_and_wait(3, set(), 100, 20) == (3, 60)
+          assert stop_and_wait(0, {0}, 100, 20) == (0, 0)
+          assert stop_and_wait(1, {0, 1, 2}, 50, 10) == (4, 160)
+      - name: attempt numbers are global
+        code: |
+          # attempts 0 and 2 are lost: packet 0 needs attempts 0, 1; packet 1 needs attempts 2, 3
+          assert stop_and_wait(2, {0, 2}, 30, 5) == (4, 30 + 5 + 30 + 5)
+          # lost attempts beyond the end do nothing
+          assert stop_and_wait(2, {99}, 30, 5) == (2, 10)
+      - name: counts
+        code: |
+          import random
+          rng = random.Random(14)
+          for _ in range(100):
+              n = rng.randint(0, 8)
+              lost = {rng.randint(0, 15) for _ in range(rng.randint(0, 6))}
+              tx, total = stop_and_wait(n, lost, 7, 3)
+              used = [a for a in range(tx) if a in lost]
+              assert tx == n + len(used)
+              assert total == 3 * n + 7 * len(used)
+    hints:
+      - "Loop with `packet = 0` and `attempt = 0` while `packet < n`."
+      - "Each iteration: if `attempt in lost` add `timeout`, otherwise add `rtt` and move to the next packet. Always count the attempt."
+    solution: |
+      def stop_and_wait(n, lost, timeout, rtt):
+          attempt = 0
+          packet = 0
+          total = 0
+          while packet < n:
+              if attempt in lost:
+                  total += timeout
+              else:
+                  total += rtt
+                  packet += 1
+              attempt += 1
+          return attempt, total
+    explanation: |
+      The cost of a loss in stop-and-wait is a whole timeout of idleness, which is why the timeout value is so important, and why TCP works so hard to estimate it. Each lost attempt adds exactly `timeout - 0` to the time and one transmission to the count, as the last test checks.
+
+  - id: windows
+    title: Go-back-N and selective repeat
+    difficulty: 4
+    prompt: |
+      Write `go_back_n(n, window, loss)` and `selective_repeat(n, window, loss)`. Packets are numbered `0` to `n-1`. `loss` is a dictionary `{seq: k}` meaning the **first `k` transmissions** of packet `seq` are lost. The protocols run in **rounds**. In each round the sender transmits packets from `base` up to `min(base + window, n) - 1`. **Go-back-N** sends every packet in that range (including ones that were delivered in an earlier round); the receiver accepts only in order, so afterwards `base` becomes the **first lost packet of the round**, or the end of the range if none was lost. **Selective repeat** sends only packets in the range that have not yet been delivered; every delivered packet is remembered, and afterwards `base` moves up past all consecutively delivered packets. Count each transmission, lost or not. Return `(transmissions, rounds)`. Raise `ValueError` if `window < 1`. For `n == 0` return `(0, 0)`.
+    starter: |
+      def go_back_n(n, window, loss):
+          pass
+
+
+      def selective_repeat(n, window, loss):
+          pass
+    tests:
+      - name: no loss
+        code: |
+          assert go_back_n(5, 3, {}) == (5, 2)
+          assert selective_repeat(5, 3, {}) == (5, 2)
+          assert go_back_n(0, 3, {}) == (0, 0) and selective_repeat(0, 3, {}) == (0, 0)
+          assert go_back_n(7, 1, {}) == (7, 7)
+      - name: one loss
+        code: |
+          assert go_back_n(5, 3, {1: 1}) == (7, 3)
+          assert selective_repeat(5, 3, {1: 1}) == (6, 3)
+      - name: the worked example
+        code: |
+          loss = {3: 1, 6: 2}
+          assert go_back_n(10, 4, loss) == (16, 4)
+          assert selective_repeat(10, 4, loss) == (13, 4)
+      - name: properties
+        code: |
+          import math, random
+          rng = random.Random(13)
+          for _ in range(150):
+              n = rng.randint(0, 12)
+              w = rng.randint(1, 6)
+              loss = {s: rng.randint(1, 3) for s in range(n) if rng.random() < 0.3}
+              g_sent, g_rounds = go_back_n(n, w, loss)
+              s_sent, s_rounds = selective_repeat(n, w, loss)
+              assert s_sent == n + sum(loss.values())          # each loss costs exactly one extra transmission
+              assert g_sent >= s_sent
+              assert g_rounds >= math.ceil(n / w) and s_rounds >= math.ceil(n / w)
+      - name: bad window
+        code: |
+          for f in (go_back_n, selective_repeat):
+              try:
+                  f(3, 0, {})
+                  assert False
+              except ValueError:
+                  pass
+    hints:
+      - "Copy `loss` into a working dictionary `left` and decrement `left[seq]` each time a transmission of `seq` is lost."
+      - "Go-back-N: in each round loop `seq` over the window, count a transmission, and remember the first `seq` that was lost. Then `base = first_lost` if there was one, otherwise the end of the window."
+      - "Selective repeat: keep a set `delivered`. In each round skip packets already in the set; add a packet to it if the transmission is not lost. Then `while base in delivered: base += 1`."
+      - "Both loops end when `base >= n`; `rounds` counts the iterations."
+    solution: |
+      def go_back_n(n, window, loss):
+          if window < 1:
+              raise ValueError("window must be at least 1")
+          left = dict(loss)
+          base = sent = rounds = 0
+          while base < n:
+              rounds += 1
+              end = min(base + window, n)
+              first_lost = None
+              for seq in range(base, end):
+                  sent += 1
+                  if left.get(seq, 0) > 0:
+                      left[seq] -= 1
+                      if first_lost is None:
+                          first_lost = seq
+              base = end if first_lost is None else first_lost
+          return sent, rounds
+
+
+      def selective_repeat(n, window, loss):
+          if window < 1:
+              raise ValueError("window must be at least 1")
+          left = dict(loss)
+          delivered = set()
+          base = sent = rounds = 0
+          while base < n:
+              rounds += 1
+              for seq in range(base, min(base + window, n)):
+                  if seq in delivered:
+                      continue
+                  sent += 1
+                  if left.get(seq, 0) > 0:
+                      left[seq] -= 1
+                  else:
+                      delivered.add(seq)
+              while base in delivered:
+                  base += 1
+          return sent, rounds
+    explanation: |
+      The property test captures the whole story: selective repeat pays exactly one extra transmission per lost packet, which is the minimum possible. Go-back-N pays more because a loss makes it resend packets that had already arrived. That waste grows with the window, which is why TCP uses SACK on fast links.
+
+  - id: rtt
+    title: Estimating the timeout
+    difficulty: 3
+    prompt: |
+      Write a class `RttEstimator` with `__init__(self, min_rto=200, max_rto=60000)`, `update(self, sample)`, `backoff(self)` and a property-like method `rto(self)`. The first `update` sets `srtt = sample` and `rttvar = sample / 2`. Later updates set `rttvar = 0.75 * rttvar + 0.25 * abs(srtt - sample)` (using the **old** `srtt`) and then `srtt = 0.875 * srtt + 0.125 * sample`. After any update `rto = srtt + 4 * rttvar`, clamped to `[min_rto, max_rto]`, and `update` also **resets any back-off**. `update` returns the new RTO. `backoff()` doubles the current RTO (still clamped to `max_rto`) and returns it; consecutive calls keep doubling. `rto()` returns the current RTO, which is `1000` before any sample. Samples must be positive, otherwise `ValueError`.
+    starter: |
+      class RttEstimator:
+          def __init__(self, min_rto=200, max_rto=60000):
+              pass
+
+          def update(self, sample):
+              pass
+
+          def backoff(self):
+              pass
+
+          def rto(self):
+              pass
+    tests:
+      - name: first samples
+        code: |
+          e = RttEstimator()
+          assert e.rto() == 1000
+          assert e.update(100) == 300
+          assert e.srtt == 100 and e.rttvar == 50
+          assert e.update(140) == 295
+          assert e.srtt == 105 and e.rttvar == 47.5
+      - name: clamping
+        code: |
+          e = RttEstimator()
+          assert e.update(10) == 200                      # 10 + 4*5 = 30, raised to the minimum
+          e2 = RttEstimator(min_rto=0, max_rto=250)
+          assert e2.update(100) == 250                    # 300 clamped
+      - name: backoff
+        code: |
+          e = RttEstimator()
+          e.update(100)
+          assert e.backoff() == 600 and e.backoff() == 1200 and e.rto() == 1200
+          assert e.update(100) < 600                      # a fresh sample ends the back-off
+          e.update(100)
+          for _ in range(20):
+              e.backoff()
+          assert e.rto() == 60000
+      - name: invalid
+        code: |
+          e = RttEstimator()
+          for bad in (0, -5):
+              try:
+                  e.update(bad)
+                  assert False
+              except ValueError:
+                  pass
+          assert e.rto() == 1000
+      - name: it converges
+        code: |
+          e = RttEstimator(min_rto=0)
+          for _ in range(200):
+              e.update(80)
+          assert abs(e.srtt - 80) < 1e-6 and e.rttvar < 1e-6 and abs(e.rto() - 80) < 1e-3
+    hints:
+      - "Store `self.srtt = None`, `self.rttvar = None` and `self._rto = 1000`."
+      - "The order matters: compute the new `rttvar` from the old `srtt`, then update `srtt`."
+      - "A helper `_clamp(x)` returning `max(min_rto, min(max_rto, x))` keeps the code tidy."
+    solution: |
+      class RttEstimator:
+          def __init__(self, min_rto=200, max_rto=60000):
+              self.min_rto = min_rto
+              self.max_rto = max_rto
+              self.srtt = None
+              self.rttvar = None
+              self._rto = 1000
+
+          def _clamp(self, x):
+              return max(self.min_rto, min(self.max_rto, x))
+
+          def update(self, sample):
+              if sample <= 0:
+                  raise ValueError("sample must be positive")
+              if self.srtt is None:
+                  self.srtt = sample
+                  self.rttvar = sample / 2
+              else:
+                  self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - sample)
+                  self.srtt = 0.875 * self.srtt + 0.125 * sample
+              self._rto = self._clamp(self.srtt + 4 * self.rttvar)
+              return self._rto
+
+          def backoff(self):
+              self._rto = self._clamp(self._rto * 2)
+              return self._rto
+
+          def rto(self):
+              return self._rto
+    explanation: |
+      The fractions 7/8 and 1/8 were chosen so that a 1990s CPU could compute them with shifts, and they stuck. The variance term is the key insight of Jacobson's 1988 paper: earlier TCPs used `2 × srtt` as a timeout, which fires needlessly on a jittery path and waits too long on a steady one.
+
+  - id: cwnd
+    title: The congestion window
+    difficulty: 3
+    prompt: |
+      Write `cwnd_trace(rounds, ssthresh, loss_rounds, variant)` returning a list with the congestion window (in segments) at the **start** of each of `rounds` round trips. The window starts at 1. After recording a round's window: if the round number (counting from 0) is in `loss_rounds`, react to the loss by setting `ssthresh = max(cwnd // 2, 2)` and then `cwnd = 1` for `"tahoe"` or `cwnd = ssthresh` for `"reno"`; otherwise, if `cwnd < ssthresh` grow by slow start `cwnd = min(2 * cwnd, ssthresh)`, else by congestion avoidance `cwnd += 1`. Raise `ValueError` for any other variant name. Also write `peak(trace)` returning the largest window seen and `time_to_reach(trace, target)` returning the index of the first round whose window is at least `target`, or `None`.
+    starter: |
+      def cwnd_trace(rounds, ssthresh, loss_rounds, variant):
+          pass
+
+
+      def peak(trace):
+          pass
+
+
+      def time_to_reach(trace, target):
+          pass
+    tests:
+      - name: slow start and avoidance
+        code: |
+          assert cwnd_trace(12, 16, {6}, "reno") == [1, 2, 4, 8, 16, 17, 18, 9, 10, 11, 12, 13]
+          assert cwnd_trace(12, 16, {6}, "tahoe") == [1, 2, 4, 8, 16, 17, 18, 1, 2, 4, 8, 9]
+          assert cwnd_trace(6, 100, set(), "reno") == [1, 2, 4, 8, 16, 32]
+          assert cwnd_trace(0, 16, set(), "reno") == []
+      - name: two losses
+        code: |
+          assert cwnd_trace(24, 16, {6, 14}, "reno") == [1, 2, 4, 8, 16, 17, 18, 9, 10, 11, 12, 13, 14, 15, 16, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+          assert cwnd_trace(24, 16, {6, 14}, "tahoe") == [1, 2, 4, 8, 16, 17, 18, 1, 2, 4, 8, 9, 10, 11, 12, 1, 2, 4, 6, 7, 8, 9, 10, 11]
+      - name: floor of two
+        code: |
+          # a loss at cwnd 1 or 2 still leaves ssthresh at 2
+          assert cwnd_trace(5, 8, {0}, "reno") == [1, 2, 3, 4, 5]
+          t = cwnd_trace(6, 8, {1}, "tahoe")
+          assert t == [1, 2, 1, 2, 3, 4]
+      - name: helpers and errors
+        code: |
+          assert peak([1, 2, 4, 3]) == 4 and peak([]) == 0
+          assert time_to_reach([1, 2, 4, 8], 3) == 2
+          assert time_to_reach([1, 2, 4, 8], 1) == 0
+          assert time_to_reach([1, 2], 10) is None
+          try:
+              cwnd_trace(3, 8, set(), "cubic")
+              assert False
+          except ValueError:
+              pass
+    hints:
+      - "Loop `r` from 0 to `rounds - 1`. First `trace.append(cwnd)`, then update `cwnd`."
+      - "The loss test comes first: `if r in loss_rounds: ... elif cwnd < ssthresh: ... else: ...`."
+      - "`ssthresh` changes during the run, so assign it inside the function."
+      - "`peak` of an empty list is 0, so use `max(trace, default=0)`."
+    solution: |
+      def cwnd_trace(rounds, ssthresh, loss_rounds, variant):
+          if variant not in ("tahoe", "reno"):
+              raise ValueError("unknown variant " + variant)
+          cwnd = 1
+          trace = []
+          for r in range(rounds):
+              trace.append(cwnd)
+              if r in loss_rounds:
+                  ssthresh = max(cwnd // 2, 2)
+                  cwnd = 1 if variant == "tahoe" else ssthresh
+              elif cwnd < ssthresh:
+                  cwnd = min(2 * cwnd, ssthresh)
+              else:
+                  cwnd += 1
+          return trace
+
+
+      def peak(trace):
+          return max(trace, default=0)
+
+
+      def time_to_reach(trace, target):
+          for i, w in enumerate(trace):
+              if w >= target:
+                  return i
+          return None
+    explanation: |
+      The sawtooth is visible in the lists: climb, drop, climb. Reno recovers in a few rounds because it keeps half its window, while Tahoe has to rebuild from one. Averaged over a sawtooth, a connection achieves about three quarters of the peak window, so the link is not full all the time, which is why newer algorithms try to stay near the capacity without causing loss.
+
+commonMistakes:
+  - title: Thinking more bandwidth fixes a slow single connection
+    explanation: |
+      A connection's throughput is limited by window ÷ RTT. A big pipe with a long delay needs a big window, not just fast hardware.
+  - title: Retransmitting everything with go-back-N on lossy wireless
+    explanation: |
+      On lossy links go-back-N wastes capacity resending packets that already arrived. Selective acknowledgements (SACK) avoid this.
+  - title: Using a fixed timeout
+    explanation: |
+      A fixed timer is wrong for both fast and slow paths. Measure the RTT and track its variation.
+  - title: Sampling the RTT of a retransmitted segment
+    explanation: |
+      You cannot tell whether the ACK answers the first or the second copy, so Karn's rule ignores those samples.
+  - title: Confusing flow control with congestion control
+    explanation: |
+      Flow control (`rwnd`) protects the receiver. Congestion control (`cwnd`) protects the network. The sender obeys the smaller of the two.
+  - title: Believing slow start is slow
+    explanation: |
+      It doubles every round trip. It is "slow" only compared with starting at full speed, which would risk overwhelming the network.
+
+summary:
+  - "**ARQ** repeats what is not acknowledged. **Stop-and-wait** sends one packet per round trip, so utilisation is `tx / (tx + RTT)`, tiny on long links."
+  - "The **bandwidth-delay product** is the data needed in flight to fill the pipe. **Sliding windows** keep many packets outstanding."
+  - "**Go-back-N** resends the whole window from the first loss; **selective repeat** resends only lost packets. TCP uses cumulative ACKs plus **SACK**."
+  - "Three **duplicate ACKs** trigger **fast retransmit**. Otherwise a **retransmission timeout** `srtt + 4 * rttvar` fires, doubling on each failure."
+  - "**Flow control** uses the receiver's advertised window; **congestion control** uses `cwnd`: slow start (doubling), congestion avoidance (+1 per RTT) and a multiplicative decrease on loss (**AIMD**). Tahoe restarts from 1; Reno halves and continues."
+  - "Throughput is about `window × MSS / RTT`, so distance limits a single connection."
+next: |
+  Both ends of a connection need to find each other first, and nobody types IP addresses. Next: the **Domain Name System**, the internet's phone book, with its hierarchy of servers, caches and time-to-live.
+
+quiz:
+  - type: mcq
+    question: A stop-and-wait sender uses a link with a 50 ms round trip, and each packet takes 1 ms to transmit. About what fraction of the time is the link in use?
+    options: ["2%", "50%", "98%", "0.02%"]
+    answer: 0
+    explanation: "1 / (1 + 50) is about 2%. The other 98% is spent waiting for the acknowledgement."
+  - type: mcq
+    question: What is the bandwidth-delay product of a 10 Mbps link with an 80 ms round trip?
+    options: ["100,000 bytes", "800,000 bytes", "10,000 bytes", "12,500 bytes"]
+    answer: 0
+    explanation: "10 Mbps × 80 ms = 800,000 bits = 100,000 bytes. The sender needs that much in flight to keep the pipe full."
+  - type: mcq
+    question: In go-back-N, packet 4 in a window of 8 is lost but 5, 6 and 7 arrive. What does the receiver do with 5, 6 and 7?
+    options: [
+      "Discards them, and the sender resends from 4",
+      "Buffers them and asks for only 4",
+      "Delivers them to the application",
+      "Sends them back"
+    ]
+    answer: 0
+    explanation: "Go-back-N accepts packets only in order, so everything after the gap is thrown away and resent."
+  - type: mcq
+    question: What tells a TCP sender that a segment was probably lost, without waiting for the timer?
+    options: ["Three duplicate acknowledgements", "A SYN flag", "A larger window", "A checksum of zero"]
+    answer: 0
+    explanation: "Repeated ACKs for the same number mean later segments are arriving but one is missing. This triggers fast retransmit."
+  - type: mcq
+    question: What does AIMD stand for, and what does it do?
+    options: [
+      "Additive increase, multiplicative decrease: grow the window by one per round trip and halve it on loss",
+      "Automatic internet message delivery",
+      "Acknowledged IP multicast datagrams",
+      "Add one, multiply by ten"
+    ]
+    answer: 0
+    explanation: "This simple rule makes competing connections converge to fair shares of a link."
+  - type: mcq
+    question: What is the difference between flow control and congestion control?
+    options: [
+      "Flow control protects the receiver's buffer; congestion control protects the network",
+      "They are the same thing",
+      "Flow control is for UDP and congestion control for TCP",
+      "Flow control protects the network; congestion control protects the receiver"
+    ]
+    answer: 0
+    explanation: "The sender obeys both limits: the receiver's advertised window and its own congestion window."
+  - type: code
+    question: |
+      Write `next_srtt(srtt, sample)` returning the new smoothed round-trip time using `7/8` of the old value plus `1/8` of the new sample.
+    starter: |
+      def next_srtt(srtt, sample):
+          pass
+    tests:
+      - name: smoothing
+        code: |
+          assert next_srtt(100, 140) == 105
+          assert next_srtt(80, 80) == 80
+          assert next_srtt(0, 8) == 1
+          assert next_srtt(200, 100) == 187.5
+    solution: |
+      def next_srtt(srtt, sample):
+          return 0.875 * srtt + 0.125 * sample

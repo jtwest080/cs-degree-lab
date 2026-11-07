@@ -1,0 +1,903 @@
+id: u11-transport
+title: "Ports, UDP and TCP"
+minutes: 60
+objective: |
+  See how data gets from a program on one machine to a program on another. Learn what ports are and how a host sorts arriving packets, how simple and fast UDP is, and how TCP turns an unreliable packet network into a reliable, ordered byte stream using sequence numbers, acknowledgements, a three-way handshake and a state machine.
+outcomes:
+  - Explain ports, multiplexing and the (address, port) pairs that identify a connection
+  - Build and parse a UDP datagram and say what UDP does and does not guarantee
+  - Describe TCP segments, flags, sequence and acknowledgement numbers, and trace a handshake and a teardown
+  - Split a byte stream into segments and reassemble it from out-of-order arrivals
+  - Walk a TCP connection through its states
+  - Choose between TCP and UDP for an application
+
+sections:
+  - heading: From host to program
+    body: |
+      IP delivers a packet to a **host**. But a host runs many programs at once: a browser with twenty tabs, a music app, a mail client. The **transport layer** finishes the delivery to the right **program**. The mechanism is the **port**: a 16-bit number (0 to 65535) that names an endpoint on a host.
+
+      A server **listens** on a well-known port so clients know where to find it: 80 for HTTP, 443 for HTTPS, 22 for SSH, 25 for email, 53 for DNS. Ports below 1024 are "well-known", reserved for services run by the system. A client program does not need a fixed port: the operating system gives it a random **ephemeral** port (typically in the 49152 to 65535 range) for each connection.
+
+      A TCP connection is therefore identified by four numbers, the **4-tuple** *(source address, source port, destination address, destination port)*. Two browser tabs talking to the same web server share the server's address and port 443, but their ephemeral source ports differ, so the server (and the OS) can tell the conversations apart. Sending incoming data to the right program is called **demultiplexing**; letting many programs share one network connection is **multiplexing**.
+
+      The transport layer offers two main services:
+
+      - **UDP**: a thin wrapper that adds ports and a checksum to IP's "best effort" delivery.
+      - **TCP**: a full, reliable, ordered **byte stream** between two programs, built from UDP-like pieces plus a great deal of machinery.
+
+  - heading: "UDP: the minimal transport"
+    body: |
+      The **User Datagram Protocol** has an 8-byte header with four 16-bit fields:
+
+      | Field | Meaning |
+      |---|---|
+      | Source port | where replies go |
+      | Destination port | which program should receive it |
+      | Length | header plus data, in bytes |
+      | Checksum | the internet checksum (Lesson 11.1) over a pseudo-header, the header and the data |
+
+      That is all. UDP has **no connection**, no acknowledgements, no retransmission and no ordering. Each **datagram** is sent independently, may be lost, duplicated or reordered, and keeps its boundaries (one send is one receive). A damaged datagram is silently dropped.
+
+      This sounds like a bad deal, but it is exactly right for some jobs. It adds no setup delay (nothing to negotiate), no waiting for retransmissions (an old video frame is worthless anyway), and little overhead. So UDP carries **DNS** queries (one tiny question, one tiny answer; the application just asks again if there is no reply), **voice and video calls**, **online games**, and **QUIC**, the newer transport that HTTP/3 uses, which builds its own reliability on top of UDP.
+
+  - heading: "TCP: a reliable byte stream"
+    body: |
+      The **Transmission Control Protocol** gives programs the illusion of a pipe: bytes written at one end come out of the other **complete, in order and without duplicates**, even though the network underneath loses, reorders and duplicates packets. TCP is **connection-oriented**: the two ends first agree to talk, and keep state for the connection.
+
+      A TCP **segment** has a header of at least 20 bytes. The fields that matter most:
+
+      - **source and destination port** (16 bits each),
+      - **sequence number** (32 bits): the position in the stream of the first data byte in this segment,
+      - **acknowledgement number** (32 bits): the position of the next byte the sender of this segment expects to receive,
+      - **flags**: **SYN** (open a connection), **ACK** (the acknowledgement number is valid), **FIN** (I have finished sending), **RST** (abort), **PSH** and **URG**,
+      - **window**: how many more bytes the sender of this segment is willing to receive (flow control, next lesson),
+      - **checksum**.
+
+      **Sequence numbers count bytes**, not segments. If a segment has sequence number 1000 and carries 500 bytes, it covers bytes 1000 to 1499, and the receiver acknowledges with 1500: "I have everything up to 1499 and want 1500 next". That is a **cumulative acknowledgement**. SYN and FIN each consume one sequence number, as if they were a byte, so that they too can be acknowledged. Sequence numbers are 32 bits and wrap around, so arithmetic on them is done modulo 2³².
+
+      **Segmentation.** The application hands TCP any amount of data. TCP cuts it into segments no larger than the **MSS** (maximum segment size), usually 1460 bytes, so each fits in a 1500-byte Ethernet frame after the IP and TCP headers. The receiver puts segments back in order by their sequence numbers (**reassembly**), holds on to early arrivals, and delivers bytes to the program only up to the first gap.
+
+  - heading: The three-way handshake
+    body: |
+      Before data flows, the two ends synchronise their sequence numbers. Each side picks a random **initial sequence number (ISN)**, which prevents old stray segments of a previous connection from being mistaken for new ones (and makes blind spoofing harder). The exchange takes three segments, the **three-way handshake**:
+
+      1. **Client → server: SYN**, `seq = x`. "I'd like to connect; my numbers start at x."
+      2. **Server → client: SYN+ACK**, `seq = y, ack = x + 1`. "OK; mine start at y, and I expect your next byte to be x + 1."
+      3. **Client → server: ACK**, `seq = x + 1, ack = y + 1`. "Got it."
+
+      Now the connection is **established**. The client can send data in the very next segment. Notice the cost: one full **round trip** before any data moves, which is why latency (Lesson 11.1) makes opening connections expensive, and why HTTP keeps connections open for reuse.
+
+      Closing is done with FINs. Each direction is closed independently: the side finished with its data sends **FIN**, the other **ACK**s it; later the other side sends its own FIN and receives an ACK. So a normal close takes four segments. The side that closes first lingers in **TIME_WAIT** for a couple of minutes, so that late stray segments cannot confuse a new connection that reuses the same 4-tuple. A **RST** aborts a connection immediately, for example when a segment arrives for a port nobody is listening on.
+
+  - heading: The TCP state machine
+    body: |
+      Each end of a connection keeps a **state** and moves between states when events happen: the application calls something, or a segment arrives. The main states for a client and a server:
+
+      | State | Meaning |
+      |---|---|
+      | `CLOSED` | no connection |
+      | `LISTEN` | a server waiting for a SYN |
+      | `SYN_SENT` | client sent SYN, waiting for SYN+ACK |
+      | `SYN_RCVD` | server got SYN, sent SYN+ACK, waiting for ACK |
+      | `ESTABLISHED` | data can flow both ways |
+      | `FIN_WAIT_1` / `FIN_WAIT_2` | I sent FIN; waiting for its ACK, then for the other side's FIN |
+      | `CLOSE_WAIT` | the other side finished; I may still send |
+      | `LAST_ACK` | I sent my FIN after theirs; waiting for the final ACK |
+      | `TIME_WAIT` | waiting out stray segments before closing for good |
+
+      When you see thousands of connections stuck in `CLOSE_WAIT` on a server, it usually means the program forgot to close its sockets: the state tells you whose fault it is. `netstat` and `ss` show these states.
+
+  - heading: TCP or UDP?
+    body: |
+      **Choose TCP** when every byte must arrive correctly and in order and you can afford some delay: web pages, email, file transfers, SSH, databases. **Choose UDP** when timeliness matters more than completeness, when messages are tiny and independent, or when you want to design your own reliability: DNS lookups, live audio and video, games, streaming telemetry. A lost frame in a video call is better skipped than waited for. The next lesson shows how TCP detects loss and what it does about it.
+
+examples:
+  - title: A UDP datagram
+    intro: "Eight bytes of header, then the data. The length field covers both."
+    code: |
+      import struct
+
+
+      def internet_checksum(data):
+          if len(data) % 2:
+              data += b"\x00"
+          total = sum((data[i] << 8) | data[i + 1] for i in range(0, len(data), 2))
+          while total > 0xFFFF:
+              total = (total & 0xFFFF) + (total >> 16)
+          return ~total & 0xFFFF
+
+
+      def make_udp(src, dst, payload):
+          length = 8 + len(payload)
+          checksum = internet_checksum(struct.pack(">HHHH", src, dst, length, 0) + payload)
+          return struct.pack(">HHHH", src, dst, length, checksum or 0xFFFF) + payload
+
+
+      datagram = make_udp(50000, 53, b"example.com?")
+      print(datagram.hex(" "))
+      src, dst, length, checksum = struct.unpack(">HHHH", datagram[:8])
+      print(f"from port {src} to port {dst}, {length} bytes in all, checksum {checksum:#06x}")
+      print("payload:", datagram[8:])
+    output: |
+      c3 50 00 35 00 14 cf 36 65 78 61 6d 70 6c 65 2e 63 6f 6d 3f
+      from port 50000 to port 53, 20 bytes in all, checksum 0xcf36
+      payload: b'example.com?'
+    lines:
+      - line: 12
+        note: "The length includes the 8-byte header, so an empty datagram has length 8."
+      - line: 13
+        note: "The checksum is computed with the checksum field set to zero."
+      - line: 14
+        note: "In UDP a computed checksum of zero is sent as all ones, since zero means 'no checksum'."
+  - title: Ports and demultiplexing
+    intro: "A server socket is identified by its address and port; each connection by the whole 4-tuple."
+    code: |
+      class Host:
+          def __init__(self, address):
+              self.address = address
+              self.listeners = {}        # port -> service name
+              self.connections = {}      # (src address, src port, dst port) -> service name
+
+          def listen(self, port, service):
+              self.listeners[port] = service
+
+          def receive(self, src_address, src_port, dst_port):
+              if dst_port not in self.listeners:
+                  return "RST (nobody is listening on port %d)" % dst_port
+              key = (src_address, src_port, dst_port)
+              self.connections.setdefault(key, self.listeners[dst_port])
+              return f"delivered to {self.listeners[dst_port]}, connection #{list(self.connections).index(key) + 1}"
+
+
+      server = Host("203.0.113.9")
+      server.listen(80, "web server")
+      server.listen(22, "ssh daemon")
+
+      print(server.receive("198.51.100.4", 50001, 80))     # browser tab 1
+      print(server.receive("198.51.100.4", 50002, 80))     # browser tab 2
+      print(server.receive("198.51.100.4", 50001, 80))     # more data for tab 1
+      print(server.receive("198.51.100.77", 50001, 22))    # someone else, ssh
+      print(server.receive("198.51.100.4", 50003, 8080))   # nobody listening
+      print(len(server.connections), "connections")
+    output: |
+      delivered to web server, connection #1
+      delivered to web server, connection #2
+      delivered to web server, connection #1
+      delivered to ssh daemon, connection #3
+      RST (nobody is listening on port 8080)
+      3 connections
+    lines:
+      - line: 12
+        note: "A new 4-tuple makes a new connection; a known one is the same conversation."
+      - line: 19
+        note: "Both tabs go to port 80 but have different source ports, so they are separate connections."
+      - line: 23
+        note: "A segment for a closed port is answered with a reset."
+  - title: A TCP conversation, segment by segment
+    intro: "The handshake, a request and a reply, then the close. Watch the sequence and acknowledgement numbers."
+    code: |
+      def conversation(client_isn, server_isn, sends):
+          M = 2 ** 32
+          trace = []
+          cnext, snext = (client_isn + 1) % M, (server_isn + 1) % M
+          trace.append(("client", "SYN", client_isn, 0, 0))
+          trace.append(("server", "SYN+ACK", server_isn, cnext, 0))
+          trace.append(("client", "ACK", cnext, snext, 0))
+          for who, n in sends:
+              if who == "client":
+                  trace.append(("client", "ACK", cnext, snext, n))
+                  cnext = (cnext + n) % M
+                  trace.append(("server", "ACK", snext, cnext, 0))
+              else:
+                  trace.append(("server", "ACK", snext, cnext, n))
+                  snext = (snext + n) % M
+                  trace.append(("client", "ACK", cnext, snext, 0))
+          trace.append(("client", "FIN+ACK", cnext, snext, 0))
+          trace.append(("server", "ACK", snext, (cnext + 1) % M, 0))
+          trace.append(("server", "FIN+ACK", snext, (cnext + 1) % M, 0))
+          trace.append(("client", "ACK", (cnext + 1) % M, (snext + 1) % M, 0))
+          return trace
+
+
+      print(f"{'from':7} {'flags':8} {'seq':>5} {'ack':>5} {'bytes':>5}")
+      for row in conversation(100, 500, [("client", 40), ("server", 120)]):
+          print(f"{row[0]:7} {row[1]:8} {row[2]:>5} {row[3]:>5} {row[4]:>5}")
+    output: |
+      from    flags      seq   ack bytes
+      client  SYN        100     0     0
+      server  SYN+ACK    500   101     0
+      client  ACK        101   501     0
+      client  ACK        101   501    40
+      server  ACK        501   141     0
+      server  ACK        501   141   120
+      client  ACK        141   621     0
+      client  FIN+ACK    141   621     0
+      server  ACK        621   142     0
+      server  FIN+ACK    621   142     0
+      client  ACK        142   622     0
+    lines:
+      - line: 5
+        note: "SYN uses up one sequence number, so the next byte is isn + 1."
+      - line: 11
+        note: "Sending n bytes advances the sender's next sequence number by n, and the receiver acknowledges it."
+      - line: 19
+        note: "FIN also consumes one sequence number, so it is acknowledged with +1."
+  - title: Segmenting and reassembling a stream
+    intro: "Cut the data by MSS and number the pieces by byte position; the receiver uses the numbers to restore order."
+    code: |
+      import random
+
+
+      def segment(data, mss, isn):
+          return [((isn + i) % 2 ** 32, data[i:i + mss]) for i in range(0, len(data), mss)]
+
+
+      def reassemble(segments, isn):
+          buffer = bytearray()
+          for seq, chunk in sorted(segments, key=lambda s: (s[0] - isn) % 2 ** 32):
+              offset = (seq - isn) % 2 ** 32
+              if offset > len(buffer):
+                  break                            # a gap: stop and wait for the missing bytes
+              buffer += chunk[len(buffer) - offset:]
+          return bytes(buffer), (isn + len(buffer)) % 2 ** 32
+
+
+      message = b"The quick brown fox jumps over the lazy dog."
+      parts = segment(message, 10, 4294967290)       # sequence numbers wrap around
+      for seq, chunk in parts:
+          print(seq, chunk)
+
+      random.Random(1).shuffle(parts)
+      arrived = parts + [parts[0]]                    # one duplicate
+      data, expected = reassemble(arrived, 4294967290)
+      print(data == message, "next expected byte:", expected)
+
+      missing = [p for p in parts if p[0] != 14]          # drop the segment that starts at sequence number 14
+      data, expected = reassemble(missing, 4294967290)
+      print(data, expected)
+    output: |
+      4294967290 b'The quick '
+      4 b'brown fox '
+      14 b'jumps over'
+      24 b' the lazy '
+      34 b'dog.'
+      True next expected byte: 38
+      b'The quick brown fox ' 14
+    lines:
+      - line: 5
+        note: "A segment's sequence number is the stream position of its first byte, wrapped at 2^32."
+      - line: 9
+        note: "Sort by distance from the start so that wrapped numbers come out in the right order."
+      - line: 12
+        note: "If the next piece does not begin where the buffer ends, there is a hole, so stop. Anything after it waits."
+      - line: 13
+        note: "Slicing off the part we already have means duplicates and overlaps are harmless."
+  - title: A client and server through their states
+    intro: "A table of (state, event) -> next state is the whole protocol machine."
+    code: |
+      TRANSITIONS = {
+          ("CLOSED", "passive_open"): "LISTEN",
+          ("CLOSED", "active_open"): "SYN_SENT",
+          ("LISTEN", "recv_SYN"): "SYN_RCVD",
+          ("SYN_SENT", "recv_SYN_ACK"): "ESTABLISHED",
+          ("SYN_RCVD", "recv_ACK"): "ESTABLISHED",
+          ("ESTABLISHED", "close"): "FIN_WAIT_1",
+          ("ESTABLISHED", "recv_FIN"): "CLOSE_WAIT",
+          ("FIN_WAIT_1", "recv_ACK"): "FIN_WAIT_2",
+          ("FIN_WAIT_2", "recv_FIN"): "TIME_WAIT",
+          ("CLOSE_WAIT", "close"): "LAST_ACK",
+          ("LAST_ACK", "recv_ACK"): "CLOSED",
+          ("TIME_WAIT", "timeout"): "CLOSED",
+      }
+
+
+      def walk(name, state, events):
+          print(name)
+          for event in events:
+              new = TRANSITIONS.get((state, event))
+              if new is None:
+                  print(f"   {state} + {event}: not allowed here")
+                  return
+              print(f"   {state:12} --{event}--> {new}")
+              state = new
+
+
+      walk("client", "CLOSED", ["active_open", "recv_SYN_ACK", "close", "recv_ACK", "recv_FIN", "timeout"])
+      walk("server", "CLOSED", ["passive_open", "recv_SYN", "recv_ACK", "recv_FIN", "close", "recv_ACK"])
+      walk("confused", "LISTEN", ["recv_FIN"])
+    output: |
+      client
+         CLOSED       --active_open--> SYN_SENT
+         SYN_SENT     --recv_SYN_ACK--> ESTABLISHED
+         ESTABLISHED  --close--> FIN_WAIT_1
+         FIN_WAIT_1   --recv_ACK--> FIN_WAIT_2
+         FIN_WAIT_2   --recv_FIN--> TIME_WAIT
+         TIME_WAIT    --timeout--> CLOSED
+      server
+         CLOSED       --passive_open--> LISTEN
+         LISTEN       --recv_SYN--> SYN_RCVD
+         SYN_RCVD     --recv_ACK--> ESTABLISHED
+         ESTABLISHED  --recv_FIN--> CLOSE_WAIT
+         CLOSE_WAIT   --close--> LAST_ACK
+         LAST_ACK     --recv_ACK--> CLOSED
+      confused
+         LISTEN + recv_FIN: not allowed here
+    lines:
+      - line: 1
+        note: "Every legal move is one entry in a dictionary keyed by the state and the event."
+      - line: 19
+        note: "An event that has no entry for the current state is a protocol error."
+      - line: 29
+        note: "The client closes first, so it ends up in TIME_WAIT. The server closes second and goes straight to CLOSED."
+
+playground:
+  prompt: |
+    Change the MSS in the segmentation example to 7 and check that reassembly still returns the message. Then drop two segments and see where the data stops. Try a `conversation` with a first `sends` entry from the server.
+  code: |
+    import struct
+    print(struct.pack(">HHHH", 53, 50000, 8, 0).hex(" "))
+    print(2 ** 32 - 1, (2 ** 32 - 1 + 1) % 2 ** 32)
+
+exercises:
+  - id: udp
+    title: UDP datagrams
+    difficulty: 3
+    prompt: |
+      The function `internet_checksum(data)` from Lesson 11.1 is provided in the starter. Write `make_udp(src_port, dst_port, payload)` returning the datagram `bytes`: a header of four big-endian 16-bit fields (source port, destination port, length = 8 + payload length, checksum) followed by the payload. The checksum is the internet checksum of the header (with the checksum field zero) plus the payload, and if it comes out as `0` it is sent as `0xFFFF`. Write `parse_udp(datagram)` returning `(src_port, dst_port, payload)` and raising `ValueError` if the datagram is shorter than 8 bytes, if the length field does not equal the actual datagram length, or if the checksum is wrong. A checksum field of `0xFFFF` is accepted when the recomputed checksum is `0`.
+    starter: |
+      import struct
+
+
+      def internet_checksum(data):
+          if len(data) % 2:
+              data += b"\x00"
+          total = sum((data[i] << 8) | data[i + 1] for i in range(0, len(data), 2))
+          while total > 0xFFFF:
+              total = (total & 0xFFFF) + (total >> 16)
+          return ~total & 0xFFFF
+
+
+      def make_udp(src_port, dst_port, payload):
+          pass
+
+
+      def parse_udp(datagram):
+          pass
+    tests:
+      - name: make
+        code: |
+          d = make_udp(50000, 53, b"hello")
+          assert len(d) == 13 and d[8:] == b"hello"
+          assert struct.unpack(">HHH", d[:6]) == (50000, 53, 13)
+          assert make_udp(1, 2, b"")[4:6] == b"\x00\x08"
+          assert isinstance(d, bytes)
+      - name: round trip
+        code: |
+          import random
+          rng = random.Random(7)
+          for _ in range(200):
+              payload = bytes(rng.randrange(256) for _ in range(rng.randint(0, 50)))
+              s, t = rng.randrange(65536), rng.randrange(65536)
+              assert parse_udp(make_udp(s, t, payload)) == (s, t, payload)
+      - name: damage is detected
+        code: |
+          d = bytearray(make_udp(1234, 80, b"GET /"))
+          d[9] ^= 0x04
+          for bad in (bytes(d), b"", b"short", make_udp(1, 2, b"abc")[:-1], make_udp(1, 2, b"abc") + b"x"):
+              try:
+                  parse_udp(bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+      - name: zero checksum becomes all ones
+        code: |
+          # find a payload whose checksum would be 0
+          found = False
+          for a in range(256):
+              for b in range(256):
+                  payload = bytes([a, b])
+                  raw = struct.pack(">HHHH", 0, 0, 10, 0) + payload
+                  if internet_checksum(raw) == 0:
+                      d = make_udp(0, 0, payload)
+                      assert d[6:8] == b"\xff\xff"
+                      assert parse_udp(d) == (0, 0, payload)
+                      found = True
+                      break
+              if found:
+                  break
+          assert found
+    hints:
+      - "`struct.pack(\">HHHH\", src, dst, 8 + len(payload), 0) + payload` is the header with a zero checksum."
+      - "`checksum = internet_checksum(that) or 0xFFFF` handles the zero case."
+      - "To verify, extract the fields, rebuild the zero-checksum version, recompute, and compare (treating `0xFFFF` as 0)."
+    solution: |
+      import struct
+
+
+      def internet_checksum(data):
+          if len(data) % 2:
+              data += b"\x00"
+          total = sum((data[i] << 8) | data[i + 1] for i in range(0, len(data), 2))
+          while total > 0xFFFF:
+              total = (total & 0xFFFF) + (total >> 16)
+          return ~total & 0xFFFF
+
+
+      def make_udp(src_port, dst_port, payload):
+          length = 8 + len(payload)
+          checksum = internet_checksum(struct.pack(">HHHH", src_port, dst_port, length, 0) + payload)
+          return struct.pack(">HHHH", src_port, dst_port, length, checksum or 0xFFFF) + payload
+
+
+      def parse_udp(datagram):
+          if len(datagram) < 8:
+              raise ValueError("too short")
+          src, dst, length, checksum = struct.unpack(">HHHH", datagram[:8])
+          payload = datagram[8:]
+          if length != len(datagram):
+              raise ValueError("bad length")
+          expected = internet_checksum(struct.pack(">HHHH", src, dst, length, 0) + payload) or 0xFFFF
+          if checksum != expected:
+              raise ValueError("bad checksum")
+          return src, dst, payload
+    explanation: |
+      The real UDP checksum also covers a "pseudo-header" of the IP addresses, so a datagram delivered to the wrong host is caught too; we left that out to keep the exercise self-contained. The `or 0xFFFF` rule exists because zero is reserved to mean "the sender did not compute a checksum".
+
+  - id: flags
+    title: TCP flags
+    difficulty: 2
+    prompt: |
+      TCP flags are bits in one byte: `FIN` = 1, `SYN` = 2, `RST` = 4, `PSH` = 8, `ACK` = 16, `URG` = 32. Write `flags_to_byte(names)` turning a collection of flag names into the byte (duplicates are fine; raise `ValueError` for an unknown name), `byte_to_flags(value)` returning the list of names set in the byte, **in the order FIN, SYN, RST, PSH, ACK, URG** (raise `ValueError` unless `0 <= value <= 63`), and `describe(value)` returning the names joined with `"+"`, or `"none"` for 0, but writing `ACK` last as is customary: `describe(18)` is `"SYN+ACK"`.
+    starter: |
+      def flags_to_byte(names):
+          pass
+
+
+      def byte_to_flags(value):
+          pass
+
+
+      def describe(value):
+          pass
+    tests:
+      - name: to byte
+        code: |
+          assert flags_to_byte(["SYN"]) == 2
+          assert flags_to_byte(["SYN", "ACK"]) == 18
+          assert flags_to_byte(["ACK", "SYN", "ACK"]) == 18
+          assert flags_to_byte([]) == 0
+          assert flags_to_byte({"FIN", "ACK"}) == 17
+          assert flags_to_byte(["FIN", "SYN", "RST", "PSH", "ACK", "URG"]) == 63
+          try:
+              flags_to_byte(["SYN", "WAT"])
+              assert False
+          except ValueError:
+              pass
+      - name: from byte
+        code: |
+          assert byte_to_flags(0) == []
+          assert byte_to_flags(18) == ["SYN", "ACK"]
+          assert byte_to_flags(17) == ["FIN", "ACK"]
+          assert byte_to_flags(63) == ["FIN", "SYN", "RST", "PSH", "ACK", "URG"]
+          assert byte_to_flags(24) == ["PSH", "ACK"]
+          for bad in (-1, 64, 255):
+              try:
+                  byte_to_flags(bad)
+                  assert False
+              except ValueError:
+                  pass
+      - name: describe
+        code: |
+          assert describe(0) == "none"
+          assert describe(2) == "SYN" and describe(18) == "SYN+ACK" and describe(16) == "ACK"
+          assert describe(17) == "FIN+ACK" and describe(4) == "RST"
+          assert describe(24) == "PSH+ACK"
+          assert describe(63) == "FIN+SYN+RST+PSH+URG+ACK"
+          for v in range(64):
+              assert flags_to_byte(byte_to_flags(v)) == v
+    hints:
+      - "Keep a list of `(name, bit)` pairs in the required order, plus a dictionary built from it."
+      - "`flags_to_byte`: OR together `1 << position` or the bit value for each name."
+      - "`describe`: take `byte_to_flags`, move `\"ACK\"` to the end if present, join with `+`."
+    solution: |
+      ORDER = ["FIN", "SYN", "RST", "PSH", "ACK", "URG"]
+      BIT = {name: 1 << i for i, name in enumerate(ORDER)}
+
+
+      def flags_to_byte(names):
+          value = 0
+          for name in names:
+              if name not in BIT:
+                  raise ValueError("unknown flag " + name)
+              value |= BIT[name]
+          return value
+
+
+      def byte_to_flags(value):
+          if not 0 <= value <= 63:
+              raise ValueError("flag byte out of range")
+          return [name for name in ORDER if value & BIT[name]]
+
+
+      def describe(value):
+          names = byte_to_flags(value)
+          if not names:
+              return "none"
+          if "ACK" in names:
+              names.remove("ACK")
+              names.append("ACK")
+          return "+".join(names)
+    explanation: |
+      Flags are exactly the masks and bit-sets of Lesson 9.8, and tools like Wireshark show them this way: `[SYN, ACK]`. Every segment of a connection after the first carries ACK, and a SYN with no ACK means "someone is starting a connection" - the packet that port scanners and SYN floods send.
+
+  - id: segments
+    title: Segmentation and reassembly
+    difficulty: 4
+    prompt: |
+      Write `segment(data, mss, isn)` returning a list of `(seq, chunk)` for `bytes` data: chunks of at most `mss` bytes in order, where `seq = (isn + offset) % 2**32` and `offset` is the position of the chunk's first byte. Empty data gives `[]`. Write `reassemble(segments, isn)` for segments that arrive in **any order, with duplicates, and possibly overlapping**. Return `(data, next_seq)`: the longest contiguous run of bytes starting at `isn` that has been received, and `next_seq = (isn + len(data)) % 2**32`, the next byte expected. Bytes that arrive after a gap are not delivered. Offsets are computed modulo 2**32, so sequence numbers may wrap around.
+    starter: |
+      def segment(data, mss, isn):
+          pass
+
+
+      def reassemble(segments, isn):
+          pass
+    tests:
+      - name: segment
+        code: |
+          assert segment(b"abcdefg", 3, 100) == [(100, b"abc"), (103, b"def"), (106, b"g")]
+          assert segment(b"", 3, 100) == []
+          assert segment(b"abcdef", 3, 2**32 - 2) == [(2**32 - 2, b"abc"), (1, b"def")]
+          assert segment(b"ab", 10, 0) == [(0, b"ab")]
+      - name: in order, shuffled and duplicated
+        code: |
+          import random
+          msg = bytes(range(200))
+          parts = segment(msg, 17, 1000)
+          assert reassemble(parts, 1000) == (msg, 1200)
+          rng = random.Random(3)
+          for _ in range(50):
+              mixed = parts + rng.sample(parts, 5)
+              rng.shuffle(mixed)
+              assert reassemble(mixed, 1000) == (msg, 1200)
+      - name: gaps and overlaps
+        code: |
+          parts = segment(b"0123456789", 2, 50)           # 50:01 52:23 54:45 56:67 58:89
+          without = [p for p in parts if p[0] != 54]
+          assert reassemble(without, 50) == (b"0123", 54)
+          assert reassemble([], 50) == (b"", 50)
+          assert reassemble([(52, b"23")], 50) == (b"", 50)
+          overlap = [(50, b"0123"), (52, b"2345"), (55, b"56789")]
+          assert reassemble(overlap, 50) == (b"0123456789", 60)
+          assert reassemble([(50, b"abcdef"), (51, b"bc")], 50) == (b"abcdef", 56)
+      - name: wraparound
+        code: |
+          import random
+          msg = b"wrap around the end of the sequence space"
+          isn = 2**32 - 13
+          parts = segment(msg, 8, isn)
+          assert any(seq < 100 for seq, _ in parts) and any(seq > 2**32 - 100 for seq, _ in parts)
+          random.Random(8).shuffle(parts)
+          data, nxt = reassemble(parts, isn)
+          assert data == msg and nxt == (isn + len(msg)) % 2**32
+    hints:
+      - "`segment`: `range(0, len(data), mss)` gives each offset."
+      - "`reassemble`: compute `offset = (seq - isn) % 2**32` for each segment and sort by it."
+      - "Keep a `bytearray`. For each segment in order: if `offset > len(buffer)` there is a gap, so stop. Otherwise append `chunk[len(buffer) - offset:]`, which skips bytes you already have (and does nothing for a duplicate)."
+    solution: |
+      M = 2 ** 32
+
+
+      def segment(data, mss, isn):
+          return [((isn + i) % M, data[i:i + mss]) for i in range(0, len(data), mss)]
+
+
+      def reassemble(segments, isn):
+          buffer = bytearray()
+          for seq, chunk in sorted(segments, key=lambda s: (s[0] - isn) % M):
+              offset = (seq - isn) % M
+              if offset > len(buffer):
+                  break
+              buffer += chunk[len(buffer) - offset:]
+          return bytes(buffer), (isn + len(buffer)) % M
+    explanation: |
+      This is TCP's receive buffer in miniature. `next_seq` is exactly the acknowledgement number the receiver would send back: everything below it has arrived. When a gap appears the receiver keeps sending the same acknowledgement (a "duplicate ACK"), which is the signal the sender uses to notice a loss, as you'll see in the next lesson.
+
+  - id: states
+    title: The TCP state machine
+    difficulty: 3
+    prompt: |
+      Implement `next_state(state, event)` using the transition table from the lesson's last example (12 transitions): `CLOSED`+`passive_open`→`LISTEN`, `CLOSED`+`active_open`→`SYN_SENT`, `LISTEN`+`recv_SYN`→`SYN_RCVD`, `SYN_SENT`+`recv_SYN_ACK`→`ESTABLISHED`, `SYN_RCVD`+`recv_ACK`→`ESTABLISHED`, `ESTABLISHED`+`close`→`FIN_WAIT_1`, `ESTABLISHED`+`recv_FIN`→`CLOSE_WAIT`, `FIN_WAIT_1`+`recv_ACK`→`FIN_WAIT_2`, `FIN_WAIT_2`+`recv_FIN`→`TIME_WAIT`, `CLOSE_WAIT`+`close`→`LAST_ACK`, `LAST_ACK`+`recv_ACK`→`CLOSED`, `TIME_WAIT`+`timeout`→`CLOSED`. Raise `ValueError` for any other pair. Write `simulate(state, events)` returning the list of states visited **including the starting one**, and raising `ValueError` at the first illegal event. Write `is_open(state)` returning `True` only for `ESTABLISHED`. Write `can_send(state)` (`ESTABLISHED` and `CLOSE_WAIT`) and `can_receive(state)` (`ESTABLISHED`, `FIN_WAIT_1` and `FIN_WAIT_2`).
+    starter: |
+      def next_state(state, event):
+          pass
+
+
+      def simulate(state, events):
+          pass
+
+
+      def is_open(state):
+          pass
+
+
+      def can_send(state):
+          pass
+
+
+      def can_receive(state):
+          pass
+    tests:
+      - name: transitions
+        code: |
+          assert next_state("CLOSED", "active_open") == "SYN_SENT"
+          assert next_state("LISTEN", "recv_SYN") == "SYN_RCVD"
+          assert next_state("TIME_WAIT", "timeout") == "CLOSED"
+          assert next_state("ESTABLISHED", "recv_FIN") == "CLOSE_WAIT"
+          for bad in (("CLOSED", "close"), ("LISTEN", "recv_FIN"), ("NOWHERE", "close"), ("ESTABLISHED", "recv_SYN")):
+              try:
+                  next_state(*bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+      - name: whole conversations
+        code: |
+          client = simulate("CLOSED", ["active_open", "recv_SYN_ACK", "close", "recv_ACK", "recv_FIN", "timeout"])
+          assert client == ["CLOSED", "SYN_SENT", "ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2", "TIME_WAIT", "CLOSED"]
+          server = simulate("CLOSED", ["passive_open", "recv_SYN", "recv_ACK", "recv_FIN", "close", "recv_ACK"])
+          assert server == ["CLOSED", "LISTEN", "SYN_RCVD", "ESTABLISHED", "CLOSE_WAIT", "LAST_ACK", "CLOSED"]
+          assert simulate("LISTEN", []) == ["LISTEN"]
+          try:
+              simulate("CLOSED", ["active_open", "recv_FIN"])
+              assert False
+          except ValueError:
+              pass
+      - name: abilities
+        code: |
+          states = ["CLOSED", "LISTEN", "SYN_SENT", "SYN_RCVD", "ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2", "CLOSE_WAIT", "LAST_ACK", "TIME_WAIT"]
+          assert [s for s in states if is_open(s)] == ["ESTABLISHED"]
+          assert [s for s in states if can_send(s)] == ["ESTABLISHED", "CLOSE_WAIT"]
+          assert [s for s in states if can_receive(s)] == ["ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2"]
+    hints:
+      - "A dictionary keyed by `(state, event)` pairs holds the whole table; `TABLE.get((state, event))` returns `None` for an illegal pair."
+      - "`simulate`: start a list with `[state]`, and for each event call `next_state` and append the result."
+      - "The three yes/no functions are just membership tests on small tuples."
+    solution: |
+      TABLE = {
+          ("CLOSED", "passive_open"): "LISTEN",
+          ("CLOSED", "active_open"): "SYN_SENT",
+          ("LISTEN", "recv_SYN"): "SYN_RCVD",
+          ("SYN_SENT", "recv_SYN_ACK"): "ESTABLISHED",
+          ("SYN_RCVD", "recv_ACK"): "ESTABLISHED",
+          ("ESTABLISHED", "close"): "FIN_WAIT_1",
+          ("ESTABLISHED", "recv_FIN"): "CLOSE_WAIT",
+          ("FIN_WAIT_1", "recv_ACK"): "FIN_WAIT_2",
+          ("FIN_WAIT_2", "recv_FIN"): "TIME_WAIT",
+          ("CLOSE_WAIT", "close"): "LAST_ACK",
+          ("LAST_ACK", "recv_ACK"): "CLOSED",
+          ("TIME_WAIT", "timeout"): "CLOSED",
+      }
+
+
+      def next_state(state, event):
+          new = TABLE.get((state, event))
+          if new is None:
+              raise ValueError(f"{event} is not allowed in {state}")
+          return new
+
+
+      def simulate(state, events):
+          visited = [state]
+          for event in events:
+              state = next_state(state, event)
+              visited.append(state)
+          return visited
+
+
+      def is_open(state):
+          return state == "ESTABLISHED"
+
+
+      def can_send(state):
+          return state in ("ESTABLISHED", "CLOSE_WAIT")
+
+
+      def can_receive(state):
+          return state in ("ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2")
+    explanation: |
+      Protocol implementations are state machines: a table of what is legal in each state turns a thicket of "if" statements into data you can read and test. Lesson 10.2's process states used the same idea. The `can_send` / `can_receive` split shows TCP's half-close: after `close()` you can no longer send, but the other side may still be sending.
+
+  - id: conversation
+    title: Tracing a TCP conversation
+    difficulty: 4
+    prompt: |
+      Write `conversation(client_isn, server_isn, sends)` returning the list of segments as tuples `(sender, flags, seq, ack, length)` for a complete connection, with `sender` `"client"` or `"server"`. All sequence and acknowledgement numbers are modulo 2**32. The segments, in order: (1) client `SYN` with `seq = client_isn`, `ack = 0`; (2) server `SYN+ACK` with `seq = server_isn`, `ack = client_isn + 1`; (3) client `ACK` with `seq = client_isn + 1`, `ack = server_isn + 1`. Then for each `(who, n)` in `sends` with `n > 0`: that side sends a data segment with flags `ACK` carrying `n` bytes (its `seq` is its next sequence number, its `ack` is the next byte it expects from the other side), then the other side sends a pure `ACK` (length 0) acknowledging it; entries with `n == 0` are skipped. Finally the close: client `FIN+ACK`, server `ACK`, server `FIN+ACK`, client `ACK`, each using the current numbers (a FIN uses one sequence number). Raise `ValueError` if `who` is not `"client"` or `"server"`, or `n` is negative.
+    starter: |
+      def conversation(client_isn, server_isn, sends):
+          pass
+    tests:
+      - name: worked example
+        code: |
+          assert conversation(100, 500, [("client", 10), ("server", 20)]) == [
+              ("client", "SYN", 100, 0, 0),
+              ("server", "SYN+ACK", 500, 101, 0),
+              ("client", "ACK", 101, 501, 0),
+              ("client", "ACK", 101, 501, 10),
+              ("server", "ACK", 501, 111, 0),
+              ("server", "ACK", 501, 111, 20),
+              ("client", "ACK", 111, 521, 0),
+              ("client", "FIN+ACK", 111, 521, 0),
+              ("server", "ACK", 521, 112, 0),
+              ("server", "FIN+ACK", 521, 112, 0),
+              ("client", "ACK", 112, 522, 0),
+          ]
+      - name: no data and zero-length sends
+        code: |
+          assert conversation(0, 0, []) == [
+              ("client", "SYN", 0, 0, 0), ("server", "SYN+ACK", 0, 1, 0), ("client", "ACK", 1, 1, 0),
+              ("client", "FIN+ACK", 1, 1, 0), ("server", "ACK", 1, 2, 0), ("server", "FIN+ACK", 1, 2, 0), ("client", "ACK", 2, 2, 0),
+          ]
+          assert conversation(0, 0, [("client", 0), ("server", 0)]) == conversation(0, 0, [])
+      - name: wraparound
+        code: |
+          t = conversation(2**32 - 1, 2**32 - 5, [("client", 3)])
+          assert t[0] == ("client", "SYN", 2**32 - 1, 0, 0)
+          assert t[1] == ("server", "SYN+ACK", 2**32 - 5, 0, 0)
+          assert t[2] == ("client", "ACK", 0, 2**32 - 4, 0)
+          assert t[3] == ("client", "ACK", 0, 2**32 - 4, 3)
+          assert t[4] == ("server", "ACK", 2**32 - 4, 3, 0)
+      - name: acknowledgements add up
+        code: |
+          import random
+          rng = random.Random(6)
+          for _ in range(50):
+              c, s = rng.randrange(2**32), rng.randrange(2**32)
+              sends = [(rng.choice(["client", "server"]), rng.randint(0, 50)) for _ in range(rng.randint(0, 6))]
+              t = conversation(c, s, sends)
+              sent = {"client": 0, "server": 0}
+              for who, n in sends:
+                  sent[who] += n
+              fin = t[-4]
+              assert fin[1] == "FIN+ACK" and fin[2] == (c + 1 + sent["client"]) % 2**32
+              assert t[-1][3] == (s + 2 + sent["server"]) % 2**32 and t[-1][2] == (c + 2 + sent["client"]) % 2**32
+      - name: errors
+        code: |
+          for bad in ([("proxy", 5)], [("client", -1)]):
+              try:
+                  conversation(1, 2, bad)
+                  assert False
+              except ValueError:
+                  pass
+    hints:
+      - "Keep two counters: `cnext = client_isn + 1` and `snext = server_isn + 1`, reduced modulo `2**32` every time they change."
+      - "A data segment from the client is `(\"client\", \"ACK\", cnext, snext, n)`; afterwards `cnext += n` and the server replies `(\"server\", \"ACK\", snext, cnext, 0)`. The server's case is the mirror image."
+      - "Validate the whole `sends` list before building anything, so errors come first."
+      - "The close: the FIN consumes one number, so the server's ACK acknowledges `cnext + 1`, and the client's last ACK acknowledges `snext + 1`."
+    solution: |
+      def conversation(client_isn, server_isn, sends):
+          M = 2 ** 32
+          for who, n in sends:
+              if who not in ("client", "server") or n < 0:
+                  raise ValueError("bad send")
+          trace = []
+          cnext, snext = (client_isn + 1) % M, (server_isn + 1) % M
+          trace.append(("client", "SYN", client_isn % M, 0, 0))
+          trace.append(("server", "SYN+ACK", server_isn % M, cnext, 0))
+          trace.append(("client", "ACK", cnext, snext, 0))
+          for who, n in sends:
+              if n == 0:
+                  continue
+              if who == "client":
+                  trace.append(("client", "ACK", cnext, snext, n))
+                  cnext = (cnext + n) % M
+                  trace.append(("server", "ACK", snext, cnext, 0))
+              else:
+                  trace.append(("server", "ACK", snext, cnext, n))
+                  snext = (snext + n) % M
+                  trace.append(("client", "ACK", cnext, snext, 0))
+          trace.append(("client", "FIN+ACK", cnext, snext, 0))
+          trace.append(("server", "ACK", snext, (cnext + 1) % M, 0))
+          trace.append(("server", "FIN+ACK", snext, (cnext + 1) % M, 0))
+          trace.append(("client", "ACK", (cnext + 1) % M, (snext + 1) % M, 0))
+          return trace
+    explanation: |
+      Wireshark shows exactly this table for every TCP connection. Learning to read `seq` and `ack` is a real debugging skill: a stuck `ack` number tells you which byte the receiver is still missing, and a SYN with no SYN+ACK in reply tells you the server is unreachable or a firewall is dropping the packets.
+
+commonMistakes:
+  - title: Thinking an IP address is enough to reach a program
+    explanation: |
+      The address finds the host. The port finds the program on it. A connection needs both ends' addresses and ports.
+  - title: Assuming UDP is just "TCP without the checks" for everything
+    explanation: |
+      UDP gives no delivery, order or duplicate guarantees. If you need them with UDP, your application must build them.
+  - title: Counting segments instead of bytes
+    explanation: |
+      TCP sequence numbers count bytes. An acknowledgement of 1500 means bytes up to 1499 were received, whatever the segment sizes were.
+  - title: Forgetting SYN and FIN use a sequence number
+    explanation: |
+      Each consumes one number. That is why the handshake's acknowledgement is the ISN plus one even though no data was sent.
+  - title: Expecting one send to equal one receive on TCP
+    explanation: |
+      TCP is a stream with no message boundaries. Two `send` calls may arrive as one `recv`, or one send as several. Applications must mark their own message ends (a length prefix or a delimiter).
+  - title: Ignoring wraparound
+    explanation: |
+      32-bit sequence numbers wrap around. Compare them using differences modulo 2^32, never with a plain `<`.
+
+summary:
+  - "**Ports** (16-bit numbers) let a host deliver packets to the right program. A TCP connection is identified by the **4-tuple** of both addresses and both ports."
+  - "**UDP** adds ports and a checksum to IP and nothing else: no connection, delivery, order or retransmission. It suits DNS, calls, games and custom protocols."
+  - "**TCP** provides a reliable, ordered **byte stream** using **sequence numbers** (counting bytes), **cumulative acknowledgements**, **segmentation** by MSS and **reassembly** by sequence number."
+  - "A connection opens with the **three-way handshake** (SYN, SYN+ACK, ACK) and closes with FIN/ACK in each direction. SYN and FIN each consume a sequence number."
+  - "Each end follows a **state machine** (`LISTEN`, `SYN_SENT`, `ESTABLISHED`, `FIN_WAIT`, `CLOSE_WAIT`, `TIME_WAIT`, ...), which tools like `ss` display."
+  - "Use TCP when completeness matters, and UDP when timeliness and low overhead matter more."
+next: |
+  TCP promises reliability on an unreliable network. How does it actually notice a lost segment and fix it, and how does it avoid flooding a slow receiver or an overloaded network? That is the next lesson: **retransmission, flow control and congestion control**.
+
+quiz:
+  - type: mcq
+    question: What identifies one TCP connection uniquely?
+    options: [
+      "Source address, source port, destination address and destination port",
+      "Only the destination port",
+      "Only the destination address",
+      "The sequence number"
+    ]
+    answer: 0
+    explanation: "The 4-tuple. That is why many clients can connect to the same server port."
+  - type: mcq
+    question: Which service would most naturally use UDP?
+    options: ["A live video call", "Downloading an operating system image", "Sending an email", "Loading a bank's web page"]
+    answer: 0
+    explanation: "Live media prefers fresh data over perfect data. The others need every byte to arrive correctly."
+  - type: mcq
+    question: A TCP segment with sequence number 3000 carries 250 bytes of data. What acknowledgement number does the receiver send when it has received it and everything before it?
+    options: ["3250", "3000", "251", "3249"]
+    answer: 0
+    explanation: "The acknowledgement is the number of the next byte expected: 3000 + 250."
+  - type: mcq
+    question: What does the second step of the three-way handshake (SYN+ACK) acknowledge?
+    options: [
+      "The client's SYN, with ack = client ISN + 1",
+      "The client's data",
+      "The server's own SYN",
+      "Nothing; it is just a reply"
+    ]
+    answer: 0
+    explanation: "The SYN consumed one sequence number, so it is acknowledged with ISN + 1."
+  - type: mcq
+    question: A server shows thousands of connections in CLOSE_WAIT. What is the likely cause?
+    options: [
+      "The program received the other side's FIN but never closed its own socket",
+      "The network is too slow",
+      "The clients crashed before connecting",
+      "UDP is flooding the port"
+    ]
+    answer: 0
+    explanation: "CLOSE_WAIT means the other end finished and the local application has not yet called close."
+  - type: mcq
+    question: Why does UDP's header contain a length field while UDP has no connections?
+    options: [
+      "Each datagram is independent and the receiver needs to know where the data ends",
+      "Because UDP retransmits lost data",
+      "To count the packets",
+      "It is unused"
+    ]
+    answer: 0
+    explanation: "UDP preserves datagram boundaries, so each datagram says how long it is."
+  - type: code
+    question: |
+      Write `ack_number(seq, length, syn_or_fin=False)` returning the acknowledgement number a receiver sends after getting a segment with sequence number `seq` carrying `length` bytes of data. A SYN or FIN counts as one extra sequence number. Numbers are modulo 2**32.
+    starter: |
+      def ack_number(seq, length, syn_or_fin=False):
+          pass
+    tests:
+      - name: acks
+        code: |
+          assert ack_number(3000, 250) == 3250
+          assert ack_number(100, 0, True) == 101
+          assert ack_number(2**32 - 1, 0, True) == 0
+          assert ack_number(2**32 - 10, 20) == 10
+          assert ack_number(5, 0) == 5
+    solution: |
+      def ack_number(seq, length, syn_or_fin=False):
+          return (seq + length + (1 if syn_or_fin else 0)) % 2 ** 32

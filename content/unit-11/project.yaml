@@ -1,0 +1,505 @@
+title: Mini Network Toolkit
+brief: |
+  You are building the **toolkit of a small network operator**: it answers questions about subnets, forwards packets with a routing table, resolves names through a caching resolver, reassembles a TCP byte stream that arrives out of order, and takes URLs apart. It reads a script from `network.txt` (created for you each time you run) and prints a report. Blank lines and lines starting with `#` are ignored. The commands are:
+
+  - `route CIDR NEXT_HOP`: add an entry to the forwarding table.
+  - `record NAME ADDRESS TTL`: a name the authoritative servers know, and the TTL they give it.
+  - `at SECONDS`: set the current time (it starts at 0).
+  - `subnet CIDR`, `forward ADDRESS`, `dns NAME`: ask a question.
+  - `stream ISN MSS ORDER TEXT`: send TEXT as a stream whose first byte has sequence number ISN, cut it into segments of MSS bytes, deliver only the segments listed in ORDER (comma-separated segment numbers, counting from 0, in the order they arrive; repeats are allowed), and report what the receiver can read.
+  - `url URL`: parse a URL.
+
+  **Exact requirements** (the tests check each piece on its own, including random cases):
+
+  - `ip_to_int`, `int_to_ip` and `percent_decode` are given.
+  - `subnet_info(cidr)`: return `(network, netmask, broadcast, usable_hosts)`. (Lesson 11.2)
+  - `lookup(table, ip)`: longest-prefix match over a list of `(cidr, next_hop)`; `None` if nothing matches; the first entry wins a tie. (Lesson 11.2)
+  - `DnsCache`: `put(name, ip, ttl, now)`, `put_negative(name, ttl, now)`, `get(name, now)` returning `("hit", ip)`, `("nxdomain", None)` or `("miss", None)`, and `remaining(name, now)`. Names are case-insensitive and an entry is valid while `now < now_when_stored + ttl`. (Lesson 11.6)
+  - `segment(data, mss, isn)` and `reassemble(segments, isn)` for bytes, with 32-bit wraparound. (Lesson 11.4)
+  - `parse_url(url)`: return `(scheme, host, port, path, query)`. (Lesson 11.7)
+  - `process(text)` carries out the commands and returns the output lines. `main()` prints each line for `network.txt`:
+
+  ```text
+  Subnet 192.168.1.128/26: mask 255.255.255.192, broadcast 192.168.1.191, 62 usable hosts
+  Subnet 10.0.0.0/8: mask 255.0.0.0, broadcast 10.255.255.255, 16777214 usable hosts
+  Subnet 172.16.5.8/30: mask 255.255.255.252, broadcast 172.16.5.11, 2 usable hosts
+  10.1.2.7 -> lab
+  10.1.9.9 -> branch
+  10.200.0.1 -> core
+  192.168.1.1 -> office
+  8.8.8.8 -> no route
+  t=0 example.com -> 93.184.216.34 (looked up, ttl 60)
+  t=10 example.com -> 93.184.216.34 (cached, 50s left)
+  t=10 missing.example.com -> NXDOMAIN (looked up)
+  t=25 missing.example.com -> NXDOMAIN (cached, 15s left)
+  t=70 example.com -> 93.184.216.34 (looked up, ttl 60)
+  t=70 www.example.com -> 93.184.216.35 (looked up, ttl 120)
+  Stream: 'Hello, world!' complete, next seq 1013
+  Stream: 'Hello' incomplete, next seq 1005
+  Stream: 'Wrap around' complete, next seq 5
+  URL: https example.com:8443/search query={'q': ['café au lait'], 'page': ['2']}
+  URL: http example.com:80/ query={}
+  Bad URL: ftp://example.com/file
+  Bad URL: http://example.com:99999/
+  ```
+
+  The last line of the program calls `main()`. In the `dns` lines, a fresh answer says `looked up` and a cached one says `cached`; both show the time `t=` and the lower-cased name. A bad URL prints `Bad URL: ` followed by the URL.
+prelude: |
+  # Creates network.txt fresh before every run.
+  with open("network.txt", "w") as _f:
+      _f.write("# A mini network session\nroute 10.0.0.0/8 core\nroute 10.1.0.0/16 branch\nroute 10.1.2.0/24 lab\nroute 192.168.0.0/16 office\n\nrecord example.com 93.184.216.34 60\nrecord www.example.com 93.184.216.35 120\n\nsubnet 192.168.1.130/26\nsubnet 10.0.0.0/8\nsubnet 172.16.5.9/30\n\nforward 10.1.2.7\nforward 10.1.9.9\nforward 10.200.0.1\nforward 192.168.1.1\nforward 8.8.8.8\n\nat 0\ndns example.com\nat 10\ndns example.com\ndns missing.example.com\nat 25\ndns missing.example.com\nat 70\ndns Example.COM\ndns www.example.com\n\nstream 1000 5 0,2,1 Hello, world!\nstream 1000 5 0,2 Hello, world!\nstream 4294967290 4 2,0,1,2 Wrap around\n\nurl https://Example.com:8443/search?q=caf%C3%A9+au+lait&page=2#top\nurl http://example.com\nurl ftp://example.com/file\nurl http://example.com:99999/\n")
+  del _f
+steps:
+- title: Addresses and subnets
+  body: Use the given `ip_to_int` and `int_to_ip`. The mask is `(0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF`; the network is `ip & mask`; the broadcast is `network | (~mask & 0xFFFFFFFF)`. Remember the special counts for /31 and /32 (Lesson 11.2).
+- title: Forwarding
+  body: Loop over the table and keep the entry with the longest prefix that contains the address. Use `>` (not `>=`) when comparing prefix lengths so that the first of two equal prefixes wins (Lesson 11.2).
+- title: The DNS cache
+  body: Store `(kind, value, expires)` per lower-cased name, as in Lesson 11.6. An entry is valid while `now < expires`; a ttl of 0 stores nothing. `remaining` returns the whole seconds left.
+- title: Streams
+  body: '`segment` is a range loop over the byte offsets. For `reassemble`, sort the segments by `(seq - isn) % 2**32`, stop at the first gap, and append only the bytes you do not already have (Lesson 11.4).'
+- title: URLs
+  body: Take off the fragment first, then the query, then split the host part from the path (Lesson 11.7). Decode keys and values with `percent_decode(..., True)`. Raise `ValueError` for bad input.
+- title: Commands and output
+  body: '`process` keeps the route table, the DNS records, a `DnsCache` and the current time `now` while it reads the lines in order. A `dns` lookup first asks the cache, and only on a miss looks in the records, caching the answer (or an NXDOMAIN for 30 seconds). Print the wording shown in the expected output exactly.'
+checklist:
+- text: subnet_info computes the network, mask, broadcast and host count
+  test: subnet_info matches the examples
+- text: subnet_info agrees with the standard library
+  test: subnet_info agrees with the standard library
+- text: lookup picks the longest matching prefix
+  test: lookup chooses the longest prefix
+- text: lookup agrees with a brute-force check
+  test: lookup matches a brute-force check
+- text: DnsCache stores entries and expires them on time
+  test: DnsCache stores and expires entries
+- text: DnsCache caches NXDOMAIN answers
+  test: DnsCache remembers missing names
+- text: segment numbers pieces by byte position
+  test: segment cuts a stream by byte position
+- text: reassemble copes with shuffling, duplicates and gaps
+  test: reassemble handles any order, duplicates and gaps
+- text: reassemble handles sequence-number wraparound
+  test: reassemble copes with sequence wraparound
+- text: parse_url splits and decodes a URL
+  test: parse_url splits a URL
+- text: parse_url rejects invalid URLs
+  test: parse_url rejects bad URLs
+- text: main prints the whole session
+  test: main prints the session
+- text: I wrote a comment explaining why the DNS cache needs a TTL, and what could go wrong if it were too long
+- text: I explained in a comment why reassemble stops at the first gap instead of returning every byte it has
+starter: |
+  # Unit 11 project: Mini Network Toolkit
+  M = 2 ** 32
+
+
+  def ip_to_int(text):
+      a, b, c, d = (int(part) for part in text.split("."))
+      return (a << 24) | (b << 16) | (c << 8) | d
+
+
+  def int_to_ip(n):
+      return ".".join(str((n >> shift) & 255) for shift in (24, 16, 8, 0))
+
+
+  def percent_decode(text, plus=False):
+      out = bytearray()
+      i = 0
+      while i < len(text):
+          ch = text[i]
+          if ch == "%":
+              pair = text[i + 1:i + 3]
+              if len(pair) != 2 or not all(c in "0123456789abcdefABCDEF" for c in pair):
+                  raise ValueError("bad percent escape")
+              out.append(int(pair, 16))
+              i += 3
+              continue
+          out.extend((" " if plus and ch == "+" else ch).encode("utf-8"))
+          i += 1
+      return out.decode("utf-8")
+
+
+  def subnet_info(cidr):
+      """Return (network, netmask, broadcast, usable_hosts): three dotted quads and an integer.
+      Host bits in the address are zeroed. Usable hosts: 2**(32-p)-2, but 2 for /31 and 1 for /32."""
+      return "", "", "", 0
+
+
+  def lookup(table, ip):
+      """table is a list of (cidr, next_hop). Return the next hop of the longest matching prefix
+      (the first one in the table wins a tie), or None."""
+      return None
+
+
+  class DnsCache:
+      """A cache of name -> address with expiry. All times are passed in as `now` (seconds)."""
+
+      def __init__(self):
+          pass
+
+      def put(self, name, ip, ttl, now):
+          """Store an address for ttl seconds. A ttl of 0 or less stores nothing and removes any old entry."""
+
+      def put_negative(self, name, ttl, now):
+          """Remember that the name does not exist, for ttl seconds."""
+
+      def get(self, name, now):
+          """Return ("hit", ip), ("nxdomain", None) or ("miss", None). Names are case-insensitive.
+          An entry is valid while now < stored_at + ttl."""
+          return "miss", None
+
+      def remaining(self, name, now):
+          """Whole seconds of life left for the entry, or 0."""
+          return 0
+
+
+  def segment(data, mss, isn):
+      """Split bytes into [(seq, chunk), ...] of at most mss bytes. seq = (isn + offset) % 2**32."""
+      return []
+
+
+  def reassemble(segments, isn):
+      """Segments may arrive in any order, duplicated or overlapping. Return (data, next_seq): the
+      contiguous bytes from isn that have arrived, and the next expected sequence number."""
+      return b"", isn
+
+
+  def parse_url(url):
+      """Return (scheme, host, port, path, query) for an http or https URL. The scheme and host are
+      lower case, the port defaults to 80 or 443, the path to "/", and query maps each key to the list of
+      its decoded values (use percent_decode with plus=True). The fragment is dropped.
+      Raise ValueError for other schemes, a missing host, or a port outside 1..65535."""
+      return "", "", 0, "/", {}
+
+
+  def process(text):
+      """Carry out every command in text and return the output lines."""
+      return []
+
+
+  def main():
+      with open("network.txt") as f:
+          for line in process(f.read()):
+              print(line)
+
+
+  main()
+tests:
+- name: subnet_info matches the examples
+  code: |
+    assert subnet_info("192.168.1.130/26") == ("192.168.1.128", "255.255.255.192", "192.168.1.191", 62)
+    assert subnet_info("10.0.0.0/8") == ("10.0.0.0", "255.0.0.0", "10.255.255.255", 16777214)
+    assert subnet_info("172.16.5.9/30") == ("172.16.5.8", "255.255.255.252", "172.16.5.11", 2)
+    assert subnet_info("1.2.3.4/32") == ("1.2.3.4", "255.255.255.255", "1.2.3.4", 1)
+    assert subnet_info("10.0.0.1/31") == ("10.0.0.0", "255.255.255.254", "10.0.0.1", 2)
+    assert subnet_info("0.0.0.0/0") == ("0.0.0.0", "0.0.0.0", "255.255.255.255", 4294967294)
+- name: subnet_info agrees with the standard library
+  code: |
+    import ipaddress, random
+    rng = random.Random(4)
+    for _ in range(200):
+        p = rng.randint(0, 30)
+        ip = ".".join(str(rng.randrange(256)) for _ in range(4))
+        net = ipaddress.ip_network(f"{ip}/{p}", strict=False)
+        assert subnet_info(f"{ip}/{p}") == (str(net.network_address), str(net.netmask), str(net.broadcast_address), net.num_addresses - 2)
+- name: lookup chooses the longest prefix
+  code: |
+    table = [("0.0.0.0/0", "G"), ("10.0.0.0/8", "A"), ("10.1.0.0/16", "B"), ("10.1.2.0/24", "C")]
+    assert lookup(table, "10.1.2.7") == "C" and lookup(table, "10.1.9.9") == "B"
+    assert lookup(table, "10.9.9.9") == "A" and lookup(table, "8.8.8.8") == "G"
+    assert lookup([("10.0.0.0/8", "first"), ("10.0.0.0/8", "second")], "10.5.5.5") == "first"
+    assert lookup([("10.0.0.0/8", "A")], "11.0.0.1") is None and lookup([], "1.2.3.4") is None
+    assert lookup([("10.1.0.0/16", "B"), ("10.0.0.0/8", "A")], "10.1.1.1") == "B"
+- name: lookup matches a brute-force check
+  code: |
+    import ipaddress, random
+    rng = random.Random(9)
+    for _ in range(150):
+        table = []
+        for _ in range(rng.randint(0, 8)):
+            p = rng.randint(0, 16)
+            net = ".".join(str(rng.choice([10, 11, 192, 0])) if i == 0 else str(rng.randrange(0, 4)) for i in range(4))
+            table.append((f"{net}/{p}", f"hop{len(table)}"))
+        ip = ".".join(str(rng.choice([10, 11, 192, 0])) if i == 0 else str(rng.randrange(0, 4)) for i in range(4))
+        best = None
+        for cidr, hop in table:
+            n = ipaddress.ip_network(cidr, strict=False)
+            if ipaddress.ip_address(ip) in n and (best is None or n.prefixlen > best[0]):
+                best = (n.prefixlen, hop)
+        assert lookup(table, ip) == (best[1] if best else None), (table, ip)
+- name: DnsCache stores and expires entries
+  code: |
+    c = DnsCache()
+    c.put("Example.com", "1.2.3.4", 60, 100)
+    assert c.get("example.COM", 100) == ("hit", "1.2.3.4")
+    assert c.get("example.com", 159) == ("hit", "1.2.3.4")
+    assert c.remaining("example.com", 130) == 30
+    assert c.get("example.com", 160) == ("miss", None)
+    assert c.remaining("example.com", 160) == 0
+    assert c.get("other.com", 100) == ("miss", None)
+    c.put("z.com", "9.9.9.9", 0, 0)
+    assert c.get("z.com", 0) == ("miss", None)
+    c.put("y.com", "2.2.2.2", 100, 0)
+    c.put("y.com", "3.3.3.3", 0, 1)
+    assert c.get("y.com", 2) == ("miss", None)
+    c.put("r.com", "1.1.1.1", 10, 0)
+    c.put("r.com", "2.2.2.2", 100, 5)
+    assert c.get("r.com", 50) == ("hit", "2.2.2.2")
+- name: DnsCache remembers missing names
+  code: |
+    c = DnsCache()
+    c.put_negative("typo.com", 30, 0)
+    assert c.get("TYPO.com", 29) == ("nxdomain", None)
+    assert c.remaining("typo.com", 20) == 10
+    assert c.get("typo.com", 30) == ("miss", None)
+    c.put("typo.com", "5.5.5.5", 10, 40)
+    assert c.get("typo.com", 41) == ("hit", "5.5.5.5")
+    c.put_negative("typo.com", 10, 45)
+    assert c.get("typo.com", 46) == ("nxdomain", None)
+- name: segment cuts a stream by byte position
+  code: |
+    assert segment(b"abcdefg", 3, 100) == [(100, b"abc"), (103, b"def"), (106, b"g")]
+    assert segment(b"", 3, 100) == []
+    assert segment(b"abcdef", 3, 2**32 - 2) == [(2**32 - 2, b"abc"), (1, b"def")]
+    assert segment(b"ab", 10, 0) == [(0, b"ab")]
+- name: reassemble handles any order, duplicates and gaps
+  code: |
+    import random
+    msg = bytes(range(200))
+    parts = segment(msg, 17, 1000)
+    assert reassemble(parts, 1000) == (msg, 1200)
+    rng = random.Random(3)
+    for _ in range(40):
+        mixed = parts + rng.sample(parts, 5)
+        rng.shuffle(mixed)
+        assert reassemble(mixed, 1000) == (msg, 1200)
+    five = segment(b"0123456789", 2, 50)
+    assert reassemble([p for p in five if p[0] != 54], 50) == (b"0123", 54)
+    assert reassemble([], 50) == (b"", 50)
+    assert reassemble([(52, b"23")], 50) == (b"", 50)
+    assert reassemble([(50, b"0123"), (52, b"2345"), (55, b"56789")], 50) == (b"0123456789", 60)
+- name: reassemble copes with sequence wraparound
+  code: |
+    import random
+    msg = b"wrap around the end of the sequence space"
+    isn = 2**32 - 13
+    parts = segment(msg, 8, isn)
+    assert any(seq < 100 for seq, _ in parts)
+    random.Random(8).shuffle(parts)
+    assert reassemble(parts, isn) == (msg, (isn + len(msg)) % 2**32)
+- name: parse_url splits a URL
+  code: |
+    u = parse_url("https://WWW.Example.com:8443/shop/items?id=42&colour=red&colour=blue&q=caf%C3%A9+au+lait#reviews")
+    assert u == ("https", "www.example.com", 8443, "/shop/items", {"id": ["42"], "colour": ["red", "blue"], "q": ["café au lait"]})
+    assert parse_url("http://example.com") == ("http", "example.com", 80, "/", {})
+    assert parse_url("HTTPS://example.com/") == ("https", "example.com", 443, "/", {})
+    assert parse_url("http://example.com?x=1")[3:] == ("/", {"x": ["1"]})
+    assert parse_url("http://example.com/a?flag&&k=")[4] == {"flag": [""], "k": [""]}
+- name: parse_url rejects bad URLs
+  code: |
+    for bad in ("example.com/path", "ftp://example.com", "http:///path", "http://:80/", "http://example.com:abc/",
+                "http://example.com:0/", "http://example.com:65536/", "http://example.com/?q=%zz"):
+        try:
+            parse_url(bad)
+            assert False, bad
+        except ValueError:
+            pass
+- name: main prints the session
+  code: |
+    lines = output.strip().splitlines()
+    expected = "Subnet 192.168.1.128/26: mask 255.255.255.192, broadcast 192.168.1.191, 62 usable hosts\nSubnet 10.0.0.0/8: mask 255.0.0.0, broadcast 10.255.255.255, 16777214 usable hosts\nSubnet 172.16.5.8/30: mask 255.255.255.252, broadcast 172.16.5.11, 2 usable hosts\n10.1.2.7 -> lab\n10.1.9.9 -> branch\n10.200.0.1 -> core\n192.168.1.1 -> office\n8.8.8.8 -> no route\nt=0 example.com -> 93.184.216.34 (looked up, ttl 60)\nt=10 example.com -> 93.184.216.34 (cached, 50s left)\nt=10 missing.example.com -> NXDOMAIN (looked up)\nt=25 missing.example.com -> NXDOMAIN (cached, 15s left)\nt=70 example.com -> 93.184.216.34 (looked up, ttl 60)\nt=70 www.example.com -> 93.184.216.35 (looked up, ttl 120)\nStream: 'Hello, world!' complete, next seq 1013\nStream: 'Hello' incomplete, next seq 1005\nStream: 'Wrap around' complete, next seq 5\nURL: https example.com:8443/search query={'q': ['café au lait'], 'page': ['2']}\nURL: http example.com:80/ query={}\nBad URL: ftp://example.com/file\nBad URL: http://example.com:99999/".splitlines()
+    assert lines == expected, "Output differs. First difference: " + next((f"got {a!r}, expected {b!r}" for a, b in zip(lines, expected) if a != b), f"got {len(lines)} lines, expected {len(expected)}")
+solution: |
+  # Unit 11 project: Mini Network Toolkit
+  M = 2 ** 32
+
+
+  def ip_to_int(text):
+      a, b, c, d = (int(part) for part in text.split("."))
+      return (a << 24) | (b << 16) | (c << 8) | d
+
+
+  def int_to_ip(n):
+      return ".".join(str((n >> shift) & 255) for shift in (24, 16, 8, 0))
+
+
+  def percent_decode(text, plus=False):
+      out = bytearray()
+      i = 0
+      while i < len(text):
+          ch = text[i]
+          if ch == "%":
+              pair = text[i + 1:i + 3]
+              if len(pair) != 2 or not all(c in "0123456789abcdefABCDEF" for c in pair):
+                  raise ValueError("bad percent escape")
+              out.append(int(pair, 16))
+              i += 3
+              continue
+          out.extend((" " if plus and ch == "+" else ch).encode("utf-8"))
+          i += 1
+      return out.decode("utf-8")
+
+
+  def subnet_info(cidr):
+      """Return (network, netmask, broadcast, usable_hosts) as three dotted quads and an integer."""
+      text, prefix = cidr.split("/")
+      p = int(prefix)
+      mask = (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF
+      network = ip_to_int(text) & mask
+      broadcast = network | (~mask & 0xFFFFFFFF)
+      usable = 1 if p == 32 else 2 if p == 31 else 2 ** (32 - p) - 2
+      return int_to_ip(network), int_to_ip(mask), int_to_ip(broadcast), usable
+
+
+  def lookup(table, ip):
+      """table is a list of (cidr, next_hop). Return the next hop of the longest matching prefix, or None."""
+      best, best_len = None, -1
+      addr = ip_to_int(ip)
+      for cidr, hop in table:
+          text, prefix = cidr.split("/")
+          p = int(prefix)
+          mask = (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF
+          if p > best_len and addr & mask == ip_to_int(text) & mask:
+              best, best_len = hop, p
+      return best
+
+
+  class DnsCache:
+      def __init__(self):
+          self.entries = {}
+
+      def put(self, name, ip, ttl, now):
+          if ttl > 0:
+              self.entries[name.lower()] = ("hit", ip, now + ttl)
+          else:
+              self.entries.pop(name.lower(), None)
+
+      def put_negative(self, name, ttl, now):
+          if ttl > 0:
+              self.entries[name.lower()] = ("nxdomain", None, now + ttl)
+          else:
+              self.entries.pop(name.lower(), None)
+
+      def get(self, name, now):
+          entry = self.entries.get(name.lower())
+          if entry is not None and now >= entry[2]:
+              del self.entries[name.lower()]
+              entry = None
+          if entry is None:
+              return "miss", None
+          return entry[0], entry[1]
+
+      def remaining(self, name, now):
+          entry = self.entries.get(name.lower())
+          if entry is None or now >= entry[2]:
+              return 0
+          return entry[2] - now
+
+
+  def segment(data, mss, isn):
+      return [((isn + i) % M, data[i:i + mss]) for i in range(0, len(data), mss)]
+
+
+  def reassemble(segments, isn):
+      buffer = bytearray()
+      for seq, chunk in sorted(segments, key=lambda s: (s[0] - isn) % M):
+          offset = (seq - isn) % M
+          if offset > len(buffer):
+              break
+          buffer += chunk[len(buffer) - offset:]
+      return bytes(buffer), (isn + len(buffer)) % M
+
+
+  def parse_url(url):
+      """Return (scheme, host, port, path, query) where query maps keys to lists of decoded values."""
+      scheme, sep, rest = url.partition("://")
+      if not sep or scheme.lower() not in ("http", "https"):
+          raise ValueError("unsupported URL")
+      scheme = scheme.lower()
+      rest = rest.partition("#")[0]
+      rest, _, query_text = rest.partition("?")
+      hostport, slash, path = rest.partition("/")
+      path = "/" + path if slash else "/"
+      host, colon, port_text = hostport.partition(":")
+      if not host:
+          raise ValueError("empty host")
+      if colon:
+          if not (port_text.isascii() and port_text.isdigit()) or not 1 <= int(port_text) <= 65535:
+              raise ValueError("bad port")
+          port = int(port_text)
+      else:
+          port = 80 if scheme == "http" else 443
+      query = {}
+      for pair in query_text.split("&"):
+          if pair:
+              key, _, value = pair.partition("=")
+              query.setdefault(percent_decode(key, True), []).append(percent_decode(value, True))
+      return scheme, host.lower(), port, path, query
+
+
+  def process(text):
+      table, records, cache, now, out = [], {}, DnsCache(), 0, []
+      for line in text.splitlines():
+          line = line.strip()
+          if not line or line.startswith("#"):
+              continue
+          parts = line.split()
+          cmd = parts[0]
+          if cmd == "route":
+              table.append((parts[1], parts[2]))
+          elif cmd == "record":
+              records[parts[1].lower()] = (parts[2], int(parts[3]))
+          elif cmd == "at":
+              now = int(parts[1])
+          elif cmd == "subnet":
+              network, mask, broadcast, usable = subnet_info(parts[1])
+              prefix = parts[1].split("/")[1]
+              out.append(f"Subnet {network}/{prefix}: mask {mask}, broadcast {broadcast}, {usable} usable hosts")
+          elif cmd == "forward":
+              hop = lookup(table, parts[1])
+              out.append(f"{parts[1]} -> {hop if hop is not None else 'no route'}")
+          elif cmd == "dns":
+              name = parts[1].lower()
+              status, value = cache.get(name, now)
+              if status == "hit":
+                  out.append(f"t={now} {name} -> {value} (cached, {cache.remaining(name, now)}s left)")
+              elif status == "nxdomain":
+                  out.append(f"t={now} {name} -> NXDOMAIN (cached, {cache.remaining(name, now)}s left)")
+              elif name in records:
+                  ip, ttl = records[name]
+                  cache.put(name, ip, ttl, now)
+                  out.append(f"t={now} {name} -> {ip} (looked up, ttl {ttl})")
+              else:
+                  cache.put_negative(name, 30, now)
+                  out.append(f"t={now} {name} -> NXDOMAIN (looked up)")
+          elif cmd == "stream":
+              isn, mss = int(parts[1]), int(parts[2])
+              order = [int(x) for x in parts[3].split(",")]
+              message = line.split(None, 4)[4]
+              segs = segment(message.encode(), mss, isn)
+              data, nxt = reassemble([segs[i] for i in order], isn)
+              status = "complete" if len(data) == len(message.encode()) else "incomplete"
+              out.append(f"Stream: {data.decode()!r} {status}, next seq {nxt}")
+          elif cmd == "url":
+              try:
+                  scheme, host, port, path, query = parse_url(parts[1])
+                  out.append(f"URL: {scheme} {host}:{port}{path} query={query!r}")
+              except ValueError:
+                  out.append(f"Bad URL: {parts[1]}")
+      return out
+
+
+  def main():
+      with open("network.txt") as f:
+          for line in process(f.read()):
+              print(line)
+
+
+  main()
+stretch:
+- Add a `subnets CIDR NEWPREFIX` command that lists how a network splits into longer-prefix blocks (Lesson 11.2).
+- Make `dns` follow CNAME records (`alias NAME TARGET`) and give up after eight steps (Lesson 11.6).
+- Add a `limit CAPACITY RATE` command and a `request` command that applies a token-bucket rate limiter at the current time (Lesson 11.8).
+- Add a `bad` option to `stream` that corrupts one segment and use the internet checksum (Lesson 11.1) to detect and drop it.
+- Print the TCP handshake and teardown for a `connect` command using the segment numbers from Lesson 11.4.

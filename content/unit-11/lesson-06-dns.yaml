@@ -1,0 +1,980 @@
+id: u11-dns
+title: "DNS: The Internet's Phone Book"
+minutes: 60
+objective: |
+  Learn how a name like `www.example.com` becomes an IP address. See the hierarchy of name servers, how a recursive resolver walks it, how caching with time-to-live makes the system fast, what the common record types mean, and how a DNS message is laid out in bytes.
+outcomes:
+  - Explain the structure of a domain name and the root / TLD / authoritative hierarchy
+  - Trace an iterative resolution, including delegations and CNAME aliases
+  - Explain caching, TTL and negative caching, and their effect on latency and on changes
+  - Name the main record types (A, AAAA, CNAME, NS, MX, TXT, PTR) and what each is for
+  - Encode and decode DNS names and build and parse a DNS query in wire format
+  - Describe the main DNS security problems and defences
+
+sections:
+  - heading: Why names?
+    body: |
+      Computers route by IP address, but people remember names. And names carry a second benefit: they can stay the same while the address changes. A website can move to a new server, or be spread over a hundred servers around the world, and its name stays `example.com`. The **Domain Name System (DNS)** is the global, distributed database that maps names to the information needed to reach them, mostly IP addresses.
+
+      A single file listing every name could not work for a billion names, and in the early internet it nearly did (a file called `HOSTS.TXT` was copied around by hand). DNS replaced it in 1983 with a design that scales: the database is split into **zones**, each managed by whoever owns that part of the name space, and queries are answered by a hierarchy of servers with heavy **caching**. DNS is one of the internet's most-used services: almost every connection begins with a lookup.
+
+  - heading: Names and the hierarchy
+    body: |
+      A domain name is a list of **labels** separated by dots, read from **right to left** from the most general to the most specific. In `www.example.com`:
+
+      - `com` is the **top-level domain (TLD)**,
+      - `example` is a **second-level** name that someone registered under `com`,
+      - `www` is a host name chosen by the owner of `example.com`.
+
+      The full form ends with a dot, `www.example.com.`, where the final empty label stands for the **root** of the tree. Each label is 1 to 63 characters of letters, digits and hyphens (not starting or ending with a hyphen), and the whole name is at most 253 characters. Names are **case-insensitive**: `Example.COM` is `example.com`.
+
+      The name tree is mirrored by a tree of servers, and each level delegates authority to the next:
+
+      1. The **root servers** (13 named addresses, each replicated at hundreds of sites) know only who runs each TLD: "for anything under `com`, ask these servers".
+      2. The **TLD servers** (`com`, `org`, `uk`, ...) know who runs each registered name beneath them: "for `example.com`, ask `ns1.example.com`".
+      3. The **authoritative servers** of a domain hold its actual records and give the final answers.
+
+      A pointer from one level to the next is a **delegation**, stored as an **NS** record. The owner of a zone can create subdomains freely (`mail.example.com`, `a.b.c.example.com`) without asking anyone.
+
+  - heading: How a lookup works
+    body: |
+      Your program calls a library function such as `getaddrinfo`. This **stub resolver** is deliberately simple: it asks one **recursive resolver** (usually run by your ISP, your company, or a public service) and waits for the answer. The recursive resolver does the work:
+
+      1. It asks a **root server**: "who knows `www.example.com`?" The root replies with a **referral**: the servers for `com`.
+      2. It asks a `com` server, which replies with a referral to the servers for `example.com`.
+      3. It asks one of those authoritative servers, which answers: `www.example.com` is `93.184.216.34`.
+      4. It returns the answer to the stub resolver and **remembers** all of it.
+
+      Asking one server after another and following referrals is **iterative** resolution. The stub's request to the recursive resolver ("do it all for me") is a **recursive** query. Queries are normally sent in a single **UDP** datagram to port 53 (Lesson 11.4); if the answer is too large, or for zone transfers, DNS switches to TCP.
+
+      A name can also be an **alias**: a **CNAME** record says "`blog.example.com` is really `www.example.com`". The resolver restarts the search with the canonical name. A CNAME may chain, but not loop.
+
+  - heading: Caching and TTL
+    body: |
+      If every lookup went to the root, the root servers would melt. Instead every record in an answer carries a **TTL** (time to live): the number of seconds the answer may be reused. Resolvers (and your operating system, and your browser) keep answers in a **cache** until the TTL runs out. Popular names are answered instantly from memory; the root servers are asked only rarely, because the referral to `com` stays cached for a day or two.
+
+      The TTL is a trade-off made by the domain's owner:
+
+      - A **long** TTL (a day) means fewer queries and faster lookups, but changes are slow to take effect: after moving a website to a new server, some visitors keep going to the old address until their cached copy expires.
+      - A **short** TTL (a minute) allows quick changes and fast failover but increases load and latency. Operators lower the TTL a day before a planned migration.
+
+      Resolvers also cache **negative** answers. A reply of **NXDOMAIN** ("that name does not exist") is cached too, for a time given by the zone, so repeated lookups of a mistyped name do not hammer the servers.
+
+  - heading: Record types
+    body: |
+      A zone is a set of **resource records**, each with a name, a type, a TTL and a value:
+
+      | Type | Value | Used for |
+      |---|---|---|
+      | **A** | an IPv4 address | the address of a host |
+      | **AAAA** | an IPv6 address | the same, for IPv6 |
+      | **CNAME** | another name | alias |
+      | **NS** | a name server's name | delegation: who is responsible for the zone |
+      | **MX** | a preference number and a mail server name | where to deliver email for the domain; **lower preference is tried first** |
+      | **TXT** | free text | verification and email policy (SPF, DKIM) |
+      | **PTR** | a name | **reverse lookup**: address to name, stored under `4.3.2.1.in-addr.arpa` for the address `1.2.3.4` (digits reversed) |
+
+      One name can have several records of the same type. Returning several A records and rotating their order (**round-robin DNS**) crudely spreads load over several servers, and content delivery networks answer with the address of a server **near the asker**, using the resolver's location.
+
+  - heading: DNS messages in bytes
+    body: |
+      A DNS message, query or reply, starts with a **12-byte header** of six 16-bit big-endian fields:
+
+      | Field | Meaning |
+      |---|---|
+      | ID | chosen by the client; the reply carries the same ID |
+      | Flags | the top bit is 0 for a query and 1 for a response; also opcode, "recursion desired" (`0x0100`), response code (0 = OK, 3 = NXDOMAIN), ... |
+      | QDCOUNT | number of questions |
+      | ANCOUNT, NSCOUNT, ARCOUNT | number of answer, authority and additional records |
+
+      After the header come the **question** (name, type, class) and the records. Types are numbers: A = 1, NS = 2, CNAME = 5, MX = 15, TXT = 16, AAAA = 28. Class 1 is "Internet".
+
+      A name is encoded as a sequence of **length-prefixed labels** ending with a zero byte: `www.example.com` becomes `03 77 77 77 07 65 78 61 6d 70 6c 65 03 63 6f 6d 00`. Replies repeat names a lot, so DNS offers **compression**: a length byte whose top two bits are `11` is a **pointer**. The remaining 14 bits give an offset elsewhere in the message where the rest of the name can be found. Decoding must follow pointers carefully, and reject pointers that form a loop.
+
+  - heading: Security
+    body: |
+      Plain DNS has no authentication, so a forged reply that reaches the resolver first, carrying the right ID, is accepted: **cache poisoning**. A poisoned cache sends every user of that resolver to an attacker's server. Defences are random IDs and random source ports (so the attacker must guess about 32 bits), and **DNSSEC**, which signs records with public-key cryptography (Unit 16) so that a resolver can verify an answer really came from the zone's owner. DNS queries are also visible to anyone on the path, so **DNS over HTTPS (DoH)** and **DNS over TLS** encrypt them. Finally, DNS is used in attacks: a small spoofed query can trigger a large reply aimed at a victim (**amplification**), and when a major DNS provider was attacked in 2016, large parts of the web became unreachable though their servers were fine.
+
+examples:
+  - title: The parts of a name
+    intro: "Split on dots; reading from the right gives the path down the hierarchy."
+    code: |
+      def hierarchy(name):
+          labels = name.lower().rstrip(".").split(".")
+          return [".".join(labels[i:]) for i in range(len(labels) - 1, -1, -1)]
+
+
+      for name in ("www.example.com", "Mail.Example.CO.UK.", "localhost"):
+          print(name)
+          for step, zone in enumerate(hierarchy(name), start=1):
+              print(f"   {step}. ask the servers for  {zone or '(root)'}")
+
+      name = "www.example.com"
+      print(len(name), "characters,", len(name.split(".")), "labels, longest label", max(map(len, name.split("."))))
+    output: |
+      www.example.com
+         1. ask the servers for  com
+         2. ask the servers for  example.com
+         3. ask the servers for  www.example.com
+      Mail.Example.CO.UK.
+         1. ask the servers for  uk
+         2. ask the servers for  co.uk
+         3. ask the servers for  example.co.uk
+         4. ask the servers for  mail.example.co.uk
+      localhost
+         1. ask the servers for  localhost
+      15 characters, 3 labels, longest label 7
+    lines:
+      - line: 2
+        note: "Lower-case it (names are case-insensitive), drop the trailing root dot, and split into labels."
+      - line: 3
+        note: "Starting from the rightmost label, build each longer suffix: com, example.com, www.example.com."
+  - title: Following the referrals
+    intro: "Each simulated server either has the record, or points to the next server for a longer suffix of the name. A CNAME restarts the search."
+    code: |
+      SERVERS = {
+          "root": {"delegations": {"com": "tld-com", "org": "tld-org"}, "records": {}},
+          "tld-com": {"delegations": {"example.com": "ns-example"}, "records": {}},
+          "tld-org": {"delegations": {}, "records": {}},
+          "ns-example": {"delegations": {}, "records": {
+              ("www.example.com", "A"): "93.184.216.34",
+              ("mail.example.com", "A"): "93.184.216.40",
+              ("blog.example.com", "CNAME"): "www.example.com",
+              ("example.com", "MX"): "mail.example.com",
+          }},
+      }
+
+
+      def resolve(name, rtype):
+          path, name = [], name.lower()
+          for _ in range(8):                                   # at most 8 CNAME restarts
+              server = "root"
+              while True:
+                  path.append(server)
+                  data = SERVERS[server]
+                  if (name, rtype) in data["records"]:
+                      return data["records"][(name, rtype)], path
+                  if (name, "CNAME") in data["records"]:
+                      name = data["records"][(name, "CNAME")]
+                      break
+                  matches = [z for z in data["delegations"] if name == z or name.endswith("." + z)]
+                  if not matches:
+                      return None, path
+                  server = data["delegations"][max(matches, key=len)]
+          raise ValueError("too many aliases")
+
+
+      for name, rtype in (("www.example.com", "A"), ("blog.example.com", "A"), ("example.com", "MX"), ("nothing.example.com", "A"), ("site.org", "A")):
+          answer, path = resolve(name, rtype)
+          print(f"{name:20} {rtype:3} -> {answer}   via {' > '.join(path)}")
+    output: |
+      www.example.com      A   -> 93.184.216.34   via root > tld-com > ns-example
+      blog.example.com     A   -> 93.184.216.34   via root > tld-com > ns-example > root > tld-com > ns-example
+      example.com          MX  -> mail.example.com   via root > tld-com > ns-example
+      nothing.example.com  A   -> None   via root > tld-com > ns-example
+      site.org             A   -> None   via root > tld-org
+    lines:
+      - line: 17
+        note: "Every resolution starts at the root, unless an earlier answer is in the cache."
+      - line: 20
+        note: "A server with the record answers directly (it is authoritative)."
+      - line: 22
+        note: "A CNAME gives a new name; start the whole walk again with it."
+      - line: 25
+        note: "Otherwise find the delegation for the longest matching suffix and ask that server next."
+      - line: 26
+        note: "No delegation and no record means the name does not exist (NXDOMAIN)."
+  - title: A query in bytes
+    intro: "A 12-byte header, then the question. The name is length-prefixed labels ending in zero."
+    code: |
+      import struct
+
+
+      def encode_name(name):
+          out = b""
+          for label in name.rstrip(".").split("."):
+              out += bytes([len(label)]) + label.encode("ascii")
+          return out + b"\x00"
+
+
+      query = struct.pack(">HHHHHH", 0xBEEF, 0x0100, 1, 0, 0, 0) + encode_name("www.example.com") + struct.pack(">HH", 1, 1)
+      print(len(query), "bytes")
+      print(query.hex(" "))
+      print("header  :", query[:12].hex(" "))
+      print("name    :", query[12:29])
+      print("type A=1, class IN=1:", query[29:].hex(" "))
+    output: |
+      33 bytes
+      be ef 01 00 00 01 00 00 00 00 00 00 03 77 77 77 07 65 78 61 6d 70 6c 65 03 63 6f 6d 00 00 01 00 01
+      header  : be ef 01 00 00 01 00 00 00 00 00 00
+      name    : b'\x03www\x07example\x03com\x00'
+      type A=1, class IN=1: 00 01 00 01
+    lines:
+      - line: 11
+        note: "ID 0xBEEF, flags 0x0100 (recursion desired), one question, and no answers yet."
+      - line: 15
+        note: "Each label is a length byte followed by the characters, and a zero byte ends the name."
+  - title: Name compression
+    intro: "A pointer starts with the bits 11. It says: continue reading the name from this offset."
+    code: |
+      def decode_name(data, offset):
+          labels, next_offset, jumps = [], None, 0
+          while True:
+              length = data[offset]
+              if length == 0:
+                  offset += 1
+                  break
+              if length & 0xC0 == 0xC0:
+                  pointer = ((length & 0x3F) << 8) | data[offset + 1]
+                  if next_offset is None:
+                      next_offset = offset + 2
+                  offset = pointer
+                  jumps += 1
+                  if jumps > 10:
+                      raise ValueError("pointer loop")
+                  continue
+              labels.append(data[offset + 1:offset + 1 + length].decode("ascii"))
+              offset += 1 + length
+          return ".".join(labels), (next_offset if next_offset is not None else offset)
+
+
+      message = b"\x07example\x03com\x00" + b"\x03www\xc0\x00" + b"\x04mail\xc0\x08"
+      #           offset 0 ........ 12        offset 13 ... 18      offset 19 ... 25
+      print(decode_name(message, 0))
+      print(decode_name(message, 13))
+      print(decode_name(message, 19))
+    output: |
+      ('example.com', 13)
+      ('www.example.com', 19)
+      ('mail.com', 26)
+    lines:
+      - line: 7
+        note: "The two top bits set mean the next 14 bits are an offset, not a label length."
+      - line: 9
+        note: "After a jump, the name's bytes in the original place end after the 2-byte pointer."
+      - line: 13
+        note: "Limit the jumps: a malicious message can make pointers loop forever."
+      - line: 20
+        note: "`www.example.com` is stored as the label `www` plus a pointer to `example.com` at offset 0."
+      - line: 21
+        note: "`mail` followed by a pointer to offset 8, the `com` label."
+  - title: A cache with time-to-live
+    intro: "Answers are reused until they expire. Time is passed in explicitly so the behaviour is easy to follow."
+    code: |
+      cache = {}
+      lookups = 0
+
+
+      def lookup(name, now, ttl=60):
+          global lookups
+          entry = cache.get(name)
+          if entry and now < entry[1]:
+              return f"cache hit ({entry[1] - now}s left)"
+          lookups += 1                                    # go to the authoritative server
+          cache[name] = ("203.0.113.7", now + ttl)
+          return "network lookup"
+
+
+      for t in (0, 10, 59, 60, 61, 125, 200):
+          print(f"t={t:>3}s  {lookup('example.com', t)}")
+      print("queries that reached the authoritative server:", lookups)
+    output: |
+      t=  0s  network lookup
+      t= 10s  cache hit (50s left)
+      t= 59s  cache hit (1s left)
+      t= 60s  network lookup
+      t= 61s  cache hit (59s left)
+      t=125s  network lookup
+      t=200s  network lookup
+      queries that reached the authoritative server: 4
+    lines:
+      - line: 7
+        note: "An entry is valid while the current time is before its expiry."
+      - line: 10
+        note: "At exactly t = 60 the entry has expired, so the resolver asks again."
+      - line: 15
+        note: "Seven lookups cost only four trips to the server. A longer TTL would save more."
+
+playground:
+  prompt: |
+    Add a new record to `SERVERS`, for example `shop.example.com` as a CNAME to `www.example.com`, and resolve it. Then change the TTL in the cache example to 30 and count the network lookups again.
+  code: |
+    name = "www.example.com"
+    print(name.split("."))
+    print(".".join(reversed(name.split("."))))
+
+exercises:
+  - id: hostnames
+    title: Valid names and the hierarchy
+    difficulty: 2
+    prompt: |
+      Write `valid_name(name)` returning `True` for a valid domain name. A trailing dot (the root) is allowed and ignored. After removing it the name must be 1 to 253 characters, made of dot-separated labels, each 1 to 63 characters long, containing only ASCII letters, digits and hyphens, and neither starting nor ending with a hyphen. Letters may be either case. The empty string and a lone `"."` are **not** valid. Write `hierarchy(name)` returning the list of zones to query, from the most general to the most specific, lower-cased and without a trailing dot: `hierarchy("www.Example.com.")` is `["com", "example.com", "www.example.com"]`. Raise `ValueError` if the name is not valid. Write `same_name(a, b)` which is `True` when two names are the same ignoring case and an optional trailing dot (and both are valid).
+    starter: |
+      def valid_name(name):
+          pass
+
+
+      def hierarchy(name):
+          pass
+
+
+      def same_name(a, b):
+          pass
+    tests:
+      - name: valid and invalid
+        code: |
+          for good in ("example.com", "www.example.com.", "a", "A-b.c-D", "x" * 63 + ".com", "1.2.3.4", "xn--bcher-kva.example"):
+              assert valid_name(good) is True, good
+          long_ok = ".".join(["a" * 63] * 3 + ["b" * 61])
+          assert len(long_ok) == 253 and valid_name(long_ok) is True
+          for bad in ("", ".", "..", "a..b", ".com", "-a.com", "a-.com", "a_b.com", "x" * 64 + ".com", "exa mple.com", "é.com", long_ok + "c", "a.b.", "a.b..", "a.-b"):
+              if bad == "a.b.":
+                  assert valid_name(bad) is True
+              else:
+                  assert valid_name(bad) is False, bad
+      - name: hierarchy
+        code: |
+          assert hierarchy("www.Example.com.") == ["com", "example.com", "www.example.com"]
+          assert hierarchy("localhost") == ["localhost"]
+          assert hierarchy("a.b.c.d") == ["d", "c.d", "b.c.d", "a.b.c.d"]
+          try:
+              hierarchy("bad..name")
+              assert False
+          except ValueError:
+              pass
+      - name: same_name
+        code: |
+          assert same_name("Example.COM", "example.com.") is True
+          assert same_name("example.com", "example.org") is False
+          assert same_name("a.example.com", "example.com") is False
+          assert same_name("bad..name", "bad..name") is False
+          assert same_name("", "") is False
+    hints:
+      - "Strip one trailing dot with `if name.endswith('.'): name = name[:-1]`, then the empty string is invalid."
+      - "Check each label with a small helper: length 1 to 63, not starting or ending with `-`, and every character in `string.ascii_letters + string.digits + '-'` (use a set, not `isalnum`, which accepts non-ASCII letters)."
+      - "`hierarchy`: lower-case, strip the dot, split, then `'.'.join(labels[i:])` for `i` from the last label back to 0."
+    solution: |
+      ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+
+
+      def valid_name(name):
+          if name.endswith("."):
+              name = name[:-1]
+          if not name or len(name) > 253:
+              return False
+          for label in name.split("."):
+              if not 1 <= len(label) <= 63:
+                  return False
+              if label[0] == "-" or label[-1] == "-":
+                  return False
+              if any(ch not in ALLOWED for ch in label):
+                  return False
+          return True
+
+
+      def hierarchy(name):
+          if not valid_name(name):
+              raise ValueError("invalid domain name")
+          labels = name.lower().rstrip(".").split(".")
+          return [".".join(labels[i:]) for i in range(len(labels) - 1, -1, -1)]
+
+
+      def same_name(a, b):
+          if not (valid_name(a) and valid_name(b)):
+              return False
+          return a.lower().rstrip(".") == b.lower().rstrip(".")
+    explanation: |
+      Real validators are stricter or looser depending on context. Hostnames follow the letter-digit-hyphen rule used here, while DNS itself allows nearly any bytes in a label. International names such as `bücher.example` are sent as ASCII using the `xn--` "punycode" encoding, which is why the first test accepts `xn--bcher-kva.example` but rejects `é.com`.
+
+  - id: wire-names
+    title: DNS names on the wire
+    difficulty: 4
+    prompt: |
+      Write `encode_name(name)` returning the DNS wire encoding: for each label a length byte followed by its ASCII bytes, then a zero byte. A trailing dot is ignored, and `""` or `"."` encode the root as `b"\x00"`. Raise `ValueError` for an empty label (like `"a..b"`) or a label longer than 63 bytes. Write `decode_name(data, offset)` returning `(name, next_offset)` where `name` has labels joined by dots (no trailing dot, `""` for the root) and `next_offset` is the offset just after the name **in its original position**, i.e. after the terminating zero byte, or after the 2-byte pointer if the name ended with a compression pointer. A length byte with the top two bits `11` is a pointer to the 14-bit offset formed with the next byte. Raise `ValueError` for a pointer loop (follow at most 20 pointers), a pointer or label that runs past the end of `data`, or a length byte whose top two bits are `01` or `10`.
+    starter: |
+      def encode_name(name):
+          pass
+
+
+      def decode_name(data, offset):
+          pass
+    tests:
+      - name: encode
+        code: |
+          assert encode_name("www.example.com") == b"\x03www\x07example\x03com\x00"
+          assert encode_name("example.com.") == b"\x07example\x03com\x00"
+          assert encode_name("") == b"\x00" and encode_name(".") == b"\x00"
+          for bad in ("a..b", "x" * 64 + ".com", ".a"):
+              try:
+                  encode_name(bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+          assert encode_name("x" * 63) == bytes([63]) + b"x" * 63 + b"\x00"
+      - name: decode
+        code: |
+          data = b"\x07example\x03com\x00"
+          assert decode_name(data, 0) == ("example.com", 13)
+          assert decode_name(b"\x00", 0) == ("", 1)
+          assert decode_name(b"xx" + data, 2) == ("example.com", 15)
+      - name: compression
+        code: |
+          message = b"\x07example\x03com\x00" + b"\x03www\xc0\x00" + b"\x04mail\xc0\x08" + b"\xc0\x00"
+          assert decode_name(message, 13) == ("www.example.com", 19)
+          assert decode_name(message, 19) == ("mail.com", 26)
+          assert decode_name(message, 26) == ("example.com", 28)
+      - name: malformed
+        code: |
+          bad_messages = [
+              (b"\xc0\x00", 0),                       # pointer to itself
+              (b"\x01a\xc0\x00", 0),                  # loops back through a label
+              (b"\x05ab", 0),                         # label runs off the end
+              (b"\x03abc", 0),                        # no terminating zero
+              (b"\xc0", 0),                           # truncated pointer
+              (b"\xc0\x40", 0),                       # points past the end
+              (b"\x40abc\x00", 0),                    # reserved label type 01
+              (b"\x80abc\x00", 0),                    # reserved label type 10
+          ]
+          for data, off in bad_messages:
+              try:
+                  decode_name(data, off)
+                  assert False, data
+              except ValueError:
+                  pass
+      - name: round trip
+        code: |
+          import random
+          rng = random.Random(16)
+          for _ in range(100):
+              labels = ["".join(rng.choice("abcxyz09-") for _ in range(rng.randint(1, 12))) for _ in range(rng.randint(1, 5))]
+              name = ".".join(labels)
+              enc = encode_name(name)
+              assert decode_name(enc, 0) == (name, len(enc))
+    hints:
+      - "`encode_name`: `bytes([len(label)]) + label.encode('ascii')` for each label, then `b'\\x00'`."
+      - "`decode_name`: loop reading `length = data[offset]`. Catch `IndexError` and re-raise as `ValueError`, or check bounds yourself."
+      - "`length & 0xC0 == 0xC0` is a pointer: `((length & 0x3F) << 8) | data[offset + 1]`. Remember the `next_offset` the first time you jump."
+      - "`length & 0xC0` equal to `0x40` or `0x80` is invalid. Count jumps and raise after 20."
+    solution: |
+      def encode_name(name):
+          name = name.rstrip(".") if name != "." else ""
+          if name == "":
+              return b"\x00"
+          out = b""
+          for label in name.split("."):
+              if not 1 <= len(label) <= 63:
+                  raise ValueError("bad label length")
+              out += bytes([len(label)]) + label.encode("ascii")
+          return out + b"\x00"
+
+
+      def decode_name(data, offset):
+          labels = []
+          next_offset = None
+          jumps = 0
+          try:
+              while True:
+                  length = data[offset]
+                  if length == 0:
+                      offset += 1
+                      break
+                  kind = length & 0xC0
+                  if kind == 0xC0:
+                      pointer = ((length & 0x3F) << 8) | data[offset + 1]
+                      if next_offset is None:
+                          next_offset = offset + 2
+                      jumps += 1
+                      if jumps > 20:
+                          raise ValueError("pointer loop")
+                      if pointer >= len(data):
+                          raise ValueError("pointer past the end")
+                      offset = pointer
+                  elif kind != 0:
+                      raise ValueError("reserved label type")
+                  else:
+                      chunk = data[offset + 1:offset + 1 + length]
+                      if len(chunk) != length:
+                          raise ValueError("label runs past the end")
+                      labels.append(chunk.decode("ascii"))
+                      offset += 1 + length
+          except IndexError:
+              raise ValueError("truncated name")
+          return ".".join(labels), (next_offset if next_offset is not None else offset)
+    explanation: |
+      Name decompression is a classic source of vulnerabilities: a pointer that points to itself would make a naive decoder spin forever, and a label length that runs past the end of the buffer would read other memory in a C implementation. Every field of a message from the network must be checked before it is trusted.
+
+  - id: query
+    title: Building and reading a DNS query
+    difficulty: 3
+    prompt: |
+      The helpers `encode_name` and `decode_name` are given in the starter. Write `build_query(query_id, name, qtype)` returning the bytes of a DNS query with one question: the 12-byte header (the ID, flags `0x0100`, QDCOUNT 1 and the other three counts 0), the encoded name, then the type number and class 1 (IN), each 16-bit big-endian. `qtype` is a name such as `"A"`, `"AAAA"`, `"MX"`: use `TYPES`, and raise `ValueError` for an unknown type name or an ID outside 0 to 65535. Write `parse_query(data)` returning `(query_id, name, type_name)` and raising `ValueError` if the data is shorter than the header, the QR flag (top bit of the flags) says it is a response, QDCOUNT is not 1, the question is truncated, or the class is not 1. A type number not in `TYPES` is reported as `"TYPE" + str(number)`.
+    starter: |
+      import struct
+
+      TYPES = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28}
+      NUMBERS = {v: k for k, v in TYPES.items()}
+
+
+      def encode_name(name):
+          name = name.rstrip(".")
+          if name == "":
+              return b"\x00"
+          out = b""
+          for label in name.split("."):
+              if not 1 <= len(label) <= 63:
+                  raise ValueError("bad label length")
+              out += bytes([len(label)]) + label.encode("ascii")
+          return out + b"\x00"
+
+
+      def decode_name(data, offset):
+          labels = []
+          while True:
+              if offset >= len(data):
+                  raise ValueError("truncated name")
+              length = data[offset]
+              if length == 0:
+                  return ".".join(labels), offset + 1
+              if length & 0xC0:
+                  raise ValueError("compression not expected in a query")
+              chunk = data[offset + 1:offset + 1 + length]
+              if len(chunk) != length:
+                  raise ValueError("truncated label")
+              labels.append(chunk.decode("ascii"))
+              offset += 1 + length
+
+
+      def build_query(query_id, name, qtype):
+          pass
+
+
+      def parse_query(data):
+          pass
+    tests:
+      - name: build
+        code: |
+          q = build_query(0xBEEF, "www.example.com", "A")
+          assert q == bytes.fromhex("beef 0100 0001 0000 0000 0000") + b"\x03www\x07example\x03com\x00" + bytes.fromhex("0001 0001")
+          assert len(q) == 33
+          q2 = build_query(1, "example.com.", "MX")
+          assert q2[:2] == b"\x00\x01" and q2[-4:] == bytes.fromhex("000f 0001")
+          assert build_query(0, "x.y", "AAAA")[-4:-2] == b"\x00\x1c"
+      - name: parse
+        code: |
+          q = build_query(0xBEEF, "www.example.com", "A")
+          assert parse_query(q) == (0xBEEF, "www.example.com", "A")
+          assert parse_query(build_query(65535, "a.b", "TXT")) == (65535, "a.b", "TXT")
+          odd = bytes.fromhex("0007 0100 0001 0000 0000 0000") + b"\x01a\x00" + bytes.fromhex("0063 0001")
+          assert parse_query(odd) == (7, "a", "TYPE99")
+      - name: errors
+        code: |
+          good = build_query(5, "a.com", "A")
+          for call in (lambda: build_query(70000, "a.com", "A"), lambda: build_query(-1, "a.com", "A"), lambda: build_query(1, "a.com", "WAT")):
+              try:
+                  call()
+                  assert False
+              except ValueError:
+                  pass
+          response = bytes([good[0], good[1], 0x81, 0x80]) + good[4:]
+          two_questions = good[:4] + b"\x00\x02" + good[6:]
+          wrong_class = good[:-2] + b"\x00\x03"
+          for bad in (b"", good[:11], response, two_questions, good[:-3], wrong_class):
+              try:
+                  parse_query(bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+    hints:
+      - "`struct.pack('>HHHHHH', query_id, 0x0100, 1, 0, 0, 0)` is the header."
+      - "After the name come `struct.pack('>HH', TYPES[qtype], 1)`."
+      - "`parse_query`: unpack the first 12 bytes, test `flags & 0x8000`, call `decode_name(data, 12)`, then unpack 4 bytes from the returned offset (check there are 4)."
+    solution: |
+      import struct
+
+      TYPES = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28}
+      NUMBERS = {v: k for k, v in TYPES.items()}
+
+
+      def encode_name(name):
+          name = name.rstrip(".")
+          if name == "":
+              return b"\x00"
+          out = b""
+          for label in name.split("."):
+              if not 1 <= len(label) <= 63:
+                  raise ValueError("bad label length")
+              out += bytes([len(label)]) + label.encode("ascii")
+          return out + b"\x00"
+
+
+      def decode_name(data, offset):
+          labels = []
+          while True:
+              if offset >= len(data):
+                  raise ValueError("truncated name")
+              length = data[offset]
+              if length == 0:
+                  return ".".join(labels), offset + 1
+              if length & 0xC0:
+                  raise ValueError("compression not expected in a query")
+              chunk = data[offset + 1:offset + 1 + length]
+              if len(chunk) != length:
+                  raise ValueError("truncated label")
+              labels.append(chunk.decode("ascii"))
+              offset += 1 + length
+
+
+      def build_query(query_id, name, qtype):
+          if not 0 <= query_id <= 65535:
+              raise ValueError("bad id")
+          if qtype not in TYPES:
+              raise ValueError("unknown type")
+          header = struct.pack(">HHHHHH", query_id, 0x0100, 1, 0, 0, 0)
+          return header + encode_name(name) + struct.pack(">HH", TYPES[qtype], 1)
+
+
+      def parse_query(data):
+          if len(data) < 12:
+              raise ValueError("too short")
+          query_id, flags, qdcount, _, _, _ = struct.unpack(">HHHHHH", data[:12])
+          if flags & 0x8000:
+              raise ValueError("this is a response")
+          if qdcount != 1:
+              raise ValueError("expected one question")
+          name, offset = decode_name(data, 12)
+          if len(data) < offset + 4:
+              raise ValueError("truncated question")
+          qtype, qclass = struct.unpack(">HH", data[offset:offset + 4])
+          if qclass != 1:
+              raise ValueError("not class IN")
+          return query_id, name, NUMBERS.get(qtype, "TYPE" + str(qtype))
+    explanation: |
+      Tools like `dig` and `nslookup` do exactly this, then print the reply. Build a query by hand, send it in a UDP datagram to port 53 of a resolver (Lesson 11.8 shows how sockets do that), and you have written your own DNS client. Parsing requires the same defensive checks as the previous exercise: lengths, counts and types all come from the network.
+
+  - id: dns-cache
+    title: A DNS cache
+    difficulty: 4
+    prompt: |
+      Write the class `DnsCache`. Time is always passed in as a number of seconds (`now`), not read from a clock. `put(name, rtype, value, ttl, now)` stores a record; names are case-insensitive and ignore a trailing dot, and types are case-insensitive. A record is valid while `now < now_when_stored + ttl`; a `ttl` of 0 (or less) stores nothing (and removes any existing entry for that key). `put_negative(name, rtype, ttl, now)` stores an NXDOMAIN answer the same way. `get(name, rtype, now)` returns `("hit", value)` for a valid record, `("nxdomain", None)` for a valid negative entry, and `("miss", None)` otherwise (expired entries are deleted when they are found). `remaining(name, rtype, now)` returns the whole seconds of life left, or 0. `stats()` returns `(hits, misses)`, where a `get` that returns `"hit"` or `"nxdomain"` counts as a hit and `"miss"` as a miss. A new `put` replaces the previous entry for the same key.
+    starter: |
+      class DnsCache:
+          def __init__(self):
+              pass
+
+          def put(self, name, rtype, value, ttl, now):
+              pass
+
+          def put_negative(self, name, rtype, ttl, now):
+              pass
+
+          def get(self, name, rtype, now):
+              pass
+
+          def remaining(self, name, rtype, now):
+              pass
+
+          def stats(self):
+              pass
+    tests:
+      - name: hits and expiry
+        code: |
+          c = DnsCache()
+          c.put("Example.com.", "a", "1.2.3.4", 60, 100)
+          assert c.get("example.com", "A", 100) == ("hit", "1.2.3.4")
+          assert c.get("EXAMPLE.COM", "a", 159) == ("hit", "1.2.3.4")
+          assert c.get("example.com", "A", 160) == ("miss", None)
+          assert c.get("example.com", "A", 161) == ("miss", None)
+          assert c.get("other.com", "A", 100) == ("miss", None)
+          assert c.get("example.com", "AAAA", 100) == ("miss", None)
+      - name: remaining ttl
+        code: |
+          c = DnsCache()
+          c.put("a.com", "A", "x", 60, 0)
+          assert c.remaining("a.com", "A", 0) == 60
+          assert c.remaining("a.com", "A", 10) == 50
+          assert c.remaining("a.com", "A", 59) == 1
+          assert c.remaining("a.com", "A", 60) == 0
+          assert c.remaining("nope.com", "A", 0) == 0
+      - name: negative and zero ttl
+        code: |
+          c = DnsCache()
+          c.put_negative("typo.com", "A", 30, 0)
+          assert c.get("typo.com", "A", 29) == ("nxdomain", None)
+          assert c.get("typo.com", "A", 30) == ("miss", None)
+          c.put("z.com", "A", "1.1.1.1", 0, 0)
+          assert c.get("z.com", "A", 0) == ("miss", None)
+          c.put("y.com", "A", "2.2.2.2", 100, 0)
+          c.put("y.com", "A", "3.3.3.3", 0, 1)          # ttl 0 removes the old entry
+          assert c.get("y.com", "A", 2) == ("miss", None)
+      - name: replacing and statistics
+        code: |
+          c = DnsCache()
+          c.put("s.com", "A", "old", 10, 0)
+          c.put("s.com", "A", "new", 100, 5)
+          assert c.get("s.com", "A", 50) == ("hit", "new")
+          c.put_negative("s.com", "A", 5, 60)
+          assert c.get("s.com", "A", 61) == ("nxdomain", None)
+          c.put("s.com", "A", "back", 5, 70)
+          assert c.get("s.com", "A", 71) == ("hit", "back")
+          assert c.get("never.com", "A", 71) == ("miss", None)
+          assert c.stats() == (3, 1)
+    hints:
+      - "Keep a dictionary from `(name.lower().rstrip('.'), rtype.upper())` to `(kind, value, expires)`."
+      - "A helper `_key(name, rtype)` avoids repeating the normalisation."
+      - "In `get`, look up the entry; if `now >= expires` delete it and count a miss."
+    solution: |
+      class DnsCache:
+          def __init__(self):
+              self.entries = {}
+              self.hits = 0
+              self.misses = 0
+
+          def _key(self, name, rtype):
+              return name.lower().rstrip("."), rtype.upper()
+
+          def put(self, name, rtype, value, ttl, now):
+              key = self._key(name, rtype)
+              if ttl <= 0:
+                  self.entries.pop(key, None)
+              else:
+                  self.entries[key] = ("hit", value, now + ttl)
+
+          def put_negative(self, name, rtype, ttl, now):
+              key = self._key(name, rtype)
+              if ttl <= 0:
+                  self.entries.pop(key, None)
+              else:
+                  self.entries[key] = ("nxdomain", None, now + ttl)
+
+          def get(self, name, rtype, now):
+              key = self._key(name, rtype)
+              entry = self.entries.get(key)
+              if entry is not None and now >= entry[2]:
+                  del self.entries[key]
+                  entry = None
+              if entry is None:
+                  self.misses += 1
+                  return "miss", None
+              self.hits += 1
+              return entry[0], entry[1]
+
+          def remaining(self, name, rtype, now):
+              entry = self.entries.get(self._key(name, rtype))
+              if entry is None or now >= entry[2]:
+                  return 0
+              return int(entry[2] - now)
+
+          def stats(self):
+              return self.hits, self.misses
+    explanation: |
+      Every resolver, operating system and browser has something like this. Passing the clock in as a parameter, instead of calling `time.time()` inside, is a real-world habit too: it makes time-dependent code testable, since the test controls "now". The negative entry is why a mistyped domain is slow the first time and instant the second.
+
+  - id: resolver
+    title: An iterative resolver
+    difficulty: 4
+    prompt: |
+      A simulated hierarchy is a dictionary `servers = {server_name: {"delegations": {zone: server_name}, "records": {(name, type): value}}}`. Write `resolve(servers, name, rtype)` returning `(answer, path)`. Work in lower case. Start at the server `"root"`, append its name to `path`, and then: (1) if `(name, rtype)` is in its records, return that value; (2) otherwise if `(name, "CNAME")` is in its records, replace `name` by the target and **start again from `"root"`** (keeping the same `path` list, so it records every server visited); (3) otherwise find the delegation whose zone is the **longest** one that equals the name or is a suffix of it after a dot (`example.com` matches `www.example.com`, not `badexample.com`), continue at the server it names; (4) if there is none, return `(None, path)` (NXDOMAIN). Follow at most 8 CNAMEs; a ninth raises `ValueError`. Raise `KeyError` if a delegation names a server that is missing from `servers`. Also write `cname_chain(servers, name)` returning the list of names visited when resolving an A record (starting with `name`, and adding each CNAME target), without the path details.
+    starter: |
+      def resolve(servers, name, rtype):
+          pass
+
+
+      def cname_chain(servers, name):
+          pass
+    tests:
+      - name: the simulated internet
+        code: |
+          servers = {
+              "root": {"delegations": {"com": "tld-com", "org": "tld-org"}, "records": {}},
+              "tld-com": {"delegations": {"example.com": "ns-example", "example.com.au": "x"}, "records": {}},
+              "tld-org": {"delegations": {}, "records": {("nonprofit.org", "A"): "198.51.100.5"}},
+              "ns-example": {"delegations": {"sub.example.com": "ns-sub"}, "records": {
+                  ("www.example.com", "A"): "93.184.216.34",
+                  ("blog.example.com", "CNAME"): "www.example.com",
+                  ("shop.example.com", "CNAME"): "blog.example.com",
+                  ("example.com", "MX"): "mail.example.com",
+              }},
+              "ns-sub": {"delegations": {}, "records": {("a.sub.example.com", "A"): "10.9.9.9"}},
+          }
+          assert resolve(servers, "www.example.com", "A") == ("93.184.216.34", ["root", "tld-com", "ns-example"])
+          assert resolve(servers, "WWW.Example.COM", "A") == ("93.184.216.34", ["root", "tld-com", "ns-example"])
+          assert resolve(servers, "example.com", "MX") == ("mail.example.com", ["root", "tld-com", "ns-example"])
+          assert resolve(servers, "nonprofit.org", "A") == ("198.51.100.5", ["root", "tld-org"])
+          assert resolve(servers, "a.sub.example.com", "A") == ("10.9.9.9", ["root", "tld-com", "ns-example", "ns-sub"])
+      - name: aliases and failures
+        code: |
+          servers = {
+              "root": {"delegations": {"com": "tld"}, "records": {}},
+              "tld": {"delegations": {"example.com": "ns"}, "records": {}},
+              "ns": {"delegations": {}, "records": {
+                  ("www.example.com", "A"): "1.1.1.1",
+                  ("blog.example.com", "CNAME"): "www.example.com",
+                  ("shop.example.com", "CNAME"): "blog.example.com",
+              }},
+          }
+          path3 = ["root", "tld", "ns"]
+          assert resolve(servers, "blog.example.com", "A") == ("1.1.1.1", path3 + path3)
+          assert resolve(servers, "shop.example.com", "A") == ("1.1.1.1", path3 * 3)
+          assert resolve(servers, "nothing.example.com", "A") == (None, path3)
+          assert resolve(servers, "badexample.com", "A") == (None, ["root", "tld"])
+          assert resolve(servers, "site.net", "A") == (None, ["root"])
+          assert cname_chain(servers, "shop.example.com") == ["shop.example.com", "blog.example.com", "www.example.com"]
+          assert cname_chain(servers, "www.example.com") == ["www.example.com"]
+      - name: loops and missing servers
+        code: |
+          loop = {
+              "root": {"delegations": {"com": "ns"}, "records": {}},
+              "ns": {"delegations": {}, "records": {("a.com", "CNAME"): "b.com", ("b.com", "CNAME"): "a.com"}},
+          }
+          try:
+              resolve(loop, "a.com", "A")
+              assert False
+          except ValueError:
+              pass
+          broken = {"root": {"delegations": {"com": "gone"}, "records": {}}}
+          try:
+              resolve(broken, "x.com", "A")
+              assert False
+          except KeyError:
+              pass
+    hints:
+      - "Use two nested loops: an outer loop for CNAME restarts (at most 8 restarts) and an inner `while True` walking servers."
+      - "A name matches a zone when `name == zone or name.endswith('.' + zone)`. `max(matches, key=len)` picks the longest."
+      - "Count the CNAME restarts; if you would restart a 9th time, raise `ValueError`."
+      - "`cname_chain` can reuse your logic, or look up `(name, 'CNAME')` in every server's records."
+    solution: |
+      def resolve(servers, name, rtype):
+          name = name.lower()
+          path = []
+          restarts = 0
+          while True:
+              server = "root"
+              restarted = False
+              while True:
+                  path.append(server)
+                  data = servers[server]
+                  records = data["records"]
+                  if (name, rtype) in records:
+                      return records[(name, rtype)], path
+                  if (name, "CNAME") in records:
+                      restarts += 1
+                      if restarts > 8:
+                          raise ValueError("too many CNAMEs")
+                      name = records[(name, "CNAME")]
+                      restarted = True
+                      break
+                  matches = [z for z in data["delegations"] if name == z or name.endswith("." + z)]
+                  if not matches:
+                      return None, path
+                  server = data["delegations"][max(matches, key=len)]
+              if not restarted:
+                  return None, path
+
+
+      def cname_chain(servers, name):
+          name = name.lower()
+          chain = [name]
+          for _ in range(9):
+              target = None
+              for data in servers.values():
+                  if (name, "CNAME") in data["records"]:
+                      target = data["records"][(name, "CNAME")]
+              if target is None:
+                  return chain
+              name = target
+              chain.append(name)
+          raise ValueError("too many CNAMEs")
+    explanation: |
+      This is what happens, in miniature, behind every first visit to a website. A real recursive resolver also caches every referral and answer along the way, so the second lookup of anything under `.com` skips the root and the TLD, and this is why a mistyped CNAME loop is a classic misconfiguration that resolvers must defend against, exactly as the eight-restart limit does.
+
+commonMistakes:
+  - title: Reading a domain name left to right
+    explanation: |
+      The hierarchy is right to left: `com` is the top, `example` below it, `www` below that. Delegation follows that order.
+  - title: Forgetting that names are case-insensitive
+    explanation: |
+      `Example.COM` and `example.com` are the same name. Normalise before comparing or caching.
+  - title: Trusting a TTL change to take effect at once
+    explanation: |
+      Cached copies stay valid until their TTL runs out. Lower the TTL well before a planned change.
+  - title: Matching zones by plain text
+    explanation: |
+      `badexample.com` ends with `example.com` but is not inside that zone. Match on whole labels (a dot before the zone).
+  - title: Following compression pointers blindly
+    explanation: |
+      A pointer can point at itself or loop. Limit the number of jumps and check every offset.
+  - title: Using CNAME at the zone apex
+    explanation: |
+      A CNAME cannot coexist with other records for the same name, and the apex (`example.com`) needs NS and SOA records, so aliasing it breaks the zone. Providers offer special "ALIAS" records instead.
+
+summary:
+  - "**DNS** maps names to addresses (and more) with a distributed, hierarchical database: the **root**, **TLD** and **authoritative** servers, linked by **delegations**."
+  - "A **stub resolver** asks a **recursive resolver**, which **iteratively** follows referrals from the root. A **CNAME** alias restarts the search with a new name."
+  - "Every answer has a **TTL**; resolvers **cache** answers (and **NXDOMAIN** results) until it expires. Short TTLs allow fast changes at the cost of more traffic."
+  - "Common **records**: A, AAAA, CNAME, NS, MX (lower preference first), TXT, PTR (reverse lookup under `in-addr.arpa`)."
+  - "A DNS message is a 12-byte header plus questions and records. Names are **length-prefixed labels** ending in zero, with **compression pointers** that must be decoded safely."
+  - "Plain DNS can be forged (**cache poisoning**). Defences: random IDs and ports, **DNSSEC** signatures, and encrypted transports (**DoH**, DoT)."
+next: |
+  With a name resolved and a connection open, programs finally talk to each other. Next is the most widely used application protocol of all: **HTTP**, the language of the web, with requests, responses, status codes, headers and cookies.
+
+quiz:
+  - type: mcq
+    question: In which order are the labels of www.example.com ordered in the DNS hierarchy, from the top?
+    options: ["com, example, www", "www, example, com", "example, www, com", "www, com, example"]
+    answer: 0
+    explanation: "The tree starts at the root, then the TLD `com`, then `example`, then `www`."
+  - type: mcq
+    question: What does a root server return for a query about www.example.com?
+    options: [
+      "A referral to the servers for com",
+      "The IP address of www.example.com",
+      "NXDOMAIN",
+      "A TCP connection to the website"
+    ]
+    answer: 0
+    explanation: "Root servers only know who runs each top-level domain. Authoritative servers know the final answers."
+  - type: mcq
+    question: A site's DNS records have a TTL of 86400 seconds, and the owner changes the server's IP address now. What happens?
+    options: [
+      "Some visitors keep using the old address for up to a day, until their cached copy expires",
+      "Everyone switches immediately",
+      "The old address is used for a year",
+      "DNS refuses the change"
+    ]
+    answer: 0
+    explanation: "Caches are not told about changes. They only refresh after the TTL runs out."
+  - type: mcq
+    question: A domain has MX records with preferences 20 (mail2) and 10 (mail1). Which server does a sender try first?
+    options: ["mail1", "mail2", "Both at once", "The one with the longer name"]
+    answer: 0
+    explanation: "A lower MX preference number means higher priority."
+  - type: mcq
+    question: What is DNS cache poisoning?
+    options: [
+      "A forged reply accepted by a resolver and cached, sending users to the wrong address",
+      "A cache that has run out of memory",
+      "A DNS record with a TTL of zero",
+      "A name that does not exist"
+    ]
+    answer: 0
+    explanation: "Because plain DNS has no authentication, a forged answer that arrives first can fool a resolver. DNSSEC defends against this."
+  - type: mcq
+    question: What is the reverse-lookup (PTR) name for the address 192.0.2.5?
+    options: ["5.2.0.192.in-addr.arpa", "192.0.2.5.in-addr.arpa", "arpa.in-addr.192.0.2.5", "5.2.0.192.com"]
+    answer: 0
+    explanation: "The octets are reversed so that the name hierarchy follows the address hierarchy."
+  - type: code
+    question: |
+      Write `reverse_name(ip)` returning the PTR name for an IPv4 address: the four numbers reversed, then `.in-addr.arpa`.
+    starter: |
+      def reverse_name(ip):
+          pass
+    tests:
+      - name: reverse
+        code: |
+          assert reverse_name("192.0.2.5") == "5.2.0.192.in-addr.arpa"
+          assert reverse_name("1.2.3.4") == "4.3.2.1.in-addr.arpa"
+          assert reverse_name("10.0.0.1") == "1.0.0.10.in-addr.arpa"
+    solution: |
+      def reverse_name(ip):
+          return ".".join(reversed(ip.split("."))) + ".in-addr.arpa"

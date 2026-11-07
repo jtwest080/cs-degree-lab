@@ -1,0 +1,1030 @@
+id: u11-http
+title: "HTTP and the Web"
+minutes: 65
+objective: |
+  Learn the protocol that carries the web. Take a URL apart, read and write HTTP requests and responses as plain text, understand methods, status codes and headers, see how cookies add memory to a stateless protocol, how caching and conditional requests save bandwidth, and build a small REST-style API.
+outcomes:
+  - Split a URL into scheme, host, port, path, query and fragment, and apply percent-encoding
+  - Read and write HTTP/1.1 request and response messages, including headers and bodies
+  - Choose appropriate methods and status codes, and explain safe and idempotent methods
+  - Explain cookies, caching headers, ETags and conditional requests
+  - Implement a small REST-style API with routing, JSON bodies and proper error responses
+  - Describe how HTTP/2 and HTTP/3 improve on HTTP/1.1
+
+sections:
+  - heading: URLs
+    body: |
+      A **URL** (uniform resource locator) names a thing on the web and says how to fetch it:
+
+      ```text
+      https://www.example.com:8443/shop/items?id=42&colour=red#reviews
+      \___/   \_____________/ \__/ \________/ \______________/ \_____/
+      scheme       host       port    path        query       fragment
+      ```
+
+      - The **scheme** is the protocol: `http`, `https`, `ftp`, `mailto`, ...
+      - The **host** is a domain name (resolved through DNS, Lesson 11.6) or an IP address.
+      - The **port** is optional; the default is 80 for `http` and 443 for `https`.
+      - The **path** names the resource on the server; an empty path means `/`.
+      - The **query** after `?` is a list of `key=value` pairs separated by `&`.
+      - The **fragment** after `#` points inside the page and is **never sent** to the server; the browser uses it locally.
+
+      URLs can only contain a limited set of characters. Anything else, such as spaces, `&` inside a value, or non-English letters, is written as **percent-encoding**: each byte of its UTF-8 form becomes `%` and two hex digits. A space is `%20` (in query strings `+` is also used for a space), `é` is `%C3%A9`, and `&` inside a value is `%26`, so it cannot be mistaken for a separator. Forgetting to encode user input is how many bugs and security holes begin.
+
+  - heading: Requests and responses
+    body: |
+      **HTTP** (HyperText Transfer Protocol) is a **request/response** protocol over TCP. The client opens a connection to the server's port (Lesson 11.4), sends one **request**, and the server sends back one **response**. The messages are **plain text** (in HTTP/1.1), which is why you can type one by hand and why they are easy to debug. A request:
+
+      ```text
+      GET /shop/items?id=42 HTTP/1.1
+      Host: www.example.com
+      User-Agent: demo/1.0
+      Accept: text/html
+
+      ```
+
+      - The first line is the **request line**: a **method**, the **target** (path and query), and the HTTP version.
+      - Then come **headers**, one `Name: value` per line. Names are case-insensitive. `Host` is **required** in HTTP/1.1, because one server (one IP address) often hosts many websites.
+      - A **blank line** ends the headers. Every line ends with the two characters **CRLF** (`\r\n`).
+      - An optional **body** follows. Its length is given by a `Content-Length` header (or by chunked transfer encoding).
+
+      A response:
+
+      ```text
+      HTTP/1.1 200 OK
+      Content-Type: text/html; charset=utf-8
+      Content-Length: 13
+
+      Hello, world!
+      ```
+
+      The first line is the **status line**: version, a numeric **status code** and a human-readable reason. Then headers, a blank line and the body. `Content-Type` tells the client how to interpret the bytes: `text/html`, `application/json`, `image/png`, ...
+
+  - heading: Methods
+    body: |
+      The **method** says what the client wants to do:
+
+      | Method | Meaning | Safe? | Idempotent? |
+      |---|---|---|---|
+      | **GET** | fetch a resource | yes | yes |
+      | **HEAD** | like GET but only the headers | yes | yes |
+      | **POST** | submit data; create something; trigger an action | no | no |
+      | **PUT** | replace a resource with the body | no | yes |
+      | **DELETE** | remove a resource | no | yes |
+      | **PATCH** | change part of a resource | no | no |
+      | **OPTIONS** | ask what is allowed | yes | yes |
+
+      A **safe** method does not change anything on the server, so it can be repeated, prefetched and cached freely. An **idempotent** method has the same effect whether you do it once or ten times: deleting something twice leaves it deleted. This matters when a request times out and the client does not know if it arrived: retrying a PUT or DELETE is harmless, but retrying a POST might charge a credit card twice. That is why "Do not click twice" warnings exist and why payment APIs ask for an **idempotency key**.
+
+      A form that only searches should use GET (the data goes in the URL, so the result can be bookmarked and shared). A form that changes things should use POST (the data goes in the body). Never put passwords in a URL: URLs end up in logs and browser history.
+
+  - heading: Status codes
+    body: |
+      The three-digit **status code** groups by its first digit:
+
+      | Range | Meaning | Common codes |
+      |---|---|---|
+      | **1xx** | informational | 101 Switching Protocols |
+      | **2xx** | success | **200** OK, **201** Created, **204** No Content |
+      | **3xx** | redirection | **301** Moved Permanently, **302** Found, **304** Not Modified |
+      | **4xx** | the **client** made a mistake | **400** Bad Request, **401** Unauthorized (really: unauthenticated), **403** Forbidden, **404** Not Found, **405** Method Not Allowed, **429** Too Many Requests |
+      | **5xx** | the **server** failed | **500** Internal Server Error, **502** Bad Gateway, **503** Service Unavailable |
+
+      A redirect carries a `Location` header giving the new URL. The difference between 301 (permanent, caches may remember it) and 302 (temporary) matters for search engines and caches. A **405** must include an `Allow` header listing the methods that do work on that URL. Choosing the right status code is part of designing an API: clients (and automatic retry logic) act on the code, not the text.
+
+  - heading: Cookies and state
+    body: |
+      HTTP is **stateless**: each request stands alone, and the server keeps no memory of earlier ones. But shops have baskets and sites have logins. The solution is the **cookie**:
+
+      1. The server's response includes `Set-Cookie: session=abc123; HttpOnly; Secure; Max-Age=3600`.
+      2. The browser stores it and sends `Cookie: session=abc123` with **every later request to that site**.
+      3. The server uses the value as a key into its own data about you.
+
+      So the state lives on the server (or is signed inside the cookie); the cookie is just a ticket. Cookie attributes matter for security: **HttpOnly** hides it from JavaScript (limiting what a script-injection attack can steal), **Secure** sends it only over HTTPS, **SameSite** stops it being sent on requests triggered by other sites (defending against cross-site request forgery), and **Max-Age** or **Expires** sets how long it lasts. Cookies are also how advertisers track you across sites, which is why browsers now restrict third-party cookies. Passing credentials with each request in an `Authorization` header (for example a bearer token) is the usual alternative for APIs.
+
+  - heading: Caching and conditional requests
+    body: |
+      The fastest request is the one never sent. A response can say how long it may be reused with `Cache-Control: max-age=3600` (one hour); until then the browser, or any cache between, serves the stored copy without asking. `no-store` forbids storing, `no-cache` means "store it but check with the server before reuse", and `private` allows only the user's own browser to keep it, not shared caches.
+
+      After the copy goes **stale**, the client does not have to download it again. The server includes a validator, usually an **ETag** (a fingerprint, such as a hash of the content). The client's next request asks conditionally:
+
+      ```text
+      GET /logo.png HTTP/1.1
+      Host: example.com
+      If-None-Match: "abc123"
+      ```
+
+      If the ETag still matches, the server replies **304 Not Modified** with no body, and the client reuses its copy; otherwise it sends **200** with the new content and a new ETag. This is a **conditional GET**. The best practice for static files is to give them a fingerprint in their file name (`app.3f9c2e.js`) and a very long `max-age`, so they are cached for a year and a new version simply has a new URL.
+
+  - heading: REST and JSON
+    body: |
+      Most web services today expose an **API** over HTTP, usually in the **REST** style: every kind of thing is a **resource** with its own URL, and the standard methods act on it.
+
+      | Request | Meaning | Success response |
+      |---|---|---|
+      | `GET /items` | list the items | 200 with a JSON array |
+      | `POST /items` with a JSON body | create an item | **201 Created** with a `Location: /items/7` header |
+      | `GET /items/7` | read one | 200, or 404 if it does not exist |
+      | `PUT /items/7` | replace it | 200 or 204 |
+      | `DELETE /items/7` | remove it | **204 No Content** |
+
+      Bodies are usually **JSON** (JavaScript Object Notation): objects `{"name": "pen"}`, arrays, strings, numbers, `true`, `false`, `null`. In Python the `json` module converts between JSON text and dictionaries and lists. A good API validates input (a malformed body is **400**, not a crash), uses the correct status codes, and answers a wrong method with 405 and an `Allow` header.
+
+  - heading: HTTP/2 and HTTP/3
+    body: |
+      HTTP/1.1 sends one request at a time per connection; opening several connections is the way to get parallelism, and a slow response blocks the ones behind it (**head-of-line blocking**). **HTTP/2** keeps the same methods, headers and status codes but changes the transport format: messages are binary **frames** carrying numbered **streams**, so many requests and responses are **multiplexed** over one TCP connection, and headers are compressed. **HTTP/3** runs over **QUIC**, built on UDP (Lesson 11.4), which gives each stream its own loss recovery so a lost packet no longer stalls the others, and which merges the transport and encryption handshakes to save round trips (Lesson 11.5 explained why those matter). The application sees the same HTTP semantics throughout.
+
+examples:
+  - title: Taking a URL apart
+    intro: "The standard library does the splitting; the pieces are the ones in the diagram."
+    code: |
+      from urllib.parse import urlsplit, parse_qs, quote, unquote
+
+      url = "https://www.example.com:8443/shop/items?id=42&colour=red&colour=blue&q=caf%C3%A9+au+lait#reviews"
+      parts = urlsplit(url)
+      print("scheme  :", parts.scheme)
+      print("host    :", parts.hostname)
+      print("port    :", parts.port)
+      print("path    :", parts.path)
+      print("query   :", parts.query)
+      print("fragment:", parts.fragment)
+      print("params  :", parse_qs(parts.query))
+
+      print(quote("a b&c=é"), "<-", unquote("a%20b%26c%3D%C3%A9"))
+      print(urlsplit("http://example.com").path == "", "(an empty path means /)")
+    output: |
+      scheme  : https
+      host    : www.example.com
+      port    : 8443
+      path    : /shop/items
+      query   : id=42&colour=red&colour=blue&q=caf%C3%A9+au+lait
+      fragment: reviews
+      params  : {'id': ['42'], 'colour': ['red', 'blue'], 'q': ['café au lait']}
+      a%20b%26c%3D%C3%A9 <- a b&c=é
+      True (an empty path means /)
+    lines:
+      - line: 4
+        note: "The default port is not shown: this URL gives 8443 explicitly."
+      - line: 11
+        note: "Repeated keys give lists, and `%C3%A9` and `+` are decoded to é and a space."
+      - line: 13
+        note: "Percent-encoding turns each unsafe byte into % and two hex digits."
+  - title: A request and a response as text
+    intro: "Just lines of text joined with CRLF. This is exactly what travels over the TCP connection."
+    code: |
+      request = "\r\n".join([
+          "GET /hello?name=Maya HTTP/1.1",
+          "Host: www.example.com",
+          "Accept: text/plain",
+          "",
+          "",
+      ])
+
+      body = "Hello, Maya!"
+      response = "\r\n".join([
+          "HTTP/1.1 200 OK",
+          "Content-Type: text/plain; charset=utf-8",
+          f"Content-Length: {len(body)}",
+          "",
+          body,
+      ])
+
+      print(repr(request))
+      print()
+      print(response.replace("\r\n", "\n"))
+      print()
+      head, _, payload = response.partition("\r\n\r\n")
+      status_line, *header_lines = head.split("\r\n")
+      print(status_line.split(" ", 2))
+      print(dict(line.split(": ", 1) for line in header_lines))
+      print(repr(payload))
+    output: |
+      'GET /hello?name=Maya HTTP/1.1\r\nHost: www.example.com\r\nAccept: text/plain\r\n\r\n'
+
+      HTTP/1.1 200 OK
+      Content-Type: text/plain; charset=utf-8
+      Content-Length: 12
+
+      Hello, Maya!
+
+      ['HTTP/1.1', '200', 'OK']
+      {'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': '12'}
+      'Hello, Maya!'
+    lines:
+      - line: 1
+        note: "Header lines are separated by CRLF, and an empty line ends the headers."
+      - line: 12
+        note: "Content-Length tells the client where the body ends."
+      - line: 25
+        note: "The first blank line splits the head of the message from its body."
+  - title: Status code families
+    intro: "The first digit tells you who is at fault and what to do next."
+    code: |
+      FAMILIES = {1: "informational", 2: "success", 3: "redirect", 4: "client error", 5: "server error"}
+      REASONS = {200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently", 304: "Not Modified",
+                 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+                 405: "Method Not Allowed", 429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}
+      ADVICE = {2: "use the response", 3: "follow the Location header", 4: "fix the request; do not just retry",
+                5: "the server is at fault; retry later with backoff"}
+
+      for code in sorted(REASONS):
+          family = code // 100
+          advice = "reuse your cached copy" if code == 304 else ADVICE[family]
+          print(f"{code} {REASONS[code]:22} {FAMILIES[family]:13} -> {advice}")
+    output: |
+      200 OK                     success       -> use the response
+      201 Created                success       -> use the response
+      204 No Content             success       -> use the response
+      301 Moved Permanently      redirect      -> follow the Location header
+      304 Not Modified           redirect      -> reuse your cached copy
+      400 Bad Request            client error  -> fix the request; do not just retry
+      401 Unauthorized           client error  -> fix the request; do not just retry
+      403 Forbidden              client error  -> fix the request; do not just retry
+      404 Not Found              client error  -> fix the request; do not just retry
+      405 Method Not Allowed     client error  -> fix the request; do not just retry
+      429 Too Many Requests      client error  -> fix the request; do not just retry
+      500 Internal Server Error  server error  -> the server is at fault; retry later with backoff
+      503 Service Unavailable    server error  -> the server is at fault; retry later with backoff
+    lines:
+      - line: 8
+        note: "Integer division by 100 gives the class of the response."
+      - line: 9
+        note: "Retrying a 4xx unchanged will fail again; retrying a 5xx often succeeds later."
+  - title: A tiny web application
+    intro: "Routes map a method and a path to a handler. Wrong methods get 405; unknown paths get 404."
+    code: |
+      import json
+
+      items = {1: "pen", 2: "ink"}
+
+
+      def handle(method, path, body=""):
+          if path == "/items":
+              if method == "GET":
+                  return 200, {"Content-Type": "application/json"}, json.dumps([{"id": i, "name": n} for i, n in items.items()])
+              if method == "POST":
+                  try:
+                      name = json.loads(body)["name"]
+                  except (ValueError, KeyError, TypeError):
+                      return 400, {}, "need a JSON body with a name"
+                  new_id = max(items, default=0) + 1
+                  items[new_id] = name
+                  return 201, {"Location": f"/items/{new_id}"}, ""
+              return 405, {"Allow": "GET, POST"}, ""
+          if path.startswith("/items/") and path[7:].isdigit():
+              item_id = int(path[7:])
+              if item_id not in items:
+                  return 404, {}, "no such item"
+              if method == "GET":
+                  return 200, {}, items[item_id]
+              if method == "DELETE":
+                  del items[item_id]
+                  return 204, {}, ""
+              return 405, {"Allow": "DELETE, GET"}, ""
+          return 404, {}, "not found"
+
+
+      calls = [("GET", "/items", ""), ("POST", "/items", '{"name": "paper"}'), ("POST", "/items", "oops"),
+               ("GET", "/items/3", ""), ("DELETE", "/items/1", ""), ("DELETE", "/items/1", ""),
+               ("PUT", "/items", ""), ("GET", "/nothing", "")]
+      for method, path, body in calls:
+          status, headers, out = handle(method, path, body)
+          print(f"{method:6} {path:11} -> {status} {headers} {out[:40]!r}")
+    output: |
+      GET    /items      -> 200 {'Content-Type': 'application/json'} '[{"id": 1, "name": "pen"}, {"id": 2, "na'
+      POST   /items      -> 201 {'Location': '/items/3'} ''
+      POST   /items      -> 400 {} 'need a JSON body with a name'
+      GET    /items/3    -> 200 {} 'paper'
+      DELETE /items/1    -> 204 {} ''
+      DELETE /items/1    -> 404 {} 'no such item'
+      PUT    /items      -> 405 {'Allow': 'GET, POST'} ''
+      GET    /nothing    -> 404 {} 'not found'
+    lines:
+      - line: 15
+        note: "A malformed body is the client's fault: 400, not a crash."
+      - line: 18
+        note: "Creating a resource answers 201 with the new resource's URL in Location."
+      - line: 20
+        note: "A known path with an unsupported method: 405 and the list of allowed methods."
+      - line: 29
+        note: "Deleting succeeds with 204 and no body. Repeating it gives 404 because the item is gone."
+  - title: Caching with an ETag
+    intro: "The client says which version it has. If it is current, the server sends no body at all."
+    code: |
+      import hashlib
+
+      page = "<h1>Welcome</h1>" * 100
+
+
+      def etag_of(content):
+          return '"' + hashlib.sha256(content.encode()).hexdigest()[:8] + '"'
+
+
+      def get(if_none_match=None):
+          tag = etag_of(page)
+          if if_none_match == tag:
+              return 304, tag, 0
+          return 200, tag, len(page)
+
+
+      status, tag, size = get()
+      print("first visit :", status, tag, f"{size} bytes sent")
+      status, tag, size = get(if_none_match=tag)
+      print("second visit:", status, tag, f"{size} bytes sent")
+      page = page + "<p>Updated</p>"
+      status, tag, size = get(if_none_match=tag)
+      print("after change:", status, tag, f"{size} bytes sent")
+    output: |
+      first visit : 200 "9c3f92ae" 1600 bytes sent
+      second visit: 304 "9c3f92ae" 0 bytes sent
+      after change: 200 "857c8fad" 1614 bytes sent
+    lines:
+      - line: 7
+        note: "An ETag is a fingerprint of the content: change one byte and it changes."
+      - line: 12
+        note: "304 Not Modified has no body. The client keeps using its stored copy."
+
+playground:
+  prompt: |
+    Use `urlsplit` on a URL of your own and print each part. Then encode a sentence with `quote` and decode it with `unquote`. Add a `PUT` route to the web application that renames an item.
+  code: |
+    from urllib.parse import urlsplit, quote
+    print(urlsplit("http://localhost:8000/a/b?x=1"))
+    print(quote("100% fun & games"))
+
+exercises:
+  - id: percent
+    title: Percent-encoding
+    difficulty: 3
+    prompt: |
+      Write `percent_encode(text, safe="")` that encodes `text` as UTF-8 and returns a string in which every byte is left alone if it is an unreserved character (ASCII letters, digits, and `-`, `.`, `_`, `~`) or a character listed in `safe`, and otherwise written as `%` followed by **two uppercase hex digits**. Write `percent_decode(text, plus=False)` that reverses this: every `%XX` becomes the byte, the bytes are decoded as UTF-8, and when `plus` is true a `+` becomes a space. Raise `ValueError` for a `%` that is not followed by two hex digits, or for bytes that are not valid UTF-8. Write `build_query(params)` where `params` is a dictionary mapping keys to a value or a **list** of values; return `key=value` pairs joined by `&`, in the dictionary's order, with a list producing the key several times, and keys and values converted with `str` and encoded with `percent_encode`.
+    starter: |
+      def percent_encode(text, safe=""):
+          pass
+
+
+      def percent_decode(text, plus=False):
+          pass
+
+
+      def build_query(params):
+          pass
+    tests:
+      - name: encode
+        code: |
+          assert percent_encode("abc-._~XYZ019") == "abc-._~XYZ019"
+          assert percent_encode("a b&c=d") == "a%20b%26c%3Dd"
+          assert percent_encode("café") == "caf%C3%A9"
+          assert percent_encode("/a/b c", safe="/") == "/a/b%20c"
+          assert percent_encode("") == ""
+          assert percent_encode("100%") == "100%25"
+          assert percent_encode("€") == "%E2%82%AC"
+      - name: decode
+        code: |
+          assert percent_decode("a%20b%26c%3Dd") == "a b&c=d"
+          assert percent_decode("caf%C3%A9") == "café"
+          assert percent_decode("a+b") == "a+b"
+          assert percent_decode("a+b", plus=True) == "a b"
+          assert percent_decode("%e2%82%ac") == "€"
+          assert percent_decode("100%25") == "100%"
+          assert percent_decode("") == ""
+      - name: round trip
+        code: |
+          import random
+          rng = random.Random(15)
+          alphabet = "abc XYZ 019 &=?/#%+é€~-._\n"
+          for _ in range(200):
+              s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 20)))
+              assert percent_decode(percent_encode(s)) == s
+      - name: errors
+        code: |
+          for bad in ("%", "%2", "%zz", "abc%g1", "%C3", "%80"):
+              try:
+                  percent_decode(bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+      - name: build_query
+        code: |
+          assert build_query({}) == ""
+          assert build_query({"q": "café au lait", "page": 2}) == "q=caf%C3%A9%20au%20lait&page=2"
+          assert build_query({"colour": ["red", "blue"], "x": "1"}) == "colour=red&colour=blue&x=1"
+          assert build_query({"a&b": "c=d"}) == "a%26b=c%3Dd"
+          assert build_query({"empty": ""}) == "empty="
+    hints:
+      - "`text.encode('utf-8')` gives bytes. For each byte `b`, `chr(b)` is the character when it is unreserved."
+      - "Format a byte as hex with `f'%{b:02X}'`."
+      - "Decoding: walk through the string; on `%` read the next two characters with `int(h, 16)` after checking they are hex digits. Collect bytes in a `bytearray` and finish with `.decode('utf-8')`, converting `UnicodeDecodeError` into `ValueError` (it already is a subclass of `ValueError`)."
+      - "`build_query`: for each key and value, make a list if the value is not one, then join `quote(key)=quote(str(v))`."
+    solution: |
+      UNRESERVED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+      HEX = set("0123456789abcdefABCDEF")
+
+
+      def percent_encode(text, safe=""):
+          out = []
+          for b in text.encode("utf-8"):
+              ch = chr(b)
+              if b < 128 and (ch in UNRESERVED or ch in safe):
+                  out.append(ch)
+              else:
+                  out.append(f"%{b:02X}")
+          return "".join(out)
+
+
+      def percent_decode(text, plus=False):
+          out = bytearray()
+          i = 0
+          while i < len(text):
+              ch = text[i]
+              if ch == "%":
+                  pair = text[i + 1:i + 3]
+                  if len(pair) != 2 or not all(c in HEX for c in pair):
+                      raise ValueError("bad percent escape")
+                  out.append(int(pair, 16))
+                  i += 3
+                  continue
+              if plus and ch == "+":
+                  out.append(32)
+              else:
+                  out.extend(ch.encode("utf-8"))
+              i += 1
+          return out.decode("utf-8")
+
+
+      def build_query(params):
+          pairs = []
+          for key, value in params.items():
+              values = value if isinstance(value, list) else [value]
+              for v in values:
+                  pairs.append(percent_encode(str(key)) + "=" + percent_encode(str(v)))
+          return "&".join(pairs)
+    explanation: |
+      Percent-encoding is the reason `&` or `=` inside a value cannot confuse a query parser: the delimiters stay literal and the data is encoded. Building URLs with string concatenation, without encoding, is how "injection" bugs begin; the library functions `urllib.parse.quote` and `urlencode` do exactly what you wrote.
+
+  - id: parse-url
+    title: Parsing a URL
+    difficulty: 4
+    prompt: |
+      The function `percent_decode(text, plus=False)` is given in the starter. Write `parse_url(url)` returning a dictionary with the keys `scheme` (lower case), `host` (lower case), `port` (an integer; 80 for `http` and 443 for `https` if not given), `path` (`"/"` if empty), `query` (a dictionary mapping each key to the **list** of its values, in order, with keys and values decoded using `plus=True`; pairs without `=` give the value `""`; empty pairs are skipped) and `fragment` (decoded text, `""` if absent). Support only `http` and `https`, no user name or password. Raise `ValueError` if there is no `://`, the scheme is not `http` or `https`, the host is empty, or the port is not made of digits or is not between 1 and 65535.
+    starter: |
+      def percent_decode(text, plus=False):
+          out = bytearray()
+          i = 0
+          while i < len(text):
+              ch = text[i]
+              if ch == "%":
+                  pair = text[i + 1:i + 3]
+                  if len(pair) != 2 or not all(c in "0123456789abcdefABCDEF" for c in pair):
+                      raise ValueError("bad percent escape")
+                  out.append(int(pair, 16))
+                  i += 3
+                  continue
+              out.extend((" " if plus and ch == "+" else ch).encode("utf-8"))
+              i += 1
+          return out.decode("utf-8")
+
+
+      def parse_url(url):
+          pass
+    tests:
+      - name: full url
+        code: |
+          u = parse_url("https://WWW.Example.com:8443/shop/items?id=42&colour=red&colour=blue&q=caf%C3%A9+au+lait#reviews")
+          assert u == {
+              "scheme": "https", "host": "www.example.com", "port": 8443, "path": "/shop/items",
+              "query": {"id": ["42"], "colour": ["red", "blue"], "q": ["café au lait"]}, "fragment": "reviews",
+          }
+      - name: defaults
+        code: |
+          assert parse_url("http://example.com") == {"scheme": "http", "host": "example.com", "port": 80, "path": "/", "query": {}, "fragment": ""}
+          assert parse_url("HTTPS://example.com/")["port"] == 443
+          assert parse_url("http://example.com?x=1")["path"] == "/"
+          assert parse_url("http://example.com?x=1")["query"] == {"x": ["1"]}
+          assert parse_url("http://example.com#top")["fragment"] == "top"
+          assert parse_url("http://example.com/a?flag&&k=&=v")["query"] == {"flag": [""], "k": [""], "": ["v"]}
+          assert parse_url("http://example.com/a%20b/c")["path"] == "/a%20b/c"
+      - name: invalid
+        code: |
+          for bad in ("example.com/path", "ftp://example.com", "http:///path", "http://:80/", "http://example.com:/", "http://example.com:abc/",
+                      "http://example.com:0/", "http://example.com:65536/", "http://example.com:-1/", "http://example.com/?q=%zz"):
+              try:
+                  parse_url(bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+      - name: agrees with the standard library
+        code: |
+          from urllib.parse import urlsplit, parse_qs
+          for url in ("http://a.com/x?y=1&y=2&z=%41", "https://b.org:99/p/q#frag", "http://c.net/?k=v+w"):
+              ours = parse_url(url)
+              theirs = urlsplit(url)
+              assert ours["host"] == theirs.hostname and ours["path"] == (theirs.path or "/")
+              assert ours["query"] == parse_qs(theirs.query, keep_blank_values=True)
+    hints:
+      - "Split in a sensible order: scheme (`partition('://')`), then the fragment (`partition('#')`), then the query (`partition('?')`), then the host part before the first `/`."
+      - "Host and port: `host, colon, port = hostport.partition(':')`. If there was a colon, the port must be non-empty, all ASCII digits, and 1 to 65535."
+      - "The query: for each `pair` in `query.split('&')`, skip empty ones, use `pair.partition('=')`, decode both parts with `plus=True`, and `setdefault(key, []).append(value)`."
+    solution: |
+      def percent_decode(text, plus=False):
+          out = bytearray()
+          i = 0
+          while i < len(text):
+              ch = text[i]
+              if ch == "%":
+                  pair = text[i + 1:i + 3]
+                  if len(pair) != 2 or not all(c in "0123456789abcdefABCDEF" for c in pair):
+                      raise ValueError("bad percent escape")
+                  out.append(int(pair, 16))
+                  i += 3
+                  continue
+              out.extend((" " if plus and ch == "+" else ch).encode("utf-8"))
+              i += 1
+          return out.decode("utf-8")
+
+
+      def parse_url(url):
+          scheme, sep, rest = url.partition("://")
+          if not sep:
+              raise ValueError("missing ://")
+          scheme = scheme.lower()
+          if scheme not in ("http", "https"):
+              raise ValueError("unsupported scheme")
+          rest, _, fragment = rest.partition("#")
+          rest, _, query_text = rest.partition("?")
+          hostport, slash, path = rest.partition("/")
+          path = "/" + path if slash else "/"
+          host, colon, port_text = hostport.partition(":")
+          if not host:
+              raise ValueError("empty host")
+          if colon:
+              if not (port_text.isascii() and port_text.isdigit()):
+                  raise ValueError("bad port")
+              port = int(port_text)
+              if not 1 <= port <= 65535:
+                  raise ValueError("port out of range")
+          else:
+              port = 80 if scheme == "http" else 443
+          query = {}
+          for pair in query_text.split("&"):
+              if not pair:
+                  continue
+              key, _, value = pair.partition("=")
+              query.setdefault(percent_decode(key, plus=True), []).append(percent_decode(value, plus=True))
+          return {
+              "scheme": scheme,
+              "host": host.lower(),
+              "port": port,
+              "path": path,
+              "query": query,
+              "fragment": percent_decode(fragment),
+          }
+    explanation: |
+      The order of splitting is the whole trick: take off the fragment first, then the query, so that a `#` or `?` inside later parts cannot confuse the earlier splits. Real browsers follow a lengthy standard (the WHATWG URL spec) that handles many more cases, such as user names, IPv6 hosts and relative links; mismatches between how a security filter and a browser parse the same URL are a source of real vulnerabilities.
+
+  - id: messages
+    title: Reading and writing HTTP messages
+    difficulty: 4
+    prompt: |
+      Write `parse_request(text)` for an HTTP/1.1 request given as a string with `"\r\n"` line endings. Return `(method, target, version, headers, body)`. `headers` is a dictionary with **lower-case** names and whitespace-stripped values; a header that appears twice is joined with `", "`. Raise `ValueError` if there is no blank line (`"\r\n\r\n"`) ending the headers, the request line does not have exactly three space-separated parts, the method is not all upper-case letters, the version is not `HTTP/1.0` or `HTTP/1.1`, a header line has no colon or an empty name, a `HTTP/1.1` request has no `host` header, `content-length` is not a non-negative integer, or the body has **fewer** characters than `content-length`. The body is the first `content-length` characters after the blank line (or `""` when there is no `content-length`). Write `build_response(status, headers, body="")` returning the response string: `HTTP/1.1 <status> <reason>`, then the given headers in order, then `Content-Length: <len(body)>` unless the status is 204 or 304, a blank line, and the body, all lines ending in `"\r\n"`. Use these reasons: 200 OK, 201 Created, 204 No Content, 301 Moved Permanently, 302 Found, 304 Not Modified, 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 405 Method Not Allowed, 429 Too Many Requests, 500 Internal Server Error, 503 Service Unavailable. Raise `ValueError` for any other status, or if a 204 or 304 has a non-empty body.
+    starter: |
+      REASONS = {200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently", 302: "Found", 304: "Not Modified",
+                 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+                 429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}
+
+
+      def parse_request(text):
+          pass
+
+
+      def build_response(status, headers, body=""):
+          pass
+    tests:
+      - name: a simple request
+        code: |
+          text = "GET /hello?name=Maya HTTP/1.1\r\nHost: www.example.com\r\nAccept: text/plain\r\nX-Note:   padded value  \r\n\r\n"
+          assert parse_request(text) == ("GET", "/hello?name=Maya", "HTTP/1.1",
+                                          {"host": "www.example.com", "accept": "text/plain", "x-note": "padded value"}, "")
+      - name: bodies and repeated headers
+        code: |
+          text = "POST /items HTTP/1.1\r\nHost: a\r\nContent-Length: 15\r\ncontent-type: application/json\r\nAccept: a/b\r\nAccept: c/d\r\n\r\n{\"name\": \"pen\"}EXTRA"
+          method, target, version, headers, body = parse_request(text)
+          assert (method, target, version) == ("POST", "/items", "HTTP/1.1")
+          assert body == '{"name": "pen"}'
+          assert headers["accept"] == "a/b, c/d" and headers["content-type"] == "application/json"
+          assert parse_request("GET / HTTP/1.0\r\n\r\n") == ("GET", "/", "HTTP/1.0", {}, "")
+      - name: bad requests
+        code: |
+          bad = [
+              "GET / HTTP/1.1\r\nHost: a\r\n",                              # no blank line
+              "GET /\r\nHost: a\r\n\r\n",                                   # two parts
+              "GET / extra HTTP/1.1\r\nHost: a\r\n\r\n",                    # four parts
+              "get / HTTP/1.1\r\nHost: a\r\n\r\n",                          # lower-case method
+              "GET / HTTP/2\r\nHost: a\r\n\r\n",                            # version
+              "GET / HTTP/1.1\r\nHost a\r\n\r\n",                           # no colon
+              "GET / HTTP/1.1\r\n: value\r\n\r\n",                          # empty name
+              "GET / HTTP/1.1\r\nAccept: x\r\n\r\n",                        # no host
+              "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: x\r\n\r\n",    # bad length
+              "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n",
+              "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nabc",  # short body
+          ]
+          for text in bad:
+              try:
+                  parse_request(text)
+                  assert False, text
+              except ValueError:
+                  pass
+      - name: build_response
+        code: |
+          r = build_response(200, [("Content-Type", "text/plain")], "Hello")
+          assert r == "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHello"
+          assert build_response(404, [], "") == "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+          assert build_response(204, [("X", "y")]) == "HTTP/1.1 204 No Content\r\nX: y\r\n\r\n"
+          assert build_response(304, []) == "HTTP/1.1 304 Not Modified\r\n\r\n"
+          assert build_response(405, [("Allow", "GET, POST")]).startswith("HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, POST\r\n")
+          for call in (lambda: build_response(418, []), lambda: build_response(204, [], "x"), lambda: build_response(304, [], "x")):
+              try:
+                  call()
+                  assert False
+              except ValueError:
+                  pass
+      - name: round trip
+        code: |
+          raw = build_response(200, [("Content-Type", "text/plain")], "Hi")
+          head, _, body = raw.partition("\r\n\r\n")
+          lines = head.split("\r\n")
+          assert lines[0] == "HTTP/1.1 200 OK" and "Content-Length: 2" in lines and body == "Hi"
+    hints:
+      - "`head, sep, rest = text.partition('\\r\\n\\r\\n')`; if `sep` is empty, raise `ValueError`."
+      - "Split `head` on `'\\r\\n'`. The first line is the request line (`split(' ')` must give 3 parts). The remaining lines are headers: `name, colon, value = line.partition(':')`."
+      - "`content-length`: use `isdigit()` for a non-negative integer (this rejects `-1` and `x`). Then check `len(rest) >= length` and take `rest[:length]`."
+      - "`build_response`: build a list of lines, add `Content-Length` unless the status is 204 or 304, then join with `\\r\\n` and append the blank line and body."
+    solution: |
+      REASONS = {200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently", 302: "Found", 304: "Not Modified",
+                 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+                 429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable"}
+
+
+      def parse_request(text):
+          head, sep, rest = text.partition("\r\n\r\n")
+          if not sep:
+              raise ValueError("headers are not terminated by a blank line")
+          lines = head.split("\r\n")
+          parts = lines[0].split(" ")
+          if len(parts) != 3:
+              raise ValueError("bad request line")
+          method, target, version = parts
+          if not (method.isalpha() and method.isupper() and method.isascii()):
+              raise ValueError("bad method")
+          if version not in ("HTTP/1.0", "HTTP/1.1"):
+              raise ValueError("unsupported version")
+          headers = {}
+          for line in lines[1:]:
+              name, colon, value = line.partition(":")
+              name = name.strip().lower()
+              if not colon or not name:
+                  raise ValueError("bad header line")
+              value = value.strip()
+              headers[name] = headers[name] + ", " + value if name in headers else value
+          if version == "HTTP/1.1" and "host" not in headers:
+              raise ValueError("missing Host header")
+          body = ""
+          if "content-length" in headers:
+              length_text = headers["content-length"]
+              if not (length_text.isascii() and length_text.isdigit()):
+                  raise ValueError("bad Content-Length")
+              length = int(length_text)
+              if len(rest) < length:
+                  raise ValueError("incomplete body")
+              body = rest[:length]
+          return method, target, version, headers, body
+
+
+      def build_response(status, headers, body=""):
+          if status not in REASONS:
+              raise ValueError("unknown status")
+          if status in (204, 304):
+              if body:
+                  raise ValueError("this status must not have a body")
+          lines = [f"HTTP/1.1 {status} {REASONS[status]}"]
+          lines += [f"{name}: {value}" for name, value in headers]
+          if status not in (204, 304):
+              lines.append(f"Content-Length: {len(body)}")
+          return "\r\n".join(lines) + "\r\n\r\n" + body
+    explanation: |
+      Parsing a network message is mostly checking: every rule in the prompt is something a real server must verify, because the bytes come from strangers. Ambiguities in this parsing (for example, a proxy and a server disagreeing about where a request body ends) have caused serious attacks called "request smuggling", so strict parsers that reject anything odd are safer.
+
+  - id: rest-api
+    title: A REST API
+    difficulty: 4
+    prompt: |
+      Write the class `Api` with `handle(method, path, body="")` returning `(status, headers, body)` where `headers` is a dictionary and `body` is a string. Any query string in `path` (after `?`) is ignored. Routes: **`/`**: GET returns `200`, `{"Content-Type": "text/plain"}`, `"Welcome"`; other methods `405` with `{"Allow": "GET"}`. **`/items`**: GET returns `200` with `{"Content-Type": "application/json"}` and a JSON array of the items `{"id": n, "name": text}` ordered by id; POST reads a JSON object with a string `name` from the body and creates the item with the next id (starting at 1, never reusing an id), answering `201` with headers `{"Location": "/items/<id>", "Content-Type": "application/json"}` and the new item as JSON; a body that is not valid JSON, not an object, or lacks a string `name` gives `400`; other methods give `405` with `{"Allow": "GET, POST"}`. **`/items/<id>`** (digits only): GET returns the item as JSON with `200`, DELETE returns `204` with an empty body, PUT replaces the name from a JSON body like POST (`200` and the item; `400` if invalid), and a missing id gives `404` for every method; other methods give `405` with `{"Allow": "DELETE, GET, PUT"}`. Anything else is `404` with the body `"Not Found"`. Check the path first, then the item, then the method.
+    starter: |
+      import json
+
+
+      class Api:
+          def __init__(self):
+              pass
+
+          def handle(self, method, path, body=""):
+              pass
+    tests:
+      - name: basic routes
+        code: |
+          api = Api()
+          assert api.handle("GET", "/") == (200, {"Content-Type": "text/plain"}, "Welcome")
+          assert api.handle("POST", "/") == (405, {"Allow": "GET"}, "")
+          assert api.handle("GET", "/?x=1")[0] == 200
+          assert api.handle("GET", "/nothing") == (404, {}, "Not Found")
+          assert api.handle("GET", "/items/") [0] == 404
+          assert api.handle("GET", "/items/abc")[0] == 404
+          status, headers, out = api.handle("GET", "/items")
+          assert (status, json.loads(out)) == (200, []) and headers == {"Content-Type": "application/json"}
+      - name: creating and reading
+        code: |
+          api = Api()
+          status, headers, out = api.handle("POST", "/items", '{"name": "pen"}')
+          assert status == 201 and headers == {"Location": "/items/1", "Content-Type": "application/json"}
+          assert json.loads(out) == {"id": 1, "name": "pen"}
+          api.handle("POST", "/items", '{"name": "ink", "extra": 5}')
+          assert json.loads(api.handle("GET", "/items")[2]) == [{"id": 1, "name": "pen"}, {"id": 2, "name": "ink"}]
+          status, headers, out = api.handle("GET", "/items/2")
+          assert status == 200 and json.loads(out) == {"id": 2, "name": "ink"}
+          assert api.handle("PUT", "/items")[0] == 405
+          assert api.handle("PATCH", "/items/1") == (405, {"Allow": "DELETE, GET, PUT"}, "")
+      - name: bad bodies
+        code: |
+          api = Api()
+          for bad in ("", "oops", "[1, 2]", '{"nom": "x"}', '{"name": 5}', "null", '"pen"'):
+              assert api.handle("POST", "/items", bad)[0] == 400, bad
+          assert api.handle("GET", "/items")[2] == "[]"
+          api.handle("POST", "/items", '{"name": "a"}')
+          assert api.handle("PUT", "/items/1", "nope")[0] == 400
+      - name: put and delete
+        code: |
+          api = Api()
+          api.handle("POST", "/items", '{"name": "a"}')
+          api.handle("POST", "/items", '{"name": "b"}')
+          status, headers, out = api.handle("PUT", "/items/1", '{"name": "A"}')
+          assert status == 200 and json.loads(out) == {"id": 1, "name": "A"}
+          assert api.handle("DELETE", "/items/1") == (204, {}, "")
+          assert api.handle("DELETE", "/items/1")[0] == 404
+          assert api.handle("GET", "/items/1")[0] == 404
+          assert api.handle("PUT", "/items/1", '{"name": "x"}')[0] == 404
+          assert api.handle("PATCH", "/items/9")[0] == 404        # a missing item is 404 before the method is checked
+          # ids are never reused
+          status, headers, out = api.handle("POST", "/items", '{"name": "c"}')
+          assert json.loads(out)["id"] == 3 and headers["Location"] == "/items/3"
+          assert [i["id"] for i in json.loads(api.handle("GET", "/items?sort=id")[2])] == [2, 3]
+    hints:
+      - "Store `self.items = {}` (id to name) and `self.next_id = 1`."
+      - "Strip the query with `path = path.split('?', 1)[0]`. Detect an item path with `path.startswith('/items/') and path[7:].isdigit()`."
+      - "A helper `_parse_name(body)` returning the name or `None` keeps POST and PUT short: wrap `json.loads` in `try/except ValueError`, then check `isinstance(data, dict)` and `isinstance(data.get('name'), str)`."
+      - "Use `json.dumps({'id': i, 'name': n})` for bodies. Tests parse them back, so the spacing does not matter."
+    solution: |
+      import json
+
+
+      class Api:
+          def __init__(self):
+              self.items = {}
+              self.next_id = 1
+
+          def _name_from(self, body):
+              try:
+                  data = json.loads(body)
+              except ValueError:
+                  return None
+              if isinstance(data, dict) and isinstance(data.get("name"), str):
+                  return data["name"]
+              return None
+
+          def _json(self, item_id):
+              return json.dumps({"id": item_id, "name": self.items[item_id]})
+
+          def handle(self, method, path, body=""):
+              path = path.split("?", 1)[0]
+              if path == "/":
+                  if method == "GET":
+                      return 200, {"Content-Type": "text/plain"}, "Welcome"
+                  return 405, {"Allow": "GET"}, ""
+              if path == "/items":
+                  if method == "GET":
+                      listing = [{"id": i, "name": self.items[i]} for i in sorted(self.items)]
+                      return 200, {"Content-Type": "application/json"}, json.dumps(listing)
+                  if method == "POST":
+                      name = self._name_from(body)
+                      if name is None:
+                          return 400, {}, "need a JSON object with a string name"
+                      item_id = self.next_id
+                      self.next_id += 1
+                      self.items[item_id] = name
+                      return 201, {"Location": f"/items/{item_id}", "Content-Type": "application/json"}, self._json(item_id)
+                  return 405, {"Allow": "GET, POST"}, ""
+              if path.startswith("/items/") and path[7:].isascii() and path[7:].isdigit():
+                  item_id = int(path[7:])
+                  if item_id not in self.items:
+                      return 404, {}, "Not Found"
+                  if method == "GET":
+                      return 200, {"Content-Type": "application/json"}, self._json(item_id)
+                  if method == "DELETE":
+                      del self.items[item_id]
+                      return 204, {}, ""
+                  if method == "PUT":
+                      name = self._name_from(body)
+                      if name is None:
+                          return 400, {}, "need a JSON object with a string name"
+                      self.items[item_id] = name
+                      return 200, {"Content-Type": "application/json"}, self._json(item_id)
+                  return 405, {"Allow": "DELETE, GET, PUT"}, ""
+              return 404, {}, "Not Found"
+    explanation: |
+      Web frameworks such as Flask and Express do the routing and parsing for you, but underneath they work like this: a table of routes, a function per route, and a disciplined choice of status codes. The order of checks (path, then item, then method, then body) is a design decision worth being explicit about, since it determines which error a confused client sees first.
+
+  - id: caching
+    title: Caching headers and conditional GET
+    difficulty: 3
+    prompt: |
+      Write `parse_cache_control(value)` returning a dictionary of directives from a header such as `"public, max-age=3600, must-revalidate"`: lower-cased names, with an integer value for `name=digits`, a string for any other `name=value` (surrounding double quotes removed), and `True` for a name alone; ignore empty parts and surrounding spaces. Write `is_fresh(cache_control, age)` which is `True` only if the header has an integer `max-age` greater than `age` and has neither `no-store` nor `no-cache`; an empty or `None` header is never fresh. Write `conditional_get(etag, body, if_none_match)` implementing a conditional GET: `etag` is the current validator including its quotes (like `'"v7"'`), `if_none_match` is the request header value or `None`. If the header is `None` or none of its comma-separated tags match, return `(200, {"ETag": etag}, body)`. If it is `"*"` or any tag matches (ignoring a leading `W/` weak marker on the request tags, and spaces), return `(304, {"ETag": etag}, "")`.
+    starter: |
+      def parse_cache_control(value):
+          pass
+
+
+      def is_fresh(cache_control, age):
+          pass
+
+
+      def conditional_get(etag, body, if_none_match):
+          pass
+    tests:
+      - name: directives
+        code: |
+          assert parse_cache_control("public, max-age=3600, must-revalidate") == {"public": True, "max-age": 3600, "must-revalidate": True}
+          assert parse_cache_control("No-Store") == {"no-store": True}
+          assert parse_cache_control("") == {} and parse_cache_control(" , ,") == {}
+          assert parse_cache_control('private, community="UCI"') == {"private": True, "community": "UCI"}
+          assert parse_cache_control("max-age=abc") == {"max-age": "abc"}
+          assert parse_cache_control("max-age = 60 ,s-maxage=0") == {"max-age": 60, "s-maxage": 0}
+      - name: freshness
+        code: |
+          assert is_fresh("max-age=60", 59) is True
+          assert is_fresh("max-age=60", 60) is False
+          assert is_fresh("public, max-age=60", 0) is True
+          assert is_fresh("no-store, max-age=60", 0) is False
+          assert is_fresh("no-cache, max-age=60", 0) is False
+          assert is_fresh("public", 0) is False
+          assert is_fresh("", 0) is False and is_fresh(None, 0) is False
+          assert is_fresh("max-age=abc", 0) is False
+      - name: conditional get
+        code: |
+          body = "<h1>Hi</h1>"
+          assert conditional_get('"v7"', body, None) == (200, {"ETag": '"v7"'}, body)
+          assert conditional_get('"v7"', body, '"v6"') == (200, {"ETag": '"v7"'}, body)
+          assert conditional_get('"v7"', body, '"v7"') == (304, {"ETag": '"v7"'}, "")
+          assert conditional_get('"v7"', body, '"v5", "v7"') == (304, {"ETag": '"v7"'}, "")
+          assert conditional_get('"v7"', body, 'W/"v7"') == (304, {"ETag": '"v7"'}, "")
+          assert conditional_get('"v7"', body, "*") == (304, {"ETag": '"v7"'}, "")
+          assert conditional_get('"v7"', body, '"v70"')[0] == 200
+          assert conditional_get('"v7"', body, "")[0] == 200
+    hints:
+      - "`parse_cache_control`: for each part from `value.split(',')`, strip it; skip empties; `name, eq, val = part.partition('=')`; strip both and lower-case the name."
+      - "An integer value is `val.isdigit()` (and ASCII). Otherwise strip quotes with `val.strip('\"')`."
+      - "`conditional_get`: split `if_none_match` on commas, strip each tag, remove a leading `W/`, and compare with `etag`. `*` matches everything."
+    solution: |
+      def parse_cache_control(value):
+          directives = {}
+          for part in (value or "").split(","):
+              part = part.strip()
+              if not part:
+                  continue
+              name, eq, val = part.partition("=")
+              name = name.strip().lower()
+              if not eq:
+                  directives[name] = True
+                  continue
+              val = val.strip()
+              if val.isascii() and val.isdigit():
+                  directives[name] = int(val)
+              else:
+                  directives[name] = val.strip('"')
+          return directives
+
+
+      def is_fresh(cache_control, age):
+          d = parse_cache_control(cache_control)
+          if "no-store" in d or "no-cache" in d:
+              return False
+          max_age = d.get("max-age")
+          return isinstance(max_age, int) and not isinstance(max_age, bool) and max_age > age
+
+
+      def conditional_get(etag, body, if_none_match):
+          if if_none_match is not None:
+              for tag in if_none_match.split(","):
+                  tag = tag.strip()
+                  if tag.startswith("W/"):
+                      tag = tag[2:]
+                  if tag == "*" or tag == etag:
+                      return 304, {"ETag": etag}, ""
+          return 200, {"ETag": etag}, body
+    explanation: |
+      A 304 response costs a few hundred bytes instead of the whole page. Multiply that by every image, script and style sheet on every page view across the web, and conditional requests save an enormous amount of bandwidth. Note how `True` and `1` are different things for `is_fresh`: a bare `max-age` with no number is not a valid lifetime, so the code checks for a real integer.
+
+commonMistakes:
+  - title: Building URLs by joining strings
+    explanation: |
+      A value containing `&`, `=`, `#` or a space breaks the URL, or worse, injects extra parameters. Percent-encode each part.
+  - title: Putting secrets in URLs
+    explanation: |
+      URLs are logged by servers and proxies and saved in browser history. Send credentials in headers or the body, over HTTPS.
+  - title: Using GET for actions that change data
+    explanation: |
+      Browsers and crawlers freely repeat and prefetch GETs. A "delete" link that uses GET can be triggered by a search-engine bot.
+  - title: Returning 200 for errors
+    explanation: |
+      Clients, caches and monitoring tools rely on the status code. An error page with status 200 is treated as success.
+  - title: Confusing 401 and 403
+    explanation: |
+      401 means "I do not know who you are" (authenticate). 403 means "I know who you are, and you may not".
+  - title: Retrying POST blindly
+    explanation: |
+      POST is not idempotent. Retrying after a timeout can create duplicates unless the API supports an idempotency key.
+
+summary:
+  - "A **URL** has a scheme, host, optional port, path, query and fragment (never sent to the server). Unsafe characters are **percent-encoded** (`%` plus two hex digits of each UTF-8 byte)."
+  - "**HTTP/1.1** is a text protocol over TCP: a request line, headers, a blank line and an optional body (sized by `Content-Length`); the response starts with a status line. `Host` is required."
+  - "**Methods** have meaning: GET and HEAD are safe; PUT and DELETE are idempotent; POST is neither. **Status codes** (2xx success, 3xx redirect, 4xx client error, 5xx server error) drive client behaviour."
+  - "HTTP is stateless; **cookies** (`Set-Cookie` / `Cookie`) carry a session key, protected by `HttpOnly`, `Secure` and `SameSite`."
+  - "**Caching** uses `Cache-Control: max-age`, and **ETags** with `If-None-Match` allow a **304 Not Modified** response with no body."
+  - "**REST** APIs map resources to URLs and use the right methods and codes with **JSON** bodies. **HTTP/2** multiplexes streams over one connection; **HTTP/3** uses QUIC over UDP."
+next: |
+  Until now the network has been a pile of messages in strings. Next we put it into practice with **sockets**: the programming interface that lets a program open connections, listen for them, and send and receive bytes, with a simulated network to build a real client and server on.
+
+quiz:
+  - type: mcq
+    question: What part of a URL is never sent to the web server?
+    options: ["The fragment (after #)", "The query (after ?)", "The path", "The host"]
+    answer: 0
+    explanation: "The fragment is used by the browser only, for example to scroll to a part of the page."
+  - type: mcq
+    question: What is the percent-encoding of a space in a URL path?
+    options: ["%20", "%00", "+", "%32"]
+    answer: 0
+    explanation: "A space is byte 0x20, written %20. A + means a space only in query strings."
+  - type: mcq
+    question: A client sends a request for a page that does not exist. Which response is correct?
+    options: ["404 Not Found", "500 Internal Server Error", "301 Moved Permanently", "204 No Content"]
+    answer: 0
+    explanation: "4xx codes mean the client asked for something wrong. 404 is the standard answer for a missing resource."
+  - type: mcq
+    question: Which of these HTTP methods is idempotent but not safe?
+    options: ["DELETE", "GET", "POST", "HEAD"]
+    answer: 0
+    explanation: "Deleting twice has the same effect as once, but it does change the server. GET and HEAD are safe; POST is neither."
+  - type: mcq
+    question: "A browser holds a stale copy of a file with ETag v3. It asks the server with the header If-None-Match set to v3 and the file has not changed. What does the server reply?"
+    options: [
+      "304 Not Modified with no body",
+      "200 OK with the whole file again",
+      "404 Not Found",
+      "301 Moved Permanently"
+    ]
+    answer: 0
+    explanation: "The validator matched, so the client's copy is still good and no body needs to be sent."
+  - type: mcq
+    question: What does the HttpOnly attribute on a cookie do?
+    options: [
+      "Hides the cookie from JavaScript running in the page",
+      "Makes the cookie work only on HTTP, not HTTPS",
+      "Deletes the cookie after one request",
+      "Encrypts the cookie value"
+    ]
+    answer: 0
+    explanation: "This limits what an attacker's injected script can steal. Secure is the attribute that restricts the cookie to HTTPS."
+  - type: code
+    question: |
+      Write `status_class(code)` returning `"success"` for 200-299, `"redirect"` for 300-399, `"client error"` for 400-499, `"server error"` for 500-599, and `"other"` for anything else.
+    starter: |
+      def status_class(code):
+          pass
+    tests:
+      - name: classes
+        code: |
+          assert status_class(200) == "success" and status_class(204) == "success"
+          assert status_class(301) == "redirect" and status_class(304) == "redirect"
+          assert status_class(404) == "client error" and status_class(429) == "client error"
+          assert status_class(500) == "server error" and status_class(503) == "server error"
+          assert status_class(101) == "other" and status_class(0) == "other" and status_class(600) == "other"
+    solution: |
+      def status_class(code):
+          if 200 <= code < 300:
+              return "success"
+          if 300 <= code < 400:
+              return "redirect"
+          if 400 <= code < 500:
+              return "client error"
+          if 500 <= code < 600:
+              return "server error"
+          return "other"

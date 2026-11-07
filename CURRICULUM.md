@@ -16,7 +16,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 8 | Algorithms II | ✅ Complete (Phase 7) | 9 | 41 | Route Planner |
 | 9 | Computer Systems (C) | ✅ Complete (Phase 8) | 9 | 37 | Mini CPU (assembler + emulator) |
 | 10 | Operating Systems | ✅ Complete (Phase 9) | 9 | 41 | Mini Kernel (scheduler, page replacement, deadlock detector) |
-| 11 | Networking | Planned | | | |
+| 11 | Networking | ✅ Complete (Phase 10) | 9 | 44 | Mini Network Toolkit (subnets, routing, DNS cache, TCP reassembly, URLs) |
 | 12 | Databases | Planned | | | |
 | 13 | Web Development | Planned | | | |
 | 14 | Software Engineering | Planned | | | |
@@ -25,7 +25,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 86 lessons, 410 practice exercises, 86 lesson quizzes (516 multiple-choice questions + 86 coding questions), 10 unit projects, 664 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 95 lessons, 454 practice exercises, 95 lesson quizzes (570 multiple-choice questions + 95 coding questions), 11 unit projects, 801 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -294,6 +294,29 @@ Deliberate forward references in Unit 8: NP-completeness of 0/1 knapsack and sub
 
 **Unit 11 can assume:** all of Units 1 to 10, including processes, threads and system calls, file descriptors and pipes, scheduling and queues, synchronisation and deadlock, virtual memory, and file systems. Unit 11 (Python) should simulate protocols and networks with plain classes and deterministic code, since browsers cannot open raw sockets.
 
+## Unit 11: Networking ✅
+
+Python again. Browsers cannot open raw sockets, so every protocol is **simulated** with plain functions, byte strings and `struct`, plus the standard library modules that do work in Pyodide (`ipaddress`, `urllib.parse`, `hashlib`, `hmac`, `json`). A simulated `Network` with listen/connect/accept/send/recv teaches the real socket API; real-socket code is shown with `runnable: false`.
+
+| Lesson | Id | Teaches |
+|---|---|---|
+| 11.1 How the Internet Is Layered | `u11-layers` | packet switching, the four layers, encapsulation, `struct` headers, internet checksum, latency vs bandwidth, store-and-forward |
+| 11.2 IP Addresses and Subnets | `u11-ip` | IPv4 as 32-bit integers, CIDR, masks, network/broadcast, private ranges, NAT, DHCP, ARP, longest-prefix match, IPv6 |
+| 11.3 Routing: Finding the Way | `u11-routing` | forwarding vs routing, link-state (Dijkstra), distance-vector (Bellman-Ford), counting to infinity, TTL, BGP path choice |
+| 11.4 Ports, UDP and TCP | `u11-transport` | ports and the 4-tuple, UDP datagrams, TCP segments, flags, handshake, sequence/ack numbers, reassembly, state machine |
+| 11.5 Reliability, Flow and Congestion Control | `u11-reliability` | stop-and-wait, BDP, go-back-N vs selective repeat, fast retransmit, RTT/RTO estimation, rwnd, slow start, AIMD, Tahoe/Reno |
+| 11.6 DNS | `u11-dns` | hierarchy, iterative resolution, CNAME, TTL caching, negative caching, record types, wire format and name compression, security |
+| 11.7 HTTP and the Web | `u11-http` | URLs and percent-encoding, HTTP/1.1 messages, methods, status codes, cookies, caching/ETag, REST/JSON, HTTP/2 and 3 |
+| 11.8 Sockets, Clients and Servers | `u11-sockets` | socket lifecycle, byte streams and framing, concurrency models, chat protocol, retry/backoff, token bucket |
+| 11.9 Network Security and TLS | `u11-network-security` | attacks per layer, hashes/HMAC/signatures, Diffie-Hellman, TLS handshake, certificate chains, firewalls, port-scan detection |
+| Project | | Mini Network Toolkit: subnets, longest-prefix forwarding, TTL DNS cache with NXDOMAIN caching, TCP stream reassembly with wraparound, URL parsing |
+
+137 glossary terms (duplicates of earlier terms such as "Frame" and "Idempotent" are not repeated).
+
+**Gotchas:** an exercise or project function cannot be named `run` (the harness uses that name), so Lesson 11.4 uses `simulate`. Block-scalar example output must not begin with spaces (left-align the first column of printed tables) or YAML parsing breaks. Quote any title, heading or question containing `: `.
+
+**Unit 12 can assume:** all of Units 1 to 11, including networking (layers, IP, TCP, DNS, HTTP, sockets, TLS), and the Python used so far (classes, generators, `struct`, `json`, `hashlib`). Unit 12 (Databases) needs SQL in the browser: add sql.js (SQLite compiled to WebAssembly) as a new language runner, like Pyodide and PicoC, with `language: sql` units, a result-table view and SQL test code that compares result sets. Verify with a new `scripts/verify_sql.mjs` and add it to `npm run verify`.
+
 ## Plan for remaining units (to refine before each phase)
 
 - **10 OS**, **11 Networking**, **12 Databases** (sql.js in browser), **13 Web Development** (JS sandbox already supported by the runner), **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
@@ -314,3 +337,4 @@ Deliberate forward references in Unit 8: NP-completeness of 0/1 knapsack and sub
 - **Phase 7 (2026-11-07):** complete Unit 8 (9 lessons, 41 exercises, 9 quizzes, Route Planner project, 47 glossary terms). App features added since Phase 6: installable PWA (manifest, generated service worker, update banner), GitHub Pages deploy, Windows/Mac desktop builds (Electron, `desktop/`), an Ask Claude button on every lesson, and a Listen button with natural recorded voice (Kokoro `am_michael`, generated by the "Record lesson voice" workflow into the `audio` branch; clips are named by a hash of the paragraph text, with the browser voice as a fallback). The verifier now also checks that `outcomes` and `summary` entries are plain strings (quote any text containing a colon and a space). Project test code can't define a function called `run` (the test harness has its own).
 - **Phase 8 (2026-11-07):** complete Unit 9 (9 lessons, 37 exercises, 9 quizzes, Mini CPU project, 58 glossary terms). New framework features: in-browser C (PicoC WebAssembly in a worker, C tag and syntax highlighting in the editor, `language: c` units and projects with JavaScript test code over the program output), and `scripts/verify_c.mjs` added to `npm run verify`. The Input button is hidden for C.
 - **Phase 9 (2026-11-07):** complete Unit 10 (9 lessons, 41 exercises, 9 quizzes, Mini Kernel project, 111 glossary terms). OS concepts are simulated in Python; `scripts/autofill_py.py` added.
+- **Phase 10 (2026-11-07):** complete Unit 11 (9 lessons, 44 exercises, 9 quizzes, Mini Network Toolkit project, 137 glossary terms). Networking simulated in Python.
