@@ -8,6 +8,7 @@ import JsWorker from '../workers/js.worker.js?worker';
 import CWorker from '../workers/c.worker.js?worker';
 import SqlWorker from '../workers/sql.worker.js?worker';
 import { createPythonEngine } from './pythonEngine.js';
+import { runHtml, testHtml } from './htmlEngine.js';
 
 const LOCAL_PYODIDE = new URL('pyodide/', document.baseURI).href;
 const CDN_PYODIDE = 'https://cdn.jsdelivr.net/npm/pyodide@0.26.4/';
@@ -167,6 +168,7 @@ const sqlRunner = new WorkerRunner(() => new SqlWorker(), () => ({}));
  */
 export async function runCode(language, { code, stdin = [], prelude = '' }) {
   try {
+    if (language === 'html') return await runHtml(code);
     if (language === 'javascript') return await js.exec('run', { code });
     if (language === 'c') return await cRunner.exec('run', { code });
     if (language === 'sql') return await sqlRunner.exec('run', { code, prelude });
@@ -184,6 +186,7 @@ export async function runCode(language, { code, stdin = [], prelude = '' }) {
  */
 export async function testCode(language, { code, tests, stdin = [], prelude = '' }) {
   try {
+    if (language === 'html') return await testHtml(code, tests);
     if (language === 'javascript') return await js.exec('test', { code, tests });
     if (language === 'c') return await cRunner.exec('test', { code, tests });
     if (language === 'sql') return await sqlRunner.exec('test', { code, tests, prelude });

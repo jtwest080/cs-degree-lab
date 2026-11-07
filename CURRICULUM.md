@@ -18,14 +18,14 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 10 | Operating Systems | ✅ Complete (Phase 9) | 9 | 41 | Mini Kernel (scheduler, page replacement, deadlock detector) |
 | 11 | Networking | ✅ Complete (Phase 10) | 9 | 44 | Mini Network Toolkit (subnets, routing, DNS cache, TCP reassembly, URLs) |
 | 12 | Databases | ✅ Complete (Phase 11) | 9 | 41 | Campus Registrar Database (clean, constrain, index and report on a messy export) |
-| 13 | Web Development | Planned | | | |
+| 13 | Web Development | ✅ Complete (Phase 12) | 9 | 41 | Task Manager Page (HTML + CSS + JS, tested in a real browser engine) |
 | 14 | Software Engineering | Planned | | | |
 | 15 | Theory of Computation | Planned | | | |
 | 16 | Security | Planned | | | |
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 104 lessons, 495 practice exercises, 104 lesson quizzes (624 multiple-choice questions + 104 coding questions), 12 unit projects, 912 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 113 lessons, 536 practice exercises, 113 lesson quizzes (678 multiple-choice questions + 113 coding questions), 13 unit projects, 991 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -340,9 +340,32 @@ Language: SQL (SQLite compiled to WebAssembly by sql.js, running in a worker). E
 
 **Unit 13 can assume:** everything through Unit 12, including HTTP/URLs/REST (Unit 11) and SQL/SQL injection (Unit 12).
 
+## Unit 13: Web Development ✅
+
+Languages: HTML/CSS/JS in a sandboxed iframe (`language: html`, lessons 13.1-13.4, 13.7 and the project) and plain JavaScript in a worker (`language: javascript`, lessons 13.5, 13.6, 13.8, 13.9). The unit language is `html`; JavaScript lessons set `language: javascript` themselves.
+
+| Lesson | Id | Teaches |
+|---|---|---|
+| 13.1 How the Web Works and HTML | `u13-html` | page load recap, elements/attributes, document skeleton, text, lists, links, images, escaping |
+| 13.2 Semantic HTML, Forms and Accessibility | `u13-html-forms` | landmarks, tables, form controls, labels, validation, a11y basics |
+| 13.3 CSS: Selectors, the Cascade and the Box Model | `u13-css` | selectors, specificity, inheritance, units, colour, box model, custom properties |
+| 13.4 CSS Layout | `u13-layout` | normal flow, flexbox, grid, positioning, responsive design, media queries |
+| 13.5 JavaScript: The Language | `u13-js-language` | const/let, equality and truthiness, functions, closures, arrays/objects, classes, errors |
+| 13.6 Asynchronous JavaScript, JSON and fetch | `u13-async` | event loop, promises, async/await, fetch, JSON |
+| 13.7 The DOM and Events | `u13-dom` | selecting, changing, creating elements, events, delegation, state + render |
+| 13.8 Components, State and Front-end Frameworks | `u13-frameworks` | virtual nodes, components, reducers/stores, diffing (built from scratch) |
+| 13.9 Back-end Servers, REST APIs and Web Security | `u13-backend` | routing, REST, middleware, validation, auth, XSS/CSRF/CORS |
+| Project | | Task Manager Page: a complete HTML/CSS/JS page checked by 12 behaviour tests |
+
+79 glossary terms (duplicates such as "Element" and "JSON" are not repeated).
+
+**HTML runner (new in Phase 12):** `src/lib/htmlEngine.js` builds the learner's page into a sandboxed `iframe` (`allow-scripts`, no same-origin) with a harness that captures `console`, errors, and runs test bodies. Test code is async JavaScript with `$`, `$$`, `css(el, prop)` (computed style), `fire`, `click`, `wait`, `assert`, `output`, `source`, `errors`; each test gets a fresh page. Inline-script loops get a counter so a runaway loop throws instead of freezing the app. The editor shows a live preview. `scripts/verify_html.mjs` runs everything in real Chromium via Playwright. **JavaScript runner upgrades:** `src/lib/jsEngine.js` runs code in an async function (top-level `await`), timers use a virtual clock and run in time order, and `fetch` talks to a pretend in-memory API (`/api/users`, `/api/users/:id`, `/api/slow`, `/api/fail`); `scripts/verify_js.mjs` checks all JavaScript items with the same engine. Gotchas: html examples have `output` only for console lines; a project/lesson `language` field overrides the unit.
+
+**Unit 14 can assume:** everything through Unit 13 (JavaScript and Python, SQL, HTTP, the web stack).
+
 ## Plan for remaining units (to refine before each phase)
 
-- **13 Web Development** (JS sandbox already supported by the runner), **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
+- **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
 
 ## Technical notes for later phases
 
@@ -362,3 +385,4 @@ Language: SQL (SQLite compiled to WebAssembly by sql.js, running in a worker). E
 - **Phase 9 (2026-11-07):** complete Unit 10 (9 lessons, 41 exercises, 9 quizzes, Mini Kernel project, 111 glossary terms). OS concepts are simulated in Python; `scripts/autofill_py.py` added.
 - **Phase 10 (2026-11-07):** complete Unit 11 (9 lessons, 44 exercises, 9 quizzes, Mini Network Toolkit project, 137 glossary terms). Networking simulated in Python.
 - **Phase 11 (2026-11-07):** complete Unit 12 (9 lessons, 41 exercises, 9 quizzes, Campus Registrar Database project, 111 glossary terms). New framework feature: in-browser SQL (sql.js/SQLite in a worker, SQL tag and editor highlighting, `language: sql` units, `verify_sql.mjs`, `autofill_sql.mjs`, error-example display).
+- **Phase 12 (2026-11-07):** complete Unit 13 (9 lessons, 41 exercises, 9 quizzes, Task Manager Page project, 79 glossary terms). New framework features: in-browser HTML/CSS/JS runner with live preview and DOM tests (`verify_html.mjs`), async JavaScript engine with virtual timers and a pretend fetch API (`verify_js.mjs`).

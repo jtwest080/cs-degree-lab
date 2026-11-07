@@ -1,0 +1,551 @@
+id: u13-backend
+title: "Back-end Servers, REST APIs and Web Security"
+minutes: 60
+language: javascript
+objective: |
+  Understand what runs on the other side of the request: how a web server routes requests to handlers, how middleware adds shared behaviour, how to design a REST API with the right methods and status codes, validate input and authenticate users, and defend against the common attacks (XSS, CSRF, injection, and CORS mistakes).
+outcomes:
+  - Describe the request-handler-response cycle of a web server and how routing works
+  - Design REST resources with the correct methods, status codes and JSON
+  - Compose middleware for logging, authentication and error handling
+  - Validate input on the server and explain why client checks are not enough
+  - Name and prevent XSS, CSRF, SQL injection, and explain CORS and the same-origin policy
+
+sections:
+  - heading: A server is a function
+    body: |
+      From Unit 11 you know a web server is a program listening on a port that reads an HTTP request and writes an HTTP response. At heart it is **a function from request to response**. In Node.js (JavaScript outside the browser) with the popular Express framework:
+
+      ```js
+      app.get("/api/users/:id", (req, res) => {
+        const user = db.users.find((u) => u.id === Number(req.params.id));
+        if (!user) return res.status(404).json({ error: "not found" });
+        res.json(user);
+      });
+      ```
+
+      Each such handler is a **route**: a method (`GET`), a path pattern (`/api/users/:id`, where `:id` is a **parameter**) and a function. The server matches the incoming request to the first route that fits, runs its handler, and sends what the handler produced. To keep this lesson runnable we will build the same machinery from plain objects: a request is `{ method, path, headers, body }` and a response is `{ status, headers, body }`. The code you write is the real shape of a back end; only the network is missing.
+
+      The back end does what the browser cannot be trusted to do: store data permanently (in a database, Unit 12), enforce rules, keep secrets (API keys, password hashes), and decide who is allowed to do what. Anything running in a browser can be inspected and changed by its user; **the server is the only place where rules are enforced**.
+
+  - heading: "REST: designing an API"
+    body: |
+      **REST** is a convention for web APIs. Things are **resources** named by nouns in the URL; the HTTP **method** says the action:
+
+      | Request | Meaning | Success status |
+      |---|---|---|
+      | `GET /api/users` | list users | 200 OK |
+      | `GET /api/users/7` | read one | 200 (or 404 Not Found) |
+      | `POST /api/users` | create (server picks the id) | 201 Created |
+      | `PUT /api/users/7` | replace the whole resource | 200 |
+      | `PATCH /api/users/7` | change some fields | 200 |
+      | `DELETE /api/users/7` | remove | 204 No Content |
+
+      `GET` must be **safe** (no change), and `GET`, `PUT` and `DELETE` **idempotent** (doing it twice equals once; Lesson 11.7). Choose status codes honestly: `400` the client sent something invalid, `401` not logged in, `403` logged in but not allowed, `404` no such thing, `409` conflict (duplicate), `422` valid syntax but unacceptable data, `429` too many requests, `500` the server failed. Errors should be JSON with a message: `{ "error": "name is required" }`. Plural nouns, no verbs in paths (`POST /api/orders`, not `/api/createOrder`), and a version prefix (`/api/v1`) you can keep stable for clients.
+
+      Responses are usually **JSON**, with `Content-Type: application/json`. Large collections are **paginated** (`?page=2&limit=20`), and filtered with query parameters (`?role=admin`).
+
+  - heading: Middleware
+    body: |
+      Many things must happen for *every* request: log it, parse JSON, check the login, add headers, catch errors. Copying that into each handler would be a mess. **Middleware** is a function that sees the request on the way in and may change it, answer it itself, or pass it on by calling `next()`. Middleware form a **chain**; each can run code before and after the rest:
+
+      ```js
+      const logger = (req, res, next) => { log(req.method, req.path); next(); };
+      const requireAuth = (req, res, next) => {
+        if (req.headers.authorization !== "Bearer secret") return res.status(401).json({ error: "login required" });
+        next();
+      };
+      ```
+
+      `requireAuth` stops the chain by responding without calling `next()`, so the protected handler never runs. Order matters: the logger goes first, the error handler last. A good mental model is the layers of an onion with the handler at the centre.
+
+  - heading: Validation, authentication and sessions
+    body: |
+      **Validate everything** that arrives, on the server, even though the page already validated (Lesson 13.2). Check that required fields exist, types are right (a number is a number), lengths and ranges are sane, and reject the rest with `400` or `422`. Treat the body as hostile. Prefer an allow-list: copy only the fields you expect (`{ name, email }`), never `Object.assign(user, req.body)`, otherwise a client can send `{ "isAdmin": true }` (a **mass assignment** attack).
+
+      **Authentication** proves who you are; **authorization** decides what you may do. Passwords are never stored: store a slow salted **hash** (bcrypt, scrypt, Argon2 from Lesson 11.9) and compare hashes. After login the server gives the browser a **session identifier** in a cookie, or a signed token such as a **JWT**, that the browser sends with each request (HTTP has no memory, so every request must carry proof). Cookies for sessions should be `HttpOnly` (scripts cannot read them), `Secure` (HTTPS only) and `SameSite=Lax` or `Strict`. Always use HTTPS.
+
+      Check authorization on **every** request for **every** resource: it is not enough that a user is logged in; `GET /api/orders/12` must verify that order 12 belongs to this user, or any user could read any order by changing the number (an **insecure direct object reference**, a leading real-world vulnerability).
+
+  - heading: Attacks and defences
+    body: |
+      - **Cross-site scripting (XSS).** An attacker gets their JavaScript to run on your page, usually because user text was put into HTML unescaped. The script can read the page, steal tokens, and act as the user. Defence: escape output (frameworks do it for you), never use `innerHTML` with untrusted text, and add a **Content-Security-Policy** header that restricts where scripts can come from.
+      - **SQL injection** (Lesson 12.9). Defence: parameterised queries, never string concatenation.
+      - **Cross-site request forgery (CSRF).** You are logged in to your bank in one tab; a malicious page in another makes your browser send `POST /transfer` to the bank, and the browser helpfully attaches your cookie. Defence: `SameSite` cookies, a secret **CSRF token** that the attacker's page cannot know, and checking the `Origin` header.
+      - **Same-origin policy and CORS.** Browsers stop a page from reading responses from a different **origin** (scheme + host + port), so a malicious site cannot read your email through your logged-in session. A server that really wants to share an API with another site says so with headers such as `Access-Control-Allow-Origin: https://app.example.com`. CORS is a rule enforced by the *browser* to protect users; it does not protect your server from direct requests (`curl` ignores it). Never answer `*` to credentialed requests.
+      - **Brute force and abuse.** Rate limiting (the token bucket from Lesson 11.8), account lockouts, and slow password hashes.
+      - **Secrets and dependencies.** Never put keys in front-end code or in the repository; load them from environment variables. Keep dependencies updated, since a vulnerable library is your vulnerability.
+
+      Security is a mindset: assume every input is hostile, give each part the least power it needs, and defend in layers so one mistake is not fatal.
+
+examples:
+  - title: A tiny router
+    intro: "Routes are method, path pattern and handler. A path like /api/users/:id captures a parameter."
+    code: |
+      function makeApp() {
+        const routes = [];
+        const add = (method) => (pattern, handler) => routes.push({ method, pattern, handler });
+        return {
+          get: add("GET"), post: add("POST"), delete: add("DELETE"),
+          handle(req) {
+            for (const r of routes) {
+              if (r.method !== req.method) continue;
+              const names = [];
+              const rx = new RegExp("^" + r.pattern.replace(/:(\w+)/g, (_, n) => { names.push(n); return "([^/]+)"; }) + "$");
+              const m = req.path.match(rx);
+              if (m) return r.handler({ ...req, params: Object.fromEntries(names.map((n, i) => [n, m[i + 1]])) });
+            }
+            return { status: 404, body: { error: "not found" } };
+          },
+        };
+      }
+      const app = makeApp();
+      const users = [{ id: 1, name: "Ada" }, { id: 2, name: "Ben" }];
+      app.get("/api/users", () => ({ status: 200, body: users }));
+      app.get("/api/users/:id", (req) => {
+        const u = users.find((x) => x.id === Number(req.params.id));
+        return u ? { status: 200, body: u } : { status: 404, body: { error: "no such user" } };
+      });
+      for (const [method, path] of [["GET", "/api/users"], ["GET", "/api/users/2"], ["GET", "/api/users/9"], ["POST", "/api/users"], ["GET", "/nope"]]) {
+        const res = app.handle({ method, path });
+        console.log(method, path, res.status, JSON.stringify(res.body));
+      }
+    output: |
+      GET /api/users 200 [{"id":1,"name":"Ada"},{"id":2,"name":"Ben"}]
+      GET /api/users/2 200 {"id":2,"name":"Ben"}
+      GET /api/users/9 404 {"error":"no such user"}
+      POST /api/users 404 {"error":"not found"}
+      GET /nope 404 {"error":"not found"}
+    lines:
+      - line: 9
+        note: "The pattern becomes a regular expression; each :name becomes a capture group."
+      - line: 12
+        note: "Parameters arrive as strings, so the handler converts the id to a number."
+      - line: 15
+        note: "No route matched: the router itself answers 404."
+  - title: Middleware chain
+    intro: "Each middleware gets next(). The logger runs first, auth may stop the chain, and the handler runs last."
+    code: |
+      function compose(middlewares, handler) {
+        return (req) => {
+          let i = 0;
+          const next = () => (i < middlewares.length ? middlewares[i++](req, next) : handler(req));
+          return next();
+        };
+      }
+      const log = [];
+      const logger = (req, next) => { log.push("in " + req.path); const res = next(); log.push("out " + res.status); return res; };
+      const auth = (req, next) => req.headers?.authorization === "Bearer secret" ? next() : { status: 401, body: { error: "login required" } };
+      const handler = (req) => ({ status: 200, body: { secret: 42 } });
+
+      const run = compose([logger, auth], handler);
+      console.log(run({ path: "/a", headers: {} }).status);
+      console.log(run({ path: "/b", headers: { authorization: "Bearer secret" } }).status);
+      console.log(log.join(" | "));
+    output: |
+      401
+      200
+      in /a | out 401 | in /b | out 200
+    lines:
+      - line: 4
+        note: "next calls the next middleware, or the handler at the end of the chain."
+      - line: 9
+        note: "The logger runs code both before and after the rest of the chain."
+      - line: 10
+        note: "auth returns without calling next, so the handler never runs."
+  - title: Validation and allow-lists
+    intro: "Return the problems found. Copy only the allowed fields, so extra fields like isAdmin are ignored."
+    code: |
+      function validateUser(body) {
+        const errors = [];
+        if (typeof body.name !== "string" || body.name.trim().length < 2) errors.push("name must be at least 2 characters");
+        if (typeof body.email !== "string" || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(body.email)) errors.push("email is not valid");
+        if (body.age !== undefined && (!Number.isInteger(body.age) || body.age < 0 || body.age > 150)) errors.push("age must be a whole number from 0 to 150");
+        return errors;
+      }
+      const clean = ({ name, email, age }) => ({ name: name.trim(), email: email.toLowerCase(), age });
+
+      const good = { name: " Ada ", email: "Ada@Example.org", age: 36, isAdmin: true };
+      console.log(validateUser(good).length, JSON.stringify(clean(good)));
+      console.log(validateUser({ name: "A", email: "nope", age: -1 }));
+      console.log(validateUser({}).length, validateUser({ name: "Bo", email: "b@c.de", age: 1.5 }));
+    output: |
+      0 {"name":"Ada","email":"ada@example.org","age":36}
+      ["name must be at least 2 characters","email is not valid","age must be a whole number from 0 to 150"]
+      2 ["age must be a whole number from 0 to 150"]
+    lines:
+      - line: 8
+        note: "Destructuring copies exactly three fields. isAdmin never reaches the record."
+      - line: 12
+        note: "Report all problems at once so the client can fix them together."
+  - title: Escaping output to stop XSS
+    intro: "A comment that contains a script tag, stored and later shown. Escaped, it is just text."
+    code: |
+      const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+      const comment = `<img src=x onerror="alert(document.cookie)">Nice post`;
+      console.log("unsafe:", `<p>${comment}</p>`);
+      console.log("safe:  ", `<p>${esc(comment)}</p>`);
+      console.log(esc("Tom & \"Jerry\""));
+    output: |
+      unsafe: <p><img src=x onerror="alert(document.cookie)">Nice post</p>
+      safe:   <p>&lt;img src=x onerror=&quot;alert(document.cookie)&quot;&gt;Nice post</p>
+      Tom &amp; &quot;Jerry&quot;
+    lines:
+      - line: 3
+        note: "The unsafe version would run the attacker's code in every visitor's browser."
+      - line: 4
+        note: "Escaping turns markup characters into entities, which the browser shows as text."
+  - title: Checking ownership
+    intro: "Being logged in is not enough. The server must check that the resource belongs to the user."
+    code: |
+      const orders = [{ id: 1, owner: "ada", total: 30 }, { id: 2, owner: "ben", total: 99 }];
+      function getOrder(user, id) {
+        if (!user) return { status: 401, body: { error: "login required" } };
+        const order = orders.find((o) => o.id === id);
+        if (!order) return { status: 404, body: { error: "not found" } };
+        if (order.owner !== user) return { status: 403, body: { error: "forbidden" } };
+        return { status: 200, body: order };
+      }
+      for (const [user, id] of [[null, 1], ["ada", 1], ["ada", 2], ["ada", 3]]) {
+        const r = getOrder(user, id);
+        console.log(user ?? "anon", id, r.status);
+      }
+    output: |
+      anon 1 401
+      ada 1 200
+      ada 2 403
+      ada 3 404
+    lines:
+      - line: 3
+        note: "401: we do not know who you are."
+      - line: 6
+        note: "403: we know you, and you may not see this order. Without this line ada could read ben's orders just by changing the number."
+  - title: CORS and the same origin
+    intro: "An origin is scheme, host and port. A server opts in to other origins with a header."
+    code: |
+      const origin = (url) => { const u = new URL(url); return u.protocol + "//" + u.host; };
+      const page = "https://shop.example.com/cart";
+      for (const api of ["https://shop.example.com/api/items", "https://api.example.com/items", "http://shop.example.com/api", "https://shop.example.com:8443/api"]) {
+        console.log(origin(api) === origin(page) ? "same origin " : "cross origin", api);
+      }
+      const allowed = new Set(["https://app.example.com"]);
+      const cors = (reqOrigin) => allowed.has(reqOrigin) ? { "Access-Control-Allow-Origin": reqOrigin, Vary: "Origin" } : {};
+      console.log(JSON.stringify(cors("https://app.example.com")), JSON.stringify(cors("https://evil.example")));
+    output: |
+      same origin  https://shop.example.com/api/items
+      cross origin https://api.example.com/items
+      cross origin http://shop.example.com/api
+      cross origin https://shop.example.com:8443/api
+      {"Access-Control-Allow-Origin":"https://app.example.com","Vary":"Origin"} {}
+    lines:
+      - line: 4
+        note: "A different host, scheme or port makes a different origin."
+      - line: 8
+        note: "Allow-list the specific origins. Echoing any origin back would defeat the protection."
+
+playground:
+  prompt: |
+    Add a `POST /api/users` route to the router in the first example that validates the body (name required) and returns 201 with a new id, or 400 with an error message. Test it with the `handle` function.
+  code: |
+    const handle = (req) => ({ status: req.method === "GET" ? 200 : 405, body: {} });
+    console.log(handle({ method: "GET", path: "/" }));
+
+exercises:
+  - id: match-route
+    title: Match a route
+    difficulty: 3
+    prompt: |
+      Write `matchRoute(pattern, path)`. The pattern is like `/users/:id/posts/:postId`. If the path matches (same number of segments, constants equal, each `:name` matches one non-empty segment) return an object of the captured parameters, otherwise `null`. A pattern with no parameters returns `{}` on a match.
+    starter: |
+      function matchRoute(pattern, path) {
+      }
+    tests:
+      - name: matches
+        code: |
+          const a = matchRoute("/users/:id", "/users/42");
+          if (!a || a.id !== "42" || Object.keys(a).length !== 1) throw new Error("Got " + JSON.stringify(a));
+          const b = matchRoute("/users/:id/posts/:postId", "/users/7/posts/x1");
+          if (!b || b.id !== "7" || b.postId !== "x1") throw new Error("Got " + JSON.stringify(b));
+          if (JSON.stringify(matchRoute("/about", "/about")) !== "{}") throw new Error("static route returns {}");
+      - name: rejects
+        code: |
+          for (const [p, u] of [["/users/:id", "/users"], ["/users/:id", "/users/1/extra"], ["/users/:id", "/people/1"], ["/a/:b", "/a/"], ["/about", "/abou"]]) {
+            if (matchRoute(p, u) !== null) throw new Error(p + " should not match " + u);
+          }
+    hints:
+      - "Split both on \"/\" and compare the lengths first."
+      - "A segment starting with \":\" captures; any other segment must be equal."
+    solution: |
+      function matchRoute(pattern, path) {
+        const p = pattern.split("/");
+        const u = path.split("/");
+        if (p.length !== u.length) return null;
+        const params = {};
+        for (let i = 0; i < p.length; i++) {
+          if (p[i].startsWith(":")) {
+            if (u[i] === "") return null;
+            params[p[i].slice(1)] = u[i];
+          } else if (p[i] !== u[i]) {
+            return null;
+          }
+        }
+        return params;
+      }
+    explanation: "Comparing segment by segment is simpler and safer than building a regular expression from user-provided patterns."
+  - id: crud
+    title: A users resource
+    difficulty: 4
+    prompt: |
+      Write `makeUsersApi()` returning an object with `handle({ method, path, body })` that implements an in-memory users resource and returns `{ status, body }`: `GET /users` (200, array), `GET /users/:id` (200, or 404 `{ error: "not found" }`), `POST /users` (body must have a string `name` of at least 1 character, else 400 `{ error: "name is required" }`; otherwise 201 with `{ id, name }`, ids start at 1), `DELETE /users/:id` (204 with body `null`, or 404). Any other path gives 404 and any other method on `/users` gives 405.
+    starter: |
+      function makeUsersApi() {
+        return { handle(req) { } };
+      }
+    tests:
+      - name: create and read
+        code: |
+          const api = makeUsersApi();
+          const c = api.handle({ method: "POST", path: "/users", body: { name: "Ada", isAdmin: true } });
+          if (c.status !== 201 || c.body.id !== 1 || c.body.name !== "Ada" || "isAdmin" in c.body) throw new Error("create: " + JSON.stringify(c));
+          api.handle({ method: "POST", path: "/users", body: { name: "Ben" } });
+          const l = api.handle({ method: "GET", path: "/users" });
+          if (l.status !== 200 || l.body.length !== 2) throw new Error("list: " + JSON.stringify(l));
+          const one = api.handle({ method: "GET", path: "/users/2" });
+          if (one.status !== 200 || one.body.name !== "Ben") throw new Error("get one: " + JSON.stringify(one));
+      - name: errors
+        code: |
+          const api = makeUsersApi();
+          for (const body of [{}, { name: "" }, { name: 5 }, undefined]) {
+            const r = api.handle({ method: "POST", path: "/users", body });
+            if (r.status !== 400 || r.body.error !== "name is required") throw new Error("bad body " + JSON.stringify(body) + " gave " + JSON.stringify(r));
+          }
+          if (api.handle({ method: "GET", path: "/users/9" }).status !== 404) throw new Error("missing user is 404");
+          if (api.handle({ method: "PUT", path: "/users" }).status !== 405) throw new Error("PUT /users is 405");
+          if (api.handle({ method: "GET", path: "/other" }).status !== 404) throw new Error("unknown path is 404");
+      - name: delete
+        code: |
+          const api = makeUsersApi();
+          api.handle({ method: "POST", path: "/users", body: { name: "A" } });
+          api.handle({ method: "POST", path: "/users", body: { name: "B" } });
+          const d = api.handle({ method: "DELETE", path: "/users/1" });
+          if (d.status !== 204 || d.body !== null) throw new Error("delete: " + JSON.stringify(d));
+          if (api.handle({ method: "DELETE", path: "/users/1" }).status !== 404) throw new Error("deleting twice is 404");
+          const l = api.handle({ method: "GET", path: "/users" });
+          if (l.body.length !== 1 || l.body[0].name !== "B") throw new Error("only B should remain");
+          const n = api.handle({ method: "POST", path: "/users", body: { name: "C" } });
+          if (n.body.id !== 3) throw new Error("ids are never reused; expected 3, got " + n.body.id);
+    hints:
+      - "Keep `users` and `nextId` in the closure of makeUsersApi."
+      - "Use a regular expression like `/^\\/users\\/(\\d+)$/` for the item routes."
+    solution: |
+      function makeUsersApi() {
+        let users = [];
+        let nextId = 1;
+        return {
+          handle({ method, path, body }) {
+            if (path === "/users") {
+              if (method === "GET") return { status: 200, body: users };
+              if (method === "POST") {
+                if (!body || typeof body.name !== "string" || body.name.length < 1) return { status: 400, body: { error: "name is required" } };
+                const user = { id: nextId++, name: body.name };
+                users.push(user);
+                return { status: 201, body: user };
+              }
+              return { status: 405, body: { error: "method not allowed" } };
+            }
+            const m = path.match(/^\/users\/(\d+)$/);
+            if (m) {
+              const id = Number(m[1]);
+              const user = users.find((u) => u.id === id);
+              if (!user) return { status: 404, body: { error: "not found" } };
+              if (method === "GET") return { status: 200, body: user };
+              if (method === "DELETE") { users = users.filter((u) => u.id !== id); return { status: 204, body: null }; }
+              return { status: 405, body: { error: "method not allowed" } };
+            }
+            return { status: 404, body: { error: "not found" } };
+          },
+        };
+      }
+    explanation: "Only name is copied from the body, so extra fields are ignored. Status codes carry the meaning: 201, 204, 400, 404, 405."
+  - id: auth-middleware
+    title: Auth and rate-limit middleware
+    difficulty: 4
+    prompt: |
+      Write `requireToken(tokens)` returning middleware `(req, next)` that looks at `req.headers.authorization`. It must be `"Bearer " + token` where `token` is a key of the object `tokens` (mapping token to user name). If valid, set `req.user` to the user name and return `next()`. If the header is missing return `{ status: 401, body: { error: "login required" } }`; if present but wrong return `{ status: 403, body: { error: "invalid token" } }`. Then write `rateLimit(max)` returning middleware that allows `max` requests per `req.user` and then returns `{ status: 429, body: { error: "slow down" } }`.
+    starter: |
+      function requireToken(tokens) {
+      }
+      function rateLimit(max) {
+      }
+    tests:
+      - name: token
+        code: |
+          const mw = requireToken({ abc: "ada", xyz: "ben" });
+          const next = () => ({ status: 200 });
+          const r1 = { headers: { authorization: "Bearer abc" } };
+          if (mw(r1, next).status !== 200 || r1.user !== "ada") throw new Error("valid token should set req.user");
+          if (mw({ headers: {} }, next).status !== 401) throw new Error("missing header is 401");
+          const bad = mw({ headers: { authorization: "Bearer nope" } }, next);
+          if (bad.status !== 403 || bad.body.error !== "invalid token") throw new Error("wrong token is 403");
+          if (mw({ headers: { authorization: "abc" } }, next).status !== 403) throw new Error("missing Bearer prefix is 403");
+          if (mw({ headers: { authorization: "Bearer toString" } }, next).status !== 403) throw new Error("inherited property names are not tokens");
+      - name: rate limit
+        code: |
+          const rl = rateLimit(2);
+          const next = () => ({ status: 200 });
+          const a = { user: "ada" }, b = { user: "ben" };
+          const out = [rl(a, next).status, rl(a, next).status, rl(a, next).status, rl(b, next).status, rl(a, next).status];
+          if (JSON.stringify(out) !== "[200,200,429,200,429]") throw new Error("Got " + JSON.stringify(out));
+    hints:
+      - "Use `Object.hasOwn(tokens, token)` rather than `token in tokens`."
+      - "Keep a counts object in rateLimit's closure."
+    solution: |
+      function requireToken(tokens) {
+        return (req, next) => {
+          const h = req.headers && req.headers.authorization;
+          if (!h) return { status: 401, body: { error: "login required" } };
+          const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+          if (token === null || !Object.hasOwn(tokens, token)) return { status: 403, body: { error: "invalid token" } };
+          req.user = tokens[token];
+          return next();
+        };
+      }
+      function rateLimit(max) {
+        const counts = {};
+        return (req, next) => {
+          counts[req.user] = (counts[req.user] ?? 0) + 1;
+          if (counts[req.user] > max) return { status: 429, body: { error: "slow down" } };
+          return next();
+        };
+      }
+    explanation: "A missing credential is 401 and a wrong one is 403. Object.hasOwn avoids accepting names like toString from the prototype."
+  - id: escape-html
+    title: Escape for HTML
+    difficulty: 2
+    prompt: |
+      Write `escapeHtml(text)` that replaces `&`, `<`, `>`, `"` and `'` with `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&#39;`. Then write `commentHtml(author, text)` returning `<div class="comment"><b>AUTHOR</b>: TEXT</div>` with both pieces escaped.
+    starter: |
+      function escapeHtml(text) {
+      }
+      function commentHtml(author, text) {
+      }
+    tests:
+      - name: escape
+        code: |
+          if (escapeHtml("a&b<c>d\"e'f") !== "a&amp;b&lt;c&gt;d&quot;e&#39;f") throw new Error("Got " + escapeHtml("a&b<c>d\"e'f"));
+          if (escapeHtml("&lt;") !== "&amp;lt;") throw new Error("escape the ampersand exactly once");
+          if (escapeHtml("plain") !== "plain") throw new Error("plain text is unchanged");
+      - name: comment
+        code: |
+          const r = commentHtml("<i>Eve</i>", "<script>x()</script>");
+          if (r !== '<div class="comment"><b>&lt;i&gt;Eve&lt;/i&gt;</b>: &lt;script&gt;x()&lt;/script&gt;</div>') throw new Error("Got " + r);
+          if (/<script|<i>/.test(r)) throw new Error("no raw tags may remain");
+    hints:
+      - "`text.replace(/[&<>\"']/g, c => map[c])` replaces everything in one pass, so & is never double-escaped."
+    solution: |
+      const MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+      function escapeHtml(text) {
+        return String(text).replace(/[&<>"']/g, (c) => MAP[c]);
+      }
+      function commentHtml(author, text) {
+        return `<div class="comment"><b>${escapeHtml(author)}</b>: ${escapeHtml(text)}</div>`;
+      }
+    explanation: "A single pass with a lookup table avoids escaping the ampersands that earlier replacements introduced."
+  - id: csrf-token
+    title: Check an origin
+    difficulty: 3
+    prompt: |
+      Write `isAllowed(req, allowedOrigins)` returning `true` for a state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) only if its `Origin` header (in `req.headers.origin`) is in the array `allowedOrigins`. Safe methods (`GET`, `HEAD`, `OPTIONS`) are always allowed. A state-changing request with no Origin header is rejected.
+    starter: |
+      function isAllowed(req, allowedOrigins) {
+      }
+    tests:
+      - name: rules
+        code: |
+          const ok = ["https://app.example.com"];
+          const t = (method, origin) => isAllowed({ method, headers: origin ? { origin } : {} }, ok);
+          if (t("GET", "https://evil.example") !== true) throw new Error("GET is always allowed");
+          if (t("POST", "https://app.example.com") !== true) throw new Error("allowed origin posts");
+          if (t("POST", "https://evil.example") !== false) throw new Error("evil origin is rejected");
+          if (t("DELETE", undefined) !== false) throw new Error("missing Origin is rejected");
+          if (t("HEAD", undefined) !== true || t("OPTIONS", undefined) !== true) throw new Error("HEAD and OPTIONS are safe");
+          if (t("post", "https://app.example.com") !== true) throw new Error("methods are case-insensitive");
+    hints:
+      - "Upper-case the method first."
+    solution: |
+      function isAllowed(req, allowedOrigins) {
+        const method = req.method.toUpperCase();
+        if (["GET", "HEAD", "OPTIONS"].includes(method)) return true;
+        const origin = req.headers && req.headers.origin;
+        return Boolean(origin) && allowedOrigins.includes(origin);
+      }
+    explanation: "Checking Origin on changing requests is one of the CSRF defences; it works together with SameSite cookies."
+
+commonMistakes:
+  - title: "Trusting the client"
+    explanation: "Anything from a browser can be forged. Validate and authorize on the server every time."
+  - title: "Authenticating but not authorizing"
+    explanation: "Being logged in does not mean you may read every record. Check ownership."
+  - title: "Wrong status codes"
+    explanation: "Returning 200 with an error message in the body breaks clients and caches. Use 4xx for client errors, 5xx for server errors."
+  - title: "Building SQL or HTML by concatenating input"
+    explanation: "Use parameterised queries and escape output."
+  - title: "Treating CORS as server security"
+    explanation: "CORS only tells browsers whether another site's page may read a response. Anyone can still call your server directly."
+
+summary:
+  - "A server is a function from request to response; routing picks the handler by method and path, with parameters."
+  - "REST names resources with nouns and uses methods and honest status codes: 200, 201, 204, 400, 401, 403, 404, 409, 429, 500."
+  - "Middleware wrap handlers for logging, authentication, validation and errors; order matters."
+  - "Validate everything on the server, copy only allowed fields, hash passwords, check authorization on every resource."
+  - "Defend against XSS (escape output, CSP), SQL injection (parameters), CSRF (SameSite, tokens, Origin) and know that CORS is a browser rule."
+next: |
+  That completes the tour of the web, from HTML and CSS to JavaScript, frameworks and back-end APIs. The Unit 13 project puts the front-end pieces together: you will build a complete **task manager page** with HTML, CSS and JavaScript that passes a suite of behaviour tests.
+
+quiz:
+  - type: mcq
+    question: Which status code means the client is logged in but not allowed?
+    options: ["403", "401", "404", "500"]
+    answer: 0
+    explanation: "401 means unauthenticated; 403 means authenticated but forbidden."
+  - type: mcq
+    question: Which HTTP method should create a new resource and let the server choose its id?
+    options: ["POST", "GET", "PUT", "HEAD"]
+    answer: 0
+    explanation: "POST to the collection creates; the server answers 201 Created."
+  - type: mcq
+    question: What does middleware do when it does not call next()?
+    options: ["It ends the chain and answers itself", "The request is retried", "The server crashes", "The next handler still runs"]
+    answer: 0
+    explanation: "Not calling next stops the chain, as an auth check does for a rejected request."
+  - type: mcq
+    question: Why must a server validate input even if the web page already does?
+    options: ["Anyone can send requests without using the page", "Browsers do not validate", "JavaScript cannot validate", "It is faster"]
+    answer: 0
+    explanation: "Client-side validation is a convenience only."
+  - type: mcq
+    question: What is the best defence against XSS?
+    options: ["Escape untrusted text when writing HTML", "Use POST instead of GET", "Hide the URL", "Use bigger passwords"]
+    answer: 0
+    explanation: "Escaping stops injected markup from being parsed as HTML."
+  - type: mcq
+    question: What does the same-origin policy prevent?
+    options: ["A page reading responses from another origin", "Servers talking to each other", "Users opening two tabs", "Images loading from other sites"]
+    answer: 0
+    explanation: "Browsers stop one site's scripts from reading another site's responses unless CORS allows it."
+  - type: code
+    question: |
+      Write `statusFor(result)` returning the HTTP status for: `"created"` → 201, `"ok"` → 200, `"missing"` → 404, `"invalid"` → 400, `"unauthenticated"` → 401, `"forbidden"` → 403, anything else → 500.
+    starter: |
+      function statusFor(result) {
+      }
+    tests:
+      - name: codes
+        code: |
+          const m = { created: 201, ok: 200, missing: 404, invalid: 400, unauthenticated: 401, forbidden: 403, boom: 500, "": 500 };
+          for (const [k, v] of Object.entries(m)) if (statusFor(k) !== v) throw new Error(k + " should be " + v);
+    solution: |
+      function statusFor(result) {
+        const codes = { created: 201, ok: 200, missing: 404, invalid: 400, unauthenticated: 401, forbidden: 403 };
+        return Object.hasOwn(codes, result) ? codes[result] : 500;
+      }
