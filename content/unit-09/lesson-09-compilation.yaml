@@ -1,0 +1,776 @@
+id: u9-compilation
+title: "From Source to Machine Code"
+minutes: 60
+objective: |
+  Follow a C program through the preprocessor, compiler, assembler and linker; read a few lines of x86-64 assembly; and understand how function calls, the stack and a processor's fetch-decode-execute cycle fit together.
+outcomes:
+  - Name the four stages of building a C program and the file each produces
+  - Use `#include`, `#define`, function-like macros and `#ifdef` correctly, and avoid macro pitfalls
+  - Read simple assembly with `mov`, `add`, `cmp`, `jmp`, `call` and `ret`
+  - Describe a stack frame, argument passing and the return address
+  - Explain what the linker does and tell a compile error from a link error
+  - Write a tiny bytecode interpreter, which is a miniature CPU
+
+sections:
+  - heading: What a compiler does
+    body: |
+      A CPU does not understand C. It understands **machine code**: numbers that encode instructions such as "add these two registers". Turning your text into those numbers takes four stages, which `gcc` runs for you when you type `gcc hello.c -o hello`:
+
+      | Stage | Input | Output | What happens | gcc flag to stop here |
+      |---|---|---|---|---|
+      | 1. **Preprocess** | `hello.c` | expanded C text | `#include` pastes headers in, `#define` macros are replaced, `#ifdef` blocks are kept or dropped | `-E` |
+      | 2. **Compile** | expanded C | `hello.s` (assembly) | checks syntax and types, optimises, produces assembly text | `-S` |
+      | 3. **Assemble** | `hello.s` | `hello.o` (object file) | turns assembly text into machine code bytes, with holes where addresses are unknown | `-c` |
+      | 4. **Link** | `.o` files and libraries | `hello` (executable) | connects the calls in one file to the functions in others, fixes addresses, adds startup code | (default) |
+
+      This is why you can look at what the compiler did: `gcc -S` shows the assembly, and `objdump -d hello` shows the machine code of the finished program. Python also translates your code before running it (to bytecode), but it does so each time, and an interpreter then executes the bytecode. C is translated **once, ahead of time**, to the real instructions of the real chip, which is a large part of why C is fast, and why a C program built for an Intel laptop will not run on a phone.
+
+  - heading: The preprocessor
+    body: |
+      The preprocessor is a **text** substituter that runs before the compiler sees anything. Lines starting with `#` are for it.
+
+      ```c
+      #include <stdio.h>      // paste the contents of stdio.h here (system header)
+      #include "mylib.h"      // paste a header from my own project
+      #define MAX_USERS 100   // every MAX_USERS becomes 100
+      #define SQ(x) ((x) * (x))
+      ```
+
+      **Constants and macros.** A `#define` is replaced as plain text, with no type checking and no scope. A **function-like macro** takes arguments, but it only pastes text, so you need heavy parentheses:
+
+      ```c
+      #define BAD_SQ(x) x * x
+      BAD_SQ(3 + 1)       // becomes 3 + 1 * 3 + 1 = 7, not 16
+      #define SQ(x) ((x) * (x))
+      SQ(3 + 1)           // becomes ((3 + 1) * (3 + 1)) = 16
+      ```
+
+      A macro also **evaluates its arguments each time they appear**. `SQ(i++)` becomes `((i++) * (i++))`, which modifies `i` twice with no defined result. That is why modern code prefers real functions (the compiler can inline them) and `const` variables for constants, and keeps macros for what only the preprocessor can do.
+
+      **Conditional compilation.** `#ifdef`, `#ifndef`, `#if` and `#endif` keep or drop whole blocks before compiling. They are used for debug-only code, for platform differences (`#ifdef _WIN32`), and for **include guards**, which stop a header being pasted twice:
+
+      ```c
+      #ifndef MYLIB_H
+      #define MYLIB_H
+      ... declarations ...
+      #endif
+      ```
+
+      **Headers and prototypes.** A header file contains **declarations**: function prototypes, struct types and macros. It promises "a function `int add(int, int)` exists somewhere". The actual definition lives in a `.c` file. That split is what lets a big project be compiled one file at a time.
+
+  - heading: Reading assembly
+    body: |
+      Assembly language is machine code written with readable names. Each line is one instruction. The processor has a small number of very fast storage slots called **registers**; on 64-bit x86 they are named `rax`, `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `rbp`, `rsp` and `r8` to `r15` (the 32-bit halves are `eax`, `edi`, and so on). Instructions mostly move data between registers and memory and do arithmetic on registers.
+
+      The function `int add(int a, int b) { return a + b; }`, compiled without optimisation (`gcc -S -O0 -masm=intel`), looks like this:
+
+      ```text
+      add:
+          push rbp                      ; save the caller's frame pointer
+          mov  rbp, rsp                 ; our frame starts here
+          mov  DWORD PTR [rbp-4], edi   ; store argument a (it arrived in edi)
+          mov  DWORD PTR [rbp-8], esi   ; store argument b (it arrived in esi)
+          mov  edx, DWORD PTR [rbp-4]   ; load a
+          mov  eax, DWORD PTR [rbp-8]   ; load b
+          add  eax, edx                 ; eax = eax + edx
+          pop  rbp                      ; restore the caller's frame pointer
+          ret                           ; return; the result is in eax
+      ```
+
+      The handful of instructions you meet constantly:
+
+      | Instruction | Meaning |
+      |---|---|
+      | `mov dst, src` | copy a value (register, memory or constant) |
+      | `add`, `sub`, `imul` | arithmetic on the destination register |
+      | `cmp a, b` | compare, setting hidden **flags** |
+      | `jmp`, `je`, `jne`, `jl`, `jg` | jump to a label, always or depending on the flags |
+      | `push`, `pop` | put a value on the stack, or take one off |
+      | `call f` | push the return address, then jump to `f` |
+      | `ret` | pop the return address and jump back to it |
+      | `lea` | compute an address (or just arithmetic) without touching memory |
+
+      **Loops and `if` become compares and jumps.** There are no `for` or `while` instructions: the compiler writes a label at the top, a `cmp` and a conditional jump out, the body, and a `jmp` back. That is what a loop **is** at the lowest level.
+
+      **Optimisation.** With `-O2` the same `add` becomes `lea eax, [rdi+rsi]` followed by `ret`: no stack traffic at all, because the compiler keeps everything in registers. Compilers also unroll loops, inline small functions, and delete code whose result is never used. Because of this, the code you wrote and the code that runs can be quite different, which is also why bugs involving undefined behaviour can appear only in optimised builds.
+
+  - heading: Function calls and the stack
+    body: |
+      Lesson 9.2 introduced **stack frames**. Here is what actually happens in hardware. The register `rsp` always points at the top of the stack, which grows toward lower addresses.
+
+      1. The caller places the first arguments in registers. On Linux x86-64 (the **System V calling convention**) those are `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, in that order; any more arguments go on the stack.
+      2. `call f` pushes the **return address** (the instruction after the call) and jumps to `f`.
+      3. `f` saves `rbp`, sets `rbp = rsp` to mark its frame, and reserves space for its locals by subtracting from `rsp`.
+      4. `f` puts its result in `rax` (or `eax` for an `int`).
+      5. `f` restores `rbp` and runs `ret`, which pops the return address and jumps there.
+
+      ```text
+      high addresses
+      +------------------+
+      | caller's frame   |
+      +------------------+
+      | return address   |  <- pushed by call
+      | saved rbp        |  <- rbp points here in f
+      | local b          |
+      | local a          |  <- rsp (top)
+      +------------------+
+      low addresses
+      ```
+
+      This layout explains several things you have met. **Recursion** just stacks more frames; **stack overflow** is running out of stack space (deep or infinite recursion). **Locals vanish** when the function returns because the frame is popped. And a **buffer overflow** on a stack array can overwrite the saved return address, so that `ret` jumps wherever an attacker chose. That is the classic security hole, and modern systems add defences: stack canaries (a guard value checked before `ret`), non-executable stacks, and address randomisation.
+
+  - heading: Linking and loading
+    body: |
+      Each `.c` file is compiled separately into an **object file**. An object file contains machine code, plus a **symbol table** listing the names it defines (like `add`) and the names it needs from elsewhere (like `printf`). When `main.o` calls `add`, the call target is left blank. The **linker** collects the object files and libraries, matches every needed symbol to a definition, and fills in the addresses.
+
+      You can tell from the message which stage failed:
+
+      | Message | Stage | Cause |
+      |---|---|---|
+      | `error: expected ';' before ...` | compiler | syntax mistake |
+      | `error: 'x' undeclared` | compiler | variable or function not declared before use |
+      | `undefined reference to 'add'` | **linker** | declared (so it compiled) but never defined, or you forgot to link the file or library |
+      | `multiple definition of 'add'` | **linker** | two files define the same function |
+
+      **Static vs dynamic linking.** A **static library** (`.a`) is copied into your executable: self-contained, but large. A **shared library** (`.so` on Linux, `.dll` on Windows, `.dylib` on macOS) is loaded when the program starts, so many programs share one copy in memory, and it can be updated without rebuilding every program. The part of the operating system that starts a program, maps it into memory, and resolves shared libraries is the **loader**.
+
+      Finally `main` is not really the first thing that runs. The linker adds a small startup routine (`_start`) that sets up the stack, calls your `main`, and then passes its return value to the operating system as the **exit status**. That is the number that `echo $?` shows in a shell, and what `exit(n)` from Lesson 9.2 sets.
+
+  - heading: A CPU is a loop
+    body: |
+      At the bottom, a processor does one thing forever, the **fetch-decode-execute cycle**:
+
+      1. **Fetch** the instruction at the address in the **program counter** (`rip` on x86).
+      2. **Decode** it: which operation, which operands.
+      3. **Execute** it, changing registers or memory.
+      4. Advance the program counter to the next instruction (or, for a jump, to its target).
+
+      A jump instruction simply overwrites the program counter. That's all a loop or an `if` is. You can build this machine in a few lines of C: an array of numbers is the program, an integer `pc` is the program counter, a stack is the memory, and a `switch` decodes the instruction. This is a **virtual machine**, the same design as the JVM, Python's bytecode interpreter and WebAssembly. The first example below does exactly that, and the unit project asks you to extend it into a complete assembler and emulator.
+
+examples:
+  - title: Macros and conditional compilation
+    intro: "The preprocessor substitutes text. Unparenthesised macros give surprising answers."
+    code: |
+      #include <stdio.h>
+
+      #define LIMIT 5
+      #define BAD_SQ(x) x * x
+      #define SQ(x) ((x) * (x))
+      #define VERBOSE 1
+
+      int main(void) {
+          printf("limit*2=%d\n", LIMIT * 2);
+          printf("bad=%d good=%d\n", BAD_SQ(3 + 1), SQ(3 + 1));
+      #ifdef VERBOSE
+          printf("verbose mode is on\n");
+      #else
+          printf("quiet mode\n");
+      #endif
+      #ifdef EXTRA
+          printf("extra feature\n");
+      #endif
+          return 0;
+      }
+    output: |
+      limit*2=10
+      bad=16 good=16
+      verbose mode is on
+    lines:
+      - line: 3
+        note: "Every LIMIT in the source is replaced with 5 before the compiler runs."
+      - line: 4
+        note: "No parentheses: the expansion is 3 + 1 * 3 + 1."
+      - line: 10
+        note: "7 versus 16. Always parenthesise each macro argument and the whole body."
+      - line: 12
+        note: "VERBOSE is defined, so this branch stays and the else branch is deleted before compiling."
+      - line: 18
+        note: "EXTRA is never defined, so this block does not exist in the compiled program at all."
+  - title: Recursion builds and unwinds frames
+    intro: "Each call has its own n. Watch the depth rise on the way in and the products appear on the way out."
+    code: |
+      #include <stdio.h>
+
+      int fact(int n, int depth) {
+          for (int i = 0; i < depth; i++) {
+              printf("  ");
+          }
+          printf("fact(%d) called\n", n);
+          int result;
+          if (n <= 1) {
+              result = 1;
+          } else {
+              result = n * fact(n - 1, depth + 1);
+          }
+          for (int i = 0; i < depth; i++) {
+              printf("  ");
+          }
+          printf("fact(%d) returns %d\n", n, result);
+          return result;
+      }
+
+      int main(void) {
+          fact(4, 0);
+          return 0;
+      }
+    output: |
+      fact(4) called
+        fact(3) called
+          fact(2) called
+            fact(1) called
+            fact(1) returns 1
+          fact(2) returns 2
+        fact(3) returns 6
+      fact(4) returns 24
+    lines:
+      - line: 4
+        note: "Indent by depth so the nesting of frames is visible."
+      - line: 12
+        note: "This call pushes a new frame. The current frame waits, holding n and its place."
+      - line: 20
+        note: "Frames pop in the reverse order they were pushed, last in first out."
+  - title: A tiny virtual machine
+    intro: "An array is the program, pc is the program counter, a small array is the stack, and a switch decodes each instruction."
+    code: |
+      #include <stdio.h>
+
+      int main(void) {
+          int program[12] = {1, 6, 1, 7, 4, 7, 0, 0, 0, 0, 0, 0};
+          int stack[16];
+          int sp = 0;
+          int pc = 0;
+          int running = 1;
+          while (running) {
+              int op = program[pc];
+              pc++;
+              switch (op) {
+                  case 1:
+                      stack[sp] = program[pc];
+                      sp++;
+                      pc++;
+                      break;
+                  case 2:
+                      sp--;
+                      stack[sp - 1] = stack[sp - 1] + stack[sp];
+                      break;
+                  case 4:
+                      sp--;
+                      stack[sp - 1] = stack[sp - 1] * stack[sp];
+                      break;
+                  case 7:
+                      sp--;
+                      printf("out: %d\n", stack[sp]);
+                      break;
+                  default:
+                      running = 0;
+                      break;
+              }
+          }
+          printf("halted at pc=%d\n", pc);
+          return 0;
+      }
+    output: |
+      out: 42
+      halted at pc=7
+    lines:
+      - line: 4
+        note: "Machine code for: PUSH 6, PUSH 7, MUL, PRINT, HALT. Opcode 1 is followed by its operand."
+      - line: 10
+        note: "Fetch: read the instruction at pc, then advance pc."
+      - line: 11
+        note: "Decode and execute: a switch on the opcode. This is the heart of every interpreter."
+      - line: 14
+        note: "PUSH reads its operand from the next slot of the program, then skips over it."
+      - line: 22
+        note: "MUL pops two values and pushes their product, reusing the slot. 6 * 7 = 42."
+  - title: Assembly for a loop, annotated
+    intro: "What the compiler produces for a simple sum. Not run here, because the engine in this app has no assembler."
+    runnable: false
+    code: |
+      int sum_to(int n) {
+          int total = 0;
+          for (int i = 1; i <= n; i++) {
+              total += i;
+          }
+          return total;
+      }
+
+      ; typical gcc -O0 output (Intel syntax, simplified)
+      sum_to:
+          push rbp
+          mov  rbp, rsp
+          mov  DWORD PTR [rbp-20], edi
+          mov  DWORD PTR [rbp-4], 0
+          mov  DWORD PTR [rbp-8], 1
+          jmp  .check
+      .body:
+          mov  eax, DWORD PTR [rbp-8]
+          add  DWORD PTR [rbp-4], eax
+          add  DWORD PTR [rbp-8], 1
+      .check:
+          mov  eax, DWORD PTR [rbp-8]
+          cmp  eax, DWORD PTR [rbp-20]
+          jle  .body
+          mov  eax, DWORD PTR [rbp-4]
+          pop  rbp
+          ret
+    lines:
+      - line: 10
+        note: "A label: the address where this function begins. The caller's call instruction jumps here."
+      - line: 13
+        note: "n arrives in edi (first argument) and is saved in the frame at rbp-20."
+      - line: 14
+        note: "total lives at rbp-4. Locals are just offsets from the frame pointer."
+      - line: 16
+        note: "The for loop starts by jumping to the test, so the body is skipped when n < 1."
+      - line: 19
+        note: "total += i: the body of the loop."
+      - line: 23
+        note: "cmp sets the flags, and jle (jump if less or equal) goes back to .body. This pair is the whole loop."
+      - line: 24
+        note: "Returning: the value goes in eax, the register where the caller expects an int."
+  - title: The build pipeline
+    intro: "Commands that stop after each stage, so you can see its output. Run these in a real terminal."
+    runnable: false
+    code: |
+      gcc -E hello.c -o hello.i        # preprocessed C (headers pasted in)
+      gcc -S hello.c -o hello.s        # assembly text
+      gcc -c hello.c -o hello.o        # object file (machine code, unlinked)
+      gcc hello.o -o hello             # linked executable
+      ./hello                          # run it
+      echo $?                          # the exit status returned by main
+
+      objdump -d hello.o               # disassemble the machine code
+      nm hello.o                       # list the symbols it defines or needs
+      gcc -g -fsanitize=address hello.c -o hello_asan   # catch heap bugs at run time
+    lines:
+      - line: 1
+        note: "hello.i is thousands of lines long: stdio.h is pasted into it."
+      - line: 3
+        note: "hello.o holds machine code, but a call to printf is left as a blank to be filled in by the linker."
+      - line: 6
+        note: "main's return value becomes the process exit status, 0 meaning success."
+      - line: 8
+        note: "objdump turns the bytes back into assembly so you can read them."
+      - line: 9
+        note: "nm shows 'T main' (defined here) and 'U printf' (undefined, needed from elsewhere)."
+
+playground:
+  prompt: |
+    Change the VM program so it computes (2 + 3) * 4 and prints it. The opcodes are 1 = PUSH n, 2 = ADD, 4 = MUL, 7 = PRINT, 0 = HALT. Then try writing a loop with a `while` that sums the program array instead.
+  code: |
+    #include <stdio.h>
+
+    #define TRIPLE(x) ((x) * 3)
+    #define SHOW(label, value) printf(label " = %d\n", value)
+
+    int main(void) {
+        int n = 14;
+        SHOW("triple", TRIPLE(n));
+        SHOW("expression", TRIPLE(n + 1));
+        return 0;
+    }
+
+exercises:
+  - id: macros
+    title: Safe macros
+    difficulty: 2
+    prompt: |
+      Complete these function-like macros so that they behave correctly even with arguments such as `3 - 5` or `a + b`. `ABS(x)` is the absolute value, `MIN(a, b)` and `MAX(a, b)` are the smaller and larger, `CLAMP(x, lo, hi)` limits `x` to the range `lo` to `hi` (you may use your own `MIN` and `MAX`), `IS_EVEN(x)` is 1 if even and 0 otherwise, and `IS_BETWEEN(x, lo, hi)` is 1 if `lo <= x <= hi`. Parenthesise every argument and the whole expression.
+    starter: |
+      #include <stdio.h>
+
+      #define ABS(x) 0
+      #define MIN(a, b) 0
+      #define MAX(a, b) 0
+      #define CLAMP(x, lo, hi) 0
+      #define IS_EVEN(x) 0
+      #define IS_BETWEEN(x, lo, hi) 0
+
+      int main(void) {
+          printf("%d %d\n", ABS(-4), MIN(2, 9));
+          return 0;
+      }
+    tests:
+      - name: abs min max
+        append: |
+          int main(void) {
+              int a = 4;
+              int b = 9;
+              printf("%d %d %d %d\n", ABS(3 - 5), ABS(-7), ABS(0), ABS(a - b));
+              printf("%d %d %d %d\n", MIN(a, b), MAX(a, b), MIN(2 + 3, 1 + 1), MAX(a + 1, b - 5));
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "2 7 0 5\n4 9 2 5") throw new Error(`Expected "2 7 0 5\\n4 9 2 5" but got "${output.trim()}"`);
+      - name: clamp
+        append: |
+          int main(void) {
+              printf("%d %d %d %d\n", CLAMP(15, 0, 10), CLAMP(-3, 0, 10), CLAMP(7, 0, 10), CLAMP(2 + 9, 1 + 1, 5 + 5));
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "10 0 7 10") throw new Error(`Expected "10 0 7 10" but got "${output.trim()}"`);
+      - name: even and between
+        append: |
+          int main(void) {
+              printf("%d %d %d %d\n", IS_EVEN(10), IS_EVEN(7), IS_EVEN(1 + 2), IS_EVEN(2 + 2));
+              printf("%d %d %d %d\n", IS_BETWEEN(5, 1, 10), IS_BETWEEN(0, 1, 10), IS_BETWEEN(10, 1, 10), IS_BETWEEN(5 + 6, 1, 10));
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "1 0 0 1\n1 0 1 0") throw new Error(`Expected "1 0 0 1\\n1 0 1 0" but got "${output.trim()}"`);
+    hints:
+      - "`#define ABS(x) ((x) < 0 ? -(x) : (x))`"
+      - "`MIN` and `MAX` use the conditional operator: `((a) < (b) ? (a) : (b))`."
+      - "`CLAMP` can nest the two: `MIN(MAX((x), (lo)), (hi))`."
+      - "`IS_EVEN(x)` is `(((x) % 2) == 0)`. `IS_BETWEEN` is `(((x) >= (lo)) && ((x) <= (hi)))`."
+    solution: |
+      #include <stdio.h>
+
+      #define ABS(x) ((x) < 0 ? -(x) : (x))
+      #define MIN(a, b) ((a) < (b) ? (a) : (b))
+      #define MAX(a, b) ((a) > (b) ? (a) : (b))
+      #define CLAMP(x, lo, hi) MIN(MAX((x), (lo)), (hi))
+      #define IS_EVEN(x) (((x) % 2) == 0)
+      #define IS_BETWEEN(x, lo, hi) (((x) >= (lo)) && ((x) <= (hi)))
+
+      int main(void) {
+          printf("%d %d\n", ABS(-4), MIN(2, 9));
+          return 0;
+      }
+    explanation: |
+      Each argument is wrapped in its own parentheses, and so is the whole result. Without them `ABS(3 - 5)` would expand to `3 - 5 < 0 ? -3 - 5 : 3 - 5`, giving the wrong sign. Notice that each of these macros mentions its arguments more than once, so `ABS(i++)` would increment twice. That is the main reason modern C prefers small `static inline` functions, which the compiler optimises just as well and which evaluate their arguments once.
+
+  - id: vm-run
+    title: A stack machine
+    difficulty: 4
+    prompt: |
+      Write `int run(int *code)` that executes a program on a stack machine and returns the value on top of the stack when it halts. Instructions (an operand, where there is one, is the next slot): `0` HALT, `1 n` PUSH n, `2` ADD, `3` SUB (second from top minus top), `4` MUL, `5` DUP (copy the top), `6 a` JNZ (pop; if the value is not 0 jump to index `a`), `7 a` JMP (jump to index `a`), `8` SWAP (exchange the top two). Also keep a global `steps` that counts how many instructions were executed, including HALT. Use an array of 64 ints for the stack.
+    starter: |
+      #include <stdio.h>
+
+      int steps = 0;
+
+      int run(int *code) {
+          return 0;
+      }
+
+      int main(void) {
+          int program[5] = {1, 2, 1, 3, 2};
+          int end[1] = {0};
+          printf("%d\n", run(program));
+          return 0;
+      }
+    tests:
+      - name: arithmetic
+        append: |
+          int main(void) {
+              int p1[8] = {1, 2, 1, 3, 2, 1, 4, 4};
+              int p2[8] = {1, 10, 1, 4, 3, 5, 4, 0};
+              int p3[8] = {1, 1, 1, 2, 8, 3, 0, 0};
+              int tmp[4];
+              printf("%d ", run(p1));
+              printf("%d ", run(p2));
+              printf("%d\n", run(p3));
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "20 36 1") throw new Error(`Got "${output.trim()}"`);
+      - name: steps counted
+        append: |
+          int main(void) {
+              int p[6] = {1, 5, 1, 6, 2, 0};
+              int r = run(p);
+              printf("%d %d\n", r, steps);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "11 4") throw new Error(`Expected "11 4" but got "${output.trim()}"`);
+      - name: countdown loop
+        append: |
+          int main(void) {
+              int p[10] = {1, 3, 1, 1, 3, 5, 6, 2, 0, 0};
+              int r = run(p);
+              printf("%d %d\n", r, steps);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "0 14") throw new Error(`Expected "0 14" but got "${output.trim()}"`);
+      - name: jmp skips
+        append: |
+          int main(void) {
+              int p[10] = {1, 1, 7, 6, 1, 99, 1, 2, 2, 0};
+              int r = run(p);
+              printf("%d %d\n", r, steps);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "3 5") throw new Error(`Expected "3 5" but got "${output.trim()}"`);
+    hints:
+      - "Keep `int stack[64]; int sp = 0; int pc = 0;`. Each loop turn: read `op = code[pc]`, `pc++`, `steps++`, then `switch (op)`."
+      - "PUSH: `stack[sp] = code[pc]; sp++; pc++;`. ADD: `sp--; stack[sp-1] = stack[sp-1] + stack[sp];`."
+      - "SUB is `stack[sp-1] - stack[sp]` after the pop: second from top minus top."
+      - "JNZ: `sp--; if (stack[sp] != 0) pc = code[pc]; else pc++;`. JMP: `pc = code[pc];`."
+      - "Reset `steps = 0` at the start of `run`. HALT should `return stack[sp - 1]`."
+    solution: |
+      #include <stdio.h>
+
+      int steps = 0;
+
+      int run(int *code) {
+          int stack[64];
+          int sp = 0;
+          int pc = 0;
+          steps = 0;
+          while (1) {
+              int op = code[pc];
+              pc++;
+              steps++;
+              if (op == 0) {
+                  return stack[sp - 1];
+              } else if (op == 1) {
+                  stack[sp] = code[pc];
+                  sp++;
+                  pc++;
+              } else if (op == 2) {
+                  sp--;
+                  stack[sp - 1] = stack[sp - 1] + stack[sp];
+              } else if (op == 3) {
+                  sp--;
+                  stack[sp - 1] = stack[sp - 1] - stack[sp];
+              } else if (op == 4) {
+                  sp--;
+                  stack[sp - 1] = stack[sp - 1] * stack[sp];
+              } else if (op == 5) {
+                  stack[sp] = stack[sp - 1];
+                  sp++;
+              } else if (op == 6) {
+                  sp--;
+                  if (stack[sp] != 0) {
+                      pc = code[pc];
+                  } else {
+                      pc++;
+                  }
+              } else if (op == 7) {
+                  pc = code[pc];
+              } else if (op == 8) {
+                  int top = stack[sp - 1];
+                  stack[sp - 1] = stack[sp - 2];
+                  stack[sp - 2] = top;
+              } else {
+                  return -1;
+              }
+          }
+      }
+
+      int main(void) {
+          int program[5] = {1, 2, 1, 3, 2};
+          printf("%d\n", run(program));
+          return 0;
+      }
+    explanation: |
+      This loop is a processor: `pc` is the program counter, the three steps in the loop body are fetch, decode and execute, and a jump is nothing more than assigning to `pc`. The countdown program (`PUSH 3; L: PUSH 1; SUB; DUP; JNZ L; HALT`) shows how a loop is built purely from a conditional jump to an earlier address. The unit project builds an assembler on top of this so you can write programs with names instead of numbers.
+
+  - id: disassemble
+    title: A disassembler
+    difficulty: 3
+    prompt: |
+      Write `void disassemble(int *code, int n)` that prints one line per instruction for a program of `n` slots, using the opcode table from the previous exercise. Print the address, a colon, then the mnemonic and, for the instructions that have one, the operand. Format: `%02d: NAME` or `%02d: NAME operand`. The names are `HALT`, `PUSH`, `ADD`, `SUB`, `MUL`, `DUP`, `JNZ`, `JMP`, `SWAP`. An unknown opcode prints `%02d: ??? value`. Instructions that take an operand (PUSH, JNZ, JMP) consume two slots.
+    starter: |
+      #include <stdio.h>
+
+      void disassemble(int *code, int n) {
+      }
+
+      int main(void) {
+          int p[3] = {1, 5, 0};
+          disassemble(p, 3);
+          return 0;
+      }
+    tests:
+      - name: simple program
+        append: |
+          int main(void) {
+              int p[8] = {1, 3, 1, 4, 2, 5, 4, 0};
+              disassemble(p, 8);
+              return 0;
+          }
+        code: |
+          const want = "00: PUSH 3\n02: PUSH 4\n04: ADD\n05: DUP\n06: MUL\n07: HALT";
+          if (output.trim() !== want) throw new Error(`Expected:\n${want}\nGot:\n${output.trim()}`);
+      - name: jumps and unknown
+        append: |
+          int main(void) {
+              int p[7] = {1, 2, 6, 0, 7, 0, 42};
+              disassemble(p, 7);
+              return 0;
+          }
+        code: |
+          const want = "00: PUSH 2\n02: JNZ 0\n04: JMP 0\n06: ??? 42";
+          if (output.trim() !== want) throw new Error(`Expected:\n${want}\nGot:\n${output.trim()}`);
+    hints:
+      - "Use an index `i` and a loop `while (i < n)`. Print with `printf(\"%02d: \", i)`, then decide by `code[i]`."
+      - "For PUSH, JNZ and JMP print `code[i + 1]` as well and add 2 to `i`; for the others add 1."
+      - "A `switch` with `case 1:` through `case 8:` and a `default:` for the unknown opcode is neat."
+    solution: |
+      #include <stdio.h>
+
+      void disassemble(int *code, int n) {
+          int i = 0;
+          while (i < n) {
+              int op = code[i];
+              printf("%02d: ", i);
+              if (op == 0) {
+                  printf("HALT\n");
+                  i += 1;
+              } else if (op == 1) {
+                  printf("PUSH %d\n", code[i + 1]);
+                  i += 2;
+              } else if (op == 2) {
+                  printf("ADD\n");
+                  i += 1;
+              } else if (op == 3) {
+                  printf("SUB\n");
+                  i += 1;
+              } else if (op == 4) {
+                  printf("MUL\n");
+                  i += 1;
+              } else if (op == 5) {
+                  printf("DUP\n");
+                  i += 1;
+              } else if (op == 6) {
+                  printf("JNZ %d\n", code[i + 1]);
+                  i += 2;
+              } else if (op == 7) {
+                  printf("JMP %d\n", code[i + 1]);
+                  i += 2;
+              } else if (op == 8) {
+                  printf("SWAP\n");
+                  i += 1;
+              } else {
+                  printf("??? %d\n", op);
+                  i += 1;
+              }
+          }
+      }
+
+      int main(void) {
+          int p[3] = {1, 5, 0};
+          disassemble(p, 3);
+          return 0;
+      }
+    explanation: |
+      A disassembler is the reverse of an assembler: it walks the bytes, uses each opcode to decide how many slots the instruction occupies, and prints the text. This is what `objdump -d` does for real machine code. It is harder on real CPUs like x86, where instructions have different lengths (1 to 15 bytes), so you can't even tell where an instruction starts without decoding the ones before it.
+
+commonMistakes:
+  - title: Missing parentheses in a macro
+    explanation: |
+      `#define DOUBLE(x) x * 2` turns `DOUBLE(1 + 2)` into `1 + 2 * 2`. Parenthesise each argument and the whole body.
+  - title: Macro arguments with side effects
+    explanation: |
+      A macro may evaluate an argument several times. `MAX(i++, j)` can increment `i` twice.
+  - title: A semicolon after a #define
+    explanation: |
+      `#define N 10;` makes every `N` expand to `10;`, which breaks expressions like `int a[N];` in strange ways.
+  - title: Putting definitions in headers
+    explanation: |
+      A function defined in a header is compiled into every file that includes it, causing "multiple definition" link errors. Headers hold declarations; definitions go in one `.c` file.
+  - title: Confusing a compile error with a link error
+    explanation: |
+      "Undefined reference" means the compiler was satisfied by a declaration, but the linker found no definition. Check you listed the file or library, and that the names and types match.
+  - title: Forgetting include guards
+    explanation: |
+      Including the same header twice declares things twice. Wrap headers in `#ifndef`/`#define`/`#endif`.
+  - title: Expecting source and machine code to match line by line
+    explanation: |
+      The optimiser reorders, merges and deletes code. Use `-O0` to study, and `-O2` to measure real performance.
+
+summary:
+  - "Building C has four stages: **preprocess** (text substitution), **compile** (to assembly), **assemble** (to an object file), **link** (combine objects and libraries into an executable)."
+  - "The preprocessor handles `#include`, `#define`, macros and `#ifdef`. Macros paste text: parenthesise arguments, and avoid side effects in them."
+  - "**Assembly** is readable machine code: registers, `mov`, arithmetic, `cmp` with conditional jumps, `call` and `ret`. Loops and ifs are compares and jumps."
+  - "A call pushes the **return address**; arguments travel in registers (rdi, rsi, ...) and the result in rax. Each call gets a **stack frame**, popped on return."
+  - "Compile errors come from syntax and types; **undefined reference** comes from the linker. Shared libraries are loaded at start-up by the loader."
+  - "A CPU is a **fetch-decode-execute** loop over a program counter; a jump just changes the counter. A bytecode interpreter is the same loop in software."
+next: |
+  You now have the whole path from a line of C to a running CPU. The Unit 9 project puts it together: you will build a complete **assembler and emulator** for a small processor, in C, with labels, registers, a memory array and a stack, and run real programs on it. After that, Unit 10 moves up one level to the **operating system**: processes, scheduling, memory management and files, in Python.
+
+quiz:
+  - type: mcq
+    question: What is the correct order of the stages that build a C program?
+    options: [
+      "Preprocess, compile, assemble, link",
+      "Compile, preprocess, link, assemble",
+      "Assemble, compile, preprocess, link",
+      "Link, compile, assemble, preprocess"
+    ]
+    answer: 0
+    explanation: "Text expansion first, then C to assembly, then assembly to object code, then joining the objects."
+  - type: mcq
+    question: What does BAD_SQ(3 + 1) give if BAD_SQ(x) is defined as x * x?
+    options: ["7", "16", "12", "9"]
+    answer: 0
+    explanation: "It expands to 3 + 1 * 3 + 1, and multiplication goes first: 3 + 3 + 1 = 7."
+  - type: mcq
+    question: You get "undefined reference to 'helper'". Which stage reported it?
+    options: ["The linker", "The preprocessor", "The compiler's parser", "The assembler"]
+    answer: 0
+    explanation: "The function was declared, so it compiled, but no object file or library provided its definition."
+  - type: mcq
+    question: On Linux x86-64, where does a function find its first integer argument?
+    options: ["In the rdi register", "At the top of the stack", "In rax", "In a global variable"]
+    answer: 0
+    explanation: "The System V convention passes the first six integer arguments in rdi, rsi, rdx, rcx, r8, r9."
+  - type: mcq
+    question: What does the ret instruction do?
+    options: [
+      "Pops the return address and jumps to it",
+      "Pushes a return value",
+      "Restarts the function",
+      "Frees the stack frame's heap memory"
+    ]
+    answer: 0
+    explanation: "call pushed the address of the next instruction in the caller; ret takes it back."
+  - type: mcq
+    question: At the level of the CPU, what is a loop?
+    options: [
+      "A conditional jump back to an earlier address",
+      "A special loop instruction",
+      "A copy of the body repeated many times in memory",
+      "A hardware timer"
+    ]
+    answer: 0
+    explanation: "Jumps change the program counter. A compare and a conditional jump back make a loop."
+  - type: code
+    question: |
+      Write a macro `SQUARE(x)` that is safe for arguments such as `2 + 3` (so `SQUARE(2 + 3)` is 25), and a macro `CUBE(x)` built from `SQUARE` and `x`, safe for `1 + 1` (so `CUBE(1 + 1)` is 8).
+    starter: |
+      #include <stdio.h>
+
+      #define SQUARE(x) 0
+      #define CUBE(x) 0
+
+      int main(void) {
+          printf("%d %d\n", SQUARE(4), CUBE(2));
+          return 0;
+      }
+    tests:
+      - name: macros
+        append: |
+          int main(void) {
+              printf("%d %d %d %d\n", SQUARE(2 + 3), SQUARE(-4), CUBE(1 + 1), CUBE(3));
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "25 16 8 27") throw new Error(`Expected "25 16 8 27" but got "${output.trim()}"`);
+    solution: |
+      #include <stdio.h>
+
+      #define SQUARE(x) ((x) * (x))
+      #define CUBE(x) (SQUARE(x) * (x))
+
+      int main(void) {
+          printf("%d %d\n", SQUARE(4), CUBE(2));
+          return 0;
+      }

@@ -1,0 +1,617 @@
+title: Mini CPU
+brief: |
+
+  You are going to build a complete little computer in C: an **assembler** that turns readable text into machine code, and an **emulator** (a virtual CPU) that runs that machine code. It uses everything in this unit: strings and pointers, arrays and structs of data, bit-level encoding, the stack, and the fetch-decode-execute loop.
+
+  **The machine.** It has four registers `A`, `B`, `C` and `D` (each an `int`), a program counter, and a stack of up to 64 values. An assembly program looks like this:
+
+  ```text
+  ; factorial of 6
+        LDI A, 1        ; A = 1  (the answer so far)
+        LDI B, 6        ; B = 6  (the counter)
+        LDI C, 1
+  loop:
+        MUL A, B
+        SUB B, C
+        JNZ B, loop     ; jump back while B is not zero
+        OUT A
+        HALT
+  ```
+
+  A line may have a **label** (`name:`), an **instruction**, a **`;` comment**, or be blank. Operands are separated by spaces and/or commas. Labels may stand alone on a line or in front of an instruction.
+
+  | Instruction | Operands | Effect |
+  |---|---|---|
+  | `HALT` | none | stop the program |
+  | `LDI r, n` | register, number | `r = n` |
+  | `MOV r, s` | two registers | `r = s` |
+  | `ADD r, s` / `SUB r, s` / `MUL r, s` | two registers | `r = r + s` (or `-`, `*`) |
+  | `JMP label` | label | go to the label |
+  | `JNZ r, label` / `JZ r, label` | register, label | go to the label if `r` is not zero / is zero |
+  | `OUT r` | register | append `r` to the output list |
+  | `PUSH r` / `POP r` | register | push `r` onto the stack / pop the top into `r` |
+  | `CALL label` | label | push the address of the next instruction, then jump to the label |
+  | `RET` | none | pop an address and jump to it |
+
+  **Machine code.** Every instruction is stored as **three ints**: `[opcode, a, b]`. The opcodes are `HALT` 0, `LDI` 1, `MOV` 2, `ADD` 3, `SUB` 4, `MUL` 5, `JMP` 6, `JNZ` 7, `JZ` 8, `OUT` 9, `PUSH` 10, `POP` 11, `CALL` 12, `RET` 13. Registers are numbered `A`=0 to `D`=3. Unused slots are 0. Where each instruction puts its operands:
+
+  - `LDI r, n`: `a` = register number, `b` = n. `MOV/ADD/SUB/MUL r, s`: `a` = r, `b` = s.
+  - `JMP label` and `CALL label`: `a` = the label's **instruction number** (the first instruction is number 0; labels and comments do not count).
+  - `JNZ r, label` and `JZ r, label`: `a` = register, `b` = the label's instruction number.
+  - `OUT r`, `PUSH r`, `POP r`: `a` = register. `HALT` and `RET`: both 0.
+
+  **Functions** (the helpers `get_line`, `tokenize`, `reg_index` and `is_number` are given):
+
+  - `int op_index(char *s)`: the opcode for a mnemonic such as `"MUL"`, or `-1`.
+  - `int find_label(char *name)`: the instruction number stored for a label name, or `-1`.
+  - `int assemble(char *text, int *code)`: translate the whole program text and return the **number of instructions**, or a negative error: `-1` unknown mnemonic, `-2` wrong operand count or a bad register or number, `-3` undefined label, `-4` label defined twice. Use **two passes**: the first records where every label is (a jump can go forward to a label that has not been seen yet), the second encodes.
+  - `int run(int *code, int n, int *out)`: execute the `n` instructions and return how many numbers `OUT` produced (stored in `out`). Set the global `cpu_error` to `0` when the program ends normally with `HALT`, `1` after **10,000 steps** without halting, `2` for a stack underflow (`POP` or `RET` on an empty stack) or overflow (more than 64 entries), and `3` if the program counter runs off the end or hits a bad opcode. On an error, stop and return the outputs so far.
+  - `void report(char *title, char *text)`: assemble and run one program and print a line. For an assemble error print `Title: assemble error N`. Otherwise print `Title: K instructions, M outputs`, then a space and each output (every output preceded by a space), and `(cpu error E)` after a space if `cpu_error` is not 0.
+  - `main` calls `report` for four programs: a factorial loop, a program with a `square` subroutine, a broken one (`JMP nowhere`) and an endless loop (`spin:` then `JMP spin`). The expected output is:
+
+    ```text
+    Factorial: 8 instructions, 1 outputs 720
+    Squares: 10 instructions, 2 outputs 49 64
+    Broken: assemble error -3
+    Endless: 1 instructions, 0 outputs (cpu error 1)
+    ```
+prelude: ""
+steps:
+- title: Read the helpers
+  body: "Skim `get_line` (copies one line of the text into a buffer and returns where the next line starts, or -1 at the end), `tokenize` (splits a line into words in the global `tokens` array, ignoring commas and comments, and returns how many) and `is_number`. You will call them, not rewrite them. A label shows up as a first token ending in a colon."
+- title: Opcodes and labels
+  body: "Write `op_index` as a chain of `strcmp` tests, and `find_label` as a loop over the label table. These are small, and every later step depends on them."
+- title: "Pass 1: find the labels"
+  body: "Loop over the lines. For each line tokenize it; if the first token ends with `:` remove the colon (set that character to `'\\\\0'`), check it is new (otherwise return -4), store it in `label_names` with the current instruction count in `label_addr`, and treat the rest of the line as the instruction. Count an instruction only when something follows the label."
+- title: "Pass 2: encode"
+  body: "Loop again, this time writing `code[3*i]`, `code[3*i+1]`, `code[3*i+2]`. Decide the operands by opcode, checking the operand count first (the number of tokens after the mnemonic). Return a negative error code as soon as something is wrong. A forward jump now works because every label is already known."
+- title: The CPU loop
+  body: "Keep `reg[4]`, `stack[64]`, `sp`, `pc`, `outs` and `steps`. Each turn: check `pc` is in range and `steps` is under the limit, then fetch the three ints, advance `pc`, and branch on the opcode. For `CALL`, push `pc` (already advanced) and jump; for `RET`, pop it back into `pc`."
+- title: Report and main
+  body: "`report` ties the pieces together. Test each part as you go: assemble a tiny program and print the `code` array before trying to run anything."
+checklist:
+- text: assemble produces the right machine code
+  test: assemble encodes instructions
+- text: assemble handles labels, comments, blank lines and forward jumps
+  test: assemble handles labels and comments
+- text: assemble returns the right error codes
+  test: assemble reports errors
+- text: run does arithmetic and output
+  test: run does arithmetic
+- text: run handles loops and conditional jumps
+  test: run handles loops and jumps
+- text: PUSH, POP, CALL and RET work with the stack
+  test: push, pop, call and ret use the stack
+- text: run reports step-limit, stack and program-counter errors
+  test: run stops with the right error code
+- text: main prints the report for the four programs
+  test: main prints the report
+- text: I wrote a comment explaining why the assembler needs two passes
+- text: I wrote a comment saying what a real CPU adds that this one lacks (for example memory loads, flags, interrupts)
+starter: |
+  // Unit 9 project: Mini CPU
+  // Given: get_line, tokenize, reg_index, is_number. Yours: op_index, find_label, assemble, run, report.
+  #include <string.h>
+
+  char tokens[4][16];
+  char label_names[32][16];
+  int label_addr[32];
+  int label_count = 0;
+  int cpu_error = 0;
+
+  int get_line(char *text, int start, char *buf) {
+      if (text[start] == '\0') {
+          return -1;
+      }
+      int i = start;
+      int n = 0;
+      while (text[i] != '\0' && text[i] != '\n') {
+          if (n < 79) {
+              buf[n] = text[i];
+              n++;
+          }
+          i++;
+      }
+      buf[n] = '\0';
+      if (text[i] == '\n') {
+          i++;
+      }
+      return i;
+  }
+
+  int tokenize(char *line) {
+      int count = 0;
+      int i = 0;
+      while (line[i] != '\0' && line[i] != ';') {
+          char c = line[i];
+          if (c == ' ' || c == ',' || c == '\t') {
+              i++;
+          } else {
+              int n = 0;
+              while (line[i] != '\0' && line[i] != ';' && line[i] != ' ' && line[i] != ',' && line[i] != '\t') {
+                  if (n < 15 && count < 4) {
+                      tokens[count][n] = line[i];
+                      n++;
+                  }
+                  i++;
+              }
+              if (count < 4) {
+                  tokens[count][n] = '\0';
+                  count++;
+              }
+          }
+      }
+      return count;
+  }
+
+  int find_label(char *name) {
+      // TODO: search label_names[0..label_count-1]; return its label_addr or -1
+      return -1;
+  }
+
+  int reg_index(char *s) {
+      if (strlen(s) == 1 && s[0] >= 'A' && s[0] <= 'D') {
+          return s[0] - 'A';
+      }
+      return -1;
+  }
+
+  int op_index(char *s) {
+      // TODO: HALT 0, LDI 1, MOV 2, ADD 3, SUB 4, MUL 5, JMP 6, JNZ 7, JZ 8, OUT 9, PUSH 10, POP 11, CALL 12, RET 13; -1 if unknown
+      return -1;
+  }
+
+  int is_number(char *s) {
+      int i = 0;
+      if (s[0] == '-') {
+          i = 1;
+      }
+      if (s[i] == '\0') {
+          return 0;
+      }
+      while (s[i] != '\0') {
+          if (s[i] < '0' || s[i] > '9') {
+              return 0;
+          }
+          i++;
+      }
+      return 1;
+  }
+
+  int assemble(char *text, int *code) {
+      // TODO: pass 1 records labels, pass 2 encodes 3 ints per instruction
+      return -1;
+  }
+
+  int run(int *code, int n, int *out) {
+      // TODO: the fetch-decode-execute loop
+      cpu_error = 0;
+      return 0;
+  }
+
+  void report(char *title, char *text) {
+      // TODO: assemble, run and print one line (see the brief)
+  }
+
+  int main(void) {
+      report("Factorial", "LDI A, 1\nLDI B, 6\nLDI C, 1\nloop:\nMUL A, B\nSUB B, C\nJNZ B, loop\nOUT A\nHALT\n");
+      report("Squares", "LDI A, 7\nCALL square\nOUT B\nLDI A, 8\nCALL square\nOUT B\nHALT\nsquare:\nMOV B, A\nMUL B, A\nRET\n");
+      report("Broken", "JMP nowhere\n");
+      report("Endless", "spin:\nJMP spin\n");
+      return 0;
+  }
+tests:
+- name: assemble encodes instructions
+  append: |
+    int main(void) {
+        int code[30];
+        int n = assemble("LDI A, 5\nADD A, B\nOUT A\nHALT\n", code);
+        printf("%d:", n);
+        for (int i = 0; i < n * 3; i++) {
+            printf(" %d", code[i]);
+        }
+        printf("\n");
+        return 0;
+    }
+  code: |
+    if (output.trim() !== "4: 1 0 5 3 0 1 9 0 0 0 0 0") throw new Error(`Expected "4: 1 0 5 3 0 1 9 0 0 0 0 0" but got "${output.trim()}"`);
+- name: assemble handles labels and comments
+  append: |
+    int main(void) {
+        int code[60];
+        char *text = "; countdown\nstart: LDI A, 3   ; set up\n    LDI B, 1\n\nloop:\n    SUB A, B\n    JNZ A, loop\n    JZ A, done\n    JMP start\ndone:\n    HALT\n";
+        int n = assemble(text, code);
+        printf("%d:", n);
+        for (int i = 0; i < n * 3; i++) {
+            printf(" %d", code[i]);
+        }
+        printf("\n");
+        return 0;
+    }
+  code: |
+    const want = "7: 1 0 3 1 1 1 4 0 1 7 0 2 8 0 6 6 0 0 0 0 0"; if (output.trim() !== want) throw new Error(`Expected "${want}" but got "${output.trim()}"`);
+- name: assemble reports errors
+  append: |
+    int main(void) {
+        int code[30];
+        printf("%d ", assemble("FOO A\n", code));
+        printf("%d ", assemble("LDI Z, 5\n", code));
+        printf("%d ", assemble("ADD A\n", code));
+        printf("%d ", assemble("LDI A, x\n", code));
+        printf("%d ", assemble("HALT now\n", code));
+        printf("%d ", assemble("JMP nowhere\n", code));
+        printf("%d ", assemble("JNZ A, nowhere\n", code));
+        printf("%d ", assemble("a:\na:\nHALT\n", code));
+        printf("%d\n", assemble("; nothing here\n\n", code));
+        return 0;
+    }
+  code: |
+    const want = "-1 -2 -2 -2 -2 -3 -3 -4 0"; if (output.trim() !== want) throw new Error(`Expected "${want}" but got "${output.trim()}"`);
+- name: run does arithmetic
+  append: |
+    int main(void) {
+        int code[60];
+        int out[10];
+        int n = assemble("LDI A, 6\nLDI B, 7\nMUL A, B\nOUT A\nSUB A, B\nOUT A\nMOV C, A\nADD C, C\nOUT C\nHALT\n", code);
+        int k = run(code, n, out);
+        printf("%d: %d %d %d err=%d\n", k, out[0], out[1], out[2], cpu_error);
+        return 0;
+    }
+  code: |
+    if (output.trim() !== "3: 42 35 70 err=0") throw new Error(`Expected "3: 42 35 70 err=0" but got "${output.trim()}"`);
+- name: run handles loops and jumps
+  append: |
+    int main(void) {
+        int code[90];
+        int out[10];
+        int n = assemble("LDI A, 0\nLDI B, 10\nLDI C, 1\nloop:\nADD A, B\nSUB B, C\nJNZ B, loop\nOUT A\nLDI D, 0\nJZ D, skip\nOUT D\nskip:\nLDI D, 9\nOUT D\nHALT\n", code);
+        int k = run(code, n, out);
+        printf("%d: %d %d err=%d\n", k, out[0], out[1], cpu_error);
+        return 0;
+    }
+  code: |
+    if (output.trim() !== "2: 55 9 err=0") throw new Error(`Expected "2: 55 9 err=0" but got "${output.trim()}"`);
+- name: push, pop, call and ret use the stack
+  append: |
+    int main(void) {
+        int code[90];
+        int out[10];
+        int n = assemble("LDI A, 1\nLDI B, 2\nPUSH A\nPUSH B\nPOP A\nPOP B\nOUT A\nOUT B\nHALT\n", code);
+        int k = run(code, n, out);
+        printf("%d: %d %d ", k, out[0], out[1]);
+        n = assemble("LDI A, 7\nCALL square\nOUT B\nLDI A, 8\nCALL square\nOUT B\nHALT\nsquare:\nMOV B, A\nMUL B, A\nRET\n", code);
+        k = run(code, n, out);
+        printf("%d: %d %d ", k, out[0], out[1]);
+        n = assemble("CALL f\nOUT A\nHALT\nf:\nLDI A, 1\nCALL g\nADD A, B\nRET\ng:\nLDI B, 41\nRET\n", code);
+        k = run(code, n, out);
+        printf("%d: %d err=%d\n", k, out[0], cpu_error);
+        return 0;
+    }
+  code: |
+    const want = "2: 2 1 2: 49 64 1: 42 err=0"; if (output.trim() !== want) throw new Error(`Expected "${want}" but got "${output.trim()}"`);
+- name: run stops with the right error code
+  append: |
+    int main(void) {
+        int code[90];
+        int out[10];
+        int n = assemble("LDI A, 1\nspin:\nADD A, A\nJMP spin\n", code);
+        int k = run(code, n, out);
+        printf("%d ", cpu_error);
+        n = assemble("POP A\nHALT\n", code);
+        k = run(code, n, out);
+        printf("%d ", cpu_error);
+        n = assemble("RET\n", code);
+        k = run(code, n, out);
+        printf("%d ", cpu_error);
+        n = assemble("LDI A, 5\nOUT A\n", code);
+        k = run(code, n, out);
+        printf("%d:%d ", cpu_error, k);
+        n = assemble("again:\nCALL again\n", code);
+        k = run(code, n, out);
+        printf("%d ", cpu_error);
+        n = assemble("HALT\n", code);
+        k = run(code, n, out);
+        printf("%d\n", cpu_error);
+        return 0;
+    }
+  code: |
+    const want = "1 2 2 3:1 2 0"; if (output.trim() !== want) throw new Error(`Expected "${want}" but got "${output.trim()}"`);
+- name: main prints the report
+  code: |
+    const want = "Factorial: 8 instructions, 1 outputs 720\nSquares: 10 instructions, 2 outputs 49 64\nBroken: assemble error -3\nEndless: 1 instructions, 0 outputs (cpu error 1)"; if (output.trim() !== want) throw new Error(`Expected:\n${want}\nGot:\n${output.trim()}`);
+solution: |
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <string.h>
+
+  char tokens[4][16];
+  char label_names[32][16];
+  int label_addr[32];
+  int label_count = 0;
+  int cpu_error = 0;
+
+  int get_line(char *text, int start, char *buf) {
+      if (text[start] == '\0') {
+          return -1;
+      }
+      int i = start;
+      int n = 0;
+      while (text[i] != '\0' && text[i] != '\n') {
+          if (n < 79) {
+              buf[n] = text[i];
+              n++;
+          }
+          i++;
+      }
+      buf[n] = '\0';
+      if (text[i] == '\n') {
+          i++;
+      }
+      return i;
+  }
+
+  int tokenize(char *line) {
+      int count = 0;
+      int i = 0;
+      while (line[i] != '\0' && line[i] != ';') {
+          char c = line[i];
+          if (c == ' ' || c == ',' || c == '\t') {
+              i++;
+          } else {
+              int n = 0;
+              while (line[i] != '\0' && line[i] != ';' && line[i] != ' ' && line[i] != ',' && line[i] != '\t') {
+                  if (n < 15 && count < 4) {
+                      tokens[count][n] = line[i];
+                      n++;
+                  }
+                  i++;
+              }
+              if (count < 4) {
+                  tokens[count][n] = '\0';
+                  count++;
+              }
+          }
+      }
+      return count;
+  }
+
+  int find_label(char *name) {
+      for (int i = 0; i < label_count; i++) {
+          if (strcmp(label_names[i], name) == 0) {
+              return label_addr[i];
+          }
+      }
+      return -1;
+  }
+
+  int reg_index(char *s) {
+      if (strlen(s) == 1 && s[0] >= 'A' && s[0] <= 'D') {
+          return s[0] - 'A';
+      }
+      return -1;
+  }
+
+  int op_index(char *s) {
+      if (strcmp(s, "HALT") == 0) return 0;
+      if (strcmp(s, "LDI") == 0) return 1;
+      if (strcmp(s, "MOV") == 0) return 2;
+      if (strcmp(s, "ADD") == 0) return 3;
+      if (strcmp(s, "SUB") == 0) return 4;
+      if (strcmp(s, "MUL") == 0) return 5;
+      if (strcmp(s, "JMP") == 0) return 6;
+      if (strcmp(s, "JNZ") == 0) return 7;
+      if (strcmp(s, "JZ") == 0) return 8;
+      if (strcmp(s, "OUT") == 0) return 9;
+      if (strcmp(s, "PUSH") == 0) return 10;
+      if (strcmp(s, "POP") == 0) return 11;
+      if (strcmp(s, "CALL") == 0) return 12;
+      if (strcmp(s, "RET") == 0) return 13;
+      return -1;
+  }
+
+  int is_number(char *s) {
+      int i = 0;
+      if (s[0] == '-') {
+          i = 1;
+      }
+      if (s[i] == '\0') {
+          return 0;
+      }
+      while (s[i] != '\0') {
+          if (s[i] < '0' || s[i] > '9') {
+              return 0;
+          }
+          i++;
+      }
+      return 1;
+  }
+
+  int assemble(char *text, int *code) {
+      char line[80];
+      int pos;
+      int count;
+      int n;
+      int first;
+      label_count = 0;
+      count = 0;
+      pos = 0;
+      while ((pos = get_line(text, pos, line)) != -1) {
+          n = tokenize(line);
+          first = 0;
+          if (n > 0 && tokens[0][strlen(tokens[0]) - 1] == ':') {
+              tokens[0][strlen(tokens[0]) - 1] = '\0';
+              if (find_label(tokens[0]) != -1) {
+                  return -4;
+              }
+              strcpy(label_names[label_count], tokens[0]);
+              label_addr[label_count] = count;
+              label_count++;
+              first = 1;
+          }
+          if (n > first) {
+              count++;
+          }
+      }
+      count = 0;
+      pos = 0;
+      while ((pos = get_line(text, pos, line)) != -1) {
+          n = tokenize(line);
+          first = 0;
+          if (n > 0 && tokens[0][strlen(tokens[0]) - 1] == ':') {
+              first = 1;
+          }
+          if (n > first) {
+              int op = op_index(tokens[first]);
+              int a = 0;
+              int b = 0;
+              int args = n - first - 1;
+              if (op < 0) {
+                  return -1;
+              }
+              if (op == 0 || op == 13) {
+                  if (args != 0) return -2;
+              } else if (op == 1) {
+                  if (args != 2) return -2;
+                  a = reg_index(tokens[first + 1]);
+                  if (a < 0 || !is_number(tokens[first + 2])) return -2;
+                  b = atoi(tokens[first + 2]);
+              } else if (op >= 2 && op <= 5) {
+                  if (args != 2) return -2;
+                  a = reg_index(tokens[first + 1]);
+                  b = reg_index(tokens[first + 2]);
+                  if (a < 0 || b < 0) return -2;
+              } else if (op == 6 || op == 12) {
+                  if (args != 1) return -2;
+                  a = find_label(tokens[first + 1]);
+                  if (a < 0) return -3;
+              } else if (op == 7 || op == 8) {
+                  if (args != 2) return -2;
+                  a = reg_index(tokens[first + 1]);
+                  if (a < 0) return -2;
+                  b = find_label(tokens[first + 2]);
+                  if (b < 0) return -3;
+              } else {
+                  if (args != 1) return -2;
+                  a = reg_index(tokens[first + 1]);
+                  if (a < 0) return -2;
+              }
+              code[count * 3] = op;
+              code[count * 3 + 1] = a;
+              code[count * 3 + 2] = b;
+              count++;
+          }
+      }
+      return count;
+  }
+
+  int run(int *code, int n, int *out) {
+      int reg[4] = {0, 0, 0, 0};
+      int stack[64];
+      int sp = 0;
+      int pc = 0;
+      int outs = 0;
+      int steps = 0;
+      cpu_error = 0;
+      while (1) {
+          if (pc < 0 || pc >= n) {
+              cpu_error = 3;
+              return outs;
+          }
+          if (steps >= 10000) {
+              cpu_error = 1;
+              return outs;
+          }
+          steps++;
+          int op = code[pc * 3];
+          int a = code[pc * 3 + 1];
+          int b = code[pc * 3 + 2];
+          pc++;
+          if (op == 0) {
+              return outs;
+          } else if (op == 1) {
+              reg[a] = b;
+          } else if (op == 2) {
+              reg[a] = reg[b];
+          } else if (op == 3) {
+              reg[a] = reg[a] + reg[b];
+          } else if (op == 4) {
+              reg[a] = reg[a] - reg[b];
+          } else if (op == 5) {
+              reg[a] = reg[a] * reg[b];
+          } else if (op == 6) {
+              pc = a;
+          } else if (op == 7) {
+              if (reg[a] != 0) pc = b;
+          } else if (op == 8) {
+              if (reg[a] == 0) pc = b;
+          } else if (op == 9) {
+              out[outs] = reg[a];
+              outs++;
+          } else if (op == 10) {
+              if (sp >= 64) {
+                  cpu_error = 2;
+                  return outs;
+              }
+              stack[sp] = reg[a];
+              sp++;
+          } else if (op == 11) {
+              if (sp == 0) {
+                  cpu_error = 2;
+                  return outs;
+              }
+              sp--;
+              reg[a] = stack[sp];
+          } else if (op == 12) {
+              if (sp >= 64) {
+                  cpu_error = 2;
+                  return outs;
+              }
+              stack[sp] = pc;
+              sp++;
+              pc = a;
+          } else if (op == 13) {
+              if (sp == 0) {
+                  cpu_error = 2;
+                  return outs;
+              }
+              sp--;
+              pc = stack[sp];
+          } else {
+              cpu_error = 3;
+              return outs;
+          }
+      }
+  }
+
+  void report(char *title, char *text) {
+      int code[90];
+      int out[40];
+      int n = assemble(text, code);
+      printf("%s: ", title);
+      if (n < 0) {
+          printf("assemble error %d\n", n);
+          return;
+      }
+      int k = run(code, n, out);
+      printf("%d instructions, %d outputs", n, k);
+      for (int i = 0; i < k; i++) {
+          printf(" %d", out[i]);
+      }
+      if (cpu_error != 0) {
+          printf(" (cpu error %d)", cpu_error);
+      }
+      printf("\n");
+  }
+
+  int main(void) {
+      report("Factorial", "LDI A, 1\nLDI B, 6\nLDI C, 1\nloop:\nMUL A, B\nSUB B, C\nJNZ B, loop\nOUT A\nHALT\n");
+      report("Squares", "LDI A, 7\nCALL square\nOUT B\nLDI A, 8\nCALL square\nOUT B\nHALT\nsquare:\nMOV B, A\nMUL B, A\nRET\n");
+      report("Broken", "JMP nowhere\n");
+      report("Endless", "spin:\nJMP spin\n");
+      return 0;
+  }
+stretch:
+- Add a `LOAD r, addr` and `STORE r, addr` pair with a 64-word data memory, and use them to sum an array.
+- Add `CMP`-style flags: let `JL` and `JG` jump on less and greater instead of only zero and non-zero.
+- Write `void disassemble(int *code, int n)` that turns machine code back into text, labelling every jump target.
+- Print a trace of every step (pc, instruction, registers) when an environment flag is set, and use it to debug a program.

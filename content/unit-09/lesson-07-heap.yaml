@@ -1,0 +1,1174 @@
+id: u9-heap
+title: "The Heap: malloc, free and Their Bugs"
+minutes: 60
+objective: |
+  Ask for memory while the program runs with `malloc`, give it back with `free`, and build structures that grow: dynamic arrays, strings and linked lists. Learn the three classic heap bugs (leaks, use-after-free and double free) and the habits that prevent them.
+outcomes:
+  - Contrast stack memory with heap memory and say when each is the right choice
+  - Allocate, resize and release memory with malloc, calloc, realloc and free
+  - Size an allocation with sizeof and check for failure
+  - Build a growing array and a linked list on the heap
+  - Recognise memory leaks, use-after-free, double free and buffer overflows in code
+  - Apply an ownership rule so that every allocation has exactly one matching free
+
+sections:
+  - heading: Two places to keep data
+    body: |
+      You now know one home for data: the **stack**, where each function call gets a frame holding its local variables (Lesson 9.2). The stack is fast and automatic, but it has two limits:
+
+      - A local variable disappears when its function returns.
+      - Its size must be known when you write the program. `int a[n]` with `n` read from the user is not allowed in older C and risky in newer C.
+
+      The **heap** is the other region. It is a large pool of memory that you borrow **while the program is running**, in any size, and keep for as long as you like. Python objects live on a heap too, but there you never ask for memory or give it back. In C, you do both yourself.
+
+      | | Stack | Heap |
+      |---|---|---|
+      | Allocated by | the compiler, automatically | your code, with `malloc` |
+      | Freed by | the function returning | your code, with `free` |
+      | Size | fixed when you write it | decided at run time |
+      | Lifetime | until the function returns | until you free it |
+      | Speed | very fast | slower (a search for a free block) |
+      | Typical size limit | a few MB | most of the machine's memory |
+
+      Rule of thumb: use the stack for small things with a short, obvious lifetime. Use the heap when the size is not known in advance, when the data must outlive the function that created it, or when it is large.
+
+  - heading: malloc and free
+    body: |
+      `#include <stdlib.h>` provides the heap functions.
+
+      ```c
+      int *p = (int *)malloc(5 * sizeof(int));   // room for 5 ints
+      if (p == NULL) { /* out of memory */ }
+      p[0] = 10;
+      ...
+      free(p);                                    // give it back
+      ```
+
+      - **`malloc(n)`** reserves `n` **bytes** and returns the address of the first, or `NULL` if there is no room. Always multiply the count by `sizeof` the element type rather than writing a number, and **check for `NULL`** before using it. The memory contains garbage until you fill it.
+      - The `(int *)` in front is a **cast**. In C it is optional (a `void *` converts automatically), but this runner requires it, and many people write it.
+      - **`calloc(count, size)`** does the multiplication for you and fills the block with **zeros**.
+      - **`realloc(p, new_size)`** changes the size of a block, moving it if it must, and returns the (possibly new) address. Keep the result, since the old pointer may be invalid after the call.
+      - **`free(p)`** returns the block to the pool. After the call, `p` still holds the old address, but you no longer own that memory.
+
+      The rule: **every `malloc` needs exactly one `free`**. The memory is not freed when the pointer variable goes out of scope; the program just loses the only address it had. (Freeing `NULL` is allowed and does nothing.)
+
+  - heading: The three classic bugs
+    body: |
+      The heap gives you power with no supervision. Almost every serious bug in C programs is one of these.
+
+      **1. Memory leak.** You forget to `free`, or you overwrite the only pointer to a block. The memory stays reserved but unreachable until the program ends. A short program doesn't care, but a server that leaks 100 bytes per request will eventually run out of memory and die.
+
+      ```c
+      void leak(void) {
+          int *p = malloc(100);
+          p = NULL;           // the address is lost; the 100 bytes can never be freed
+      }
+      ```
+
+      **2. Use after free (dangling pointer).** You free a block and then keep using the pointer. The memory may already belong to something else, so you read someone's data or corrupt it. It often seems to work in testing, which makes it vicious. A good habit: set the pointer to `NULL` right after freeing it.
+
+      **3. Double free.** Freeing the same block twice corrupts the allocator's bookkeeping and can let an attacker take over the program. After `free(p); p = NULL;` a second `free(p)` is harmless.
+
+      A fourth bug, the **buffer overflow** (Lesson 9.3), is a heap bug as much as a stack bug: `malloc(5)` for a 5-character string leaves no room for the terminator. Allocate `strlen(s) + 1`.
+
+      None of these are errors the compiler can see. Real tools find them: **valgrind** and the compiler flag `-fsanitize=address` watch every allocation at run time and report leaks, overflows and use-after-free with the line number. Professional C programmers run their tests under these tools. (PicoC in this app does not detect them, and will happily run code that real C would crash on.)
+
+  - heading: Ownership
+    body: |
+      The cure for most heap bugs is a clear rule about **who owns** each block, meaning who is responsible for freeing it. Common conventions:
+
+      - **The function that allocates documents it.** `char *str_dup(const char *s)` returns a new block that the **caller** must free.
+      - **Create/destroy pairs.** A `list_create` always has a `list_destroy`, and the destroy frees every inner block before freeing the struct itself.
+      - **Free in reverse order of creation**, and free inner pointers before the struct that holds them: freeing the struct first loses the addresses of its parts.
+      - **One owner at a time.** If two pointers refer to the same block, decide which one frees it.
+
+      Languages that remove this burden do it in different ways: Python and Java use a garbage collector that periodically finds unreachable objects; Rust uses an ownership system checked by the compiler; C++ uses destructors that run automatically. All of them are solving the problem you are solving by hand in C.
+
+  - heading: Growing structures
+    body: |
+      With the heap you can build the structures of Unit 7 for real.
+
+      **A dynamic array.** Keep a pointer to a heap block, how many items are used (`size`), and how many fit (`capacity`). When it is full, `realloc` to **double** the capacity. Because each doubling copies at most the current items, the average cost of a push is constant, the amortised O(1) of Lesson 7.1. That is exactly what Python's `list.append` does underneath.
+
+      **A linked list.** Each node is a small struct allocated on its own with `malloc`, holding a value and a pointer to the next node (Lesson 7.4). Inserting at the front is a few assignments, and nothing needs to move. To free a list you must save each node's `next` pointer **before** freeing the node:
+
+      ```c
+      while (head != NULL) {
+          struct Node *next = head->next;   // save it first
+          free(head);
+          head = next;
+      }
+      ```
+
+      Reading `head->next` after `free(head)` would be a use-after-free.
+
+examples:
+  - title: A heap array whose size is decided at run time
+    intro: "malloc a block, fill it, use it, free it."
+    code: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      int main(void) {
+          int n = 6;
+          int *squares = (int *)malloc(n * sizeof(int));
+          if (squares == NULL) {
+              printf("out of memory\n");
+              return 1;
+          }
+          for (int i = 0; i < n; i++) {
+              squares[i] = i * i;
+          }
+          int total = 0;
+          for (int i = 0; i < n; i++) {
+              total += squares[i];
+          }
+          printf("last=%d total=%d bytes=%d\n", squares[n - 1], total, n * (int)sizeof(int));
+          free(squares);
+          squares = NULL;
+          return 0;
+      }
+    output: |
+      last=25 total=55 bytes=24
+    lines:
+      - line: 6
+        note: "n could just as well come from the user. The block holds n ints, so n * sizeof(int) bytes."
+      - line: 7
+        note: "malloc returns NULL when memory runs out. Check before using the block."
+      - line: 20
+        note: "Give the block back. Without this line the memory leaks."
+      - line: 21
+        note: "Setting the pointer to NULL turns a later accidental use or second free into a harmless no-op or an obvious crash."
+  - title: A dynamic array that doubles
+    intro: "A struct with a pointer, a size and a capacity. realloc doubles the block when it is full."
+    code: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      struct Vec {
+          int *data;
+          int size;
+          int capacity;
+      };
+
+      void vec_init(struct Vec *v) {
+          v->capacity = 2;
+          v->size = 0;
+          v->data = (int *)malloc(v->capacity * sizeof(int));
+      }
+
+      void vec_push(struct Vec *v, int value) {
+          if (v->size == v->capacity) {
+              v->capacity = v->capacity * 2;
+              v->data = (int *)realloc(v->data, v->capacity * sizeof(int));
+          }
+          v->data[v->size] = value;
+          v->size++;
+      }
+
+      int main(void) {
+          struct Vec v;
+          vec_init(&v);
+          for (int i = 1; i <= 10; i++) {
+              vec_push(&v, i * 10);
+              printf("size %2d capacity %2d\n", v.size, v.capacity);
+          }
+          printf("last: %d\n", v.data[v.size - 1]);
+          free(v.data);
+          return 0;
+      }
+    output: |
+      size  1 capacity  2
+      size  2 capacity  2
+      size  3 capacity  4
+      size  4 capacity  4
+      size  5 capacity  8
+      size  6 capacity  8
+      size  7 capacity  8
+      size  8 capacity  8
+      size  9 capacity 16
+      size 10 capacity 16
+      last: 100
+    lines:
+      - line: 13
+        note: "The initial block holds 2 ints."
+      - line: 17
+        note: "Full? Double the capacity."
+      - line: 19
+        note: "realloc may move the block, so we store the returned address back into v->data."
+      - line: 33
+        note: "The elements live in one heap block, the struct only holds the pointer. Free the block, not the struct."
+  - title: A linked list on the heap
+    intro: "Each node is its own allocation. Freeing walks the list, saving next before each free."
+    code: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      struct Node {
+          int value;
+          struct Node *next;
+      };
+
+      struct Node *push_front(struct Node *head, int value) {
+          struct Node *node = (struct Node *)malloc(sizeof(struct Node));
+          node->value = value;
+          node->next = head;
+          return node;
+      }
+
+      int main(void) {
+          struct Node *head = NULL;
+          for (int i = 1; i <= 4; i++) {
+              head = push_front(head, i * i);
+          }
+          for (struct Node *p = head; p != NULL; p = p->next) {
+              printf("%d -> ", p->value);
+          }
+          printf("end\n");
+          while (head != NULL) {
+              struct Node *next = head->next;
+              free(head);
+              head = next;
+          }
+          return 0;
+      }
+    output: |
+      16 -> 9 -> 4 -> 1 -> end
+    lines:
+      - line: 10
+        note: "A new node, allocated on the heap, survives after push_front returns. A local struct would not."
+      - line: 12
+        note: "The new node points at the old head and becomes the new head: no shifting, constant time."
+      - line: 22
+        note: "The loop variable p walks the chain by following next."
+      - line: 27
+        note: "Save the next pointer first: after free(head) the node is gone."
+  - title: Copying a string onto the heap
+    intro: "A string needs strlen + 1 bytes. The caller owns the result and must free it."
+    code: |
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <string.h>
+
+      char *str_dup(char *s) {
+          char *copy = (char *)malloc(strlen(s) + 1);
+          strcpy(copy, s);
+          return copy;
+      }
+
+      int main(void) {
+          char local[20] = "stack text";
+          char *a = str_dup(local);
+          local[0] = 'S';
+          a[0] = 'H';
+          printf("%s / %s\n", local, a);
+          free(a);
+          return 0;
+      }
+    output: |
+      Stack text / Htack text
+    lines:
+      - line: 6
+        note: "The + 1 is for the terminator. Forgetting it is a one-byte buffer overflow."
+      - line: 8
+        note: "Returning a pointer to heap memory is safe, unlike returning a pointer to a local array."
+      - line: 14
+        note: "The copy is independent of the original."
+      - line: 17
+        note: "The caller owns the block now and must free it exactly once."
+  - title: Three bugs, shown as text
+    intro: "Not run here, because this interpreter would not catch them. Read each one and say what is wrong."
+    runnable: false
+    code: |
+      #include <stdlib.h>
+      #include <string.h>
+
+      void leak(void) {
+          int *p = malloc(100);
+          p = malloc(200);
+          free(p);
+      }
+
+      void use_after_free(void) {
+          int *p = malloc(sizeof(int));
+          *p = 7;
+          free(p);
+          *p = 8;
+      }
+
+      void double_free(void) {
+          char *s = malloc(10);
+          free(s);
+          free(s);
+      }
+
+      void overflow(void) {
+          char *name = malloc(5);
+          strcpy(name, "Alice");
+          free(name);
+      }
+    lines:
+      - line: 6
+        note: "Leak: the first block's only pointer was overwritten, so the 100 bytes can never be freed."
+      - line: 14
+        note: "Use after free: the block belongs to the allocator again. This write may corrupt other data."
+      - line: 20
+        note: "Double free: corrupts the allocator's lists. Setting s = NULL after the first free would have prevented it."
+      - line: 25
+        note: "Overflow: Alice needs 6 bytes with the terminator, and only 5 were allocated."
+
+playground:
+  prompt: |
+    Change the vector example so it starts with capacity 1 and pushes 20 values. Watch the capacity: 1, 2, 4, 8, 16, 32. Then write a `vec_pop` that decreases size. Always keep `free` at the end.
+  code: |
+    #include <stdio.h>
+    #include <stdlib.h>
+
+    int main(void) {
+        int *a = (int *)calloc(4, sizeof(int));
+        a[2] = 5;
+        printf("%d %d %d %d\n", a[0], a[1], a[2], a[3]);
+        a = (int *)realloc(a, 8 * sizeof(int));
+        a[7] = 9;
+        printf("%d %d\n", a[2], a[7]);
+        free(a);
+        return 0;
+    }
+
+exercises:
+  - id: heap-arrays
+    title: Arrays on the heap
+    difficulty: 3
+    prompt: |
+      Write functions that **return a new heap block** (the caller will free it): `int *make_range(int n)` returning an array of `n` ints `0, 1, ..., n-1`; `int *copy_array(int *a, int n)` returning an independent copy; and `int *concat(int *a, int na, int *b, int nb)` returning a new array holding the `na` elements of `a` followed by the `nb` elements of `b`. Return the pointers; do not free them yourself.
+    starter: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      int *make_range(int n) {
+          return NULL;
+      }
+
+      int *copy_array(int *a, int n) {
+          return NULL;
+      }
+
+      int *concat(int *a, int na, int *b, int nb) {
+          return NULL;
+      }
+
+      int main(void) {
+          int *r = make_range(5);
+          printf("%d %d\n", r[0], r[4]);
+          free(r);
+          return 0;
+      }
+    tests:
+      - name: make_range
+        append: |
+          int main(void) {
+              int *r = make_range(5);
+              printf("%d %d %d %d %d\n", r[0], r[1], r[2], r[3], r[4]);
+              free(r);
+              int *big = make_range(1000);
+              printf("%d\n", big[999]);
+              free(big);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "0 1 2 3 4\n999") throw new Error(`Got "${output.trim()}"`);
+      - name: copy is independent
+        append: |
+          int main(void) {
+              int a[3] = {7, 8, 9};
+              int *c = copy_array(a, 3);
+              c[0] = 100;
+              printf("%d %d %d %d\n", a[0], c[0], c[1], c[2]);
+              free(c);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "7 100 8 9") throw new Error(`Expected "7 100 8 9" but got "${output.trim()}"`);
+      - name: concat
+        append: |
+          int main(void) {
+              int a[2] = {1, 2};
+              int b[3] = {3, 4, 5};
+              int *c = concat(a, 2, b, 3);
+              printf("%d %d %d %d %d ", c[0], c[1], c[2], c[3], c[4]);
+              free(c);
+              int *d = concat(a, 0, b, 3);
+              printf("%d %d %d\n", d[0], d[1], d[2]);
+              free(d);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "1 2 3 4 5 3 4 5") throw new Error(`Expected "1 2 3 4 5 3 4 5" but got "${output.trim()}"`);
+    hints:
+      - "`int *r = (int *)malloc(n * sizeof(int));` then fill it with a loop."
+      - "Do not use a local array: it would vanish when the function returns."
+      - "`concat` needs `(na + nb) * sizeof(int)` bytes; copy `a` first, then `b` starting at index `na`."
+    solution: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      int *make_range(int n) {
+          int *r = (int *)malloc(n * sizeof(int));
+          for (int i = 0; i < n; i++) {
+              r[i] = i;
+          }
+          return r;
+      }
+
+      int *copy_array(int *a, int n) {
+          int *c = (int *)malloc(n * sizeof(int));
+          for (int i = 0; i < n; i++) {
+              c[i] = a[i];
+          }
+          return c;
+      }
+
+      int *concat(int *a, int na, int *b, int nb) {
+          int *c = (int *)malloc((na + nb) * sizeof(int));
+          for (int i = 0; i < na; i++) {
+              c[i] = a[i];
+          }
+          for (int j = 0; j < nb; j++) {
+              c[na + j] = b[j];
+          }
+          return c;
+      }
+
+      int main(void) {
+          int *r = make_range(5);
+          printf("%d %d\n", r[0], r[4]);
+          free(r);
+          return 0;
+      }
+    explanation: |
+      Each function documents ownership by what it does: it returns memory the caller must free. A function that returned a pointer to a local array would hand back a dangling pointer, so the heap is the right place for data that must outlive the call. Real code would also check each `malloc` for `NULL` and decide how to report failure.
+
+  - id: str-heap
+    title: Strings on the heap
+    difficulty: 3
+    prompt: |
+      Write `char *str_dup(char *s)` (a heap copy of `s`), `char *str_concat(char *a, char *b)` (a new heap string `a` followed by `b`), `char *str_repeat(char *s, int times)` (the string repeated `times` times; empty if `times` is 0), and `char *str_reverse(char *s)` (a new heap string with the characters reversed). Use `strlen` and `strcpy` or loops as you like. Remember the terminator.
+    starter: |
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <string.h>
+
+      char *str_dup(char *s) {
+          return NULL;
+      }
+
+      char *str_concat(char *a, char *b) {
+          return NULL;
+      }
+
+      char *str_repeat(char *s, int times) {
+          return NULL;
+      }
+
+      char *str_reverse(char *s) {
+          return NULL;
+      }
+
+      int main(void) {
+          char *d = str_dup("hi");
+          printf("%s\n", d);
+          free(d);
+          return 0;
+      }
+    tests:
+      - name: dup and concat
+        append: |
+          int main(void) {
+              char src[10] = "abc";
+              char *d = str_dup(src);
+              src[0] = 'X';
+              char *c = str_concat("foo", "bar");
+              char *e = str_concat("", "");
+              printf("%s %s %s %d\n", d, c, e, (int)strlen(e));
+              free(d); free(c); free(e);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "abc foobar  0") throw new Error(`Expected "abc foobar  0" but got "${output.trim()}"`);
+      - name: repeat and reverse
+        append: |
+          int main(void) {
+              char *r = str_repeat("ab", 3);
+              char *z = str_repeat("ab", 0);
+              char *v = str_reverse("stressed");
+              char *w = str_reverse("");
+              printf("%s [%s] %s [%s]\n", r, z, v, w);
+              free(r); free(z); free(v); free(w);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "ababab [] desserts []") throw new Error(`Expected "ababab [] desserts []" but got "${output.trim()}"`);
+    hints:
+      - "A string of length `n` needs `n + 1` bytes."
+      - "`str_concat`: allocate `strlen(a) + strlen(b) + 1`, then `strcpy(r, a); strcat(r, b);`."
+      - "`str_repeat` with `times == 0` must still return a valid empty string: allocate 1 byte and set it to `'\\0'`."
+    solution: |
+      #include <stdio.h>
+      #include <stdlib.h>
+      #include <string.h>
+
+      char *str_dup(char *s) {
+          char *r = (char *)malloc(strlen(s) + 1);
+          strcpy(r, s);
+          return r;
+      }
+
+      char *str_concat(char *a, char *b) {
+          char *r = (char *)malloc(strlen(a) + strlen(b) + 1);
+          strcpy(r, a);
+          strcat(r, b);
+          return r;
+      }
+
+      char *str_repeat(char *s, int times) {
+          int len = (int)strlen(s);
+          char *r = (char *)malloc(len * times + 1);
+          r[0] = '\0';
+          for (int i = 0; i < times; i++) {
+              strcat(r, s);
+          }
+          return r;
+      }
+
+      char *str_reverse(char *s) {
+          int len = (int)strlen(s);
+          char *r = (char *)malloc(len + 1);
+          for (int i = 0; i < len; i++) {
+              r[i] = s[len - 1 - i];
+          }
+          r[len] = '\0';
+          return r;
+      }
+
+      int main(void) {
+          char *d = str_dup("hi");
+          printf("%s\n", d);
+          free(d);
+          return 0;
+      }
+    explanation: |
+      Every result is a new block whose size was worked out before copying. Setting `r[0] = '\0'` first in `str_repeat` matters because `malloc` does not clear memory: `strcat` appends after the first terminator it finds, and the block starts full of garbage. Python's `*` and `+` on strings do all of this invisibly.
+
+  - id: dyn-array
+    title: A growing array
+    difficulty: 4
+    prompt: |
+      Complete the `struct IntList` (a heap array `data`, a `size` and a `capacity`). Write `void list_init(struct IntList *l)` (capacity 2, size 0, allocate), `void list_push(struct IntList *l, int value)` (double the capacity with `realloc` when full), `int list_pop(struct IntList *l)` (remove and return the last value; the caller guarantees it is not empty; **halve the capacity** when `size` drops to one quarter of the capacity, but never below 2), and `void list_free(struct IntList *l)` (release the block and reset the struct to empty: `data` NULL, size and capacity 0).
+    starter: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      struct IntList {
+          int *data;
+          int size;
+          int capacity;
+      };
+
+      void list_init(struct IntList *l) {
+      }
+
+      void list_push(struct IntList *l, int value) {
+      }
+
+      int list_pop(struct IntList *l) {
+          return 0;
+      }
+
+      void list_free(struct IntList *l) {
+      }
+
+      int main(void) {
+          struct IntList l;
+          list_init(&l);
+          list_push(&l, 5);
+          printf("%d %d\n", l.size, l.capacity);
+          list_free(&l);
+          return 0;
+      }
+    tests:
+      - name: growing
+        append: |
+          int main(void) {
+              struct IntList l;
+              list_init(&l);
+              int i;
+              for (i = 1; i <= 9; i++) {
+                  list_push(&l, i * 3);
+                  printf("%d/%d ", l.size, l.capacity);
+              }
+              printf("\n%d %d\n", l.data[0], l.data[8]);
+              list_free(&l);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "1/2 2/2 3/4 4/4 5/8 6/8 7/8 8/8 9/16 \n3 27") throw new Error(`Got "${output.trim()}"`);
+      - name: shrinking
+        append: |
+          int main(void) {
+              struct IntList l;
+              list_init(&l);
+              int i;
+              for (i = 1; i <= 16; i++) list_push(&l, i);
+              printf("%d ", l.capacity);
+              int total = 0;
+              for (i = 0; i < 12; i++) total += list_pop(&l);
+              printf("%d %d %d\n", total, l.size, l.capacity);
+              for (i = 0; i < 4; i++) list_pop(&l);
+              printf("%d %d\n", l.size, l.capacity);
+              list_free(&l);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "16 126 4 8\n0 2") throw new Error(`Expected "16 126 4 8\\n0 2" but got "${output.trim()}"`);
+      - name: free resets
+        append: |
+          int main(void) {
+              struct IntList l;
+              list_init(&l);
+              list_push(&l, 1);
+              list_free(&l);
+              printf("%d %d %d\n", l.data == NULL, l.size, l.capacity);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "1 0 0") throw new Error(`Expected "1 0 0" but got "${output.trim()}"`);
+    hints:
+      - "In `list_push`: if `size == capacity`, set `capacity *= 2` and `data = (int *)realloc(data, capacity * sizeof(int))`."
+      - "In `list_pop`: take `data[size - 1]`, decrease `size`, then if `size * 4 <= capacity` and `capacity > 2`, halve the capacity and `realloc`."
+      - "In `list_free`: `free(l->data); l->data = NULL; l->size = 0; l->capacity = 0;`."
+    solution: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      struct IntList {
+          int *data;
+          int size;
+          int capacity;
+      };
+
+      void list_init(struct IntList *l) {
+          l->capacity = 2;
+          l->size = 0;
+          l->data = (int *)malloc(l->capacity * sizeof(int));
+      }
+
+      void list_push(struct IntList *l, int value) {
+          if (l->size == l->capacity) {
+              l->capacity = l->capacity * 2;
+              l->data = (int *)realloc(l->data, l->capacity * sizeof(int));
+          }
+          l->data[l->size] = value;
+          l->size++;
+      }
+
+      int list_pop(struct IntList *l) {
+          l->size--;
+          int value = l->data[l->size];
+          if (l->capacity > 2 && l->size * 4 <= l->capacity) {
+              l->capacity = l->capacity / 2;
+              l->data = (int *)realloc(l->data, l->capacity * sizeof(int));
+          }
+          return value;
+      }
+
+      void list_free(struct IntList *l) {
+          free(l->data);
+          l->data = NULL;
+          l->size = 0;
+          l->capacity = 0;
+      }
+
+      int main(void) {
+          struct IntList l;
+          list_init(&l);
+          list_push(&l, 5);
+          printf("%d %d\n", l.size, l.capacity);
+          list_free(&l);
+          return 0;
+      }
+    explanation: |
+      Doubling when full and halving at a quarter (not at a half) is the policy from Lesson 7.1: shrinking at one half would make a list that hovers around a boundary resize on every operation. Resetting the struct in `list_free` means a second call frees `NULL`, which is harmless, so the double-free bug is designed out.
+
+  - id: linked-list-heap
+    title: A linked list
+    difficulty: 4
+    prompt: |
+      Write `struct Node *push_front(struct Node *head, int value)` (new node becomes the head), `struct Node *push_back(struct Node *head, int value)` (new node at the end; return the head), `int list_length(struct Node *head)`, `struct Node *reverse(struct Node *head)` (reverse the list **in place** by relinking, no new nodes; return the new head), `struct Node *remove_value(struct Node *head, int value)` (remove and free the **first** node holding `value`; return the head), and `void free_list(struct Node *head)`. Use `!= NULL` for tests, not bare pointer conditions.
+    starter: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      struct Node {
+          int value;
+          struct Node *next;
+      };
+
+      struct Node *push_front(struct Node *head, int value) {
+          return head;
+      }
+
+      struct Node *push_back(struct Node *head, int value) {
+          return head;
+      }
+
+      int list_length(struct Node *head) {
+          return 0;
+      }
+
+      struct Node *reverse(struct Node *head) {
+          return head;
+      }
+
+      struct Node *remove_value(struct Node *head, int value) {
+          return head;
+      }
+
+      void free_list(struct Node *head) {
+      }
+
+      int main(void) {
+          struct Node *h = push_front(NULL, 1);
+          printf("%d\n", list_length(h));
+          free_list(h);
+          return 0;
+      }
+    tests:
+      - name: build and length
+        append: |
+          void show(struct Node *h) {
+              while (h != NULL) {
+                  printf("%d ", h->value);
+                  h = h->next;
+              }
+              printf("| ");
+          }
+          int main(void) {
+              struct Node *h = NULL;
+              h = push_front(h, 2);
+              h = push_front(h, 1);
+              h = push_back(h, 3);
+              h = push_back(h, 4);
+              show(h);
+              printf("%d\n", list_length(h));
+              struct Node *e = push_back(NULL, 9);
+              printf("%d %d\n", e->value, list_length(e));
+              free_list(h);
+              free_list(e);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "1 2 3 4 | 4\n9 1") throw new Error(`Expected "1 2 3 4 | 4\\n9 1" but got "${output.trim()}"`);
+      - name: reverse
+        append: |
+          void show(struct Node *h) {
+              while (h != NULL) {
+                  printf("%d ", h->value);
+                  h = h->next;
+              }
+              printf("| ");
+          }
+          int main(void) {
+              struct Node *h = NULL;
+              int i;
+              for (i = 1; i <= 4; i++) h = push_back(h, i);
+              struct Node *second = h->next;
+              h = reverse(h);
+              show(h);
+              printf("%d\n", h->next->next == second);
+              h = reverse(h);
+              show(h);
+              printf("\n");
+              struct Node *none = reverse(NULL);
+              printf("%d\n", none == NULL);
+              free_list(h);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "4 3 2 1 | 1\n1 2 3 4 | \n1") throw new Error(`Got "${output.trim()}"`);
+      - name: remove
+        append: |
+          void show(struct Node *h) {
+              while (h != NULL) {
+                  printf("%d ", h->value);
+                  h = h->next;
+              }
+              printf("| ");
+          }
+          int main(void) {
+              struct Node *h = NULL;
+              int i;
+              for (i = 1; i <= 5; i++) h = push_back(h, i % 3);
+              show(h);
+              h = remove_value(h, 2);
+              show(h);
+              h = remove_value(h, 1);
+              show(h);
+              h = remove_value(h, 7);
+              show(h);
+              printf("%d\n", list_length(h));
+              free_list(h);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "1 2 0 1 2 | 1 0 1 2 | 0 1 2 | 0 1 2 | 3") throw new Error(`Got "${output.trim()}"`);
+    hints:
+      - "`push_back`: if `head == NULL` return the new node; otherwise walk until `p->next == NULL` and attach."
+      - "`reverse`: keep `prev` (starting `NULL`) and `cur` (the head); in a loop, save `cur->next`, point `cur->next` at `prev`, then advance both."
+      - "`remove_value`: handle the head specially; otherwise keep a pointer `p` to the node *before* the one to remove. Save `p->next`, relink around it, then free it."
+      - "`free_list`: save `next` before freeing each node."
+    solution: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      struct Node {
+          int value;
+          struct Node *next;
+      };
+
+      struct Node *push_front(struct Node *head, int value) {
+          struct Node *n = (struct Node *)malloc(sizeof(struct Node));
+          n->value = value;
+          n->next = head;
+          return n;
+      }
+
+      struct Node *push_back(struct Node *head, int value) {
+          struct Node *n = (struct Node *)malloc(sizeof(struct Node));
+          n->value = value;
+          n->next = NULL;
+          if (head == NULL) {
+              return n;
+          }
+          struct Node *p = head;
+          while (p->next != NULL) {
+              p = p->next;
+          }
+          p->next = n;
+          return head;
+      }
+
+      int list_length(struct Node *head) {
+          int count = 0;
+          while (head != NULL) {
+              count++;
+              head = head->next;
+          }
+          return count;
+      }
+
+      struct Node *reverse(struct Node *head) {
+          struct Node *prev = NULL;
+          struct Node *cur = head;
+          while (cur != NULL) {
+              struct Node *next = cur->next;
+              cur->next = prev;
+              prev = cur;
+              cur = next;
+          }
+          return prev;
+      }
+
+      struct Node *remove_value(struct Node *head, int value) {
+          if (head == NULL) {
+              return NULL;
+          }
+          if (head->value == value) {
+              struct Node *rest = head->next;
+              free(head);
+              return rest;
+          }
+          struct Node *p = head;
+          while (p->next != NULL && p->next->value != value) {
+              p = p->next;
+          }
+          if (p->next != NULL) {
+              struct Node *doomed = p->next;
+              p->next = doomed->next;
+              free(doomed);
+          }
+          return head;
+      }
+
+      void free_list(struct Node *head) {
+          while (head != NULL) {
+              struct Node *next = head->next;
+              free(head);
+              head = next;
+          }
+      }
+
+      int main(void) {
+          struct Node *h = push_front(NULL, 1);
+          printf("%d\n", list_length(h));
+          free_list(h);
+          return 0;
+      }
+    explanation: |
+      Reversal relinks each node to point backwards using three pointers, with no new allocation, which is O(n) time and O(1) extra memory. In `remove_value`, saving `doomed` before relinking and freeing it afterwards is the same rule as in `free_list`: never read through a pointer after it has been freed. This is the same list as in Lesson 7.4, but now every node's memory is yours to manage.
+
+  - id: tracker
+    title: Counting allocations to catch leaks
+    difficulty: 3
+    prompt: |
+      Build a tiny leak detector. Keep global counters. Write `void *tracked_alloc(int bytes)` that increments a count of live allocations and a total of live bytes, and returns `malloc(bytes)`; but `tracked_free` needs to know how big the block was, so store the size in the first 4 bytes of the block: allocate `bytes + 4`, write `bytes` into the first 4 bytes (as an `int`), and return a pointer **just after** that header. Write `void tracked_free(void *p)` that finds the header (the 4 bytes before `p`), subtracts the size from the live total, decrements the live count and frees the real block. `int live_blocks(void)` and `int live_bytes(void)` report the counters. `tracked_free(NULL)` must do nothing.
+
+      This is exactly the trick real allocators use: a hidden **header** just before the block.
+    starter: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      int blocks = 0;
+      int bytes_in_use = 0;
+
+      void *tracked_alloc(int bytes) {
+          return NULL;
+      }
+
+      void tracked_free(void *p) {
+      }
+
+      int live_blocks(void) {
+          return 0;
+      }
+
+      int live_bytes(void) {
+          return 0;
+      }
+
+      int main(void) {
+          int *p = (int *)tracked_alloc(20);
+          printf("%d %d\n", live_blocks(), live_bytes());
+          tracked_free(p);
+          return 0;
+      }
+    tests:
+      - name: counts
+        append: |
+          int main(void) {
+              int *a = (int *)tracked_alloc(20);
+              char *b = (char *)tracked_alloc(100);
+              printf("%d %d ", live_blocks(), live_bytes());
+              tracked_free(a);
+              printf("%d %d ", live_blocks(), live_bytes());
+              tracked_free(b);
+              tracked_free(NULL);
+              printf("%d %d\n", live_blocks(), live_bytes());
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "2 120 1 100 0 0") throw new Error(`Expected "2 120 1 100 0 0" but got "${output.trim()}"`);
+      - name: memory is usable
+        append: |
+          int main(void) {
+              int *a = (int *)tracked_alloc(4 * sizeof(int));
+              int i;
+              for (i = 0; i < 4; i++) a[i] = i + 1;
+              int *b = (int *)tracked_alloc(2 * sizeof(int));
+              b[0] = 50; b[1] = 60;
+              printf("%d %d %d %d %d %d\n", a[0], a[3], b[0], b[1], live_blocks(), live_bytes());
+              tracked_free(a);
+              tracked_free(b);
+              printf("%d\n", live_blocks());
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "1 4 50 60 2 24\n0") throw new Error(`Expected "1 4 50 60 2 24\\n0" but got "${output.trim()}"`);
+    hints:
+      - "`char *raw = (char *)malloc(bytes + 4);` then store the size with `*(int *)raw = bytes;` and return `raw + 4`."
+      - "In `tracked_free`, `char *raw = (char *)p - 4;` and `int size = *(int *)raw;`."
+      - "Adjust the global counters in both functions, and free `raw`, not `p`."
+    solution: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      int blocks = 0;
+      int bytes_in_use = 0;
+
+      void *tracked_alloc(int bytes) {
+          char *raw = (char *)malloc(bytes + 4);
+          *(int *)raw = bytes;
+          blocks++;
+          bytes_in_use += bytes;
+          return raw + 4;
+      }
+
+      void tracked_free(void *p) {
+          if (p == NULL) {
+              return;
+          }
+          char *raw = (char *)p - 4;
+          int size = *(int *)raw;
+          blocks--;
+          bytes_in_use -= size;
+          free(raw);
+      }
+
+      int live_blocks(void) {
+          return blocks;
+      }
+
+      int live_bytes(void) {
+          return bytes_in_use;
+      }
+
+      int main(void) {
+          int *p = (int *)tracked_alloc(20);
+          printf("%d %d\n", live_blocks(), live_bytes());
+          tracked_free(p);
+          return 0;
+      }
+    explanation: |
+      The user's pointer is not the address `malloc` returned: it is 4 bytes later, and the 4 hidden bytes in front record the size. That is how `free(p)` knows how much to release without being told, and it is also why writing just before a block (an underflow) can wreck the allocator. Tools like valgrind work the same way, keeping a table of every live block so they can print the ones still alive at exit: the leaks.
+
+commonMistakes:
+  - title: Forgetting to free (a leak)
+    explanation: |
+      Every `malloc` needs a matching `free` on every path through the program, including early returns and error paths.
+  - title: Using memory after freeing it
+    explanation: |
+      The pointer still holds the old address, which makes the bug silent. Set the pointer to `NULL` after `free`.
+  - title: Freeing twice
+    explanation: |
+      A double free corrupts the allocator. `free(NULL)` is safe, so nulling the pointer after the first free protects you.
+  - title: Allocating too little
+    explanation: |
+      Use `n * sizeof(type)` and, for strings, `strlen(s) + 1`. The compiler cannot tell whether your number is large enough.
+  - title: Not checking malloc's result
+    explanation: |
+      `malloc` returns `NULL` when memory runs out. Using it unchecked turns a recoverable error into a crash.
+  - title: Losing the original pointer with realloc
+    explanation: |
+      `p = realloc(p, n)` leaks the old block if `realloc` fails and returns `NULL`. Use a temporary: `tmp = realloc(p, n); if (tmp != NULL) p = tmp;`.
+  - title: Reading through a node after freeing it
+    explanation: |
+      In a list loop, save `next` before calling `free` on the node.
+
+summary:
+  - "The **stack** is automatic, fast and tied to function calls. The **heap** is memory you request at run time with `malloc` and keep until you `free` it."
+  - "`malloc(n)` reserves bytes (or returns NULL); `calloc` zeroes; `realloc` resizes (keep its result); `free` returns the block. Size blocks as `count * sizeof(type)`, plus 1 for a string's terminator."
+  - "Every `malloc` needs exactly one `free`. Decide who **owns** each block and document it."
+  - "The classic bugs are **leaks**, **use after free**, **double free** and **buffer overflow**. The compiler cannot see them; valgrind and AddressSanitizer can."
+  - "A dynamic array doubles its capacity with `realloc` (amortised O(1) per push). A linked list allocates one node per element, and freeing it requires saving `next` first."
+  - "Allocators hide a small **header** before each block recording its size, which is how `free` knows how much to release."
+next: |
+  Memory is made of bits. Lesson 9.8 looks at the bits themselves: the bitwise operators, masks and flags, how negative numbers are stored in two's complement, and **endianness**, the order in which the bytes of a larger number sit in memory. You will also decode real binary formats byte by byte.
+
+quiz:
+  - type: mcq
+    question: What does malloc(20) return?
+    options: [
+      "The address of a new block of 20 bytes, or NULL on failure",
+      "20 zeroed integers",
+      "A copy of the number 20",
+      "The size of the heap"
+    ]
+    answer: 0
+    explanation: "malloc takes a size in bytes and returns the address of that many uninitialised bytes."
+  - type: mcq
+    question: What is wrong with this? char *s = malloc(5); strcpy(s, "Alice");
+    options: [
+      "Alice needs 6 bytes with its terminator, so it overflows the block",
+      "Nothing, it is correct",
+      "strcpy cannot be used with malloc",
+      "malloc cannot allocate strings"
+    ]
+    answer: 0
+    explanation: "A five-letter string needs six bytes, so the terminator is written past the block."
+  - type: mcq
+    question: What is a memory leak?
+    options: [
+      "Allocated memory that is never freed and can no longer be reached",
+      "Using memory after it has been freed",
+      "Writing past the end of an array",
+      "Freeing memory twice"
+    ]
+    answer: 0
+    explanation: "The memory stays reserved until the program ends, with nothing able to release it."
+  - type: mcq
+    question: Why should you save head->next before calling free(head) in a list loop?
+    options: [
+      "Reading it after the free would be use after free",
+      "free changes the next pointer to NULL",
+      "The compiler requires it",
+      "It makes free faster"
+    ]
+    answer: 0
+    explanation: "Once freed, the node's memory no longer belongs to you."
+  - type: mcq
+    question: Why does a dynamic array double its capacity rather than growing by one?
+    options: [
+      "Doubling makes push O(1) on average, since resizes become rare",
+      "Doubling is required by realloc",
+      "It saves memory",
+      "Growing by one is impossible"
+    ]
+    answer: 0
+    explanation: "Copying n items once every n pushes averages to a constant cost per push (amortised analysis)."
+  - type: mcq
+    question: Which is the best way to protect against a double free?
+    options: [
+      "Set the pointer to NULL after freeing it",
+      "Free it twice to be safe",
+      "Never use pointers",
+      "Cast the pointer to int"
+    ]
+    answer: 0
+    explanation: "free(NULL) does nothing, so a second free of the nulled pointer is harmless."
+  - type: code
+    question: |
+      Write `int *make_filled(int n, int value)` returning a new heap array of `n` ints, each equal to `value`.
+    starter: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      int *make_filled(int n, int value) {
+          return NULL;
+      }
+
+      int main(void) {
+          int *a = make_filled(3, 7);
+          printf("%d %d %d\n", a[0], a[1], a[2]);
+          free(a);
+          return 0;
+      }
+    tests:
+      - name: filled
+        append: |
+          int main(void) {
+              int *a = make_filled(4, 9);
+              int *b = make_filled(1, -3);
+              printf("%d %d %d %d %d\n", a[0], a[1], a[2], a[3], b[0]);
+              free(a);
+              free(b);
+              return 0;
+          }
+        code: |
+          if (output.trim() !== "9 9 9 9 -3") throw new Error(`Expected "9 9 9 9 -3" but got "${output.trim()}"`);
+    solution: |
+      #include <stdio.h>
+      #include <stdlib.h>
+
+      int *make_filled(int n, int value) {
+          int *a = (int *)malloc(n * sizeof(int));
+          for (int i = 0; i < n; i++) {
+              a[i] = value;
+          }
+          return a;
+      }
+
+      int main(void) {
+          int *a = make_filled(3, 7);
+          printf("%d %d %d\n", a[0], a[1], a[2]);
+          free(a);
+          return 0;
+      }

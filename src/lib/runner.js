@@ -5,6 +5,7 @@
 // fresh one, then report a friendly timeout error.
 import PythonWorker from '../workers/python.worker.js?worker';
 import JsWorker from '../workers/js.worker.js?worker';
+import CWorker from '../workers/c.worker.js?worker';
 import { createPythonEngine } from './pythonEngine.js';
 
 const LOCAL_PYODIDE = new URL('pyodide/', document.baseURI).href;
@@ -154,6 +155,8 @@ export function preloadPython() {
 
 const js = new WorkerRunner(() => new JsWorker(), () => ({}));
 
+const cRunner = new WorkerRunner(() => new CWorker(), () => ({}));
+
 // ---------------------------------------------------------------- public ---
 
 /**
@@ -163,6 +166,7 @@ const js = new WorkerRunner(() => new JsWorker(), () => ({}));
 export async function runCode(language, { code, stdin = [], prelude = '' }) {
   try {
     if (language === 'javascript') return await js.exec('run', { code });
+    if (language === 'c') return await cRunner.exec('run', { code });
     await startPython();
     if (mainThreadEngine) return await mainThreadEngine.run({ code, stdin, prelude });
     return await python.exec('run', { code, stdin, prelude });
@@ -178,6 +182,7 @@ export async function runCode(language, { code, stdin = [], prelude = '' }) {
 export async function testCode(language, { code, tests, stdin = [], prelude = '' }) {
   try {
     if (language === 'javascript') return await js.exec('test', { code, tests });
+    if (language === 'c') return await cRunner.exec('test', { code, tests });
     await startPython();
     if (mainThreadEngine) return await mainThreadEngine.test({ code, tests, stdin, prelude });
     return await python.exec('test', { code, tests, stdin, prelude });

@@ -14,7 +14,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 6 | Discrete Math for CS | ✅ Complete (Phase 5) | 9 | 45 | Social Network Analyser |
 | 7 | Data Structures II | ✅ Complete (Phase 6) | 9 | 45 | Help Desk |
 | 8 | Algorithms II | ✅ Complete (Phase 7) | 9 | 41 | Route Planner |
-| 9 | Computer Systems (C) | Planned | | | |
+| 9 | Computer Systems (C) | ✅ Complete (Phase 8) | 9 | 37 | Mini CPU (assembler + emulator) |
 | 10 | Operating Systems | Planned | | | |
 | 11 | Networking | Planned | | | |
 | 12 | Databases | Planned | | | |
@@ -25,7 +25,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 68 lessons, 332 practice exercises, 68 lesson quizzes (408 multiple-choice questions + 68 coding questions), 8 unit projects, 495 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide (`npm run verify`).
+Totals so far: 77 lessons, 369 practice exercises, 77 lesson quizzes (462 multiple-choice questions + 77 coding questions), 9 unit projects, 553 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -147,6 +147,33 @@ Totals so far: 68 lessons, 332 practice exercises, 68 lesson quizzes (408 multip
 
 47 glossary terms.
 
+## Unit 9: Computer Systems (C) ✅
+
+All code runs in the browser with PicoC (a small C interpreter compiled to WebAssembly, vendored in `src/vendor/picoc.js`, run in `src/workers/c.worker.js` via `src/lib/cEngine.js`).
+
+| Lesson | Id | Teaches |
+|---|---|---|
+| 9.1 Hello, C | `u9-hello-c` | compile-and-run model, types and sizes, wraparound, printf format specifiers, casts, integer division |
+| 9.2 Control Flow and Functions | `u9-control-functions` | if/loops/switch, prototypes, scope, `static`, pass by value, stack frames, exit status |
+| 9.3 Arrays and Strings | `u9-arrays-strings` | arrays, bounds (no checking), null-terminated strings, `string.h`, buffer overflow |
+| 9.4 Pointers | `u9-pointers` | addresses, dereference, swap, output parameters, pointer arithmetic, NULL, common pointer bugs |
+| 9.5 Pointers and Strings | `u9-pointers-strings` | array decay, char array vs `char *`, `*s++` idioms, arrays of strings, `const` |
+| 9.6 Structs, Enums and Unions | `u9-structs` | structs, `->`, padding and alignment, enums, unions, a ring buffer |
+| 9.7 The Heap | `u9-heap` | stack vs heap, malloc/calloc/realloc/free, leaks, use-after-free, double free, ownership, dynamic arrays, linked lists, allocator headers |
+| 9.8 Bits, Bytes and Number Representation | `u9-bits` | hex, bitwise operators, masks and flags, packing, two's complement, endianness, byte swapping |
+| 9.9 From Source to Machine Code | `u9-compilation` | preprocess/compile/assemble/link, macros, reading x86-64 assembly, calling convention and stack frames, linking errors, fetch-decode-execute, a bytecode VM |
+| Project | | Mini CPU: an assembler (two passes, labels) and emulator (registers, stack, CALL/RET, error codes) for a small instruction set |
+
+58 glossary terms.
+
+**PicoC limits that shape the lessons** (verified by probing; keep these in mind for any C content):
+- No function pointers; `T a[]` array parameters are copied, so write `T *a` (and `int *g` for 2D data); `char **words` works.
+- A typedef name cannot be a function's return type: write `struct X *`.
+- `while (p)` and `if (p)` on struct pointers fail: compare with `!= NULL`.
+- Unsigned right shift and unsigned comparisons behave as signed; `long` is 4 bytes; ternary evaluates both branches (so no recursion through `?:`); macro arguments are not re-evaluated; pointer subtraction gives bytes. Mask after shifting.
+- Deep recursion (about 1000 frames) runs out of memory; no heap or undefined-behaviour detection.
+- Test semantics for C: a test `code` is JavaScript with `output`, `status`, `error` and `source`; `append` replaces the learner's `main` (renamed `learner_main`). `scripts/verify_c.mjs` checks examples, solutions and starters; `scripts/autofill_c.mjs` fills `output: AUTO` placeholders.
+
 ## How the units connect (prerequisite check)
 
 Before writing each unit, check that everything it relies on has already been taught, and note deliberate callbacks.
@@ -242,14 +269,15 @@ Deliberate forward references in Unit 7: self-balancing trees (AVL, red-black) b
 
 Deliberate forward references in Unit 8: NP-completeness of 0/1 knapsack and subset sum (Unit 15); A* search (Unit 17); max-flow and string algorithms such as KMP (not planned); amortised analysis of union-find beyond a mention of the inverse Ackermann function.
 
+**Unit 10 can assume:** all of Units 1 to 9, including C (pointers, structs, malloc/free, bit operations, stack frames and calling conventions), how programs are compiled and linked, assembly basics and the fetch-decode-execute cycle, and a working bytecode VM (the Mini CPU project). Unit 10 (Python again) should explain processes, scheduling, virtual memory, files and concurrency, and can simulate these with Python code.
+
 ## Plan for remaining units (to refine before each phase)
 
-- **9 Computer Systems (C):** C syntax, pointers (← 1.5 address arithmetic), memory management, compilation (← 1.6), assembly (← 1.4). In-browser option needed (e.g. a WebAssembly C compiler or interpreter); otherwise give clear local-setup steps.
 - **10 OS**, **11 Networking**, **12 Databases** (sql.js in browser), **13 Web Development** (JS sandbox already supported by the runner), **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
 
 ## Technical notes for later phases
 
-- The JavaScript runner (`src/workers/js.worker.js`) is already wired up for Unit 13; SQL (sql.js) and C support still need adding.
+- The JavaScript runner (`src/workers/js.worker.js`) is already wired up for Unit 13; SQL (sql.js) still needs adding. C runs through PicoC (see Unit 9).
 - Lessons and projects now load on demand (Phase 6): the main bundle holds only a generated index (`virtual:content-index` in `vite.config.js`: titles, exercise ids, quiz MCQs for the review deck), and each full lesson/project is its own small chunk loaded by `useLesson`/`useProject` in `src/lib/content.js`. Main bundle: about 1.1 MB. When publishing, send every chunk in `dist/assets` (and null any that disappeared).
 
 ## Phase log
@@ -261,3 +289,4 @@ Deliberate forward references in Unit 8: NP-completeness of 0/1 knapsack and sub
 - **Phase 5 (2026-10-25):** complete Unit 6 (9 lessons, 45 exercises, 9 quizzes, Social Network Analyser project, 85 glossary terms). No framework changes were needed; `fractions`, `itertools` and `math.comb`/`lcm` work in the harness and Pyodide.
 - **Phase 6 (2026-10-25):** complete Unit 7 (9 lessons, 45 exercises, 9 quizzes, Help Desk project, 41 glossary terms). Lessons and projects now load on demand (main bundle 2.4 MB → 1.1 MB). Fixed a 4.2 test that newer Python versions passed by accident (now times the function instead).
 - **Phase 7 (2026-11-07):** complete Unit 8 (9 lessons, 41 exercises, 9 quizzes, Route Planner project, 47 glossary terms). App features added since Phase 6: installable PWA (manifest, generated service worker, update banner), GitHub Pages deploy, Windows/Mac desktop builds (Electron, `desktop/`), an Ask Claude button on every lesson, and a Listen button with natural recorded voice (Kokoro `am_michael`, generated by the "Record lesson voice" workflow into the `audio` branch; clips are named by a hash of the paragraph text, with the browser voice as a fallback). The verifier now also checks that `outcomes` and `summary` entries are plain strings (quote any text containing a colon and a space). Project test code can't define a function called `run` (the test harness has its own).
+- **Phase 8 (2026-11-07):** complete Unit 9 (9 lessons, 37 exercises, 9 quizzes, Mini CPU project, 58 glossary terms). New framework features: in-browser C (PicoC WebAssembly in a worker, C tag and syntax highlighting in the editor, `language: c` units and projects with JavaScript test code over the program output), and `scripts/verify_c.mjs` added to `npm run verify`. The Input button is hidden for C.
