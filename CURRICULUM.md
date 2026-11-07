@@ -13,7 +13,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 5 | Object-Oriented Programming | ✅ Complete (Phase 4) | 9 | 43 | Corner Shop |
 | 6 | Discrete Math for CS | ✅ Complete (Phase 5) | 9 | 45 | Social Network Analyser |
 | 7 | Data Structures II | ✅ Complete (Phase 6) | 9 | 45 | Help Desk |
-| 8 | Algorithms II | Planned | | | |
+| 8 | Algorithms II | ✅ Complete (Phase 7) | 9 | 41 | Route Planner |
 | 9 | Computer Systems (C) | Planned | | | |
 | 10 | Operating Systems | Planned | | | |
 | 11 | Networking | Planned | | | |
@@ -25,7 +25,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 59 lessons, 291 practice exercises, 59 lesson quizzes (354 multiple-choice questions + 59 coding questions), 7 unit projects, 448 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide (`npm run verify`).
+Totals so far: 68 lessons, 332 practice exercises, 68 lesson quizzes (408 multiple-choice questions + 68 coding questions), 8 unit projects, 495 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -130,6 +130,23 @@ Totals so far: 59 lessons, 291 practice exercises, 59 lesson quizzes (354 multip
 
 41 glossary terms.
 
+## Unit 8: Algorithms II ✅
+
+| Lesson | Id | Teaches |
+|---|---|---|
+| 8.1 Asymptotic Analysis | `u8-asymptotics` | formal O, Ω, Θ definitions with witnesses, growth-rate hierarchy, comparing functions, sums and closed forms, best/worst/average case, analysing loops |
+| 8.2 Recurrences | `u8-recurrences` | recurrence relations, unrolling, recursion trees, the master theorem and its three cases, when it does not apply |
+| 8.3 Divide and Conquer | `u8-divide-conquer` | divide/conquer/combine, merge sort, quickselect and partition, closest pairs and other splitting patterns, recurrence for each |
+| 8.4 Sorting Lower Bounds and Linear-Time Sorts | `u8-sorting-bounds` | decision-tree Ω(n log n) bound for comparison sorts, counting sort, radix sort, bucket sort, stability |
+| 8.5 Greedy Algorithms and Exchange Arguments | `u8-greedy` | greedy-choice property, exchange argument, interval scheduling, lateness (EDF), interval partitioning with a heap, fractional knapsack, Huffman coding, where greedy fails (0/1 knapsack, coin systems) |
+| 8.6 Dynamic Programming I | `u8-dp-basics` | overlapping subproblems, memoisation (`@cache`) vs tabulation, DP recipe (state, recurrence, order, answer), stairs, coin change (fewest and ways), longest increasing subsequence, grid paths |
+| 8.7 Dynamic Programming II | `u8-dp-sequences` | LCS and diff, edit distance and edit scripts, 0/1 knapsack (2D and 1D), pseudo-polynomial time, subset sum and partition, tracebacks, word break |
+| 8.8 Shortest Paths | `u8-shortest-paths` | weighted graphs, Dijkstra with a heap and stale-entry skipping, path reconstruction, Bellman-Ford with negative-cycle detection, currency arbitrage, Floyd-Warshall, choosing an algorithm |
+| 8.9 Minimum Spanning Trees and Union-Find | `u8-spanning-trees` | spanning trees, cut property, union-find (path compression, union by size), Kruskal, Prim, clustering, cycle detection, bottleneck paths |
+| Project | | Route Planner: Dijkstra for quickest routes, Kruskal with your own union-find for the cheapest network, 0/1 knapsack for a sightseeing plan, and a command processor for `map.txt` |
+
+47 glossary terms.
+
 ## How the units connect (prerequisite check)
 
 Before writing each unit, check that everything it relies on has already been taught, and note deliberate callbacks.
@@ -221,9 +238,12 @@ Deliberate forward references in Unit 7: self-balancing trees (AVL, red-black) b
 
 **Unit 8 can assume:** all of Units 1 to 7, including every classic data structure implemented and analysed informally (dynamic arrays and amortised cost, stacks, queues, deques, linked lists, hash tables, BSTs, heaps and `heapq`, graph classes), BFS for unweighted shortest paths, DFS, cycle detection with three colours, and Kahn's topological sort. Unit 8 should formalise Big-O/Θ/Ω, solve recurrences, and build on these structures for divide and conquer, greedy algorithms (with heaps), dynamic programming, Dijkstra (BFS + priority queue), minimum spanning trees (union-find is new) and DFS-based topological sort.
 
+**Unit 9 can assume:** all of Units 1 to 8, including formal asymptotic notation and recurrences, divide and conquer, greedy proofs, dynamic programming (memoisation and tabulation), Dijkstra/Bellman-Ford/Floyd-Warshall, minimum spanning trees and union-find, and pseudo-polynomial time (a first hint of NP-completeness for Unit 15).
+
+Deliberate forward references in Unit 8: NP-completeness of 0/1 knapsack and subset sum (Unit 15); A* search (Unit 17); max-flow and string algorithms such as KMP (not planned); amortised analysis of union-find beyond a mention of the inverse Ackermann function.
+
 ## Plan for remaining units (to refine before each phase)
 
-- **8 Algorithms II:** formal Big-O/Θ/Ω (← 4.2 informal counting), recurrences and the master theorem (← 4.7), greedy proofs (← 4.8), dynamic programming (← 4.5 memoisation, 4.8 coin change), graph algorithms.
 - **9 Computer Systems (C):** C syntax, pointers (← 1.5 address arithmetic), memory management, compilation (← 1.6), assembly (← 1.4). In-browser option needed (e.g. a WebAssembly C compiler or interpreter); otherwise give clear local-setup steps.
 - **10 OS**, **11 Networking**, **12 Databases** (sql.js in browser), **13 Web Development** (JS sandbox already supported by the runner), **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
 
@@ -240,3 +260,4 @@ Deliberate forward references in Unit 7: self-balancing trees (AVL, red-black) b
 - **Phase 4 (2026-10-25):** complete Unit 5 (9 lessons, 43 exercises, 9 quizzes, Corner Shop project, 66 glossary terms). No framework changes were needed; dataclasses, `abc` and `collections` run in the test harness as-is. Exercise tests now use `ast` on `source` (not `inspect.getsource`, which can't see code run from a string) when they need to inspect one function's body.
 - **Phase 5 (2026-10-25):** complete Unit 6 (9 lessons, 45 exercises, 9 quizzes, Social Network Analyser project, 85 glossary terms). No framework changes were needed; `fractions`, `itertools` and `math.comb`/`lcm` work in the harness and Pyodide.
 - **Phase 6 (2026-10-25):** complete Unit 7 (9 lessons, 45 exercises, 9 quizzes, Help Desk project, 41 glossary terms). Lessons and projects now load on demand (main bundle 2.4 MB → 1.1 MB). Fixed a 4.2 test that newer Python versions passed by accident (now times the function instead).
+- **Phase 7 (2026-11-07):** complete Unit 8 (9 lessons, 41 exercises, 9 quizzes, Route Planner project, 47 glossary terms). App features added since Phase 6: installable PWA (manifest, generated service worker, update banner), GitHub Pages deploy, Windows/Mac desktop builds (Electron, `desktop/`), an Ask Claude button on every lesson, and a Listen button with natural recorded voice (Kokoro `am_michael`, generated by the "Record lesson voice" workflow into the `audio` branch; clips are named by a hash of the paragraph text, with the browser voice as a fallback). The verifier now also checks that `outcomes` and `summary` entries are plain strings (quote any text containing a colon and a space). Project test code can't define a function called `run` (the test harness has its own).
