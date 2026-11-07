@@ -4,8 +4,10 @@
 export function registerServiceWorker(onUpdateReady) {
   if (!import.meta.env.PROD || !('serviceWorker' in navigator)) return;
   let reloading = false;
+  // The first install also fires controllerchange; only reload for updates.
+  const hadController = Boolean(navigator.serviceWorker.controller);
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (reloading) return;
+    if (reloading || !hadController) return;
     reloading = true;
     window.location.reload();
   });

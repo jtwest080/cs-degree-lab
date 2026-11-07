@@ -1,0 +1,70 @@
+# Records the lesson paragraphs in speech.json with the Kokoro voice and keeps
+# the recordings on the "audio" branch. The website build copies that branch
+# into the site, so Listen plays real recordings. Only new or changed
+# paragraphs are recorded each time.
+name: Record lesson voice
+
+on:
+  push:
+    branches: [main]
+    paths: [speech.json, voice.json, scripts/make_voice.py]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: voice
+  cancel-in-progress: false
+
+jobs:
+  units:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: echo "list=$(python3 -c "import json;print(json.dumps(list(json.load(open('speech.json')))))")" >> "$GITHUB_OUTPUT"
+
+  record:
+    needs: units
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        unit: ${{ fromJson(needs.units.outputs.list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the audio branch (or start it)
+        run: |
+          if git ls-remote --exit-code --heads origin audio >/dev/null 2>&1; then
+            git fetch --depth=1 origin audio
+            git worktree add audio FETCH_HEAD
+          else
+            git worktree add --detach audio
+            git -C audio checkout --orphan audio
+            git -C audio rm -rf . >/dev/null 2>&1 || true
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install kokoro-onnx soundfile
+      - name: Download the Kokoro voice model
+        run: |
+          curl -fsSLO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+          curl -fsSLO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+      - name: Record this unit
+        run: python scripts/make_voice.py audio ${{ matrix.unit }}
+      - name: Save the recordings
+        run: |
+          cd audio
+          git config user.name "Claude"
+          git config user.email "noreply@anthropic.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -qm "Record ${{ matrix.unit }}"
+          git push origin HEAD:audio

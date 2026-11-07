@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { chunks, collectBlocks, englishVoices, speechSupported } from '../lib/readAloud.js';
+import { chunks, collectBlocks, englishVoices, hashText, loadRecordings, speechSupported } from '../lib/readAloud.js';
 
 const SPEEDS = [0.8, 1, 1.25, 1.5, 1.75];
 const PREFS_KEY = 'cs-degree-lab:listen';
+const NATURAL = 'natural';
 
 function loadPrefs() {
   try {
@@ -19,18 +20,25 @@ function savePrefs(prefs) {
   }
 }
 
-/** "Listen" button for the lesson header, plus the player bar while reading. */
+/**
+ * "Listen" button for the lesson header, plus the player bar while reading.
+ * Paragraphs with a recording are played with the natural voice; the rest
+ * (or everything, if the learner picks a device voice) use speech synthesis.
+ */
 export default function ListenPlayer({ lessonId }) {
   const [active, setActive] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [index, setIndex] = useState(0);
   const [total, setTotal] = useState(0);
   const [voices, setVoices] = useState([]);
+  const [natural, setNatural] = useState({ voice: null, map: new Map() });
   const [prefs, setPrefs] = useState(loadPrefs);
   const blocks = useRef([]);
+  const audio = useRef(null);
   const run = useRef(0); // bumps whenever playback restarts, so stale callbacks stop
 
   useEffect(() => {
+    loadRecordings().then(setNatural);
     if (!speechSupported) return undefined;
     const refresh = () => setVoices(englishVoices());
     refresh();
@@ -46,13 +54,16 @@ export default function ListenPlayer({ lessonId }) {
     return () => document.body.classList.remove('listening');
   }, [active]);
 
-  if (!speechSupported) {
+  const hasNatural = natural.map.size > 0;
+  if (!speechSupported && !hasNatural) {
     return (
       <button className="btn listen-btn" disabled title="This browser has no built-in speech voices">
         🔊 Listen isn't available in this browser
       </button>
     );
   }
+
+  const voiceChoice = prefs.voice && (prefs.voice !== NATURAL || hasNatural) ? prefs.voice : hasNatural ? NATURAL : voices[0]?.voiceURI;
 
   const mark = (i) => {
     document.querySelectorAll('.reading-now').forEach((el) => el.classList.remove('reading-now'));
@@ -62,10 +73,23 @@ export default function ListenPlayer({ lessonId }) {
     block.el.scrollIntoView({ behavior: 'smooth', block: 'center' });
   };
 
-  const speakFrom = (i, current = prefs) => {
-    const synth = window.speechSynthesis;
+  const silence = () => {
+    if (speechSupported) window.speechSynthesis.cancel();
+    if (audio.current) {
+      audio.current.onended = null;
+      audio.current.onerror = null;
+      audio.current.pause();
+    }
+  };
+
+  const recordingFor = (i, current) => {
+    if (current.voiceChoice !== NATURAL) return null;
+    return natural.map.get(blocks.current[i]?.hash) || null;
+  };
+
+  const speakFrom = (i, current = { ...prefs, voiceChoice }) => {
     const id = ++run.current;
-    synth.cancel();
+    silence();
     if (i >= blocks.current.length) {
       setPlaying(false);
       mark(-1);
@@ -74,24 +98,54 @@ export default function ListenPlayer({ lessonId }) {
     setIndex(i);
     setPlaying(true);
     mark(i);
+    const next = () => {
+      if (run.current === id) speakFrom(i + 1, current);
+    };
+
+    const url = recordingFor(i, current);
+    if (url) {
+      const el = audio.current;
+      el.src = url;
+      el.playbackRate = current.rate || 1;
+      el.onended = next;
+      // A missing or unplayable file falls back to the device voice.
+      el.onerror = () => {
+        if (run.current === id) speakDevice(i, current, next);
+      };
+      el.play().catch(() => {
+        if (run.current === id) speakDevice(i, current, next);
+      });
+      // Warm the cache for the next paragraph so there's no gap.
+      const upcoming = recordingFor(i + 1, current);
+      if (upcoming) fetch(upcoming).catch(() => {});
+      return;
+    }
+    speakDevice(i, current, next);
+  };
+
+  const speakDevice = (i, current, next) => {
+    if (!speechSupported) {
+      next();
+      return;
+    }
+    const synth = window.speechSynthesis;
+    synth.cancel();
     const parts = chunks(blocks.current[i].text);
-    const voice = voices.find((v) => v.voiceURI === current.voice) || voices[0];
+    const voice = voices.find((v) => v.voiceURI === current.voiceChoice) || voices[0];
     parts.forEach((part, n) => {
       const u = new SpeechSynthesisUtterance(part);
       if (voice) u.voice = voice;
-      u.lang = voice?.lang || 'en-GB';
+      u.lang = voice?.lang || 'en-US';
       u.rate = current.rate || 1;
-      if (n === parts.length - 1) {
-        u.onend = () => {
-          if (run.current === id) speakFrom(i + 1, current);
-        };
-      }
+      if (n === parts.length - 1) u.onend = next;
       synth.speak(u);
     });
   };
 
   const start = () => {
-    blocks.current = collectBlocks();
+    // Created inside the tap, so phones allow it to keep playing paragraph after paragraph.
+    if (!audio.current) audio.current = new Audio();
+    blocks.current = collectBlocks().map((b) => ({ ...b, hash: hashText(b.text) }));
     setTotal(blocks.current.length);
     setActive(true);
     speakFrom(0);
@@ -99,7 +153,7 @@ export default function ListenPlayer({ lessonId }) {
 
   function stop() {
     run.current++;
-    if (speechSupported) window.speechSynthesis.cancel();
+    silence();
     document.querySelectorAll('.reading-now').forEach((el) => el.classList.remove('reading-now'));
     setPlaying(false);
     setActive(false);
@@ -107,15 +161,16 @@ export default function ListenPlayer({ lessonId }) {
 
   const pause = () => {
     run.current++;
-    window.speechSynthesis.cancel();
+    silence();
     setPlaying(false);
   };
 
-  const change = (next) => {
-    const merged = { ...prefs, ...next };
+  const change = (update) => {
+    const merged = { ...prefs, ...update };
     setPrefs(merged);
     savePrefs(merged);
-    if (playing) speakFrom(index, merged);
+    const choice = merged.voice && (merged.voice !== NATURAL || hasNatural) ? merged.voice : voiceChoice;
+    if (playing) speakFrom(index, { ...merged, voiceChoice: choice });
   };
 
   return (
@@ -139,8 +194,9 @@ export default function ListenPlayer({ lessonId }) {
             <select value={prefs.rate || 1} onChange={(e) => change({ rate: Number(e.target.value) })} aria-label="Speed">
               {SPEEDS.map((s) => <option key={s} value={s}>{s}×</option>)}
             </select>
-            {voices.length > 1 && (
-              <select value={prefs.voice || voices[0]?.voiceURI} onChange={(e) => change({ voice: e.target.value })} aria-label="Voice">
+            {(hasNatural ? 1 : 0) + voices.length > 1 && (
+              <select value={voiceChoice} onChange={(e) => change({ voice: e.target.value })} aria-label="Voice">
+                {hasNatural && <option value={NATURAL}>✨ {natural.voice}</option>}
                 {voices.map((v) => <option key={v.voiceURI} value={v.voiceURI}>{v.name}</option>)}
               </select>
             )}

@@ -95,6 +95,12 @@ def check_lesson(path, unit_lang, ids):
     lang = data.get("language", unit_lang)
     require(where, data, ["id", "title", "objective", "sections", "examples", "exercises",
                           "commonMistakes", "summary", "next", "quiz"])
+    # An unquoted "text: more text" in a YAML list becomes a dictionary, which
+    # breaks the page. These fields must be lists of plain strings.
+    for field in ("outcomes", "summary"):
+        for i, item in enumerate(data.get(field) or []):
+            if not isinstance(item, str):
+                errors.append(f"{where}: {field}[{i}] is not plain text (quote it if it contains ': ')")
 
     for i, ex in enumerate(data.get("examples", [])):
         require(f"{where} example {i+1}", ex, ["title", "code"])

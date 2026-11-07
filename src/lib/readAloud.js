@@ -64,3 +64,46 @@ export function englishVoices() {
     .filter((v) => /^en/i.test(v.lang))
     .sort((a, b) => score(a) - score(b));
 }
+
+// ---------------------------------------------------------------- natural voice
+// Recordings made with a neural voice (see scripts/make_voice.py) live in
+// audio/<unit>/<hash>.m4a, one per paragraph, named by a hash of the exact text
+// read. audio/index.json lists which exist; anything missing (new text, or
+// no recordings published) falls back to the device's own voices.
+
+/** cyrb53: a small, fast string hash. Used only to name recordings. */
+export function hashText(text) {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+let recordings = null;
+/** Map of text hash → recording URL (empty if none are published). */
+export function loadRecordings() {
+  if (!recordings) {
+    recordings = fetch('./audio/index.json')
+      .then((r) => (r.ok ? r.json() : { files: {} }))
+      .then((data) => {
+        const map = new Map();
+        for (const [unit, hashes] of Object.entries(data.files || {})) {
+          for (const h of hashes) map.set(h, `./audio/${unit}/${h}.m4a`);
+        }
+        return { voice: data.voice || 'Natural voice', map };
+      })
+      .catch(() => ({ voice: null, map: new Map() }));
+  }
+  return recordings;
+}
+
+// The recording script reads the exact paragraphs the player will read.
+if (typeof window !== 'undefined') {
+  window.__csLabSpeech = () => collectBlocks().map((b) => ({ text: b.text, hash: hashText(b.text) }));
+}
