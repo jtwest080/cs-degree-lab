@@ -1,0 +1,702 @@
+id: u10-os-overview
+title: What an Operating System Does
+minutes: 50
+objective: |
+  See the operating system as a program with two jobs: **share** the machine fairly among many programs, and **hide** its messy hardware behind clean abstractions. Learn how user programs ask the kernel for help through system calls, why the CPU has two privilege modes, and how file descriptors work.
+outcomes:
+  - Explain the two roles of an operating system, resource manager and abstraction provider
+  - Distinguish the kernel from the programs and tools that run on top of it
+  - Describe user mode versus kernel mode and what a trap or system call does
+  - Trace what happens when a program calls `read` or `write`, step by step
+  - Model a file-descriptor table, including the "lowest free number" rule and `dup`
+  - Describe the boot sequence and the main kernel designs (monolithic, microkernel)
+
+sections:
+  - heading: Why have an operating system?
+    body: |
+      Imagine a computer with no operating system. Every program you wrote would have to know how to talk to the exact disk, keyboard, screen and network card in that machine. Only one program could run at a time, because nothing would stop a second program from overwriting the first. A bug in any program could crash everything, and one user could read another's files.
+
+      An **operating system (OS)** solves these problems with two jobs:
+
+      1. **Resource manager.** The machine has a limited supply of CPU time, memory, disk space and devices. The OS decides who gets what and when, and enforces that programs cannot interfere with each other. This is the unit's main theme: scheduling (Lessons 10.3 to 10.5), memory (10.7 and 10.8) and storage (10.9).
+      2. **Abstraction provider.** The OS presents simple, uniform ideas on top of complicated hardware. A **process** is an abstraction of a CPU. A **virtual address space** is an abstraction of memory. A **file** is an abstraction of disk blocks. A **socket** is an abstraction of a network card. Your program says "write these bytes to this file" and never needs to know whether the disk is a spinning platter or flash.
+
+      Everything else you think of as part of "the OS", such as the desktop, the window manager, the file browser and the web browser, is just ordinary programs that run on top. The part that really is special is the **kernel**.
+
+  - heading: The kernel and the two modes
+    body: |
+      The **kernel** is the core of the OS: the one program that is always loaded, runs with full control of the hardware, and manages everything else. Linux, the Windows NT kernel and XNU (macOS and iOS) are kernels.
+
+      To protect the kernel from other programs, the CPU itself has (at least) two **privilege modes**:
+
+      - **User mode**: where every ordinary program runs. A program in user mode can compute, and read and write its own memory, but it **cannot** talk directly to devices, change the memory map, switch off interrupts or halt the machine. Trying to run such a **privileged instruction** makes the CPU raise an exception and hand control to the kernel, which usually terminates the offending program.
+      - **Kernel mode** (also called supervisor mode): where the kernel runs. Everything is allowed.
+
+      On x86 these are called ring 3 and ring 0; ARM calls them EL0 and EL1.
+
+      This makes the OS a **referee** that cannot be bypassed. A buggy or malicious program can crash only itself. Two more pieces of hardware make it work:
+
+      - **Memory protection**: the memory management unit (MMU) lets the kernel mark which memory each process may touch (Lesson 10.7).
+      - **A timer interrupt**: a clock that interrupts the CPU every few milliseconds and forces control back to the kernel. Without it a program stuck in `while True: pass` would own the machine forever. This is how the OS regains the CPU to do **preemptive scheduling** (Lesson 10.3).
+
+  - heading: System calls
+    body: |
+      A user program often needs something only the kernel can do: open a file, send network data, create a process, allocate more memory. It asks through a **system call** (syscall). The sequence:
+
+      1. The program puts the **syscall number** and arguments in agreed registers (Lesson 9.9 described the same idea for ordinary calls).
+      2. It executes a special instruction (`syscall` on x86-64, `svc` on ARM). This is a **trap**: the CPU switches to kernel mode and jumps to a fixed entry point that the kernel set up at boot. A program cannot choose where it lands, only which syscall it asks for.
+      3. The kernel **validates** the arguments (never trusting the caller: is that pointer valid? may this user open this file?), does the work, and puts the result in a register.
+      4. The kernel returns to user mode, to the instruction after the trap. A negative result is an error code (the C library turns it into `-1` and sets `errno`).
+
+      A trap costs more than an ordinary function call, typically hundreds of CPU cycles, because the CPU must switch modes and the kernel must check everything. That is why library functions like `printf` and Python's `print` **buffer** output: gather many characters, then make one `write` call.
+
+      A few of the most common Linux system calls:
+
+      | Area | Calls |
+      |---|---|
+      | Files | `open`, `read`, `write`, `close`, `lseek`, `stat` |
+      | Processes | `fork`, `execve`, `wait`, `exit`, `kill` |
+      | Memory | `mmap`, `brk` |
+      | Communication | `pipe`, `socket`, `connect`, `send`, `recv` |
+      | Time | `gettimeofday`, `nanosleep` |
+
+      Every programming language library, whether Python's `open()`, Java's `FileReader` or C's `fopen`, eventually bottoms out in these. On Linux you can watch them with `strace python3 script.py`, which lists every system call a program makes. Even a "hello world" makes dozens.
+
+  - heading: Everything is a file descriptor
+    body: |
+      When you `open` a file, the kernel returns a small non-negative integer called a **file descriptor (fd)**. It is an index into a table that the kernel keeps for each process. Later calls (`read(fd, ...)`, `write(fd, ...)`, `close(fd)`) use that number, so the program never gets a pointer into kernel memory and cannot forge one.
+
+      Three descriptors are open when a program starts: **0** is standard input, **1** is standard output and **2** is standard error. That is why `print` goes to the screen: it writes to fd 1. A shell can redirect fd 1 to a file (`cmd > out.txt`) without the program knowing, because the program only ever says "write to 1".
+
+      The kernel hands out the **lowest unused number**, so the first file you open is usually fd 3. `dup(fd)` returns a new descriptor that refers to the **same open file**, including its current position. This one trick builds shells' pipes and redirections.
+
+      Unix extends the idea: devices, pipes, sockets and even some kernel information are accessed through the same `read` and `write`, which is the Unix slogan "everything is a file". It means a tool like `grep` works on a file, a pipe, or a terminal without change.
+
+  - heading: Kernel designs and booting
+    body: |
+      **How big should the kernel be?** Two classic answers:
+
+      - A **monolithic kernel** (Linux, BSD) puts schedulers, memory management, file systems and device drivers all in one large program running in kernel mode. Calls between parts are fast, but a bug in any driver can take down the whole system.
+      - A **microkernel** (QNX, seL4, MINIX) keeps only the bare minimum in kernel mode (scheduling, memory, messages between processes) and runs file systems and drivers as separate user-mode servers. It is safer and easier to verify, but every request needs extra messages between processes, which costs time.
+
+      Real systems are hybrids: macOS and Windows keep most services in the kernel but use user-mode processes for others. Linux can load code at run time as **kernel modules**.
+
+      **Booting.** When the power comes on, nothing is in memory yet, so a tiny program in firmware (BIOS or UEFI) runs first. It tests the hardware, finds a **boot loader** on disk, and hands over to it. The boot loader loads the kernel into memory and starts it. The kernel sets up memory management and interrupts, mounts the root file system, and starts the first user process (`init`, or `systemd` on modern Linux, always **process 1**). That process starts everything else: login screens, network services, your desktop. Services are started in an order determined by their **dependencies**, which you will code in an exercise.
+
+examples:
+  - title: A toy kernel with a syscall table
+    intro: "User code never calls kernel functions directly. It names a syscall, and the kernel validates the request and dispatches it."
+    code: |
+      class Kernel:
+          def __init__(self):
+              self.files = {"/etc/motd": "welcome\n"}
+              self.table = {"getpid": self.sys_getpid, "write": self.sys_write, "read_file": self.sys_read_file}
+              self.log = []
+
+          def syscall(self, pid, name, *args):
+              self.log.append((pid, name))
+              handler = self.table.get(name)
+              if handler is None:
+                  return -38           # "function not implemented"
+              return handler(pid, *args)
+
+          def sys_getpid(self, pid):
+              return pid
+
+          def sys_write(self, pid, fd, text):
+              if fd not in (1, 2):
+                  return -9            # "bad file descriptor"
+              print(f"[pid {pid}] {text}", end="")
+              return len(text)
+
+          def sys_read_file(self, pid, path):
+              return self.files.get(path, -2)   # "no such file"
+
+
+      kernel = Kernel()
+      print(kernel.syscall(7, "getpid"))
+      print(kernel.syscall(7, "write", 1, "hello from user space\n"))
+      print(kernel.syscall(7, "write", 9, "oops"))
+      print(kernel.syscall(7, "read_file", "/etc/motd").strip())
+      print(kernel.syscall(7, "read_file", "/nope"))
+      print(kernel.syscall(7, "launch_missiles"))
+      print(kernel.log)
+    output: |
+      7
+      [pid 7] hello from user space
+      22
+      -9
+      welcome
+      -2
+      -38
+      [(7, 'getpid'), (7, 'write'), (7, 'write'), (7, 'read_file'), (7, 'read_file'), (7, 'launch_missiles')]
+    lines:
+      - line: 7
+        note: "Every entry goes through this one door, which is where the kernel can log, check permissions and count."
+      - line: 9
+        note: "An unknown syscall number returns an error code. It does not crash the kernel."
+      - line: 20
+        note: "The kernel validates the file descriptor before doing anything. Never trust the caller."
+      - line: 31
+        note: "Negative numbers are error codes, the convention real Linux syscalls use."
+  - title: User mode and kernel mode
+    intro: "A tiny CPU that refuses privileged instructions in user mode, and switches to kernel mode only through a trap."
+    code: |
+      class PrivilegeError(Exception):
+          pass
+
+
+      class CPU:
+          PRIVILEGED = {"halt", "set_timer", "io_out"}
+
+          def __init__(self):
+              self.mode = "user"
+
+          def execute(self, instruction):
+              if instruction in self.PRIVILEGED and self.mode != "kernel":
+                  raise PrivilegeError(f"{instruction} needs kernel mode")
+              return f"ran {instruction} in {self.mode} mode"
+
+          def trap(self, handler):
+              self.mode = "kernel"
+              try:
+                  return handler(self)
+              finally:
+                  self.mode = "user"
+
+
+      cpu = CPU()
+      print(cpu.execute("add"))
+      try:
+          cpu.execute("halt")
+      except PrivilegeError as error:
+          print("blocked:", error)
+      print(cpu.trap(lambda c: c.execute("io_out")))
+      print("back in", cpu.mode, "mode")
+    output: |
+      ran add in user mode
+      blocked: halt needs kernel mode
+      ran io_out in kernel mode
+      back in user mode
+    lines:
+      - line: 12
+        note: "The hardware check happens on every instruction. A user program has no way to skip it."
+      - line: 17
+        note: "A trap is the only door from user mode to kernel mode, and it always returns to user mode afterwards."
+      - line: 20
+        note: "finally guarantees the switch back, even if the handler fails."
+  - title: File descriptors and the lowest-free rule
+    intro: "A per-process table maps small integers to open files. dup makes two numbers share one open file, and one position."
+    code: |
+      class OpenFile:
+          def __init__(self, path, data):
+              self.path = path
+              self.data = data
+              self.offset = 0
+
+
+      class Process:
+          def __init__(self, files):
+              self.files = files
+              self.fds = {0: OpenFile("stdin", ""), 1: OpenFile("stdout", ""), 2: OpenFile("stderr", "")}
+
+          def lowest_free(self):
+              n = 0
+              while n in self.fds:
+                  n += 1
+              return n
+
+          def open(self, path):
+              fd = self.lowest_free()
+              self.fds[fd] = OpenFile(path, self.files[path])
+              return fd
+
+          def dup(self, fd):
+              new = self.lowest_free()
+              self.fds[new] = self.fds[fd]
+              return new
+
+          def read(self, fd, n):
+              f = self.fds[fd]
+              chunk = f.data[f.offset:f.offset + n]
+              f.offset += len(chunk)
+              return chunk
+
+          def close(self, fd):
+              del self.fds[fd]
+
+
+      p = Process({"a.txt": "ABCDEFGH"})
+      a = p.open("a.txt")
+      b = p.dup(a)
+      print("fds:", a, b)
+      print(p.read(a, 3), p.read(b, 3))
+      p.close(a)
+      print("after closing", a, "still readable via", b, ":", p.read(b, 5))
+      print("next open gets", p.open("a.txt"))
+    output: |
+      fds: 3 4
+      ABC DEF
+      after closing 3 still readable via 4 : GH
+      next open gets 3
+    lines:
+      - line: 13
+        note: "The lowest-numbered unused descriptor is chosen. 0, 1 and 2 are taken, so the first open returns 3."
+      - line: 22
+        note: "dup stores the very same OpenFile object under a second number."
+      - line: 40
+        note: "Because the offset lives in the shared OpenFile, the second read continues where the first stopped."
+      - line: 43
+        note: "Closing one descriptor does not close the file for the other, and the freed number 3 is reused next."
+  - title: What a real system call looks like
+    intro: "Real output from strace, which lists every syscall a program makes. Run it in a Linux terminal."
+    runnable: false
+    code: |
+      $ strace -e trace=openat,read,write,close python3 -c "print('hi')" 2>&1 | tail -6
+
+      openat(AT_FDCWD, "/usr/lib/python3.12/encodings/__init__.py", O_RDONLY) = 3
+      read(3, "\"\"\" Standard Python Codec Regist"..., 4096) = 4096
+      close(3)                                = 0
+      write(1, "hi\n", 3)                     = 3
+      close(0)                                = 0
+      +++ exited with 0 +++
+    lines:
+      - line: 3
+        note: "openat returned 3, the lowest free descriptor, just as in our simulation."
+      - line: 4
+        note: "read(3, buffer, 4096) returned 4096 bytes."
+      - line: 6
+        note: "print('hi') ends as write(1, 'hi\\n', 3): descriptor 1, three bytes, three bytes written."
+
+playground:
+  prompt: |
+    Make the toy kernel more realistic. Add a `sys_open` that returns a file descriptor and stores it per pid, or add a permission check so that only pid 1 can call a new `sys_shutdown`. Watch how the dispatcher gives you one place to enforce rules.
+  code: |
+    calls = ["open", "read", "read", "write", "read", "close", "write"]
+    counts = {}
+    for name in calls:
+        counts[name] = counts.get(name, 0) + 1
+    for name in sorted(counts, key=lambda n: (-counts[n], n)):
+        print(f"{name:6} {counts[name]}")
+
+exercises:
+  - id: cpu-modes
+    title: Privilege and traps
+    difficulty: 2
+    prompt: |
+      Complete the class `CPU`. It has a `mode` attribute, either `"user"` or `"kernel"`, starting as `"user"`. `execute(instruction)` returns the string `"ok"` for any instruction, but raises `PrivilegeError` for the privileged instructions `"halt"`, `"set_timer"` and `"io_out"` unless the CPU is in kernel mode. `trap(handler)` switches to kernel mode, calls `handler(self)`, and returns its result; the CPU must go back to user mode afterwards **even if the handler raises an exception** (the exception should still propagate). Also keep a counter `traps` of how many times `trap` has been called.
+    starter: |
+      class PrivilegeError(Exception):
+          pass
+
+
+      class CPU:
+          PRIVILEGED = {"halt", "set_timer", "io_out"}
+
+          def __init__(self):
+              pass
+
+          def execute(self, instruction):
+              pass
+
+          def trap(self, handler):
+              pass
+    tests:
+      - name: user mode blocks privileged instructions
+        code: |
+          cpu = CPU()
+          assert cpu.mode == "user" and cpu.traps == 0
+          assert cpu.execute("add") == "ok"
+          for ins in ("halt", "set_timer", "io_out"):
+              try:
+                  cpu.execute(ins)
+                  assert False, ins + " should be blocked"
+              except PrivilegeError:
+                  pass
+      - name: trap switches modes
+        code: |
+          cpu = CPU()
+          seen = []
+          result = cpu.trap(lambda c: (seen.append(c.mode), c.execute("halt"))[1])
+          assert result == "ok" and seen == ["kernel"]
+          assert cpu.mode == "user" and cpu.traps == 1
+          cpu.trap(lambda c: None)
+          assert cpu.traps == 2
+      - name: trap restores user mode after an error
+        code: |
+          cpu = CPU()
+          def bad(c):
+              raise ValueError("driver bug")
+          try:
+              cpu.trap(bad)
+              assert False, "the exception must propagate"
+          except ValueError:
+              pass
+          assert cpu.mode == "user" and cpu.traps == 1
+          try:
+              cpu.execute("halt")
+              assert False
+          except PrivilegeError:
+              pass
+    hints:
+      - "Set `self.mode = \"user\"` and `self.traps = 0` in `__init__`."
+      - "`execute`: if the instruction is in `self.PRIVILEGED` and the mode is not `\"kernel\"`, raise `PrivilegeError`."
+      - "`trap`: increment `traps`, switch to kernel, and use `try`/`finally` so that user mode is restored."
+    solution: |
+      class PrivilegeError(Exception):
+          pass
+
+
+      class CPU:
+          PRIVILEGED = {"halt", "set_timer", "io_out"}
+
+          def __init__(self):
+              self.mode = "user"
+              self.traps = 0
+
+          def execute(self, instruction):
+              if instruction in self.PRIVILEGED and self.mode != "kernel":
+                  raise PrivilegeError(instruction)
+              return "ok"
+
+          def trap(self, handler):
+              self.traps += 1
+              self.mode = "kernel"
+              try:
+                  return handler(self)
+              finally:
+                  self.mode = "user"
+    explanation: |
+      The `finally` block is the whole point: if a kernel handler fails while the CPU is still in kernel mode, the next user program would inherit full privileges. Real kernels are written so that the return-to-user path always runs, whatever happened inside.
+
+  - id: fd-table
+    title: A file-descriptor table
+    difficulty: 3
+    prompt: |
+      Write the class `FDTable`. It is created with a dictionary `files` mapping paths to their text contents. Descriptors 0, 1 and 2 are reserved (standard streams), so the first `open` returns 3. Implement `open(path)`, which returns the lowest unused descriptor (raising `FileNotFoundError` for an unknown path), `read(fd, n)`, which returns up to `n` characters from the current position and advances it, `dup(fd)`, which returns the lowest unused descriptor referring to the **same open file** (so the position is shared), and `close(fd)`. Using a descriptor that is not open (in `read`, `dup` or `close`) raises `OSError`. Closing one of two duplicated descriptors must not affect the other. Also provide `open_count()`, the number of descriptors currently open for files (excluding 0, 1 and 2).
+    starter: |
+      class FDTable:
+          def __init__(self, files):
+              pass
+
+          def open(self, path):
+              pass
+
+          def read(self, fd, n):
+              pass
+
+          def dup(self, fd):
+              pass
+
+          def close(self, fd):
+              pass
+
+          def open_count(self):
+              pass
+    tests:
+      - name: lowest free descriptor
+        code: |
+          t = FDTable({"a": "hello", "b": "world"})
+          assert t.open("a") == 3
+          assert t.open("b") == 4
+          t.close(3)
+          assert t.open("b") == 3
+          assert t.open("a") == 5
+          assert t.open_count() == 3
+      - name: read advances the position
+        code: |
+          t = FDTable({"a": "abcdefgh"})
+          fd = t.open("a")
+          assert t.read(fd, 3) == "abc"
+          assert t.read(fd, 3) == "def"
+          assert t.read(fd, 10) == "gh"
+          assert t.read(fd, 1) == ""
+          other = t.open("a")
+          assert t.read(other, 2) == "ab"
+      - name: dup shares the position
+        code: |
+          t = FDTable({"a": "abcdefgh"})
+          x = t.open("a")
+          y = t.dup(x)
+          assert y == 4
+          assert t.read(x, 2) == "ab" and t.read(y, 2) == "cd" and t.read(x, 2) == "ef"
+          t.close(x)
+          assert t.read(y, 5) == "gh"
+          assert t.dup(y) == 3
+      - name: errors
+        code: |
+          t = FDTable({"a": "x"})
+          try:
+              t.open("missing")
+              assert False
+          except FileNotFoundError:
+              pass
+          fd = t.open("a")
+          t.close(fd)
+          for call in (lambda: t.read(fd, 1), lambda: t.close(fd), lambda: t.dup(fd), lambda: t.read(99, 1)):
+              try:
+                  call()
+                  assert False, "should raise OSError"
+              except OSError as e:
+                  assert not isinstance(e, FileNotFoundError)
+    hints:
+      - "Keep `self.table = {}` mapping descriptor numbers to a small object (or list) holding `data` and `offset`."
+      - "Lowest free: start at 3 and increase while the number is in the table."
+      - "`dup` stores the **same object** under the new number, so both numbers share the offset. `close` only removes one key."
+      - "Raise `OSError(\"bad file descriptor\")` when the key is missing. `FileNotFoundError` is a subclass of `OSError`, so raise it only from `open`."
+    solution: |
+      class FDTable:
+          def __init__(self, files):
+              self.files = files
+              self.table = {}
+
+          def _lowest(self):
+              n = 3
+              while n in self.table:
+                  n += 1
+              return n
+
+          def _get(self, fd):
+              if fd not in self.table:
+                  raise OSError("bad file descriptor")
+              return self.table[fd]
+
+          def open(self, path):
+              if path not in self.files:
+                  raise FileNotFoundError(path)
+              fd = self._lowest()
+              self.table[fd] = {"data": self.files[path], "offset": 0}
+              return fd
+
+          def read(self, fd, n):
+              f = self._get(fd)
+              chunk = f["data"][f["offset"]:f["offset"] + n]
+              f["offset"] += len(chunk)
+              return chunk
+
+          def dup(self, fd):
+              f = self._get(fd)
+              new = self._lowest()
+              self.table[new] = f
+              return new
+
+          def close(self, fd):
+              self._get(fd)
+              del self.table[fd]
+
+          def open_count(self):
+              return len(self.table)
+    explanation: |
+      The per-process table holds small integers; the objects they point to hold the real state. Because `dup` copies the **reference**, not the object, both descriptors move together. Real kernels have exactly this two-level structure: a per-process fd table pointing at system-wide "open file descriptions". It is also why a child process created by `fork` shares file offsets with its parent.
+
+  - id: strace-summary
+    title: Summarising system calls
+    difficulty: 2
+    prompt: |
+      `strace -c` prints a table of which system calls a program made. Write `summarise(calls)`, where `calls` is a list of `(name, seconds)` pairs, one for each system call made. Return a list of `(name, count, total_seconds, percent)` tuples, one per distinct name, **sorted by total time, largest first** (ties broken alphabetically by name). `total_seconds` is the sum rounded to 6 decimal places and `percent` is that name's share of all time, rounded to 1 decimal place. For an empty list, or when the total time is 0, percentages are `0.0`.
+    starter: |
+      def summarise(calls):
+          pass
+    tests:
+      - name: summary
+        code: |
+          calls = [("read", 0.5), ("write", 0.25), ("read", 0.25), ("open", 0.5), ("close", 0.0)]
+          rows = summarise(calls)
+          assert rows == [("read", 2, 0.75, 50.0), ("open", 1, 0.5, 33.3), ("write", 1, 0.25, 16.7), ("close", 1, 0.0, 0.0)]
+      - name: ties and empty
+        code: |
+          assert summarise([]) == []
+          rows = summarise([("b", 1.0), ("a", 1.0), ("b", 1.0)])
+          assert rows == [("b", 2, 2.0, 66.7), ("a", 1, 1.0, 33.3)]
+          assert summarise([("x", 0.0), ("y", 0.0)]) == [("x", 1, 0.0, 0.0), ("y", 1, 0.0, 0.0)]
+    hints:
+      - "Build two dictionaries (or one of lists): count per name and total time per name."
+      - "Sort with `key=lambda row: (-row[2], row[0])`. Compute the percent from the unrounded total if you like; the tests use values where it makes no difference."
+    solution: |
+      def summarise(calls):
+          counts = {}
+          totals = {}
+          for name, seconds in calls:
+              counts[name] = counts.get(name, 0) + 1
+              totals[name] = totals.get(name, 0.0) + seconds
+          grand = sum(totals.values())
+          rows = []
+          for name in counts:
+              share = 100 * totals[name] / grand if grand > 0 else 0.0
+              rows.append((name, counts[name], round(totals[name], 6), round(share, 1)))
+          rows.sort(key=lambda r: (-r[2], r[0]))
+          return rows
+    explanation: |
+      Profilers and `strace -c` do exactly this kind of aggregation. A program that spends most of its time in `read` is waiting on input or disk, and one that makes millions of tiny `write` calls should buffer. Finding where a program spends its time is the first step in making it faster.
+
+  - id: boot-order
+    title: Boot order
+    difficulty: 3
+    prompt: |
+      Services start during boot in an order that respects their **dependencies**, as `systemd` does. Write `boot_order(deps)`, where `deps` maps each service to the list of services it needs to be running first (every service appears as a key; services with no dependencies map to `[]`). Return a list of all the services in a valid start order. When several services could start next, pick the one that comes first alphabetically. If there is a circular dependency, raise `ValueError`.
+    starter: |
+      def boot_order(deps):
+          pass
+    tests:
+      - name: simple order
+        code: |
+          deps = {"network": ["kernel"], "kernel": [], "ssh": ["network", "logging"], "logging": ["kernel"], "desktop": ["network"]}
+          assert boot_order(deps) == ["kernel", "logging", "network", "desktop", "ssh"]
+          assert boot_order({}) == []
+          assert boot_order({"b": [], "a": []}) == ["a", "b"]
+      - name: cycle
+        code: |
+          try:
+              boot_order({"a": ["b"], "b": ["c"], "c": ["a"]})
+              assert False, "needs ValueError"
+          except ValueError:
+              pass
+          try:
+              boot_order({"a": ["a"]})
+              assert False
+          except ValueError:
+              pass
+      - name: respects every dependency
+        code: |
+          import random
+          rng = random.Random(5)
+          for _ in range(40):
+              names = [chr(97 + i) for i in range(rng.randint(1, 12))]
+              deps = {n: [m for m in names[:i] if rng.random() < 0.3] for i, n in enumerate(names)}
+              order = boot_order(deps)
+              assert sorted(order) == sorted(names)
+              pos = {n: i for i, n in enumerate(order)}
+              assert all(pos[d] < pos[n] for n in deps for d in deps[n])
+    hints:
+      - "This is Kahn's algorithm from Lesson 7.8: count how many unmet dependencies each service has."
+      - "Keep a list of services whose count is 0 and always take the alphabetically smallest (`min`, or a heap with `heapq`)."
+      - "If you have started fewer services than exist when nothing is ready, there is a cycle."
+    solution: |
+      import heapq
+
+
+      def boot_order(deps):
+          waiting = {name: len(set(needs)) for name, needs in deps.items()}
+          users = {name: [] for name in deps}
+          for name, needs in deps.items():
+              for need in set(needs):
+                  users[need].append(name)
+          ready = [name for name, count in waiting.items() if count == 0]
+          heapq.heapify(ready)
+          order = []
+          while ready:
+              name = heapq.heappop(ready)
+              order.append(name)
+              for other in users[name]:
+                  waiting[other] -= 1
+                  if waiting[other] == 0:
+                      heapq.heappush(ready, other)
+          if len(order) != len(deps):
+              raise ValueError("circular dependency")
+          return order
+    explanation: |
+      Start-up order is a topological sort, the same algorithm that orders course prerequisites and build steps. A heap makes the tie-breaking rule cheap. Real init systems also start independent services **in parallel**, which is why a modern Linux machine boots in seconds.
+
+commonMistakes:
+  - title: Thinking the OS is the desktop
+    explanation: |
+      The desktop, window manager and apps are ordinary user-mode programs. The OS proper is the kernel plus the services it provides.
+  - title: Believing a syscall is just a function call
+    explanation: |
+      It crosses into kernel mode, which is much slower than a call within your program. Batch work: read and write in larger chunks.
+  - title: Using a file descriptor after closing it
+    explanation: |
+      The number may be reused by the next `open`, so you can read a different file by accident. Set the variable to `None` after closing.
+  - title: Forgetting that dup shares the file position
+    explanation: |
+      Duplicated descriptors point at one open file. If you want an independent position, `open` the path again.
+  - title: Assuming the timer is optional
+    explanation: |
+      Without a timer interrupt, a program in an infinite loop would hold the CPU forever. Preemption depends on the hardware timer.
+
+summary:
+  - "An OS is a **resource manager** (sharing CPU, memory, disk and devices fairly and safely) and an **abstraction provider** (processes, address spaces, files)."
+  - "The **kernel** runs in privileged **kernel mode**; ordinary programs run in **user mode** and cannot touch hardware directly."
+  - "Programs ask the kernel for services with **system calls**, which **trap** into the kernel; the kernel validates arguments and returns a result or error code."
+  - "A **file descriptor** is a small integer indexing a per-process table of open files. 0, 1 and 2 are stdin, stdout and stderr; `open` takes the lowest free number and `dup` shares a file's position."
+  - "Kernels are **monolithic** (fast, one big program) or **microkernel** (small and safe, more messaging). At boot, firmware starts a boot loader, which starts the kernel, which starts process 1."
+next: |
+  A program on disk is just data. When the OS runs it, it becomes a **process**: a program plus its memory, registers, open files and state. Lesson 10.2 explores the lifecycle of processes: how they are created with `fork`, what states they pass through, and how the OS switches between them.
+
+quiz:
+  - type: mcq
+    question: Which of these is a main job of an operating system?
+    options: [
+      "Sharing hardware fairly among programs while hiding its details",
+      "Compiling source code into machine code",
+      "Making programs run faster by rewriting them",
+      "Providing the user interface only"
+    ]
+    answer: 0
+    explanation: "The OS is a resource manager and an abstraction provider. Compilers and desktops are separate programs."
+  - type: mcq
+    question: What happens if a user-mode program tries to execute a privileged instruction?
+    options: [
+      "The CPU raises an exception and the kernel takes control, usually ending the program",
+      "The instruction runs normally",
+      "The computer shuts down",
+      "The instruction is silently skipped"
+    ]
+    answer: 0
+    explanation: "The hardware enforces the privilege check; the kernel then decides what to do with the offending process."
+  - type: mcq
+    question: Why does a hardware timer interrupt matter to an OS?
+    options: [
+      "It forces control back to the kernel so one program cannot hog the CPU",
+      "It keeps the clock on your desktop accurate",
+      "It makes disk reads faster",
+      "It prevents memory leaks"
+    ]
+    answer: 0
+    explanation: "Without it, a program in an infinite loop would keep the CPU forever."
+  - type: mcq
+    question: A process has descriptors 0, 1, 2 open and calls open() on a file. What descriptor is returned?
+    options: ["3", "0", "1", "A random number"]
+    answer: 0
+    explanation: "The kernel always returns the lowest unused descriptor."
+  - type: mcq
+    question: After fd2 = dup(fd1), what is true?
+    options: [
+      "Both descriptors refer to the same open file and share its position",
+      "fd2 refers to a new copy of the file",
+      "Closing fd1 also closes fd2",
+      "fd2 starts reading from the beginning of the file"
+    ]
+    answer: 0
+    explanation: "dup duplicates the descriptor, not the open file. The file offset is shared."
+  - type: mcq
+    question: What is a main advantage of a microkernel over a monolithic kernel?
+    options: [
+      "A bug in a driver or file system is less likely to crash the whole system",
+      "System calls become faster",
+      "It needs no boot loader",
+      "It does not need user mode"
+    ]
+    answer: 0
+    explanation: "Drivers and services run in user mode, so their bugs are contained, at the cost of more message passing."
+  - type: code
+    question: |
+      Write `lowest_free(used)` that returns the smallest non-negative integer that is **not** in the collection `used` (this is how the kernel picks a file descriptor).
+    starter: |
+      def lowest_free(used):
+          pass
+    tests:
+      - name: lowest
+        code: |
+          assert lowest_free([]) == 0
+          assert lowest_free([0, 1, 2]) == 3
+          assert lowest_free({0, 2, 3}) == 1
+          assert lowest_free([5, 3, 1]) == 0
+          assert lowest_free(range(1000)) == 1000
+    solution: |
+      def lowest_free(used):
+          taken = set(used)
+          n = 0
+          while n in taken:
+              n += 1
+          return n

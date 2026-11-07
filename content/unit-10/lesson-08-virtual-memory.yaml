@@ -1,0 +1,750 @@
+id: u10-virtual-memory
+title: Virtual Memory and Page Replacement
+minutes: 60
+objective: |
+  Understand how an OS lets programs use more memory than the machine has: load pages only when they are touched (demand paging), handle page faults, and choose which page to throw out when RAM is full. Compare the replacement algorithms FIFO, LRU, optimal and clock, see Belady's anomaly, and learn about the working set and thrashing.
+outcomes:
+  - Describe demand paging and the sequence of steps in handling a page fault
+  - Compute the effective access time with page faults and see why the fault rate must be tiny
+  - Simulate FIFO, LRU, optimal and clock page replacement and count faults
+  - Explain Belady's anomaly and stack algorithms
+  - Define the working set and explain thrashing and how the OS prevents it
+  - Describe swap space, memory-mapped files and the out-of-memory killer
+
+sections:
+  - heading: Demand paging
+    body: |
+      Lesson 10.7 gave every process a page table. The final trick is to let the page table say "**not present**". A page can then be in RAM, or on **disk** (in a **swap area** or in the program's own file), and the process cannot tell the difference except by speed.
+
+      With **demand paging**, a program's pages are loaded **only when first touched**. Starting a 100 MB program doesn't read 100 MB: the OS maps the file and loads the pages the program actually executes. Many pages of a large program (error handlers, rarely used features) are never loaded at all, so programs start faster and more of them fit in RAM. The total virtual memory of all processes can be far larger than physical RAM.
+
+      This works because of **locality of reference** (Lesson 1.6): at any moment a program uses only a small part of its memory, mostly the same pages again and again, so keeping that part in RAM is enough.
+
+  - heading: Handling a page fault
+    body: |
+      When an instruction touches a page whose entry is not present, the MMU raises a **page fault**, a trap into the kernel. The handler does the following:
+
+      1. Check the address is legal for this process. If not (null pointer, outside any mapping), send **SIGSEGV**, the "segmentation fault" that kills the program.
+      2. Find a **free frame**. If none is free, run the **page replacement algorithm** to pick a **victim** frame. If the victim page is **dirty** (modified since loading), write it to disk first; a clean page can simply be dropped.
+      3. Start a **disk read** of the needed page into the frame. The process is put in the **waiting** state (Lesson 10.2) and another process runs while the disk works.
+      4. When the read finishes, update the page table (frame number, present bit set), and make the process **ready**.
+      5. When the process runs again, **restart the instruction** that faulted. This time it succeeds.
+
+      A page fault is very expensive: a disk read takes milliseconds, while a memory access takes about 100 nanoseconds, a ratio of tens of thousands. (SSDs are faster than spinning disks, but still hundreds of times slower than RAM.) That makes the **fault rate** the dominant factor in performance:
+
+      **EAT = (1 − p) × memory_time + p × fault_time**
+
+      With memory time 200 ns, fault time 8 ms (8,000,000 ns) and a fault rate p of just 1 in 1,000, EAT = 0.999 × 200 + 0.001 × 8,000,000 ≈ **8,200 ns, forty times slower**. To keep the slowdown under 10%, p must be below about 1 in 400,000. So the replacement algorithm has to be good at keeping the *right* pages in RAM.
+
+  - heading: Page replacement algorithms
+    body: |
+      Given a **reference string** (the sequence of pages a process touches) and a fixed number of frames, which page should be evicted when a new page is needed and all frames are full? The measure is the number of page faults.
+
+      - **FIFO**: evict the page that has been in memory the longest. Simple, but it can evict a page that is in constant use just because it was loaded long ago.
+      - **Optimal (OPT, or Belady's MIN)**: evict the page whose next use is **farthest in the future** (or never). It gives the fewest possible faults, but needs to know the future, so it cannot be implemented in a real OS. It is the **yardstick** to compare other algorithms against.
+      - **LRU (least recently used)**: evict the page that has not been used for the longest time, on the theory that the past predicts the future (locality). It performs close to optimal, but exact LRU needs a timestamp or list update on **every memory access**, which is far too slow for hardware.
+      - **Clock (second chance)**: an inexpensive approximation of LRU. Frames form a circle with a pointer (the "hand"). Each frame has a **reference bit** that the hardware sets whenever the page is used. To find a victim the hand sweeps: if the bit is 1, clear it (a second chance) and move on; if it is 0, evict that page. Used (in variants) by Linux, BSD and Windows.
+
+      On the classic reference string `7 0 1 2 0 3 0 4 2 3 0 3 2 1 2 0 1 7 0 1` with 3 frames: FIFO causes 15 faults, LRU 12, optimal 9. Where all 20 references are distinct pages, every algorithm faults 20 times; a reference to a page already in memory is a **hit**.
+
+      Real systems also add: **dirty-page preference** (evicting a clean page is cheaper than a dirty one), **page buffering** (keep a pool of free frames so a fault never has to wait for a write-back), and **prefetching** (read neighbouring pages ahead).
+
+  - heading: Belady's anomaly and stack algorithms
+    body: |
+      You would expect that giving a process **more frames** can only reduce its page faults. For FIFO, it isn't so. On the reference string `1 2 3 4 1 2 5 1 2 3 4 5`, FIFO with 3 frames causes **9** faults, but with 4 frames it causes **10**. This is **Belady's anomaly** (1969).
+
+      LRU and OPT never show it, because they are **stack algorithms**: the set of pages held with *n* frames is always a subset of the set held with *n + 1* frames, so adding memory can't hurt. FIFO lacks this property, since which page is oldest depends on the history in a way that changes with the number of frames.
+
+  - heading: Working set and thrashing
+    body: |
+      How many frames does a process need? The **working set** W(t, Δ) is the set of distinct pages referenced in the last Δ memory references (the "window"). If a process has at least |W| frames, it runs with few faults; if not, it faults constantly.
+
+      **Thrashing** happens when the total working sets of all running processes exceed physical memory. Each process keeps stealing frames from the others, every process spends its time waiting for the disk, the CPU sits idle, and, in an old naive design, the OS notices low CPU use and starts *more* processes, making it worse. Throughput collapses. A thrashing machine is almost unusable (the disk light stays on and the mouse crawls).
+
+      Remedies: use the working-set model to run only as many processes as will fit in memory (suspend others, i.e. **swap out** whole processes), use **local** replacement so one process can't steal everyone's frames, monitor the **page-fault frequency** and add or remove frames, and, ultimately, buy more RAM.
+
+  - heading: Memory-mapped files, swap and the OOM killer
+    body: |
+      Virtual memory is also a general mechanism, not just a way to simulate extra RAM.
+
+      - **Memory-mapped files** (`mmap`): a file's contents appear as a range of virtual addresses, loaded by demand paging. Reading and writing memory reads and writes the file, and different processes mapping the same file share the same frames. Program loaders and databases use it constantly. Python has the `mmap` module.
+      - **Shared libraries and copy-on-write** (Lesson 10.7) are also page-table tricks.
+      - **Swap space** is the disk area where evicted anonymous pages (heap and stack, which have no file behind them) are saved. Systems start to "swap" heavily when RAM is overcommitted.
+      - **Overcommit and the OOM killer.** Linux lets programs allocate more virtual memory than exists, because most is never touched. If the system really does run out of both RAM and swap, the **out-of-memory (OOM) killer** picks a process to terminate, usually the one using the most memory. So `malloc` can return a pointer successfully and the process still be killed later when it touches the pages.
+      - **Guard pages**: unmapped pages placed at the ends of stacks or buffers so that an overflow causes an immediate fault instead of silent corruption (the tools in Lesson 9.7 use this trick).
+
+examples:
+  - title: Replacement algorithms on the classic reference string
+    intro: "Count the page faults of FIFO, LRU and optimal with 3 frames. This is the standard textbook comparison."
+    code: |
+      def fifo(refs, frames):
+          memory, faults = [], 0
+          for page in refs:
+              if page not in memory:
+                  faults += 1
+                  if len(memory) == frames:
+                      memory.pop(0)            # the oldest arrival
+                  memory.append(page)
+          return faults
+
+
+      def lru(refs, frames):
+          memory, faults = [], 0
+          for page in refs:
+              if page in memory:
+                  memory.remove(page)          # refresh: move to the "recent" end
+              else:
+                  faults += 1
+                  if len(memory) == frames:
+                      memory.pop(0)            # the least recently used
+              memory.append(page)
+          return faults
+
+
+      def optimal(refs, frames):
+          memory, faults = [], 0
+          for i, page in enumerate(refs):
+              if page not in memory:
+                  faults += 1
+                  if len(memory) == frames:
+                      def next_use(p):
+                          later = refs[i + 1:]
+                          return later.index(p) if p in later else float("inf")
+                      memory.remove(max(memory, key=next_use))
+                  memory.append(page)
+          return faults
+
+
+      refs = [7, 0, 1, 2, 0, 3, 0, 4, 2, 3, 0, 3, 2, 1, 2, 0, 1, 7, 0, 1]
+      for name, algorithm in (("FIFO", fifo), ("LRU", lru), ("Optimal", optimal)):
+          print(f"{name:8} {algorithm(refs, 3):2} faults out of {len(refs)} references")
+    output: |
+      FIFO     15 faults out of 20 references
+      LRU      12 faults out of 20 references
+      Optimal   9 faults out of 20 references
+    lines:
+      - line: 7
+        note: "FIFO ignores how often a page is used: the oldest page goes even if it was used a moment ago."
+      - line: 16
+        note: "LRU keeps the list ordered by recency: a hit moves the page to the end, so the front is always the least recently used."
+      - line: 30
+        note: "Optimal looks ahead in the reference string to find the page that will not be needed for the longest time. A real OS can't do this."
+      - line: 41
+        note: "LRU is much closer to optimal than FIFO is. That's why most real policies approximate LRU."
+  - title: Belady's anomaly
+    intro: "More frames, more faults: it really happens for FIFO on this reference string."
+    code: |
+      def fifo(refs, frames):
+          memory, faults = [], 0
+          for page in refs:
+              if page not in memory:
+                  faults += 1
+                  if len(memory) == frames:
+                      memory.pop(0)
+                  memory.append(page)
+          return faults
+
+
+      def lru(refs, frames):
+          memory, faults = [], 0
+          for page in refs:
+              if page in memory:
+                  memory.remove(page)
+              else:
+                  faults += 1
+                  if len(memory) == frames:
+                      memory.pop(0)
+              memory.append(page)
+          return faults
+
+
+      refs = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+      print("frames  FIFO  LRU")
+      for frames in range(1, 7):
+          print(f"{frames:6}  {fifo(refs, frames):4}  {lru(refs, frames):3}")
+    output: |
+      frames  FIFO  LRU
+           1    12   12
+           2    12   12
+           3     9   10
+           4    10    8
+           5     5    5
+           6     5    5
+    lines:
+      - line: 26
+        note: "Going from 3 to 4 frames, FIFO goes from 9 to 10 faults: the anomaly."
+      - line: 27
+        note: "LRU never gets worse with more memory, because it is a stack algorithm."
+  - title: The clock algorithm
+    intro: "A circular list with reference bits: pages used recently get a second chance."
+    code: |
+      def clock(refs, frames):
+          slots = [None] * frames
+          used = [0] * frames
+          hand = 0
+          faults = 0
+          trace = []
+          for page in refs:
+              if page in slots:
+                  used[slots.index(page)] = 1          # hardware sets the reference bit
+                  continue
+              faults += 1
+              while True:
+                  if slots[hand] is None or used[hand] == 0:
+                      if slots[hand] is not None:
+                          trace.append(slots[hand])
+                      slots[hand] = page
+                      used[hand] = 1
+                      hand = (hand + 1) % frames
+                      break
+                  used[hand] = 0                       # second chance
+                  hand = (hand + 1) % frames
+          return faults, trace
+
+
+      refs = [1, 2, 3, 1, 4, 1, 5, 2]
+      faults, evicted = clock(refs, 3)
+      print("faults:", faults, "evicted in order:", evicted)
+    output: |
+      faults: 7 evicted in order: [1, 2, 3, 4]
+    lines:
+      - line: 9
+        note: "A hit costs nothing but setting a bit, so it's cheap enough for hardware. LRU would need to reorder a list on every access."
+      - line: 18
+        note: "A page with its reference bit set is passed over once; its bit is cleared, so it must be used again to survive the next sweep."
+      - line: 22
+        note: "Page 1 is touched often, so it keeps its bit set and is spared; the hand evicts pages that were not recently used."
+  - title: Working sets and thrashing
+    intro: "The working set is the set of distinct pages used in the last few references. If it is bigger than the frames available, the process thrashes."
+    code: |
+      def working_set(refs, t, window):
+          return set(refs[max(0, t - window + 1):t + 1])
+
+
+      def faults_lru(refs, frames):
+          memory, faults = [], 0
+          for page in refs:
+              if page in memory:
+                  memory.remove(page)
+              else:
+                  faults += 1
+                  if len(memory) == frames:
+                      memory.pop(0)
+              memory.append(page)
+          return faults
+
+
+      # phase 1 uses pages 0-3, phase 2 uses pages 10-17 (a bigger working set)
+      phase1 = [0, 1, 2, 3] * 25
+      phase2 = [10, 11, 12, 13, 14, 15, 16, 17] * 12
+      refs = phase1 + phase2
+      print("working set at end of phase 1:", sorted(working_set(refs, len(phase1) - 1, 8)))
+      print("working set at end of phase 2:", sorted(working_set(refs, len(refs) - 1, 8)))
+      for frames in (4, 6, 8, 10):
+          rate = faults_lru(refs, frames) / len(refs)
+          print(f"{frames:2} frames: fault rate {rate:5.1%}")
+    output: |
+      working set at end of phase 1: [0, 1, 2, 3]
+      working set at end of phase 2: [10, 11, 12, 13, 14, 15, 16, 17]
+       4 frames: fault rate 51.0%
+       6 frames: fault rate 51.0%
+       8 frames: fault rate  6.1%
+      10 frames: fault rate  6.1%
+    lines:
+      - line: 2
+        note: "The window slides along the reference string: distinct pages among the last 8 references."
+      - line: 20
+        note: "Phase 2 touches 8 different pages in a loop, so its working set has 8 pages."
+      - line: 24
+        note: "With fewer frames than the working set (6), LRU faults on nearly every phase 2 reference: thrashing. Once frames cover the working set (8), faults vanish."
+  - title: The cost of a page fault
+    intro: "Even a tiny fault rate ruins performance because disks are so much slower than memory."
+    code: |
+      MEMORY_NS = 200
+      FAULT_NS = 8_000_000          # 8 ms to read from a hard disk
+
+      for one_in in (1_000, 10_000, 100_000, 1_000_000):
+          p = 1 / one_in
+          eat = (1 - p) * MEMORY_NS + p * FAULT_NS
+          print(f"one fault per {one_in:>9,} accesses: EAT = {eat:8.1f} ns ({eat / MEMORY_NS:5.2f}x slower)")
+      # fault rate allowed for a 10% slowdown
+      allowed = (0.10 * MEMORY_NS) / (FAULT_NS - MEMORY_NS)
+      print(f"for a 10% slowdown, faults must be rarer than one per {1 / allowed:,.0f} accesses")
+    output: |
+      one fault per     1,000 accesses: EAT =   8199.8 ns (41.00x slower)
+      one fault per    10,000 accesses: EAT =   1000.0 ns ( 5.00x slower)
+      one fault per   100,000 accesses: EAT =    280.0 ns ( 1.40x slower)
+      one fault per 1,000,000 accesses: EAT =    208.0 ns ( 1.04x slower)
+      for a 10% slowdown, faults must be rarer than one per 399,990 accesses
+    lines:
+      - line: 6
+        note: "(1 - p) of accesses cost one memory time; the rare fault costs 40,000 times that."
+      - line: 10
+        note: "Under 10% slowdown means fewer than about 1 fault per 400,000 accesses. That's the target replacement algorithms aim for."
+
+playground:
+  prompt: |
+    Try your own reference strings in the replacement examples. Build one where FIFO beats LRU (hint: a string that cycles through one more page than there are frames hurts LRU badly). Then search for another reference string that triggers Belady's anomaly for FIFO.
+  code: |
+    import random
+
+    def fifo(refs, frames):
+        mem, faults = [], 0
+        for p in refs:
+            if p not in mem:
+                faults += 1
+                if len(mem) == frames:
+                    mem.pop(0)
+                mem.append(p)
+        return faults
+
+    rng = random.Random(1)
+    found = 0
+    for _ in range(5000):
+        refs = [rng.randint(1, 6) for _ in range(20)]
+        if fifo(refs, 4) > fifo(refs, 3):
+            found += 1
+    print("random strings with Belady's anomaly:", found, "of 5000")
+
+exercises:
+  - id: fifo-lru
+    title: FIFO and LRU
+    difficulty: 3
+    prompt: |
+      Write `fifo(refs, frames)` and `lru(refs, frames)`. Each takes a list of page numbers and a number of frames (at least 1) and returns a pair `(faults, evictions)`: the number of page faults and the list of pages evicted, in order. A fault that fills a free frame evicts nothing. FIFO evicts the page that has been resident longest; LRU evicts the page whose most recent use is oldest (a hit counts as a use).
+    starter: |
+      def fifo(refs, frames):
+          pass
+
+
+      def lru(refs, frames):
+          pass
+    tests:
+      - name: textbook string
+        code: |
+          R = [7, 0, 1, 2, 0, 3, 0, 4, 2, 3, 0, 3, 2, 1, 2, 0, 1, 7, 0, 1]
+          assert fifo(R, 3) == (15, [7, 0, 1, 2, 3, 0, 4, 2, 3, 0, 1, 2])
+          assert lru(R, 3) == (12, [7, 1, 2, 3, 0, 4, 0, 3, 2])
+      - name: belady string
+        code: |
+          B = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+          assert fifo(B, 3) == (9, [1, 2, 3, 4, 1, 2])
+          assert fifo(B, 4) == (10, [1, 2, 3, 4, 5, 1])
+          assert lru(B, 3) == (10, [1, 2, 3, 4, 5, 1, 2])
+          assert lru(B, 4) == (8, [3, 4, 5, 1])
+      - name: edge cases
+        code: |
+          assert fifo([], 3) == (0, []) and lru([], 3) == (0, [])
+          assert fifo([1, 1, 1], 1) == (1, []) and lru([1, 1, 1], 1) == (1, [])
+          assert fifo([1, 2, 1, 2], 1) == (4, [1, 2, 1])
+          assert lru([1, 2, 3], 5) == (3, [])
+    hints:
+      - "Keep a list `memory`. FIFO appends new pages and pops index 0 when full."
+      - "LRU: on a hit, remove the page and append it again, so the list is ordered from least to most recently used. Evict index 0."
+      - "Only count faults on pages that are not already in memory."
+    solution: |
+      def fifo(refs, frames):
+          memory = []
+          faults = 0
+          evicted = []
+          for page in refs:
+              if page in memory:
+                  continue
+              faults += 1
+              if len(memory) == frames:
+                  evicted.append(memory.pop(0))
+              memory.append(page)
+          return faults, evicted
+
+
+      def lru(refs, frames):
+          memory = []
+          faults = 0
+          evicted = []
+          for page in refs:
+              if page in memory:
+                  memory.remove(page)
+              else:
+                  faults += 1
+                  if len(memory) == frames:
+                      evicted.append(memory.pop(0))
+              memory.append(page)
+          return faults, evicted
+    explanation: |
+      The two functions differ in a single line: LRU re-appends a page when it is used, FIFO does not. That one line is the whole difference between "oldest arrival" and "oldest use". With a list this is O(frames) per reference; a real LRU cache uses a hash map plus a linked list (or Python's `OrderedDict`) for O(1).
+
+  - id: optimal
+    title: The optimal algorithm
+    difficulty: 4
+    prompt: |
+      Write `optimal(refs, frames)`, returning `(faults, evictions)` as in the previous exercise. When a page must be evicted, choose the resident page whose **next use is farthest in the future**. A page that is never used again is the best victim. If several pages are never used again, evict the one with the **smallest page number**.
+    starter: |
+      def optimal(refs, frames):
+          pass
+    tests:
+      - name: textbook
+        code: |
+          R = [7, 0, 1, 2, 0, 3, 0, 4, 2, 3, 0, 3, 2, 1, 2, 0, 1, 7, 0, 1]
+          assert optimal(R, 3) == (9, [7, 1, 0, 4, 3, 2])
+          B = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+          assert optimal(B, 3) == (7, [3, 4, 1, 2])
+          assert optimal(B, 4) == (6, [4, 3])  or optimal(B, 4)[0] == 6
+      - name: ties
+        code: |
+          assert optimal([1, 2, 3, 4, 1, 2], 3) == (4, [3])
+          assert optimal([3, 1, 2, 4, 1], 2) == (4, [3, 2])
+          assert optimal([], 2) == (0, [])
+      - name: never worse than FIFO or LRU
+        code: |
+          import random
+          def fifo_f(refs, frames):
+              mem, f = [], 0
+              for p in refs:
+                  if p not in mem:
+                      f += 1
+                      if len(mem) == frames:
+                          mem.pop(0)
+                      mem.append(p)
+              return f
+          def lru_f(refs, frames):
+              mem, f = [], 0
+              for p in refs:
+                  if p in mem:
+                      mem.remove(p)
+                  else:
+                      f += 1
+                      if len(mem) == frames:
+                          mem.pop(0)
+                  mem.append(p)
+              return f
+          rng = random.Random(4)
+          for _ in range(100):
+              refs = [rng.randint(0, 7) for _ in range(rng.randint(1, 40))]
+              k = rng.randint(1, 5)
+              o = optimal(refs, k)[0]
+              assert o <= fifo_f(refs, k) and o <= lru_f(refs, k)
+    hints:
+      - "On a fault with all frames full, compute for each resident page the index of its next occurrence after the current position (`float('inf')` if none)."
+      - "Choose with `max(sorted(memory), key=next_use)`: sorting first makes ties go to the smallest page, because `max` returns the first maximal element."
+    solution: |
+      def optimal(refs, frames):
+          memory = []
+          faults = 0
+          evicted = []
+          for i, page in enumerate(refs):
+              if page in memory:
+                  continue
+              faults += 1
+              if len(memory) == frames:
+                  def next_use(p):
+                      try:
+                          return refs.index(p, i + 1)
+                      except ValueError:
+                          return float("inf")
+                  victim = max(sorted(memory), key=next_use)
+                  memory.remove(victim)
+                  evicted.append(victim)
+              memory.append(page)
+          return faults, evicted
+    explanation: |
+      Optimal is impossible to run on a live system because it needs future knowledge, but on a recorded trace it is a perfect benchmark: if your algorithm is within 10% of OPT, there is little left to gain. Belady proved in 1966 that this farthest-in-future rule minimises faults.
+
+  - id: clock
+    title: The clock algorithm
+    difficulty: 4
+    prompt: |
+      Write `clock(refs, frames)`, returning `(faults, evictions)`. Keep `frames` slots arranged in a circle, each with a page (or empty) and a reference bit, and a hand starting at slot 0. On a **hit**, set that slot's reference bit to 1. On a **fault**, move the hand: an **empty** slot or a slot with bit 0 is taken; a slot with bit 1 has its bit cleared and the hand moves on. The new page goes into the chosen slot with its bit set to 1, and the hand then moves to the next slot. The evicted page (if the slot was occupied) is recorded.
+    starter: |
+      def clock(refs, frames):
+          pass
+    tests:
+      - name: textbook
+        code: |
+          R = [7, 0, 1, 2, 0, 3, 0, 4, 2, 3, 0, 3, 2, 1, 2, 0, 1, 7, 0, 1]
+          assert clock(R, 3) == (14, [7, 1, 2, 0, 3, 4, 2, 0, 3, 1, 2])
+          B = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+          assert clock(B, 3) == (9, [1, 2, 3, 4, 1, 2])
+      - name: second chances
+        code: |
+          assert clock([1, 2, 3, 1, 4, 5], 3) == (5, [1, 2])
+          assert clock([1, 2, 3, 4], 3) == (4, [1])
+          assert clock([], 3) == (0, [])
+          assert clock([1, 1, 1], 2) == (1, [])
+          assert clock([1, 2, 1, 2, 3], 2) == (3, [1])
+      - name: sanity
+        code: |
+          import random
+          rng = random.Random(5)
+          for _ in range(50):
+              refs = [rng.randint(0, 6) for _ in range(rng.randint(1, 30))]
+              k = rng.randint(1, 4)
+              faults, ev = clock(refs, k)
+              assert faults >= len(set(refs)) and len(ev) == max(0, faults - k)
+    hints:
+      - "Use two lists `slots` and `used`, and an integer `hand`."
+      - "On a fault, loop: if the slot is empty or `used[hand] == 0` take it; else set `used[hand] = 0` and advance the hand. The loop always ends, since bits get cleared."
+      - "After placing the page, set `used[hand] = 1` and advance the hand by one (modulo `frames`)."
+    solution: |
+      def clock(refs, frames):
+          slots = [None] * frames
+          used = [0] * frames
+          hand = 0
+          faults = 0
+          evicted = []
+          for page in refs:
+              if page in slots:
+                  used[slots.index(page)] = 1
+                  continue
+              faults += 1
+              while True:
+                  if slots[hand] is None or used[hand] == 0:
+                      if slots[hand] is not None:
+                          evicted.append(slots[hand])
+                      slots[hand] = page
+                      used[hand] = 1
+                      hand = (hand + 1) % frames
+                      break
+                  used[hand] = 0
+                  hand = (hand + 1) % frames
+          return faults, evicted
+    explanation: |
+      If every bit is set the hand clears them all in one revolution and then evicts the first slot, so clock degrades gracefully into FIFO. In between it protects pages that are used again before the hand returns. It only needs one bit per page, which the hardware already sets for free, versus a timestamp for exact LRU.
+
+  - id: belady
+    title: Hunting Belady's anomaly
+    difficulty: 3
+    prompt: |
+      A FIFO simulator `fifo_faults(refs, frames)` is provided. Write `belady_anomaly(refs, max_frames)`, which tries 1, 2, ..., `max_frames` frames and returns `(k, faults_k, faults_k_plus_1)` for the **smallest** `k` such that `k + 1` frames cause **more** FIFO faults than `k` frames (and `k + 1 <= max_frames`), or `None` if there's no such k. Then write `find_anomaly(pages, length, max_frames, tries, seed)`, which uses `random.Random(seed)` to generate up to `tries` random reference strings of the given length over pages `1..pages` (`rng.randint(1, pages)` for each reference, strings generated one after another from the same generator), and returns the first string for which `belady_anomaly` is not `None`, or `None` if none is found.
+    starter: |
+      import random
+
+
+      def fifo_faults(refs, frames):
+          memory, faults = [], 0
+          for page in refs:
+              if page not in memory:
+                  faults += 1
+                  if len(memory) == frames:
+                      memory.pop(0)
+                  memory.append(page)
+          return faults
+
+
+      def belady_anomaly(refs, max_frames):
+          pass
+
+
+      def find_anomaly(pages, length, max_frames, tries, seed):
+          pass
+    tests:
+      - name: the classic string
+        code: |
+          B = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5]
+          assert belady_anomaly(B, 6) == (3, 9, 10)
+          assert belady_anomaly(B, 3) is None
+          assert belady_anomaly([1, 2, 3, 1, 2, 3], 5) is None
+          assert belady_anomaly([], 4) is None
+      - name: search
+        code: |
+          found = find_anomaly(6, 20, 5, 2000, 1)
+          assert found is not None and len(found) == 20
+          assert belady_anomaly(found, 5) is not None
+          assert find_anomaly(1, 10, 4, 50, 0) is None
+          again = find_anomaly(6, 20, 5, 2000, 1)
+          assert again == found
+    hints:
+      - "`belady_anomaly`: loop `k` from 1 to `max_frames - 1`, compare `fifo_faults(refs, k)` with `fifo_faults(refs, k + 1)`."
+      - "`find_anomaly`: create `rng = random.Random(seed)` once, then in a loop build `refs = [rng.randint(1, pages) for _ in range(length)]`."
+    solution: |
+      import random
+
+
+      def fifo_faults(refs, frames):
+          memory, faults = [], 0
+          for page in refs:
+              if page not in memory:
+                  faults += 1
+                  if len(memory) == frames:
+                      memory.pop(0)
+                  memory.append(page)
+          return faults
+
+
+      def belady_anomaly(refs, max_frames):
+          for k in range(1, max_frames):
+              a = fifo_faults(refs, k)
+              b = fifo_faults(refs, k + 1)
+              if b > a:
+                  return k, a, b
+          return None
+
+
+      def find_anomaly(pages, length, max_frames, tries, seed):
+          rng = random.Random(seed)
+          for _ in range(tries):
+              refs = [rng.randint(1, pages) for _ in range(length)]
+              if belady_anomaly(refs, max_frames) is not None:
+                  return refs
+          return None
+    explanation: |
+      Belady's anomaly is a nice example of randomised search for a counterexample: it's rare, but a few hundred to a few thousand random strings find one. Programmers use the same approach (property-based testing, fuzzing) to find bugs a person would never think of. For LRU the same search always comes back empty, because LRU is a stack algorithm.
+
+  - id: working-set
+    title: Working sets
+    difficulty: 3
+    prompt: |
+      Write `working_set(refs, t, window)`, returning the **set** of distinct pages among the last `window` references ending at index `t` inclusive (fewer if `t` is near the start). Write `working_set_sizes(refs, window)`, the list of working-set sizes at every index. Write `will_thrash(refs, window, frames)`, returning `True` if the working set ever exceeds the number of frames. Finally write `min_frames(refs, window)`, the smallest number of frames that avoids thrashing in that sense (0 for an empty string).
+    starter: |
+      def working_set(refs, t, window):
+          pass
+
+
+      def working_set_sizes(refs, window):
+          pass
+
+
+      def will_thrash(refs, window, frames):
+          pass
+
+
+      def min_frames(refs, window):
+          pass
+    tests:
+      - name: sets and sizes
+        code: |
+          refs = [1, 2, 1, 3, 4, 4, 4, 1]
+          assert working_set(refs, 0, 3) == {1}
+          assert working_set(refs, 3, 3) == {1, 2, 3}
+          assert working_set(refs, 6, 3) == {4}
+          assert working_set(refs, 7, 3) == {1, 4}
+          assert working_set_sizes(refs, 3) == [1, 2, 2, 3, 3, 2, 1, 2]
+          assert working_set_sizes([], 3) == []
+      - name: thrashing
+        code: |
+          refs = [1, 2, 1, 3, 4, 4, 4, 1]
+          assert will_thrash(refs, 3, 2) is True
+          assert will_thrash(refs, 3, 3) is False
+          assert min_frames(refs, 3) == 3 and min_frames(refs, 1) == 1 and min_frames(refs, 8) == 4
+          assert min_frames([], 5) == 0
+          assert will_thrash([], 5, 0) is False
+      - name: long trace is fast
+        code: |
+          import time
+          refs = [i % 50 for i in range(20000)]
+          t0 = time.time()
+          sizes = working_set_sizes(refs, 30)
+          assert max(sizes) == 30 and sizes[:3] == [1, 2, 3]
+          assert time.time() - t0 < 3
+    hints:
+      - "`working_set`: `set(refs[max(0, t - window + 1): t + 1])`."
+      - "The other three build on it; `min_frames` is the maximum of the sizes (or 0 for an empty list)."
+      - "A slice of at most `window` elements per index is fast enough here."
+    solution: |
+      def working_set(refs, t, window):
+          return set(refs[max(0, t - window + 1):t + 1])
+
+
+      def working_set_sizes(refs, window):
+          return [len(working_set(refs, t, window)) for t in range(len(refs))]
+
+
+      def will_thrash(refs, window, frames):
+          return any(size > frames for size in working_set_sizes(refs, window))
+
+
+      def min_frames(refs, window):
+          return max(working_set_sizes(refs, window), default=0)
+    explanation: |
+      The window length Δ is a tuning parameter: too small and the working set misses pages still in use, too large and it spans several program phases and overestimates the need. Operating systems use the idea to decide how many processes to keep resident: the sum of the working-set sizes should fit in RAM.
+
+commonMistakes:
+  - title: Thinking more frames always means fewer faults
+    explanation: |
+      That holds for LRU and optimal (stack algorithms) but not for FIFO: Belady's anomaly.
+  - title: Treating LRU as free to implement
+    explanation: |
+      Exact LRU needs bookkeeping on every memory access. Real systems approximate it with reference bits (clock).
+  - title: Forgetting that faults are measured on page misses only
+    explanation: |
+      A reference to a page already in memory is a hit, even if it is the first reference since the last fault.
+  - title: Ignoring dirty pages when estimating fault cost
+    explanation: |
+      Evicting a modified page costs a disk write as well as a read, doubling the fault time.
+  - title: Assuming malloc success means memory is available
+    explanation: |
+      With overcommit, pages are provided only when touched. The process can be killed later by the OOM killer.
+  - title: Blaming the CPU when the disk light is on
+    explanation: |
+      A slow machine with constant disk activity and low CPU use is often thrashing: it needs more RAM or fewer programs.
+
+summary:
+  - "**Demand paging** loads pages only when touched; pages not in RAM live on disk. A reference to such a page causes a **page fault**: the kernel loads the page (evicting a victim if needed, writing it first if dirty) and restarts the instruction."
+  - "A fault costs milliseconds while a memory access costs nanoseconds, so the fault rate must be tiny: EAT = (1−p)·m + p·fault_time."
+  - "**FIFO** evicts the oldest page; **LRU** the least recently used; **OPT** the page used farthest in the future (a benchmark, not implementable); **clock** approximates LRU with a reference bit and a sweeping hand."
+  - "**Belady's anomaly:** FIFO can fault more with more frames. LRU and OPT are **stack algorithms** and never do."
+  - "The **working set** is the set of pages used in the last Δ references. When working sets exceed RAM, the system **thrashes**; the cure is to run fewer processes or add memory."
+  - "Virtual memory also provides **memory-mapped files**, **swap**, **copy-on-write**, and guard pages. Linux's **OOM killer** terminates a process when memory and swap run out."
+next: |
+  Memory is volatile. The last piece of the picture is **persistent storage**: how disks are organised into **files and directories**. Lesson 10.9 covers file-system structures (blocks, inodes, directories, links), how files are allocated on disk, journaling for crash safety, and disk-scheduling algorithms.
+
+quiz:
+  - type: mcq
+    question: What does the OS do on a page fault for a legal address whose page is on disk?
+    options: [
+      "Loads the page into a free (or newly freed) frame, updates the page table and restarts the instruction",
+      "Kills the process",
+      "Ignores the access",
+      "Reboots the machine"
+    ]
+    answer: 0
+    explanation: "The process waits while the disk reads the page; then the faulting instruction runs again."
+  - type: mcq
+    question: Which page replacement algorithm is optimal but impossible to implement in a real OS?
+    options: ["OPT (farthest next use)", "FIFO", "LRU", "Clock"]
+    answer: 0
+    explanation: "It needs to know which page will be used furthest in the future."
+  - type: mcq
+    question: What is Belady's anomaly?
+    options: [
+      "A policy such as FIFO can cause more page faults when given more frames",
+      "A bug that crashes the kernel",
+      "A page that is both clean and dirty",
+      "A TLB with more entries than the page table"
+    ]
+    answer: 0
+    explanation: "Stack algorithms like LRU never behave this way, but FIFO can."
+  - type: mcq
+    question: What does the clock algorithm do when the hand reaches a page with its reference bit set?
+    options: [
+      "Clears the bit and moves on, giving the page a second chance",
+      "Evicts the page immediately",
+      "Writes the page to disk",
+      "Stops the process"
+    ]
+    answer: 0
+    explanation: "Only pages whose bit is 0 when the hand arrives are evicted."
+  - type: mcq
+    question: A machine's disk light is constantly on, CPU use is low, and everything crawls. What is the likely cause?
+    options: ["Thrashing", "A CPU overheating", "A deadlock", "A TLB hit"]
+    answer: 0
+    explanation: "Processes spend their time waiting for page faults to be served: the total working sets don't fit in RAM."
+  - type: mcq
+    question: A memory access takes 100 ns and a page fault 10 ms. About what fault rate gives an average access of 200 ns?
+    options: ["1 in 100,000", "1 in 100", "1 in 10", "1 in 10,000,000"]
+    answer: 0
+    explanation: "(1−p)·100 + p·10,000,000 = 200 gives p ≈ 10⁻5, i.e. one fault per 100,000 accesses."
+  - type: code
+    question: |
+      Write `fault_rate(faults, accesses)` returning faults divided by accesses as a float, or `0.0` when there are no accesses.
+    starter: |
+      def fault_rate(faults, accesses):
+          pass
+    tests:
+      - name: rate
+        code: |
+          assert fault_rate(3, 12) == 0.25
+          assert fault_rate(0, 0) == 0.0
+          assert fault_rate(5, 5) == 1.0
+    solution: |
+      def fault_rate(faults, accesses):
+          return faults / accesses if accesses else 0.0

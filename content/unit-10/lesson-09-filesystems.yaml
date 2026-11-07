@@ -1,0 +1,902 @@
+id: u10-filesystems
+title: "File Systems and Storage"
+minutes: 60
+objective: |
+  See how the OS turns a disk of numbered blocks into named files in folders. Learn the layout of a Unix-style file system (superblock, inodes, bitmaps, data blocks), how paths are resolved, what hard and symbolic links are, how permissions use bits, how a journal keeps the disk consistent through crashes, and how the OS orders disk requests.
+outcomes:
+  - Explain the file abstraction and the main operations on files and directories
+  - Describe inodes, directory entries and block allocation, and compute the maximum file size from an inode layout
+  - Resolve paths, including `.`, `..` and relative paths, and distinguish hard links from symbolic links
+  - Check Unix permission bits for a user and group
+  - Explain why crashes corrupt file systems and how journaling and copy-on-write prevent it
+  - Simulate disk scheduling policies (FCFS, SSTF, SCAN, LOOK) and compare head movement
+
+sections:
+  - heading: Files and directories
+    body: |
+      Disks (and SSDs) store fixed-size **blocks**, typically 512 bytes or 4 KB, addressed by number. Nobody wants to remember "my essay is in blocks 8812 to 8830". The file system provides the abstraction we all use instead: a **file** is a named, growable sequence of bytes with attributes (size, owner, permissions, timestamps), organised in a tree of **directories**.
+
+      The basic operations (system calls, Lesson 10.1): `open`, `read`, `write`, `lseek` (move the current position), `close`, `create`, `unlink` (delete), `rename`, `mkdir`, `stat` (read the attributes). The kernel keeps a **current position** for each open file, so successive reads continue where the last stopped.
+
+      A **directory** is just a special file whose content is a table of **(name → file number)** entries. A **path** like `/home/maya/notes.txt` is resolved one component at a time: start at the root directory, look up `home`, then within it `maya`, then `notes.txt`. A path starting with `/` is **absolute**; otherwise it is **relative** to the process's **current working directory**. Two special names are in every directory: `.` (the directory itself) and `..` (its parent; at the root, `..` is the root).
+
+      The file system also provides **mounting**: attaching another disk's file system at a directory of the tree (`/mnt/usb`), so everything appears as one tree.
+
+  - heading: Inodes and layout
+    body: |
+      A Unix-style file system divides the disk into regions:
+
+      | Region | Contents |
+      |---|---|
+      | **Superblock** | the file system's size, block size, where each region starts |
+      | **Inode bitmap** and **data bitmap** | one bit per inode / block: in use (1) or free (0) |
+      | **Inode table** | an array of **inodes** |
+      | **Data blocks** | file contents and directory contents |
+
+      An **inode** (index node) is the file's real identity. It stores everything about the file **except its name**: type (file, directory, link), owner and group, permission bits, size, timestamps, **link count**, and pointers to the data blocks. Names live in directories, which map names to inode numbers. That separation is what makes hard links possible.
+
+      The pointers are arranged to handle both tiny and enormous files: the classic ext2/UFS inode has **12 direct pointers**, then one **single indirect** pointer (to a block full of pointers), one **double indirect** and one **triple indirect**. With 4 KB blocks and 4-byte pointers, one block holds 1024 pointers, so:
+
+      - direct: 12 × 4 KB = 48 KB
+      - single indirect: 1024 × 4 KB = 4 MB
+      - double indirect: 1024² × 4 KB = 4 GB
+      - triple indirect: 1024³ × 4 KB = 4 TB
+
+      Small files, which are most files, need no indirect blocks at all, and only huge files pay for the extra reads. Modern file systems use **extents** (a start block plus a length) instead of listing every block, which is more compact and keeps files contiguous.
+
+      **Other ways to track the blocks of a file:**
+
+      - **Contiguous allocation**: fast, simple, but external fragmentation and growth problems (Lesson 10.7) apply. Good for read-only media like CDs.
+      - **Linked allocation**: each block holds a pointer to the next. No fragmentation, but random access is slow (follow the chain) and one bad pointer loses the rest.
+      - **FAT** (File Allocation Table): the pointers are collected into one table in memory, indexed by block number. Used by USB sticks and SD cards, so it is everywhere, but needs a lot of memory for big disks.
+      - **Indexed allocation** (inodes): one index per file, as above.
+
+  - heading: Links
+    body: |
+      Because names are separate from inodes, a file can have several names:
+
+      - A **hard link** is another directory entry pointing to the **same inode**. The inode's **link count** goes up by one. Deleting a name (`unlink`) lowers the count, and only when it reaches **zero** (and no process still has the file open) are the data blocks freed. All the names are equal; there is no "original". Hard links cannot cross file systems (inode numbers are only unique within one) and cannot link directories.
+      - A **symbolic (soft) link** is a tiny file whose content is **another path**. Following it means looking up that path. It can point anywhere, even to something that doesn't exist (a *dangling* link), and it can cross file systems. A chain of symlinks that loops back on itself is detected by limiting how many are followed (Linux stops after 40) and reports "too many levels of symbolic links".
+
+      `ls -l` shows the link count in its second column; `ls -i` shows inode numbers.
+
+  - heading: Permissions
+    body: |
+      Each inode holds an owner (user id), a group, and **nine permission bits** in three groups of three, which Lesson 9.8 used as an example of flags: **read (4)**, **write (2)**, **execute (1)** for the **owner**, the **group** and **others**. Mode `0o754` is `rwxr-xr--`: the owner can do everything, the group can read and execute, others can only read.
+
+      The kernel checks access in this order: if the user is the **owner**, use the owner bits; else if the user is in the file's **group**, use the group bits; else use the **others** bits. (It does not combine them: an owner with no access bits is denied even if "others" have access.) The superuser (uid 0) bypasses read and write checks. For a **directory**, *read* means you can list its names, *write* means you can add or remove entries, and *execute* means you can pass **through** it (look up names inside). Extra bits are **setuid** (run with the file owner's privileges), **setgid** and the **sticky bit** (on `/tmp`: only a file's owner may delete it). More flexible **access-control lists (ACLs)** exist on top of this simple model.
+
+  - heading: Crashes and journaling
+    body: |
+      Creating a file changes several places on disk: the inode bitmap, the inode, the data bitmap, the data block, and the directory. If power fails between those writes, the file system is **inconsistent**: a block marked used but belonging to nothing (a leak), or a directory entry pointing at an unused inode (dangerous). Old file systems ran **fsck** after a crash, scanning the entire disk to repair such problems, which took many minutes for large disks.
+
+      **Journaling** (ext3/4, NTFS, XFS) borrows an idea from databases: **write-ahead logging**. Before changing the real structures, write a description of the whole change to a reserved **journal** area:
+
+      1. Write a **begin** record and the intended block updates to the journal.
+      2. Write a **commit** record. The change is now durable: it **will** happen.
+      3. **Checkpoint**: apply the updates to their real locations.
+      4. Mark the journal entry free.
+
+      After a crash, recovery reads only the journal: transactions that have a **commit** record are **replayed** (applying them again is harmless); those with no commit are **ignored**, as if they had never started. Either the whole change happens or none of it, the property called **atomicity**. Recovery takes seconds, not minutes.
+
+      Another approach is **copy-on-write** file systems (ZFS, Btrfs, APFS): never overwrite data in place; write new versions elsewhere, and switch a single root pointer atomically. Old versions remain, so **snapshots** are nearly free.
+
+      Finally, the OS keeps a **page cache** of recently used disk blocks in RAM (the unused memory you see in `free` is mostly cache), and delays writes (**write-back**), which is why you should eject a USB stick properly, and why `fsync` exists to force data to disk when a program really needs it.
+
+  - heading: Disks and scheduling
+    body: |
+      A **hard disk** has a head that must **seek** to the right cylinder (several milliseconds), wait for the platter to rotate to the right sector, then transfer data. Seek time dominates, so the order in which pending requests are served matters. Disk-scheduling policies, with a request queue of cylinder numbers:
+
+      - **FCFS**: first come, first served. Fair but the head zig-zags wildly.
+      - **SSTF** (shortest seek time first): always go to the nearest request. Less movement, but can starve far-away requests.
+      - **SCAN** (the "elevator"): sweep the head in one direction to the end of the disk serving requests on the way, then reverse. **LOOK** is the same but reverses at the last request instead of the disk edge. **C-SCAN** only serves on the way up, then jumps back to the start, giving more uniform waiting.
+
+      For the classic queue `98 183 37 122 14 124 65 67` with the head at cylinder 53 on a 200-cylinder disk: FCFS moves 640 cylinders, SSTF 236, SCAN 331, LOOK 299.
+
+      **SSDs** have no moving parts, so there is no seek time and the order matters much less. Their quirks are different: flash must be erased in large blocks before rewriting, so the controller does **wear levelling** and the OS issues **TRIM** hints about deleted blocks. For redundancy and speed, several disks can be combined into a **RAID** array: striping (RAID 0) for speed, mirroring (RAID 1) for safety, parity (RAID 5) for a compromise.
+
+examples:
+  - title: Maximum file size from an inode layout
+    intro: "Direct pointers, then indirect blocks that are blocks full of pointers. Each level multiplies the reach by the pointers per block."
+    code: |
+      def max_file_size(block_size, pointer_size=4, direct=12):
+          per_block = block_size // pointer_size
+          blocks = direct + per_block + per_block ** 2 + per_block ** 3
+          return blocks * block_size
+
+
+      def human(n):
+          for unit in ("bytes", "KB", "MB", "GB", "TB", "PB"):
+              if n < 1024 or unit == "PB":
+                  return f"{n:.1f} {unit}" if unit != "bytes" else f"{n} bytes"
+              n /= 1024
+
+
+      for block in (1024, 4096, 8192):
+          per_block = block // 4
+          print(f"block {block:5} B: {per_block:4} pointers per block;"
+                f" direct covers {human(12 * block)}, single indirect adds {human(per_block * block)};"
+                f" maximum file {human(max_file_size(block))}")
+    output: |
+      block  1024 B:  256 pointers per block; direct covers 12.0 KB, single indirect adds 256.0 KB; maximum file 16.1 GB
+      block  4096 B: 1024 pointers per block; direct covers 48.0 KB, single indirect adds 4.0 MB; maximum file 4.0 TB
+      block  8192 B: 2048 pointers per block; direct covers 96.0 KB, single indirect adds 16.0 MB; maximum file 64.0 TB
+    lines:
+      - line: 2
+        note: "A block of 4-byte pointers holds block_size / 4 of them."
+      - line: 3
+        note: "Direct + single indirect + double indirect + triple indirect: each level is per_block times larger."
+      - line: 13
+        note: "A tiny change in block size changes the maximum file size by orders of magnitude, since the indirect levels multiply."
+  - title: A tiny file system with inodes and hard links
+    intro: "Names map to inodes; inodes own the blocks. Deleting one of two names keeps the file alive."
+    code: |
+      BLOCK = 4
+
+
+      class Disk:
+          def __init__(self, blocks):
+              self.free = list(range(blocks))
+              self.data = {}
+              self.names = {}       # file name -> inode number
+              self.inodes = {}      # inode number -> {"blocks": [...], "links": n}
+              self.next_inode = 1
+
+          def create(self, name, text):
+              n = -(-len(text) // BLOCK)
+              blocks = [self.free.pop(0) for _ in range(n)]
+              for i, b in enumerate(blocks):
+                  self.data[b] = text[i * BLOCK:(i + 1) * BLOCK]
+              self.inodes[self.next_inode] = {"blocks": blocks, "links": 1}
+              self.names[name] = self.next_inode
+              self.next_inode += 1
+
+          def link(self, old, new):
+              ino = self.names[old]
+              self.names[new] = ino
+              self.inodes[ino]["links"] += 1
+
+          def unlink(self, name):
+              ino = self.names.pop(name)
+              node = self.inodes[ino]
+              node["links"] -= 1
+              if node["links"] == 0:
+                  self.free.extend(node["blocks"])
+                  del self.inodes[ino]
+
+          def read(self, name):
+              return "".join(self.data[b] for b in self.inodes[self.names[name]]["blocks"])
+
+
+      d = Disk(10)
+      d.create("report.txt", "hello, world")
+      print("blocks used:", 10 - len(d.free), "| inode:", d.names["report.txt"], "| links:", d.inodes[1]["links"])
+      d.link("report.txt", "backup.txt")
+      print("after link: both names show", d.read("backup.txt"), "| links:", d.inodes[1]["links"])
+      d.unlink("report.txt")
+      print("after deleting one name:", d.read("backup.txt"), "| blocks used:", 10 - len(d.free))
+      d.unlink("backup.txt")
+      print("after deleting the last name: blocks used:", 10 - len(d.free), "| inodes:", len(d.inodes))
+    output: |
+      blocks used: 3 | inode: 1 | links: 1
+      after link: both names show hello, world | links: 2
+      after deleting one name: hello, world | blocks used: 3
+      after deleting the last name: blocks used: 0 | inodes: 0
+    lines:
+      - line: 12
+        note: "Contents are split into 4-byte blocks, and the inode records which blocks, in order."
+      - line: 20
+        note: "A hard link adds a second name to the same inode and bumps its count. No data is copied."
+      - line: 26
+        note: "The blocks are only released when the link count falls to zero."
+  - title: Resolving a path
+    intro: "Normalising turns relative paths, dots and double dots into one canonical absolute path. Then the walk goes one component at a time."
+    code: |
+      def normalize(path, cwd="/"):
+          parts = [] if path.startswith("/") else [p for p in cwd.split("/") if p]
+          for piece in path.split("/"):
+              if piece in ("", "."):
+                  continue
+              if piece == "..":
+                  if parts:
+                      parts.pop()           # at the root, .. stays at the root
+              else:
+                  parts.append(piece)
+          return "/" + "/".join(parts)
+
+
+      tree = {"home": {"maya": {"notes.txt": "buy milk", "photos": {}}}, "etc": {"hosts": "127.0.0.1"}}
+
+
+      def lookup(path, cwd="/"):
+          node = tree
+          for name in [p for p in normalize(path, cwd).split("/") if p]:
+              if not isinstance(node, dict):
+                  return f"error: {name!r} is inside a file, not a directory"
+              if name not in node:
+                  return f"error: {name!r} not found"
+              node = node[name]
+          return node if not isinstance(node, dict) else sorted(node)
+
+
+      for path, cwd in (("/home/maya/notes.txt", "/"), ("notes.txt", "/home/maya"), ("../../etc/hosts", "/home/maya"),
+                        ("/home/./maya//photos/..", "/"), ("/../../etc", "/"), ("/home/maya/notes.txt/x", "/"), ("/tmp", "/")):
+          print(f"{path:28} from {cwd:11} -> {normalize(path, cwd):22} {lookup(path, cwd)}")
+    output: |
+      /home/maya/notes.txt         from /           -> /home/maya/notes.txt   buy milk
+      notes.txt                    from /home/maya  -> /home/maya/notes.txt   buy milk
+      ../../etc/hosts              from /home/maya  -> /etc/hosts             127.0.0.1
+      /home/./maya//photos/..      from /           -> /home/maya             ['notes.txt', 'photos']
+      /../../etc                   from /           -> /etc                   ['hosts']
+      /home/maya/notes.txt/x       from /           -> /home/maya/notes.txt/x error: 'x' is inside a file, not a directory
+      /tmp                         from /           -> /tmp                   error: 'tmp' not found
+    lines:
+      - line: 4
+        note: "Empty pieces (from //) and . are ignored."
+      - line: 6
+        note: "The parent of the root is the root, so extra .. are harmless."
+      - line: 30
+        note: "A file in the middle of a path is an error: you can't look inside a plain file."
+  - title: Disk scheduling
+    intro: "The same request queue served under four policies. Total head movement measures the work."
+    code: |
+      requests = [98, 183, 37, 122, 14, 124, 65, 67]
+      start, last = 53, 199
+
+
+      def fcfs():
+          order, pos, total = [], start, 0
+          for r in requests:
+              total += abs(r - pos)
+              pos = r
+              order.append(r)
+          return order, total
+
+
+      def sstf():
+          left, order, pos, total = list(requests), [], start, 0
+          while left:
+              r = min(left, key=lambda x: (abs(x - pos), x))
+              left.remove(r)
+              total += abs(r - pos)
+              pos = r
+              order.append(r)
+          return order, total
+
+
+      def sweep(to_the_end):
+          up = sorted(r for r in requests if r >= start)
+          down = sorted((r for r in requests if r < start), reverse=True)
+          order = up + down
+          total = (max(up) - start) if up else 0
+          if to_the_end:
+              total += last - (max(up) if up else start)
+              total += last - (min(down) if down else last)
+          else:
+              total += (max(up) - min(down)) if up and down else 0
+          return order, total
+
+
+      for name, (order, total) in (("FCFS", fcfs()), ("SSTF", sstf()), ("SCAN", sweep(True)), ("LOOK", sweep(False))):
+          print(f"{name:5} total movement {total:3}   order: {order}")
+    output: |
+      FCFS  total movement 640   order: [98, 183, 37, 122, 14, 124, 65, 67]
+      SSTF  total movement 236   order: [65, 67, 37, 14, 98, 122, 124, 183]
+      SCAN  total movement 331   order: [65, 67, 98, 122, 124, 183, 37, 14]
+      LOOK  total movement 299   order: [65, 67, 98, 122, 124, 183, 37, 14]
+    lines:
+      - line: 3
+        note: "A 200-cylinder disk numbered 0 to 199, with the head at cylinder 53."
+      - line: 13
+        note: "SSTF picks the closest pending request every time. Greedy, like Lesson 8.5, and with the same starvation risk."
+      - line: 31
+        note: "Scan serves everything above the head going up, then everything below on the way down. SCAN travels to the disk edge; LOOK turns around at the last request."
+  - title: Journal replay after a crash
+    intro: "Committed transactions are replayed; the transaction that never committed leaves no trace."
+    code: |
+      disk = {"inode7": "free", "block42": "empty", "dir": "[]"}
+      journal = [
+          ("begin", 1),
+          ("write", 1, "inode7", "file, size 4"),
+          ("write", 1, "block42", "data"),
+          ("write", 1, "dir", "[a.txt -> 7]"),
+          ("commit", 1),
+          ("begin", 2),
+          ("write", 2, "dir", "[a.txt -> 7, b.txt -> 8]"),
+          # crash here: no commit record for transaction 2
+      ]
+
+      committed = {entry[1] for entry in journal if entry[0] == "commit"}
+      recovered = dict(disk)
+      for entry in journal:
+          if entry[0] == "write" and entry[1] in committed:
+              _, tx, key, value = entry
+              recovered[key] = value
+
+      print("committed transactions:", sorted(committed))
+      for key in sorted(recovered):
+          print(f"{key:8} {disk[key]!r} -> {recovered[key]!r}")
+    output: |
+      committed transactions: [1]
+      block42  'empty' -> 'data'
+      dir      '[]' -> '[a.txt -> 7]'
+      inode7   'free' -> 'file, size 4'
+    lines:
+      - line: 7
+        note: "A transaction groups related writes so they succeed or fail together."
+      - line: 12
+        note: "Transaction 2 started but never wrote its commit record, so the system treats it as if it never began."
+      - line: 20
+        note: "The directory shows only a.txt: the half-finished creation of b.txt left no trace."
+
+playground:
+  prompt: |
+    Add a hard link to the tiny file system and check the link count. Then change BLOCK to 2 and see how many blocks a file takes. Or compute the largest file for a different pointer size (8-byte pointers on a 64-bit file system) in the first example.
+  code: |
+    import math
+
+    def blocks_needed(size, block_size):
+        return math.ceil(size / block_size)
+
+    for size in (0, 1, 4096, 4097, 100_000):
+        blocks = blocks_needed(size, 4096)
+        waste = blocks * 4096 - size
+        print(f"{size:7} bytes -> {blocks:3} blocks, {waste:4} bytes wasted in the last block")
+
+exercises:
+  - id: inode-fs
+    title: A file system with inodes
+    difficulty: 4
+    prompt: |
+      Write the class `FileSystem(num_blocks, block_size)` storing strings. `create(name)` makes an empty file (`FileExistsError` if the name exists). `write(name, data)` **replaces** the file's contents: the data is split into blocks of `block_size` characters, each stored in the **lowest-numbered free block**, and the file's old blocks are freed first (so its own old blocks may be reused). If there are not enough free blocks, raise `OSError` and leave the file **unchanged**. `read(name)` returns the contents, `size(name)` its length in characters, `blocks_of(name)` the list of block numbers in order, and `free_blocks()` the count of free blocks. `link(existing, new)` adds another name for the same file (`FileExistsError` if `new` exists), `nlink(name)` gives the link count, and `unlink(name)` removes a name; when the last name goes, its blocks are freed. Unknown names raise `FileNotFoundError`. Because names share one inode, writing through one name is visible through the other.
+    starter: |
+      class FileSystem:
+          def __init__(self, num_blocks, block_size):
+              pass
+
+          def create(self, name):
+              pass
+
+          def write(self, name, data):
+              pass
+
+          def read(self, name):
+              pass
+
+          def size(self, name):
+              pass
+
+          def blocks_of(self, name):
+              pass
+
+          def free_blocks(self):
+              pass
+
+          def link(self, existing, new):
+              pass
+
+          def nlink(self, name):
+              pass
+
+          def unlink(self, name):
+              pass
+    tests:
+      - name: write and read
+        code: |
+          fs = FileSystem(8, 4)
+          fs.create("a")
+          fs.write("a", "hello world")
+          assert fs.read("a") == "hello world" and fs.size("a") == 11
+          assert fs.blocks_of("a") == [0, 1, 2] and fs.free_blocks() == 5
+          fs.create("b")
+          fs.write("b", "xyz")
+          assert fs.blocks_of("b") == [3]
+          fs.write("a", "hi")
+          assert fs.blocks_of("a") == [0] and fs.free_blocks() == 6
+          fs.write("b", "123456789")
+          assert fs.blocks_of("b") == [1, 2, 3] and fs.read("b") == "123456789"
+          fs.write("a", "")
+          assert fs.blocks_of("a") == [] and fs.size("a") == 0 and fs.read("a") == ""
+      - name: no space leaves the file unchanged
+        code: |
+          fs = FileSystem(3, 2)
+          fs.create("a")
+          fs.create("b")
+          fs.write("a", "abcd")           # 2 blocks
+          fs.write("b", "xy")             # 1 block, disk now full
+          try:
+              fs.write("b", "123456")     # needs 3 blocks, only its own 1 could be reused
+              assert False
+          except OSError:
+              pass
+          assert fs.read("b") == "xy" and fs.blocks_of("b") == [2] and fs.free_blocks() == 0
+          fs.write("a", "ab")             # shrinking frees a block
+          assert fs.free_blocks() == 1
+          fs.write("b", "abcd")           # b can now use its own block plus the free one
+          assert fs.read("b") == "abcd"
+      - name: links
+        code: |
+          fs = FileSystem(6, 4)
+          fs.create("a")
+          fs.write("a", "data!")
+          fs.link("a", "b")
+          assert fs.nlink("a") == 2 and fs.nlink("b") == 2
+          fs.write("b", "changed")
+          assert fs.read("a") == "changed"
+          fs.unlink("a")
+          assert fs.read("b") == "changed" and fs.nlink("b") == 1 and fs.free_blocks() == 4
+          try:
+              fs.read("a")
+              assert False
+          except FileNotFoundError:
+              pass
+          fs.unlink("b")
+          assert fs.free_blocks() == 6
+          fs.create("a")
+          assert fs.read("a") == ""
+      - name: errors
+        code: |
+          fs = FileSystem(4, 4)
+          fs.create("a")
+          for call in (lambda: fs.create("a"), lambda: fs.link("a", "a"), lambda: fs.link("zzz", "q")):
+              try:
+                  call()
+                  assert False
+              except (FileExistsError, FileNotFoundError):
+                  pass
+          for call in (lambda: fs.read("x"), lambda: fs.write("x", "1"), lambda: fs.unlink("x"), lambda: fs.size("x")):
+              try:
+                  call()
+                  assert False
+              except FileNotFoundError:
+                  pass
+    hints:
+      - "Keep `self.bitmap` (a list of booleans), `self.disk` (block contents), `self.names` (name to inode number) and `self.inodes` (inode number to a dict with `blocks`, `size`, `links`)."
+      - "`write`: compute `need = ceil(len(data) / block_size)`. The write fits if `need <= free_blocks() + len(old_blocks)`; check this **before** touching anything."
+      - "Then free the old blocks, and allocate `need` blocks with `bitmap.index(False)`, filling them in."
+      - "`unlink`: remove the name, decrement `links`, and free the blocks and the inode when it reaches 0."
+    solution: |
+      class FileSystem:
+          def __init__(self, num_blocks, block_size):
+              self.block_size = block_size
+              self.bitmap = [False] * num_blocks
+              self.disk = [""] * num_blocks
+              self.names = {}
+              self.inodes = {}
+              self.next_inode = 1
+
+          def _inode(self, name):
+              if name not in self.names:
+                  raise FileNotFoundError(name)
+              return self.inodes[self.names[name]]
+
+          def free_blocks(self):
+              return self.bitmap.count(False)
+
+          def create(self, name):
+              if name in self.names:
+                  raise FileExistsError(name)
+              self.inodes[self.next_inode] = {"blocks": [], "size": 0, "links": 1}
+              self.names[name] = self.next_inode
+              self.next_inode += 1
+
+          def write(self, name, data):
+              node = self._inode(name)
+              need = -(-len(data) // self.block_size)
+              if need > self.free_blocks() + len(node["blocks"]):
+                  raise OSError("no space left on device")
+              for b in node["blocks"]:
+                  self.bitmap[b] = False
+              blocks = []
+              for i in range(need):
+                  b = self.bitmap.index(False)
+                  self.bitmap[b] = True
+                  self.disk[b] = data[i * self.block_size:(i + 1) * self.block_size]
+                  blocks.append(b)
+              node["blocks"] = blocks
+              node["size"] = len(data)
+
+          def read(self, name):
+              node = self._inode(name)
+              return "".join(self.disk[b] for b in node["blocks"])
+
+          def size(self, name):
+              return self._inode(name)["size"]
+
+          def blocks_of(self, name):
+              return list(self._inode(name)["blocks"])
+
+          def link(self, existing, new):
+              node = self._inode(existing)
+              if new in self.names:
+                  raise FileExistsError(new)
+              self.names[new] = self.names[existing]
+              node["links"] += 1
+
+          def nlink(self, name):
+              return self._inode(name)["links"]
+
+          def unlink(self, name):
+              node = self._inode(name)
+              number = self.names.pop(name)
+              node["links"] -= 1
+              if node["links"] == 0:
+                  for b in node["blocks"]:
+                      self.bitmap[b] = False
+                  del self.inodes[number]
+    explanation: |
+      Everything the lesson described is in this class: a bitmap for free space, an inode table that owns the blocks, and a name table that points at inodes. Checking for space before modifying anything is the "all or nothing" discipline that real file systems enforce (and, with journaling, guarantee even through crashes).
+
+  - id: paths
+    title: Resolving paths
+    difficulty: 3
+    prompt: |
+      Write `normalize(path, cwd="/")`, returning the canonical absolute path: relative paths are interpreted from `cwd`, `.` and empty components (from `//` or a trailing `/`) are dropped, `..` goes to the parent directory (at the root it stays at the root), and the result has no trailing slash except for the root itself, `"/"`. Write `lookup(tree, path, cwd="/")`, where `tree` is a nested dictionary (directories are dicts and files are strings), returning the node found. Raise `FileNotFoundError` if a component does not exist and `NotADirectoryError` if a path tries to go **through** a file.
+    starter: |
+      def normalize(path, cwd="/"):
+          pass
+
+
+      def lookup(tree, path, cwd="/"):
+          pass
+    tests:
+      - name: normalize
+        code: |
+          assert normalize("/a/b/../c/./d//") == "/a/c/d"
+          assert normalize("x/../..", "/home/u") == "/home"
+          assert normalize("../../..", "/a") == "/"
+          assert normalize("", "/q") == "/q"
+          assert normalize("/") == "/" and normalize("/.") == "/" and normalize("//") == "/"
+          assert normalize("b", "/a") == "/a/b" and normalize("b/c/", "/") == "/b/c"
+          assert normalize("/../etc") == "/etc"
+      - name: lookup
+        code: |
+          tree = {"home": {"maya": {"notes.txt": "buy milk", "photos": {}}}, "etc": {"hosts": "127.0.0.1"}}
+          assert lookup(tree, "/home/maya/notes.txt") == "buy milk"
+          assert lookup(tree, "notes.txt", "/home/maya") == "buy milk"
+          assert lookup(tree, "../../etc/hosts", "/home/maya") == "127.0.0.1"
+          assert lookup(tree, "/home/./maya//photos/..") == tree["home"]["maya"]
+          assert lookup(tree, "/") is tree and lookup(tree, "/../..") is tree
+      - name: lookup errors
+        code: |
+          tree = {"home": {"maya": {"notes.txt": "x"}}}
+          for path, exc in (("/tmp", FileNotFoundError), ("/home/maya/nope.txt", FileNotFoundError),
+                            ("/home/maya/notes.txt/more", NotADirectoryError)):
+              try:
+                  lookup(tree, path)
+                  assert False, path
+              except exc:
+                  pass
+    hints:
+      - "Start the list of parts from `cwd` (split on `/`, dropping empty strings) unless the path is absolute."
+      - "Process each piece of `path.split('/')`: skip `''` and `'.'`; for `'..'` pop if the list is non-empty; otherwise append."
+      - "`lookup`: walk the components of the normalised path. Before looking a name up, check the current node is a dict (else `NotADirectoryError`); if the name is missing raise `FileNotFoundError`."
+    solution: |
+      def normalize(path, cwd="/"):
+          parts = [] if path.startswith("/") else [p for p in cwd.split("/") if p]
+          for piece in path.split("/"):
+              if piece in ("", "."):
+                  continue
+              if piece == "..":
+                  if parts:
+                      parts.pop()
+              else:
+                  parts.append(piece)
+          return "/" + "/".join(parts)
+
+
+      def lookup(tree, path, cwd="/"):
+          node = tree
+          for name in [p for p in normalize(path, cwd).split("/") if p]:
+              if not isinstance(node, dict):
+                  raise NotADirectoryError(name)
+              if name not in node:
+                  raise FileNotFoundError(name)
+              node = node[name]
+          return node
+    explanation: |
+      A stack (the `parts` list) is the natural structure for `..`: entering a directory pushes, `..` pops. Shells, web servers and archive extractors all contain this function, and getting it wrong causes security bugs: a path like `../../etc/passwd` that isn't normalised before the permission check lets an attacker escape a directory (a "path traversal" attack).
+
+  - id: disk-sched
+    title: Disk scheduling
+    difficulty: 3
+    prompt: |
+      Write `head_movement(requests, start, policy, max_cyl=199)` returning `(order, total)`: the order in which the cylinders are served and the total distance moved by the head. Policies: `"fcfs"` (in the given order), `"sstf"` (always the nearest pending request, ties go to the **lower** cylinder), `"scan"` (first sweep **upward** from `start`, serving requests at or above it in increasing order, travel on to `max_cyl`, then reverse and serve the remaining requests in decreasing order) and `"look"` (like SCAN, but turn around at the last request instead of going to `max_cyl`). Raise `ValueError` for an unknown policy. With no requests the answer is `([], 0)`.
+    starter: |
+      def head_movement(requests, start, policy, max_cyl=199):
+          pass
+    tests:
+      - name: textbook queue
+        code: |
+          R = [98, 183, 37, 122, 14, 124, 65, 67]
+          assert head_movement(R, 53, "fcfs") == ([98, 183, 37, 122, 14, 124, 65, 67], 640)
+          assert head_movement(R, 53, "sstf") == ([65, 67, 37, 14, 98, 122, 124, 183], 236)
+          assert head_movement(R, 53, "scan") == ([65, 67, 98, 122, 124, 183, 37, 14], 331)
+          assert head_movement(R, 53, "look") == ([65, 67, 98, 122, 124, 183, 37, 14], 299)
+      - name: edge cases
+        code: |
+          assert head_movement([], 5, "fcfs") == ([], 0)
+          assert head_movement([], 5, "scan") == ([], 0) or head_movement([], 5, "scan") == ([], 194)
+          assert head_movement([10, 20], 50, "scan") == ([20, 10], 338)
+          assert head_movement([60, 70], 50, "scan") == ([60, 70], 149)
+          assert head_movement([60, 70], 50, "look") == ([60, 70], 20)
+          assert head_movement([10, 20], 50, "look") == ([20, 10], 40)
+          assert head_movement([50], 50, "sstf") == ([50], 0)
+          assert head_movement([40, 60], 50, "sstf") == ([40, 60], 30)
+          try:
+              head_movement([1], 0, "elevator")
+              assert False
+          except ValueError:
+              pass
+      - name: sstf never worse than fcfs
+        code: |
+          import random
+          rng = random.Random(6)
+          for _ in range(100):
+              reqs = [rng.randint(0, 199) for _ in range(rng.randint(1, 12))]
+              s = rng.randint(0, 199)
+              f = head_movement(reqs, s, "fcfs")[1]
+              l = head_movement(reqs, s, "look")[1]
+              sc = head_movement(reqs, s, "scan")[1]
+              assert sorted(head_movement(reqs, s, "sstf")[0]) == sorted(reqs)
+              assert l <= sc
+    hints:
+      - "FCFS is a running sum of `abs(next - position)`."
+      - "SSTF: loop while requests remain, `min(left, key=lambda r: (abs(r - pos), r))`."
+      - "SCAN/LOOK: `up = sorted(r for r in requests if r >= start)`, `down = sorted((r for r in requests if r < start), reverse=True)`. Serve `up` then `down`."
+      - "For SCAN, add the trip from the last position up to `max_cyl` before turning (only when the policy is `\"scan\"`); for no requests at all return `([], 0)` straight away."
+    solution: |
+      def head_movement(requests, start, policy, max_cyl=199):
+          if policy not in ("fcfs", "sstf", "scan", "look"):
+              raise ValueError("unknown policy " + policy)
+          if not requests:
+              return [], 0
+          pos = start
+          total = 0
+          order = []
+          if policy == "fcfs":
+              for r in requests:
+                  total += abs(r - pos)
+                  pos = r
+                  order.append(r)
+          elif policy == "sstf":
+              left = list(requests)
+              while left:
+                  r = min(left, key=lambda x: (abs(x - pos), x))
+                  left.remove(r)
+                  total += abs(r - pos)
+                  pos = r
+                  order.append(r)
+          else:
+              up = sorted(r for r in requests if r >= start)
+              down = sorted((r for r in requests if r < start), reverse=True)
+              for r in up:
+                  total += r - pos
+                  pos = r
+                  order.append(r)
+              if policy == "scan":
+                  total += max_cyl - pos
+                  pos = max_cyl
+              for r in down:
+                  total += pos - r
+                  pos = r
+                  order.append(r)
+          return order, total
+    explanation: |
+      Elevator algorithms win because they never reverse needlessly: like a lift in a building, the arm passes each floor once per sweep. They also bound waiting time (no starvation), which SSTF can't promise. On SSDs none of this matters, which is why modern kernels default to simple schedulers (or `none`) for flash devices.
+
+  - id: journal
+    title: Journal recovery
+    difficulty: 3
+    prompt: |
+      Write `recover(disk, journal)`. `disk` is a dictionary of block name to contents. `journal` is a list of tuples in the order they were written: `("begin", tx)`, `("write", tx, key, value)`, `("commit", tx)` and `("abort", tx)`. Return a **new** dictionary (do not modify `disk`) with the writes of every transaction that **committed** applied. Transactions are applied in the order of their **commit records**, and within a transaction the writes are applied in the order they were logged. Transactions with no commit record, or with an abort, have no effect.
+    starter: |
+      def recover(disk, journal):
+          pass
+    tests:
+      - name: committed and uncommitted
+        code: |
+          disk = {"a": 1, "b": 2}
+          journal = [("begin", 1), ("write", 1, "a", 10), ("write", 1, "c", 30), ("commit", 1),
+                     ("begin", 2), ("write", 2, "b", 20)]
+          result = recover(disk, journal)
+          assert result == {"a": 10, "b": 2, "c": 30}
+          assert disk == {"a": 1, "b": 2}
+      - name: commit order and aborts
+        code: |
+          journal = [("begin", 1), ("begin", 2), ("write", 1, "x", "from1"), ("write", 2, "x", "from2"),
+                     ("commit", 2), ("commit", 1), ("begin", 3), ("write", 3, "y", "gone"), ("abort", 3)]
+          assert recover({}, journal) == {"x": "from1"}
+          journal2 = [("begin", 1), ("write", 1, "k", "a"), ("write", 1, "k", "b"), ("commit", 1)]
+          assert recover({"k": "old"}, journal2) == {"k": "b"}
+          assert recover({"k": 1}, []) == {"k": 1}
+      - name: replay is idempotent
+        code: |
+          disk = {"a": 0}
+          journal = [("begin", 1), ("write", 1, "a", 5), ("commit", 1)]
+          once = recover(disk, journal)
+          twice = recover(once, journal)
+          assert once == twice == {"a": 5}
+    hints:
+      - "Make one pass over the journal: collect each transaction's writes in a dict `tx -> list of (key, value)`, and a list `committed` of transaction ids in the order their commit records appear."
+      - "Then copy `disk` and apply the writes of each committed transaction."
+    solution: |
+      def recover(disk, journal):
+          writes = {}
+          committed = []
+          for entry in journal:
+              kind = entry[0]
+              if kind == "begin":
+                  writes[entry[1]] = []
+              elif kind == "write":
+                  writes.setdefault(entry[1], []).append((entry[2], entry[3]))
+              elif kind == "commit":
+                  committed.append(entry[1])
+          result = dict(disk)
+          for tx in committed:
+              for key, value in writes.get(tx, []):
+                  result[key] = value
+          return result
+    explanation: |
+      The third test shows why journal replay is safe to repeat: applying "set block a to 5" twice gives the same result as once. If the machine crashes again in the middle of recovery, it simply recovers again. Designing operations that are **idempotent** is a recurring trick in reliable systems.
+
+  - id: permissions
+    title: Checking permissions
+    difficulty: 2
+    prompt: |
+      Write `can_access(mode, file_uid, file_gid, uid, gids, want)`. `mode` is an integer such as `0o754`; `want` is `"r"`, `"w"` or `"x"`; `uid` is the user's id and `gids` is the collection of group ids the user belongs to. Apply the Unix rule: if `uid == file_uid` use the **owner** bits (the top three), else if `file_gid` is in `gids` use the **group** bits, else the **others** bits; **only one** class is used. The superuser (`uid == 0`) may always read and write, and may execute only if **at least one** execute bit is set in the mode. Also write `describe(mode)` returning the 9-character string such as `"rwxr-xr--"`.
+    starter: |
+      def can_access(mode, file_uid, file_gid, uid, gids, want):
+          pass
+
+
+      def describe(mode):
+          pass
+    tests:
+      - name: classes
+        code: |
+          m = 0o754
+          assert can_access(m, 100, 50, 100, [50], "w") is True       # owner
+          assert can_access(m, 100, 50, 7, [50], "w") is False        # group has r-x
+          assert can_access(m, 100, 50, 7, [50], "r") is True
+          assert can_access(m, 100, 50, 7, [50], "x") is True
+          assert can_access(m, 100, 50, 7, [], "r") is True           # others r--
+          assert can_access(m, 100, 50, 7, [], "x") is False
+      - name: only one class applies
+        code: |
+          # the owner has no access even though others do
+          assert can_access(0o007, 1, 1, 1, [1], "r") is False
+          assert can_access(0o070, 1, 2, 5, [2], "w") is True
+          assert can_access(0o707, 1, 2, 5, [2], "r") is False        # group class denies, others are not consulted
+      - name: root and describe
+        code: |
+          assert can_access(0o000, 1, 1, 0, [], "r") is True and can_access(0o000, 1, 1, 0, [], "w") is True
+          assert can_access(0o644, 1, 1, 0, [], "x") is False
+          assert can_access(0o700, 1, 1, 0, [], "x") is True
+          assert describe(0o754) == "rwxr-xr--" and describe(0o000) == "---------" and describe(0o777) == "rwxrwxrwx"
+          assert describe(0o644) == "rw-r--r--"
+    hints:
+      - "The permission bit for `want` is `{\"r\": 4, \"w\": 2, \"x\": 1}[want]`."
+      - "Pick the shift: 6 for owner, 3 for group, 0 for others; then test `(mode >> shift) & bit`."
+      - "`describe`: loop `i` from 8 down to 0, using the letters `rwx` repeating, and a dash when the bit is clear."
+    solution: |
+      def can_access(mode, file_uid, file_gid, uid, gids, want):
+          bit = {"r": 4, "w": 2, "x": 1}[want]
+          if uid == 0:
+              return want != "x" or (mode & 0o111) != 0
+          if uid == file_uid:
+              shift = 6
+          elif file_gid in gids:
+              shift = 3
+          else:
+              shift = 0
+          return ((mode >> shift) & bit) != 0
+
+
+      def describe(mode):
+          letters = "rwx"
+          out = ""
+          for i in range(8, -1, -1):
+              out += letters[(8 - i) % 3] if (mode >> i) & 1 else "-"
+          return out
+    explanation: |
+      This is the same bit manipulation as Lesson 9.8's permissions exercise, now inside a kernel check. Note the surprising rule that the owner class does not fall back to the others class: a file with mode `0o007` can be read by everyone except its owner. The kernel picks a class first and then asks only that class.
+
+commonMistakes:
+  - title: Thinking a file's name is stored in the file
+    explanation: |
+      The name lives in a directory entry; the inode has no name. That's why a file can have many names (hard links) or be renamed without touching its data.
+  - title: Expecting deleting a hard link to delete the data
+    explanation: |
+      `unlink` removes one name. The data is freed only when the link count reaches zero and no process holds the file open.
+  - title: Using a path before normalising it
+    explanation: |
+      Checking whether `/uploads/../etc/passwd` starts with `/uploads` passes a naive test. Normalise first, then check.
+  - title: Forgetting that permission classes do not combine
+    explanation: |
+      The owner is judged by the owner bits only, even if the group or others have more access.
+  - title: Assuming writes reach the disk immediately
+    explanation: |
+      The OS caches and delays writes. Use `flush` and `os.fsync` when you must be sure the data is durable (and unmount drives safely).
+  - title: Treating SSD scheduling like hard-disk scheduling
+    explanation: |
+      Seek-minimising policies matter on spinning disks. On flash, the controller and its internal parallelism dominate.
+
+summary:
+  - "A **file** is a named sequence of bytes; a **directory** maps names to files. **Paths** are resolved component by component, with `.`, `..`, and absolute versus relative forms."
+  - "An **inode** holds a file's metadata and block pointers (not its name); **directories** map names to inode numbers; **bitmaps** track free inodes and blocks. Inodes use **direct and indirect pointers**, so file size reach grows by a factor of block-size/pointer-size per level."
+  - "**Hard links** are extra names for one inode (counted; the file is freed when the count hits zero). **Symbolic links** store a path and can dangle or loop."
+  - "**Permissions** are nine bits (rwx for owner, group, others); the kernel uses exactly one class: owner, else group, else others. Root bypasses read and write."
+  - "**Journaling** logs changes before applying them: committed transactions are replayed after a crash, uncommitted ones ignored. **Copy-on-write** file systems never overwrite in place."
+  - "**Disk scheduling** (FCFS, SSTF, SCAN/LOOK) reduces seek movement on hard disks; SSDs change the trade-offs."
+next: |
+  That completes the tour of the operating system: processes, scheduling, concurrency, deadlock, memory and storage. The Unit 10 project ties several of these together: you will build a small **operating-system simulator** that schedules processes, manages page frames and serves a simulated workload, and report statistics from it.
+
+quiz:
+  - type: mcq
+    question: Where is a file's name stored in a Unix-style file system?
+    options: [
+      "In a directory entry that maps the name to an inode number",
+      "In the file's inode",
+      "In the superblock",
+      "In the file's data blocks"
+    ]
+    answer: 0
+    explanation: "Names live in directories; the inode holds metadata and block pointers."
+  - type: mcq
+    question: A file has two hard links. You delete one name. What happens to the data?
+    options: [
+      "It stays, because the link count is still 1",
+      "It is deleted immediately",
+      "It is moved to the trash",
+      "The remaining name becomes a symbolic link"
+    ]
+    answer: 0
+    explanation: "Data blocks are freed only when the link count reaches zero."
+  - type: mcq
+    question: What is the reach of the 12 direct pointers in an inode with 4 KB blocks?
+    options: ["48 KB", "4 MB", "12 KB", "4 GB"]
+    answer: 0
+    explanation: "12 pointers × 4 KB per block = 48 KB. Larger files use indirect blocks."
+  - type: mcq
+    question: A file has mode 0o640. The user is in the file's group, but is not its owner. Which access do they have?
+    options: ["Read only", "Read and write", "No access", "Read, write and execute"]
+    answer: 0
+    explanation: "0o640 is rw-r-----: the group class has r-- only."
+  - type: mcq
+    question: What does a journaling file system do after a crash?
+    options: [
+      "Replays committed transactions from the journal and ignores uncommitted ones",
+      "Scans the entire disk for errors, like fsck",
+      "Deletes the journal and starts again",
+      "Restores everything from a backup"
+    ]
+    answer: 0
+    explanation: "Recovery only needs the journal, so it takes seconds rather than minutes."
+  - type: mcq
+    question: Why does the SCAN (elevator) policy avoid the starvation that SSTF can cause?
+    options: [
+      "It sweeps across the whole disk, so every request is reached within a bounded number of sweeps",
+      "It serves the oldest request first",
+      "It ignores requests near the head",
+      "It uses a faster disk"
+    ]
+    answer: 0
+    explanation: "Because the arm keeps moving through every region, no request waits forever, unlike a far-away request under SSTF."
+  - type: code
+    question: |
+      Write `blocks_needed(size, block_size)` returning the number of blocks needed to store `size` bytes (rounding up; 0 bytes need 0 blocks).
+    starter: |
+      def blocks_needed(size, block_size):
+          pass
+    tests:
+      - name: rounding
+        code: |
+          assert blocks_needed(0, 4096) == 0
+          assert blocks_needed(1, 4096) == 1
+          assert blocks_needed(4096, 4096) == 1
+          assert blocks_needed(4097, 4096) == 2
+          assert blocks_needed(10, 3) == 4
+    solution: |
+      def blocks_needed(size, block_size):
+          return (size + block_size - 1) // block_size

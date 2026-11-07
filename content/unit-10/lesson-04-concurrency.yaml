@@ -1,0 +1,809 @@
+id: u10-concurrency
+title: Threads and Race Conditions
+minutes: 60
+objective: |
+  Understand what threads are, why programs use them, and why sharing memory between them is dangerous. See a **race condition** happen, enumerate every possible interleaving of two threads to find the bad ones, and learn the limits of parallel speed-up with Amdahl's law.
+outcomes:
+  - Distinguish processes from threads, and concurrency from parallelism
+  - Explain what a thread shares with its siblings and what it keeps private
+  - Show how a lost update arises from an interleaving of read-modify-write
+  - Enumerate all interleavings of small concurrent programs and count them
+  - Recognise check-then-act races and explain why testing alone rarely finds them
+  - Apply Amdahl's law to estimate the speed-up from more cores
+
+sections:
+  - heading: Threads
+    body: |
+      A process (Lesson 10.2) has its own private address space, which makes processes safe but heavy: creating one, switching between them and communicating across them all cost time. A **thread** is a lighter unit of execution **inside** a process. Several threads of one process share the same code, heap, global variables and open files, but each thread has its **own**:
+
+      - program counter and registers,
+      - stack (so its own local variables and call chain),
+      - state (ready, running, waiting) and scheduling priority.
+
+      | | Process | Thread |
+      |---|---|---|
+      | Address space | private | shared with the process's other threads |
+      | Creation cost | high | low |
+      | Switch cost | high (new address space) | low |
+      | Communication | explicit (pipes, sockets, shared memory) | just read and write shared variables |
+      | If one crashes | others unaffected | the whole process usually dies |
+
+      Programs use threads for two reasons:
+
+      1. **Responsiveness.** A GUI thread keeps handling clicks while another downloads a file. A web server handles each request in its own thread so that one slow client doesn't block the rest.
+      2. **Parallelism.** Splitting a big computation across several CPU cores to finish sooner.
+
+      **Concurrency** and **parallelism** are different. *Concurrency* means several tasks are **in progress** at overlapping times, even on one core, by taking turns. *Parallelism* means several tasks are **literally running at the same instant** on different cores. You can have one without the other.
+
+      Shared memory is the great convenience of threads, and also the source of nearly all their bugs.
+
+  - heading: Race conditions
+    body: |
+      Consider two threads that each execute `counter = counter + 1` on a shared variable. This looks like one operation, but the hardware does three:
+
+      1. **read** `counter` into a register,
+      2. **add** 1 to the register,
+      3. **write** the register back.
+
+      The scheduler (Lesson 10.3) can switch between threads at **any** point, including in the middle of these three steps. Suppose `counter` is 0 and the threads interleave like this:
+
+      | Step | Thread A | Thread B | counter |
+      |---|---|---|---|
+      | 1 | read 0 | | 0 |
+      | 2 | | read 0 | 0 |
+      | 3 | write 1 | | 1 |
+      | 4 | | write 1 | 1 |
+
+      Two increments happened, but the counter is 1. One update was **lost**. This is a **race condition**: the result depends on the exact timing of the threads. The bug is also **non-deterministic**. Most of the time the threads happen not to overlap and the answer is right, so tests pass, until one day under load the timing is different. Such bugs are famously hard to reproduce and fix (programmers call them *Heisenbugs*). A race in the Therac-25 radiation machine killed patients in the 1980s; a race in the Northeast power grid's alarm software contributed to the 2003 blackout.
+
+      Terms to know:
+
+      - A **critical section** is a stretch of code that touches shared data and must not be interleaved with another thread's use of the same data.
+      - **Atomic** means indivisible: an operation that appears to happen all at once, with no thread able to see it half-done. Hardware provides a few atomic instructions (such as compare-and-swap), and locks (Lesson 10.5) build bigger atomic sections from them.
+      - A **data race** is two threads accessing the same memory at the same time, at least one writing, with no synchronisation. In C and C++ this is undefined behaviour.
+
+  - heading: Check-then-act
+    body: |
+      The lost update is not the only shape of race. Another common one is **check-then-act**: you test a condition, then act on it, but the condition can change in between.
+
+      ```python
+      if account.balance >= amount:      # check
+          account.balance -= amount      # act
+      ```
+
+      With a balance of 100, two threads each withdraw 80. Both check: 100 ≥ 80, true. Both then subtract: the balance becomes −60. Each thread's reasoning was valid when it made it, but wrong by the time it acted. The same pattern gives double-booked seats, files created twice, and security holes: the famous **TOCTOU** ("time of check to time of use") bug, where a program checks that a file is safe to open and an attacker swaps it before the open happens.
+
+      The fix is always to make the check and the act **one atomic step**, usually with a lock (next lesson).
+
+  - heading: Counting interleavings
+    body: |
+      How many ways can two threads interleave? If thread A has *a* steps and thread B has *b* steps, the steps within each thread keep their order, so an interleaving chooses which of the *a + b* time slots belong to A: **(a + b)! / (a! b!)** possibilities. Two threads of two steps each give 6; three threads of two steps each give 90; two threads with 50 steps each give about 10²⁹.
+
+      Since the number explodes, you can't test every interleaving of a real program. In small models, though, we can enumerate them all and check each one, which is called **model checking**, and tools like TLA+ and SPIN do it for real protocols. It is also the way to be sure a design is correct.
+
+      In this lesson we model a thread as a Python **generator**. Each `yield` is a point where the scheduler is allowed to switch to another thread, so we control the interleaving exactly. A **schedule** is the list of which thread takes each next step, for example `[0, 1, 0, 1]`.
+
+  - heading: "The Python angle: GIL and real threads"
+    body: |
+      Python's standard implementation (CPython) has a **global interpreter lock (GIL)**: only one thread executes Python bytecode at a time. This protects the interpreter's internals, but has two consequences you should know.
+
+      - Threads don't speed up **CPU-bound** Python code; for that use the `multiprocessing` module (separate processes) or write the hot loop in C or NumPy. Threads are still useful for **I/O-bound** work, because a thread waiting on the network releases the GIL.
+      - The GIL does **not** make your code race-free. A switch can still happen between the bytecodes of `counter += 1`, so Python programs still need locks for read-modify-write on shared data. (Recent Python versions even offer a build without the GIL.)
+
+      Java, C#, Go and Rust threads do run in parallel on many cores, so races are even more visible there. Rust's ownership rules were designed to make data races impossible to compile.
+
+  - heading: How much faster can parallelism make things?
+    body: |
+      If a program takes time *T* on one core and you add more cores, you might hope for a speed-up proportional to the number of cores. But some part of the work is inherently **sequential** (reading input, combining results, waiting for a lock). **Amdahl's law** says that if a fraction *p* of the work can run in parallel and the rest cannot, the speed-up with *n* cores is
+
+      **speedup(n) = 1 / ((1 − p) + p / n)**
+
+      Even with infinitely many cores the speed-up cannot exceed **1 / (1 − p)**. If 90% of the program is parallelisable, the best you can ever do is 10×; with 4 cores you get only 3.08×. If only 50% is parallel, the ceiling is 2× no matter how many cores you buy. So reducing the sequential part is often worth more than adding hardware. (Gustafson's law gives a more optimistic view: in practice we often make the problem bigger as we add cores.)
+
+examples:
+  - title: Two threads, two schedules
+    intro: "A thread is a generator that yields where a switch is allowed. A schedule says who goes next. The same threads can give different answers."
+    code: |
+      def increment(shared):
+          tmp = shared["n"]        # read
+          yield                    # a switch can happen here
+          shared["n"] = tmp + 1    # write
+
+
+      def run(schedule):
+          shared = {"n": 0}
+          threads = [increment(shared), increment(shared)]
+          finished = [False, False]
+          for who in schedule:
+              if not finished[who]:
+                  try:
+                      next(threads[who])
+                  except StopIteration:
+                      finished[who] = True
+          return shared["n"]
+
+
+      print("A completely, then B: ", run([0, 0, 1, 1]))
+      print("A and B alternate:    ", run([0, 1, 0, 1]))
+      print("B reads, A all, B ends:", run([1, 0, 0, 1]))
+    output: |
+      A completely, then B:  2
+      A and B alternate:     1
+      B reads, A all, B ends: 1
+    lines:
+      - line: 3
+        note: "yield marks the gap between the read and the write: the dangerous moment."
+      - line: 17
+        note: "Each thread takes two steps: run to the yield, then finish. [0, 0, 1, 1] means A takes both steps, then B."
+      - line: 19
+        note: "Both threads read 0 before either writes, so both write 1. One increment is lost."
+  - title: Enumerating every interleaving
+    intro: "With small threads we can try all schedules and collect every possible final value."
+    code: |
+      def schedules(counts):
+          """All interleavings of threads that take counts[i] steps each."""
+          if sum(counts) == 0:
+              return [[]]
+          result = []
+          for i in range(len(counts)):
+              if counts[i] > 0:
+                  counts[i] -= 1
+                  for rest in schedules(counts):
+                      result.append([i] + rest)
+                  counts[i] += 1
+          return result
+
+
+      def run(thread_fn, n_threads, schedule):
+          shared = {"n": 0}
+          gens = [thread_fn(shared) for _ in range(n_threads)]
+          done = [False] * n_threads
+          for who in schedule:
+              if not done[who]:
+                  try:
+                      next(gens[who])
+                  except StopIteration:
+                      done[who] = True
+          return shared["n"]
+
+
+      def racy(shared):
+          tmp = shared["n"]
+          yield
+          shared["n"] = tmp + 1
+
+
+      def atomic(shared):
+          shared["n"] += 1       # read and write in one step
+          yield
+
+
+      for n_threads in (2, 3):
+          plan = schedules([2] * n_threads)
+          for name, fn in (("racy", racy), ("atomic", atomic)):
+              results = sorted({run(fn, n_threads, s) for s in plan})
+              print(f"{n_threads} threads, {len(plan):2} schedules, {name:6}: possible results {results}")
+    output: |
+      2 threads,  6 schedules, racy  : possible results [1, 2]
+      2 threads,  6 schedules, atomic: possible results [2]
+      3 threads, 90 schedules, racy  : possible results [1, 2, 3]
+      3 threads, 90 schedules, atomic: possible results [3]
+    lines:
+      - line: 2
+        note: "A recursive generator of interleavings: choose which thread goes next, then interleave the rest."
+      - line: 40
+        note: "With 2 threads there are 6 interleavings, with 3 there are 90."
+      - line: 41
+        note: "A set collects the distinct outcomes. The racy version can end with 1, 2 or 3; the atomic version always gives the right answer."
+  - title: Check-then-act on a bank account
+    intro: "Each withdrawal checks the balance, then subtracts. A switch between the two lines is enough to overdraw."
+    code: |
+      def withdraw(amount):
+          def thread(shared):
+              if shared["balance"] >= amount:     # check
+                  yield                          # <- another thread may run here
+                  shared["balance"] -= amount     # act
+          return thread
+
+
+      def run(schedule):
+          shared = {"balance": 100}
+          gens = [withdraw(80)(shared), withdraw(80)(shared)]
+          done = [False, False]
+          for who in schedule:
+              if not done[who]:
+                  try:
+                      next(gens[who])
+                  except StopIteration:
+                      done[who] = True
+          return shared["balance"]
+
+
+      print("one after the other:", run([0, 0, 1, 1]))
+      print("interleaved:        ", run([0, 1, 0, 1]))
+    output: |
+      one after the other: 20
+      interleaved:         -60
+    lines:
+      - line: 3
+        note: "The condition is checked using a value that may be out of date by the time of the next line."
+      - line: 19
+        note: "Both threads passed the check while the balance was 100, and then both subtracted 80. The account holds −60."
+  - title: Real threads (not run here)
+    intro: "The same lost update with Python's threading module. It is non-deterministic, which is the point."
+    runnable: false
+    code: |
+      import threading
+
+      counter = 0
+
+      def work():
+          global counter
+          for _ in range(100_000):
+              counter += 1          # read, add, write: not atomic
+
+      threads = [threading.Thread(target=work) for _ in range(4)]
+      for t in threads:
+          t.start()
+      for t in threads:
+          t.join()
+      print(counter)                # expected 400000, but often less on some versions
+    lines:
+      - line: 8
+        note: "counter += 1 compiles to several bytecodes, and a thread switch can land between them."
+      - line: 14
+        note: "Run it a few times: the answer can change from run to run. Adding a lock around the increment makes it always 400000."
+
+playground:
+  prompt: |
+    Add a third thread to the enumeration example with a different kind of step, or change the withdrawal amounts to 30 and 30 with a balance of 100 and see whether any schedule can overdraw. What is the smallest balance that is safe for two withdrawals of 80 each, even with the race?
+  code: |
+    import math
+
+    def interleavings(*steps):
+        total = math.factorial(sum(steps))
+        for s in steps:
+            total //= math.factorial(s)
+        return total
+
+    print(interleavings(2, 2), interleavings(2, 2, 2), interleavings(10, 10), interleavings(50, 50))
+
+exercises:
+  - id: schedule-runner
+    title: Running a schedule
+    difficulty: 3
+    prompt: |
+      Write `run_schedule(thread_fns, schedule, shared)`. `thread_fns` is a list of generator functions; each takes the `shared` dictionary and returns a generator. Create one generator per function (in list order). For each thread index in `schedule`, in order, advance that thread by **one step** (one call to `next`). A thread that has finished (its `next` raised `StopIteration`) ignores later steps. When the schedule is used up, **finish every thread that is still running** by repeatedly giving each unfinished thread one step in index order until all are done. Return `shared`.
+    starter: |
+      def run_schedule(thread_fns, schedule, shared):
+          pass
+    tests:
+      - name: schedule decides the result
+        code: |
+          def incr(shared):
+              tmp = shared["n"]
+              yield
+              shared["n"] = tmp + 1
+          assert run_schedule([incr, incr], [0, 0, 1, 1], {"n": 0}) == {"n": 2}
+          assert run_schedule([incr, incr], [0, 1, 0, 1], {"n": 0}) == {"n": 1}
+          assert run_schedule([incr, incr], [1, 0, 0, 1], {"n": 0}) == {"n": 1}
+      - name: leftover steps and extra entries
+        code: |
+          log = []
+          def a(shared):
+              log.append("a1")
+              yield
+              log.append("a2")
+              yield
+              log.append("a3")
+          def b(shared):
+              log.append("b1")
+              yield
+              log.append("b2")
+          s = {}
+          assert run_schedule([a, b], [1], s) is s
+          assert log == ["b1", "a1", "a2", "b2", "a3"] or log == ["b1", "a1", "b2", "a2", "a3"]
+          log.clear()
+          run_schedule([a, b], [0, 0, 0, 0, 0, 1, 1, 1], {})
+          assert log == ["a1", "a2", "a3", "b1", "b2"]
+      - name: empty
+        code: |
+          assert run_schedule([], [], {"x": 1}) == {"x": 1}
+    hints:
+      - "Make the generators first: `gens = [f(shared) for f in thread_fns]`. Keep a list `done` of booleans."
+      - "A helper `step(i)` that calls `next(gens[i])` inside `try`/`except StopIteration` keeps the code short."
+      - "After the schedule: `while not all(done): for i in range(len(gens)): step(i)`."
+    solution: |
+      def run_schedule(thread_fns, schedule, shared):
+          gens = [f(shared) for f in thread_fns]
+          done = [False] * len(gens)
+
+          def step(i):
+              if done[i]:
+                  return
+              try:
+                  next(gens[i])
+              except StopIteration:
+                  done[i] = True
+
+          for i in schedule:
+              step(i)
+          while not all(done):
+              for i in range(len(gens)):
+                  step(i)
+          return shared
+    explanation: |
+      This is a tiny **deterministic scheduler**. Controlling the interleaving exactly is what makes concurrent bugs testable here: a real scheduler would pick the order for you and a bug might show up once in a million runs. Tools that do this for real programs are called "systematic concurrency testers".
+
+  - id: interleavings
+    title: Listing and counting interleavings
+    difficulty: 3
+    prompt: |
+      Write `all_schedules(counts)`, which returns a list of every interleaving as a list of thread indices. `counts[i]` is the number of steps thread `i` takes, and index `i` appears exactly `counts[i]` times in each schedule. Return the schedules in **lexicographic order** (so `[0, 0, 1]` comes before `[0, 1, 0]`). Also write `count_interleavings(counts)`, which computes how many there are with the multinomial formula **without generating them** (use `math.factorial`). For no steps at all, there is exactly one (empty) schedule.
+    starter: |
+      import math
+
+
+      def all_schedules(counts):
+          pass
+
+
+      def count_interleavings(counts):
+          pass
+    tests:
+      - name: small cases
+        code: |
+          assert all_schedules([1, 1]) == [[0, 1], [1, 0]]
+          assert all_schedules([2, 1]) == [[0, 0, 1], [0, 1, 0], [1, 0, 0]]
+          assert all_schedules([0, 2]) == [[1, 1]]
+          assert all_schedules([]) == [[]]
+          assert all_schedules([0]) == [[]]
+      - name: sizes agree with the formula
+        code: |
+          assert len(all_schedules([2, 2])) == 6 == count_interleavings([2, 2])
+          assert len(all_schedules([2, 2, 2])) == 90 == count_interleavings([2, 2, 2])
+          assert len(all_schedules([3, 1, 2])) == count_interleavings([3, 1, 2]) == 60
+          assert count_interleavings([50, 50]) == math.comb(100, 50)
+          assert count_interleavings([]) == 1
+          s = all_schedules([2, 2, 1])
+          assert s == sorted(s) and len({tuple(x) for x in s}) == len(s)
+    hints:
+      - "Recursion: for each thread `i` that still has steps, put `i` first and interleave what remains."
+      - "Looping over `i` in increasing order gives lexicographic order automatically."
+      - "Count = `(sum)! / (c0! * c1! * ...)`. Use integer division `//` to stay exact."
+    solution: |
+      import math
+
+
+      def all_schedules(counts):
+          counts = list(counts)
+          out = []
+
+          def build(prefix):
+              if all(c == 0 for c in counts):
+                  out.append(list(prefix))
+                  return
+              for i in range(len(counts)):
+                  if counts[i] > 0:
+                      counts[i] -= 1
+                      prefix.append(i)
+                      build(prefix)
+                      prefix.pop()
+                      counts[i] += 1
+
+          build([])
+          return out
+
+
+      def count_interleavings(counts):
+          total = math.factorial(sum(counts))
+          for c in counts:
+              total //= math.factorial(c)
+          return total
+    explanation: |
+      The recursion is a classic backtracking search (Lesson 4.7): choose, recurse, undo. The formula explains why this approach has limits: three threads with ten steps each already have more than 9 × 10¹² interleavings, so real model checkers prune equivalent ones.
+
+  - id: race-hunt
+    title: Hunting for races
+    difficulty: 4
+    prompt: |
+      Write `possible_results(thread_fns, make_shared, counts, key)`. Using **every** schedule from `all_schedules(counts)` (provided below, so you can focus on the idea), run the threads on a **fresh** `make_shared()` dictionary each time with `run_schedule` (also provided), and return the **sorted list of distinct values** of `shared[key]` at the end. Then write `has_race(thread_fns, make_shared, counts, key)` that returns `True` if more than one result is possible.
+    starter: |
+      def run_schedule(thread_fns, schedule, shared):
+          gens = [f(shared) for f in thread_fns]
+          done = [False] * len(gens)
+
+          def step(i):
+              if done[i]:
+                  return
+              try:
+                  next(gens[i])
+              except StopIteration:
+                  done[i] = True
+
+          for i in schedule:
+              step(i)
+          while not all(done):
+              for i in range(len(gens)):
+                  step(i)
+          return shared
+
+
+      def all_schedules(counts):
+          counts = list(counts)
+          out = []
+
+          def build(prefix):
+              if all(c == 0 for c in counts):
+                  out.append(list(prefix))
+                  return
+              for i in range(len(counts)):
+                  if counts[i] > 0:
+                      counts[i] -= 1
+                      prefix.append(i)
+                      build(prefix)
+                      prefix.pop()
+                      counts[i] += 1
+
+          build([])
+          return out
+
+
+      def possible_results(thread_fns, make_shared, counts, key):
+          pass
+
+
+      def has_race(thread_fns, make_shared, counts, key):
+          pass
+    tests:
+      - name: increments
+        code: |
+          def racy(shared):
+              tmp = shared["n"]
+              yield
+              shared["n"] = tmp + 1
+          def atomic(shared):
+              shared["n"] += 1
+              yield
+          fresh = lambda: {"n": 0}
+          assert possible_results([racy, racy], fresh, [2, 2], "n") == [1, 2]
+          assert possible_results([racy] * 3, fresh, [2, 2, 2], "n") == [1, 2, 3]
+          assert possible_results([atomic] * 3, fresh, [2, 2, 2], "n") == [3]
+          assert has_race([racy, racy], fresh, [2, 2], "n") is True
+          assert has_race([atomic, atomic], fresh, [2, 2], "n") is False
+      - name: fresh state each time
+        code: |
+          made = []
+          def fresh():
+              d = {"n": 0}
+              made.append(d)
+              return d
+          def bump(shared):
+              shared["n"] += 1
+              yield
+          assert possible_results([bump, bump], fresh, [2, 2], "n") == [2]
+          assert len(made) == 6 and len({id(d) for d in made}) == 6
+      - name: check then act
+        code: |
+          def make(amount):
+              def t(shared):
+                  if shared["balance"] >= amount:
+                      yield
+                      shared["balance"] -= amount
+              return t
+          def make_safe(amount):
+              def t(shared):
+                  if shared["balance"] >= amount:
+                      shared["balance"] -= amount
+                  yield
+              return t
+          fresh = lambda: {"balance": 100}
+          assert possible_results([make(80), make(80)], fresh, [2, 2], "balance") == [-60, 20]
+          assert possible_results([make_safe(80), make_safe(80)], fresh, [2, 2], "balance") == [20]
+    hints:
+      - "`{run_schedule(thread_fns, s, make_shared())[key] for s in all_schedules(counts)}` is a set comprehension that does almost everything."
+      - "Call `make_shared()` inside the loop so every run starts from the initial state."
+      - "`has_race` is `len(possible_results(...)) > 1`."
+    solution: |
+      def run_schedule(thread_fns, schedule, shared):
+          gens = [f(shared) for f in thread_fns]
+          done = [False] * len(gens)
+
+          def step(i):
+              if done[i]:
+                  return
+              try:
+                  next(gens[i])
+              except StopIteration:
+                  done[i] = True
+
+          for i in schedule:
+              step(i)
+          while not all(done):
+              for i in range(len(gens)):
+                  step(i)
+          return shared
+
+
+      def all_schedules(counts):
+          counts = list(counts)
+          out = []
+
+          def build(prefix):
+              if all(c == 0 for c in counts):
+                  out.append(list(prefix))
+                  return
+              for i in range(len(counts)):
+                  if counts[i] > 0:
+                      counts[i] -= 1
+                      prefix.append(i)
+                      build(prefix)
+                      prefix.pop()
+                      counts[i] += 1
+
+          build([])
+          return out
+
+
+      def possible_results(thread_fns, make_shared, counts, key):
+          results = set()
+          for schedule in all_schedules(counts):
+              shared = run_schedule(thread_fns, schedule, make_shared())
+              results.add(shared[key])
+          return sorted(results)
+
+
+      def has_race(thread_fns, make_shared, counts, key):
+          return len(possible_results(thread_fns, make_shared, counts, key)) > 1
+    explanation: |
+      This is a miniature **model checker**. Where a normal test samples one interleaving and hopes, this tries them all and reports that the racy counter can end with 1 or 2. A single run of the real program would almost always give 2 and hide the bug.
+
+  - id: check-then-act
+    title: Fix the withdrawal
+    difficulty: 3
+    prompt: |
+      Write two thread factories for a shared account `shared["balance"]`. `make_withdraw(amount)` returns a generator function (taking `shared`) that **checks** whether the balance is at least `amount`, then `yield`s (a switch can happen), then subtracts: this is the racy version. `make_safe_withdraw(amount)` returns a generator function that does the check and the subtraction **with no `yield` between them**, so they happen as one atomic step; it should `yield` once after finishing (so it also takes two steps). In both, if the balance is too low, nothing is subtracted.
+    starter: |
+      def make_withdraw(amount):
+          def thread(shared):
+              pass
+              yield
+          return thread
+
+
+      def make_safe_withdraw(amount):
+          def thread(shared):
+              pass
+              yield
+          return thread
+    tests:
+      - name: sequential behaviour
+        code: |
+          for factory in (make_withdraw, make_safe_withdraw):
+              shared = {"balance": 100}
+              for _ in factory(80)(shared):
+                  pass
+              assert shared["balance"] == 20
+              for _ in factory(80)(shared):
+                  pass
+              assert shared["balance"] == 20      # not enough: unchanged
+              for _ in factory(20)(shared):
+                  pass
+              assert shared["balance"] == 0
+      - name: racy version can overdraw
+        code: |
+          def play(factory, order):
+              shared = {"balance": 100}
+              gens = [factory(80)(shared), factory(80)(shared)]
+              done = [False, False]
+              for who in order:
+                  if not done[who]:
+                      try:
+                          next(gens[who])
+                      except StopIteration:
+                          done[who] = True
+              return shared["balance"]
+          assert play(make_withdraw, [0, 1, 0, 1]) == -60
+          assert play(make_withdraw, [0, 0, 1, 1]) == 20
+      - name: safe version never overdraws
+        code: |
+          import itertools
+          def play(factory, order):
+              shared = {"balance": 100}
+              gens = [factory(80)(shared), factory(80)(shared)]
+              done = [False, False]
+              for who in order:
+                  if not done[who]:
+                      try:
+                          next(gens[who])
+                      except StopIteration:
+                          done[who] = True
+              return shared["balance"]
+          orders = {tuple(p) for p in itertools.permutations([0, 0, 1, 1])}
+          assert {play(make_safe_withdraw, o) for o in orders} == {20}
+          assert {play(make_withdraw, o) for o in orders} == {-60, 20}
+    hints:
+      - "Racy version: `if shared[\"balance\"] >= amount:` then `yield`, then `shared[\"balance\"] -= amount`."
+      - "Safe version: the `if` and the subtraction sit together with no `yield` between; put the `yield` after the `if` block."
+      - "With no `yield` in the body of a `with` or `if`, the generator runs the whole check-and-subtract in one `next` call. That is what atomic means here."
+    solution: |
+      def make_withdraw(amount):
+          def thread(shared):
+              if shared["balance"] >= amount:
+                  yield
+                  shared["balance"] -= amount
+          return thread
+
+
+      def make_safe_withdraw(amount):
+          def thread(shared):
+              if shared["balance"] >= amount:
+                  shared["balance"] -= amount
+              yield
+          return thread
+    explanation: |
+      In the safe version the scheduler simply has no opportunity to interleave between the check and the act. In a real program you create that guarantee with a lock around both lines (next lesson), or with a single atomic instruction, such as compare-and-swap, or a database transaction. Notice that the fix did not make the code slower or more complicated: it removed the gap.
+
+  - id: amdahl
+    title: Amdahl's law
+    difficulty: 2
+    prompt: |
+      Write `amdahl(p, n)` returning the speed-up with `n` cores when a fraction `p` of the work is parallelisable (`0 <= p <= 1`): `1 / ((1 - p) + p / n)`. Write `max_speedup(p)` returning the limit as the number of cores grows without bound (`1 / (1 - p)`), or `float("inf")` when `p == 1`. Write `cores_needed(p, target)` returning the **smallest whole number of cores** that achieves a speed-up of at least `target`, or `None` if no number of cores can reach it. A target of 1 or less needs 1 core. Beware of floating-point rounding when the target is exactly the limit.
+    starter: |
+      import math
+
+
+      def amdahl(p, n):
+          pass
+
+
+      def max_speedup(p):
+          pass
+
+
+      def cores_needed(p, target):
+          pass
+    tests:
+      - name: speedups
+        code: |
+          assert round(amdahl(0.9, 4), 3) == 3.077
+          assert round(amdahl(0.5, 1000), 3) == 1.998
+          assert amdahl(1.0, 8) == 8.0 and amdahl(0.0, 8) == 1.0
+          assert amdahl(0.8, 1) == 1.0
+          assert round(max_speedup(0.9)) == 10 and round(max_speedup(0.5), 6) == 2.0
+          assert max_speedup(1.0) == float("inf") and max_speedup(0.0) == 1.0
+      - name: cores needed
+        code: |
+          assert cores_needed(0.9, 5) == 9
+          assert cores_needed(0.5, 1.5) == 3
+          assert cores_needed(0.75, 3) == 9
+          assert cores_needed(0.95, 10) == 19
+          assert cores_needed(1.0, 8) == 8
+          assert cores_needed(0.9, 10) is None and cores_needed(0.5, 2) is None and cores_needed(0.0, 2) is None
+          assert cores_needed(0.9, 1) == 1 and cores_needed(0.9, 0.5) == 1
+          for p in (0.6, 0.8, 0.95):
+              for target in (1.5, 2.0, 3.0):
+                  n = cores_needed(p, target)
+                  if n is not None:
+                      assert amdahl(p, n) >= target - 1e-9 and (n == 1 or amdahl(p, n - 1) < target)
+    hints:
+      - "`max_speedup`: handle `p == 1` separately to avoid dividing by zero."
+      - "For `cores_needed`: you need `(1 - p) + p / n <= 1 / target`, so `p / n <= 1 / target - (1 - p)`."
+      - "Let `gap = 1 / target - (1 - p)`. If `gap` is zero or tiny (use `<= 1e-12`), no `n` works. Otherwise `n = ceil(p / gap)`; subtract a tiny `1e-9` before `ceil` to avoid rounding up from float noise."
+    solution: |
+      import math
+
+
+      def amdahl(p, n):
+          return 1 / ((1 - p) + p / n)
+
+
+      def max_speedup(p):
+          if p >= 1:
+              return float("inf")
+          return 1 / (1 - p)
+
+
+      def cores_needed(p, target):
+          if target <= 1:
+              return 1
+          gap = 1 / target - (1 - p)
+          if gap <= 1e-12:
+              return None
+          return max(1, math.ceil(p / gap - 1e-9))
+    explanation: |
+      Amdahl's law is a reality check for parallel programming. Going from 9 cores to 90 buys almost nothing for a program that is 90% parallel, because 10% of the work is still sequential. The sequential part, such as locks that make every thread wait in turn, is the real enemy of scalability.
+
+commonMistakes:
+  - title: Assuming `x += 1` is atomic
+    explanation: |
+      It is a read, an add and a write. Two threads can interleave between the steps and lose an update. Use a lock or an atomic type.
+  - title: Testing once and concluding the code is thread-safe
+    explanation: |
+      Races depend on timing. A program can pass a thousand runs and fail on the next. Reason about all interleavings, or use tools made for the job.
+  - title: Check-then-act without protection
+    explanation: |
+      Anything of the form "if the condition holds, do the thing" on shared state needs the check and the action to be one atomic step.
+  - title: Using threads to speed up CPU-bound Python
+    explanation: |
+      The GIL lets one thread run Python bytecode at a time. Use processes, or vectorised libraries, for CPU-bound work.
+  - title: Expecting linear speed-up from more cores
+    explanation: |
+      The sequential fraction of a program caps the speed-up (Amdahl's law), and contention for locks lowers it further.
+  - title: Sharing mutable state when you do not have to
+    explanation: |
+      The safest shared variable is one that doesn't exist. Prefer passing messages or giving each thread its own data and combining the results at the end.
+
+summary:
+  - "A **thread** is a unit of execution inside a process. Threads share the heap, globals and files but each has its own stack and registers. They are cheaper than processes but share their failures."
+  - "**Concurrency** is tasks overlapping in time; **parallelism** is tasks running at the same instant on several cores."
+  - "A **race condition** occurs when the result depends on thread timing. The classic **lost update** comes from the non-atomic read-modify-write of `counter += 1`."
+  - "**Check-then-act** bugs (and TOCTOU) arise when a condition can change between the check and the action."
+  - "Two threads of *a* and *b* steps have (a+b)!/(a!b!) interleavings; testing a few cannot show the absence of races, but enumerating all of them in a small model can."
+  - "The Python **GIL** stops threads speeding up CPU-bound code but does not prevent races. **Amdahl's law**: speed-up = 1/((1−p)+p/n), with limit 1/(1−p)."
+next: |
+  The cure for races is to make critical sections **mutually exclusive**. Lesson 10.5 introduces locks, semaphores and condition variables, builds them on top of a toy scheduler, and uses them to solve the famous producer-consumer problem correctly.
+
+quiz:
+  - type: mcq
+    question: Which of these is NOT shared between the threads of one process?
+    options: ["Each thread's stack", "The heap", "Global variables", "Open files"]
+    answer: 0
+    explanation: "Each thread has its own stack and registers, so it has its own local variables."
+  - type: mcq
+    question: Two threads each run counter = counter + 1 on a shared counter that starts at 0. Which final values are possible?
+    options: ["1 or 2", "Only 2", "Only 1", "0, 1 or 2"]
+    answer: 0
+    explanation: "If both read 0 before either writes, the result is 1. If one completes first, the result is 2."
+  - type: mcq
+    question: What is a race condition?
+    options: [
+      "A bug where the result depends on the timing of threads",
+      "A program that runs too fast",
+      "Two processes competing for the CPU",
+      "A thread that never ends"
+    ]
+    answer: 0
+    explanation: "The outcome varies with the interleaving chosen by the scheduler."
+  - type: mcq
+    question: How many ways can two threads of 3 steps each be interleaved?
+    options: ["20", "6", "9", "720"]
+    answer: 0
+    explanation: "6! / (3! × 3!) = 720 / 36 = 20."
+  - type: mcq
+    question: A program is 80% parallelisable. What is the best possible speed-up with unlimited cores?
+    options: ["5", "80", "1.25", "Unlimited"]
+    answer: 0
+    explanation: "1 / (1 − 0.8) = 5. The sequential 20% limits it."
+  - type: mcq
+    question: Does the Python GIL make `counter += 1` safe across threads?
+    options: [
+      "No, a thread switch can happen between the bytecodes of the update",
+      "Yes, it makes all operations atomic",
+      "Only on Windows",
+      "Only for integers smaller than 256"
+    ]
+    answer: 0
+    explanation: "The GIL protects the interpreter, not your logic. You still need a lock for read-modify-write."
+  - type: code
+    question: |
+      Write `interleavings(a, b)` returning the number of ways to interleave two threads with `a` and `b` steps (use `math.comb`).
+    starter: |
+      import math
+
+
+      def interleavings(a, b):
+          pass
+    tests:
+      - name: count
+        code: |
+          assert interleavings(2, 2) == 6
+          assert interleavings(3, 3) == 20
+          assert interleavings(0, 5) == 1
+          assert interleavings(10, 10) == 184756
+    solution: |
+      import math
+
+
+      def interleavings(a, b):
+          return math.comb(a + b, a)

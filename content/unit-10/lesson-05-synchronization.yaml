@@ -1,0 +1,1006 @@
+id: u10-synchronization
+title: "Synchronization: Locks, Semaphores and Monitors"
+minutes: 60
+objective: |
+  Learn the tools that make shared memory safe: mutual exclusion with locks, counting with semaphores, waiting for conditions, and lock-free updates with compare-and-swap. Build a semaphore and a mutex from scratch, run threads on a small cooperative kernel, and solve the classic producer-consumer problem correctly.
+outcomes:
+  - "State the three requirements of a critical-section solution: mutual exclusion, progress and bounded waiting"
+  - Explain how hardware atomic instructions (test-and-set, compare-and-swap) make locks possible
+  - Implement a semaphore with a wait queue and use it as a mutex and as a counter
+  - Solve the bounded-buffer producer-consumer problem with three semaphores
+  - Explain monitors and condition variables, and why waits go in loops
+  - Describe the readers-writers problem and lock-free updates
+
+sections:
+  - heading: Mutual exclusion
+    body: |
+      Lesson 10.4 showed that two threads updating shared data can lose updates. The fix is to make the **critical section** (the code touching the shared data) execute by **one thread at a time**. A correct solution must provide:
+
+      1. **Mutual exclusion**: at most one thread inside the critical section at any moment.
+      2. **Progress**: if no thread is inside and some want to enter, one of them is allowed to, in finite time (nobody waits for a thread that isn't interested).
+      3. **Bounded waiting**: once a thread asks to enter, only a limited number of other threads may enter before it does (no starvation).
+
+      The standard tool is a **lock** (also called a **mutex**, short for mutual exclusion). Before entering, a thread **acquires** the lock; if another thread holds it, the caller waits. After leaving, it **releases** the lock.
+
+      ```python
+      lock.acquire()
+      counter += 1          # critical section
+      lock.release()
+      ```
+
+      In Python the safe way is `with lock:`, which releases automatically even if an exception happens. Forgetting to release, or releasing twice, are classic bugs.
+
+      **Keep critical sections short.** While a thread holds a lock, every other thread that needs it is stuck. Lock the data for the shortest time possible, and never do slow things (disk, network) while holding a lock if you can avoid it.
+
+  - heading: Where locks come from
+    body: |
+      How can software build a lock out of nothing? A naive attempt (`while locked: pass; locked = True`) has the same check-then-act race it was meant to fix. Early solutions like **Peterson's algorithm** achieve mutual exclusion using only ordinary reads and writes, but they are subtle and break on modern CPUs that reorder memory operations.
+
+      Real locks use special **atomic instructions** that the hardware guarantees cannot be interrupted, even across cores:
+
+      - **Test-and-set**: atomically read a flag and set it to 1, returning the old value. Acquire: `while test_and_set(flag) == 1: pass`. This is a **spinlock**: it wastes CPU while waiting, but is good for very short waits on multi-core machines.
+      - **Compare-and-swap (CAS)**: atomically do `if x == expected: x = new; return True; else return False`. It is the building block of nearly all lock-free programming.
+
+      A lock that makes the waiting thread **sleep** (the kernel marks it waiting and runs someone else, Lesson 10.2) saves CPU for long waits, but costs a context switch. Real locks (like Linux's **futex**) spin briefly and then sleep.
+
+      **Lock-free updates.** With CAS you can update a shared value with no lock at all: read the old value, compute the new one, and CAS it in; if somebody else changed it meanwhile, the CAS fails and you simply retry. No thread can ever block another, which avoids deadlock (next lesson) and priority inversion. But it takes care to get right. A famous trap is the **ABA problem**: the value changes from A to B and back to A, so the CAS succeeds although the world changed underneath it.
+
+  - heading: Semaphores
+    body: |
+      A **semaphore**, invented by Edsger Dijkstra in 1965, is an integer counter with a queue of sleeping threads and two atomic operations:
+
+      - **`wait(s)`** (also called P, down, or acquire): if the counter is above 0, decrement it and continue. If it is 0, the thread **blocks**, joining the semaphore's queue.
+      - **`signal(s)`** (V, up, release, or post): if a thread is waiting, wake the first one in the queue (it takes the unit directly). Otherwise increment the counter.
+
+      A semaphore initialised to **1** is a **binary semaphore**, which works as a mutex. A semaphore initialised to *N* is a **counting semaphore**, which lets up to *N* threads in at once: *N* database connections, *N* slots in a buffer, *N* licences. A semaphore initialised to **0** is a signal: one thread waits until another says "go".
+
+      A subtle difference from a mutex: a semaphore has no **owner**, so any thread may signal it. This makes semaphores flexible (one thread can signal an event for another), and also easier to misuse.
+
+      **Producer-consumer (bounded buffer).** Producers add items to a buffer of capacity *N*; consumers remove them. Producers must wait if the buffer is full; consumers must wait if it is empty; and the buffer itself must not be touched by two threads at once. Three semaphores solve it:
+
+      ```text
+      empty = Semaphore(N)    # free slots
+      full  = Semaphore(0)    # filled slots
+      mutex = Semaphore(1)    # protects the buffer
+
+      producer:                  consumer:
+        wait(empty)                wait(full)
+        wait(mutex)                wait(mutex)
+        add item                   remove item
+        signal(mutex)              signal(mutex)
+        signal(full)               signal(empty)
+      ```
+
+      **Order matters.** If the producer waited on `mutex` *before* `empty`, then a producer holding the mutex while the buffer is full would block forever, and no consumer could get the mutex to make room. That's a **deadlock**, the subject of the next lesson.
+
+  - heading: Monitors and condition variables
+    body: |
+      Semaphores are low-level and easy to get wrong. A **monitor** packages shared data together with the code that accesses it, and guarantees that only **one thread at a time** executes inside the monitor. Java's `synchronized` methods and Python's `threading.Condition` work this way.
+
+      Inside a monitor, threads may need to wait for a **condition** ("buffer not empty"). A **condition variable** supports:
+
+      - **`wait()`**: atomically release the monitor's lock and go to sleep; when woken, re-acquire the lock before continuing.
+      - **`notify()`** / **`notify_all()`**: wake one / all sleeping threads.
+
+      Always wait **in a loop**:
+
+      ```python
+      with cond:
+          while not buffer:          # NOT "if"
+              cond.wait()
+          item = buffer.pop(0)
+      ```
+
+      Why a `while` and not an `if`? Another thread may have taken the item between the wake-up and your re-acquiring the lock, and some systems wake threads **spuriously**. Re-checking the condition makes the code correct either way.
+
+  - heading: Readers and writers, and other classics
+    body: |
+      Many threads may safely **read** shared data at once, but a **writer** needs exclusive access. A **readers-writers lock** (Python has none built in; Java has `ReadWriteLock`) lets any number of readers in together, or one writer alone. The design question is who gets priority: if readers always win, writers may starve, and vice versa.
+
+      Other classic synchronisation problems you will meet:
+
+      - **Dining philosophers**: five philosophers share five forks and each needs two to eat. A trap for deadlock (Lesson 10.6).
+      - **Barrier**: all threads must reach a point before any continues (used in parallel simulations).
+      - **Sleeping barber, cigarette smokers**: puzzles that exercise different coordination patterns.
+
+      **Tips for real programs.** (1) Prefer higher-level tools: queues (`queue.Queue` is a thread-safe bounded buffer), thread pools and message passing. (2) Share as little mutable state as you can. (3) Always acquire multiple locks in the **same global order**. (4) Hold locks briefly. (5) Test under stress and with tools like thread sanitizers; reasoning alone misses things.
+
+examples:
+  - title: A semaphore and a small kernel
+    intro: "Threads are generators that yield requests (step, wait, signal). The kernel runs them in turns and puts blocked threads to sleep on the semaphore's queue."
+    code: |
+      from collections import deque
+
+
+      class Semaphore:
+          def __init__(self, value):
+              self.value = value
+              self.queue = deque()
+
+          def wait(self, thread):
+              if self.value > 0:
+                  self.value -= 1
+                  return True              # got it
+              self.queue.append(thread)
+              return False                 # must sleep
+
+          def signal(self):
+              if self.queue:
+                  return self.queue.popleft()   # hand the unit to the oldest sleeper
+              self.value += 1
+              return None
+
+
+      class Kernel:
+          def __init__(self):
+              self.ready = deque()
+              self.blocked = 0
+
+          def spawn(self, thread):
+              self.ready.append(thread)
+
+          def run(self):
+              while self.ready:
+                  t = self.ready.popleft()
+                  try:
+                      request = next(t)
+                  except StopIteration:
+                      continue
+                  if request[0] == "step":
+                      self.ready.append(t)
+                  elif request[0] == "wait":
+                      if request[1].wait(t):
+                          self.ready.append(t)
+                      else:
+                          self.blocked += 1
+                  elif request[0] == "signal":
+                      woken = request[1].signal()
+                      if woken is not None:
+                          self.blocked -= 1
+                          self.ready.append(woken)
+                      self.ready.append(t)
+              if self.blocked:
+                  raise RuntimeError(f"deadlock: {self.blocked} threads asleep forever")
+
+
+      def counter(shared, sem, times):
+          for _ in range(times):
+              yield ("wait", sem)
+              tmp = shared["n"]
+              yield ("step",)              # a switch here is harmless: nobody else can be inside
+              shared["n"] = tmp + 1
+              yield ("signal", sem)
+
+
+      for label, start in (("mutex (value 1)", 1), ("no protection (value 3)", 3)):
+          kernel, shared, sem = Kernel(), {"n": 0}, Semaphore(start)
+          for _ in range(3):
+              kernel.spawn(counter(shared, sem, 3))
+          kernel.run()
+          print(f"{label:24} 3 threads x 3 increments = {shared['n']}")
+    output: |
+      mutex (value 1)          3 threads x 3 increments = 9
+      no protection (value 3)  3 threads x 3 increments = 3
+    lines:
+      - line: 9
+        note: "A positive count means a unit is free: take it and carry on."
+      - line: 12
+        note: "Otherwise the caller goes to sleep on the queue. In a real OS it is marked waiting (Lesson 10.2)."
+      - line: 16
+        note: "Signal hands the unit straight to the first sleeper (FIFO), which guarantees bounded waiting."
+      - line: 55
+        note: "The critical section is the read, the step and the write. The step is exactly where the race of Lesson 10.4 could occur."
+      - line: 62
+        note: "A semaphore with value 3 lets all three threads in at once, so it protects nothing and updates are lost."
+  - title: Producer and consumer with a bounded buffer
+    intro: "Three semaphores: empty slots, filled slots, and a mutex for the buffer. The buffer never exceeds its capacity."
+    code: |
+      from collections import deque
+
+
+      class Semaphore:
+          def __init__(self, value):
+              self.value, self.queue = value, deque()
+
+          def wait(self, t):
+              if self.value > 0:
+                  self.value -= 1
+                  return True
+              self.queue.append(t)
+              return False
+
+          def signal(self):
+              if self.queue:
+                  return self.queue.popleft()
+              self.value += 1
+              return None
+
+
+      def run(threads):
+          ready, blocked = deque(threads), 0
+          while ready:
+              t = ready.popleft()
+              try:
+                  op, sem = next(t)
+              except StopIteration:
+                  continue
+              if op == "step":
+                  ready.append(t)
+              elif op == "wait":
+                  if sem.wait(t):
+                      ready.append(t)
+                  else:
+                      blocked += 1
+              else:
+                  woken = sem.signal()
+                  if woken is not None:
+                      blocked -= 1
+                      ready.append(woken)
+                  ready.append(t)
+          return blocked
+
+
+      def producer(count, buf, empty, full, mutex, log):
+          for i in range(count):
+              yield ("wait", empty)
+              yield ("wait", mutex)
+              buf.append(i)
+              log.append(f"put {i} (buffer holds {len(buf)})")
+              yield ("signal", mutex)
+              yield ("signal", full)
+
+
+      def consumer(count, buf, empty, full, mutex, log):
+          for _ in range(count):
+              for _ in range(4):
+                  yield ("step", None)     # the consumer is slow
+              yield ("wait", full)
+              yield ("wait", mutex)
+              item = buf.pop(0)
+              log.append(f"got {item} (buffer holds {len(buf)})")
+              yield ("signal", mutex)
+              yield ("signal", empty)
+
+
+      buf, log = [], []
+      empty, full, mutex = Semaphore(2), Semaphore(0), Semaphore(1)
+      stuck = run([producer(5, buf, empty, full, mutex, log), consumer(5, buf, empty, full, mutex, log)])
+      print("\n".join(log))
+      print("threads stuck:", stuck)
+    output: |
+      put 0 (buffer holds 1)
+      put 1 (buffer holds 2)
+      got 0 (buffer holds 1)
+      put 2 (buffer holds 2)
+      got 1 (buffer holds 1)
+      put 3 (buffer holds 2)
+      got 2 (buffer holds 1)
+      put 4 (buffer holds 2)
+      got 3 (buffer holds 1)
+      got 4 (buffer holds 0)
+      threads stuck: 0
+    lines:
+      - line: 51
+        note: "Wait for a free slot first, then for the mutex. Reversing these two lines would risk deadlock."
+      - line: 54
+        note: "The buffer has capacity 2, so it never holds more than 2 items, even though the producer wants to make 5."
+      - line: 66
+        note: "Consumers mirror the producers: wait for a filled slot, take the mutex, remove, and free a slot."
+      - line: 73
+        note: "0 means everything finished: no thread is left asleep."
+  - title: A deadlock from the wrong order
+    intro: "The consumer takes the mutex first and then waits for an item. The producer can never get the mutex to supply one."
+    code: |
+      from collections import deque
+
+
+      class Semaphore:
+          def __init__(self, value):
+              self.value, self.queue = value, deque()
+
+          def wait(self, t):
+              if self.value > 0:
+                  self.value -= 1
+                  return True
+              self.queue.append(t)
+              return False
+
+          def signal(self):
+              if self.queue:
+                  return self.queue.popleft()
+              self.value += 1
+              return None
+
+
+      def run(threads):
+          ready, blocked = deque(threads), 0
+          while ready:
+              t = ready.popleft()
+              try:
+                  op, sem = next(t)
+              except StopIteration:
+                  continue
+              if op == "wait":
+                  if sem.wait(t):
+                      ready.append(t)
+                  else:
+                      blocked += 1
+              else:
+                  woken = sem.signal()
+                  if woken is not None:
+                      blocked -= 1
+                      ready.append(woken)
+                  ready.append(t)
+          return blocked
+
+
+      def bad_consumer(buf, full, mutex):
+          yield ("wait", mutex)       # grabs the lock first...
+          yield ("wait", full)        # ...then sleeps until an item exists
+          buf.pop()
+          yield ("signal", mutex)
+
+
+      def producer(buf, full, mutex):
+          yield ("wait", mutex)       # can never get the lock
+          buf.append("item")
+          yield ("signal", mutex)
+          yield ("signal", full)
+
+
+      buf, full, mutex = [], Semaphore(0), Semaphore(1)
+      print("threads stuck forever:", run([bad_consumer(buf, full, mutex), producer(buf, full, mutex)]))
+    output: |
+      threads stuck forever: 2
+    lines:
+      - line: 46
+        note: "The consumer holds the mutex while it sleeps. Whoever could wake it needs that very mutex."
+      - line: 53
+        note: "Neither thread can proceed: each waits for something only the other could provide. That is deadlock."
+  - title: Locks in real Python
+    intro: "The same ideas with the real threading module. Not run here, because the browser cannot start threads."
+    runnable: false
+    code: |
+      import threading, queue
+
+      lock = threading.Lock()
+      total = 0
+
+      def add(n):
+          global total
+          for _ in range(100_000):
+              with lock:            # acquire, then always release
+                  total += n
+
+      threads = [threading.Thread(target=add, args=(1,)) for _ in range(4)]
+      for t in threads: t.start()
+      for t in threads: t.join()
+      print(total)                  # always 400000
+
+      # A thread-safe bounded buffer: Queue already does the semaphore work for you
+      q = queue.Queue(maxsize=2)
+      def produce():
+          for i in range(5):
+              q.put(i)              # blocks when full
+      def consume():
+          for _ in range(5):
+              print(q.get())        # blocks when empty
+      p, c = threading.Thread(target=produce), threading.Thread(target=consume)
+      p.start(); c.start(); p.join(); c.join()
+    lines:
+      - line: 9
+        note: "with lock: acquires on entry and releases on exit, even if the body raises an exception."
+      - line: 20
+        note: "queue.Queue is the producer-consumer pattern packaged: two semaphores and a mutex inside."
+
+playground:
+  prompt: |
+    Use the producer-consumer example with two producers and one consumer, or change the buffer capacity to 1. Does the log change? Then try swapping the two `wait` lines in the producer and run it with a capacity of 1 and a consumer that starts later. Can you reproduce a deadlock?
+  code: |
+    def cas(shared, key, expected, new):
+        if shared[key] == expected:
+            shared[key] = new
+            return True
+        return False
+
+
+    box = {"x": 10}
+    print(cas(box, "x", 10, 11), box)
+    print(cas(box, "x", 10, 12), box)   # fails: x is no longer 10
+
+exercises:
+  - id: semaphore
+    title: Build a semaphore
+    difficulty: 3
+    prompt: |
+      Write the class `Semaphore`. It starts with an integer `value` (attribute `value`) and an empty FIFO queue of waiting thread ids (attribute `queue`, a list or deque). `wait(tid)` returns `True` if the thread may continue (the counter was above 0 and is decremented); otherwise it appends `tid` to the queue and returns `False` (the thread must sleep). `signal()` returns the id of the thread that is woken, if any: when the queue is non-empty, remove and return its **first** thread (the counter does **not** change, since the unit passes directly to that thread); when the queue is empty, increment the counter and return `None`.
+    starter: |
+      class Semaphore:
+          def __init__(self, value):
+              pass
+
+          def wait(self, tid):
+              pass
+
+          def signal(self):
+              pass
+    tests:
+      - name: wait and signal
+        code: |
+          s = Semaphore(2)
+          assert s.wait("a") is True and s.wait("b") is True and s.value == 0
+          assert s.wait("c") is False and s.wait("d") is False
+          assert list(s.queue) == ["c", "d"]
+          assert s.signal() == "c" and s.value == 0 and list(s.queue) == ["d"]
+          assert s.signal() == "d" and s.value == 0
+          assert s.signal() is None and s.value == 1
+          assert s.signal() is None and s.value == 2
+      - name: zero and binary
+        code: |
+          s = Semaphore(0)
+          assert s.wait("x") is False
+          assert s.signal() == "x" and s.value == 0
+          m = Semaphore(1)
+          assert m.wait(1) is True and m.wait(2) is False and m.wait(3) is False
+          assert m.signal() == 2 and m.signal() == 3 and m.signal() is None and m.value == 1
+    hints:
+      - "Use `collections.deque` (or a list with `pop(0)`) for the queue so threads are woken in arrival order."
+      - "A woken thread takes the unit directly, so `signal` must not also increment `value` in that case."
+    solution: |
+      from collections import deque
+
+
+      class Semaphore:
+          def __init__(self, value):
+              self.value = value
+              self.queue = deque()
+
+          def wait(self, tid):
+              if self.value > 0:
+                  self.value -= 1
+                  return True
+              self.queue.append(tid)
+              return False
+
+          def signal(self):
+              if self.queue:
+                  return self.queue.popleft()
+              self.value += 1
+              return None
+    explanation: |
+      Handing the unit straight to the first waiter, rather than incrementing the counter and letting everyone race for it, is what makes the semaphore **fair**: sleepers are served in the order they arrived, so nobody starves. The real thing needs the whole of `wait` and `signal` to be atomic, which the kernel arranges using a spinlock or by disabling interrupts for these few instructions.
+
+  - id: mutex
+    title: A mutex from a semaphore
+    difficulty: 3
+    prompt: |
+      Write the class `Mutex` using a binary `Semaphore` (provided below). `lock(tid)` returns `True` if the thread now owns the mutex, otherwise queues the thread and returns `False`. `unlock(tid)` releases the mutex: it raises `RuntimeError` if `tid` is not the current owner (including when the mutex is unlocked). Otherwise, if some thread is waiting, ownership passes to the **first** waiter and `unlock` returns that thread's id; if nobody waits the mutex becomes free (`owner` is `None`) and `unlock` returns `None`. Keep the owner in the attribute `owner`.
+    starter: |
+      from collections import deque
+
+
+      class Semaphore:
+          def __init__(self, value):
+              self.value = value
+              self.queue = deque()
+
+          def wait(self, tid):
+              if self.value > 0:
+                  self.value -= 1
+                  return True
+              self.queue.append(tid)
+              return False
+
+          def signal(self):
+              if self.queue:
+                  return self.queue.popleft()
+              self.value += 1
+              return None
+
+
+      class Mutex:
+          def __init__(self):
+              pass
+
+          def lock(self, tid):
+              pass
+
+          def unlock(self, tid):
+              pass
+    tests:
+      - name: ownership and handoff
+        code: |
+          m = Mutex()
+          assert m.owner is None
+          assert m.lock("a") is True and m.owner == "a"
+          assert m.lock("b") is False and m.lock("c") is False
+          assert m.owner == "a"
+          assert m.unlock("a") == "b" and m.owner == "b"
+          assert m.unlock("b") == "c" and m.owner == "c"
+          assert m.unlock("c") is None and m.owner is None
+          assert m.lock("z") is True and m.owner == "z"
+      - name: only the owner may unlock
+        code: |
+          m = Mutex()
+          for who in ("a", None):
+              try:
+                  m.unlock(who)
+                  assert False, "unlocking a free mutex must fail"
+              except RuntimeError:
+                  pass
+          m.lock("a")
+          m.lock("b")
+          try:
+              m.unlock("b")          # b is only waiting
+              assert False
+          except RuntimeError:
+              pass
+          assert m.owner == "a"
+    hints:
+      - "Keep `self.sem = Semaphore(1)` and `self.owner = None`."
+      - "`lock`: `if self.sem.wait(tid): self.owner = tid; return True`, otherwise return `False`."
+      - "`unlock`: check the owner first. Then `woken = self.sem.signal()`; the owner becomes `woken` (which may be `None`)."
+    solution: |
+      from collections import deque
+
+
+      class Semaphore:
+          def __init__(self, value):
+              self.value = value
+              self.queue = deque()
+
+          def wait(self, tid):
+              if self.value > 0:
+                  self.value -= 1
+                  return True
+              self.queue.append(tid)
+              return False
+
+          def signal(self):
+              if self.queue:
+                  return self.queue.popleft()
+              self.value += 1
+              return None
+
+
+      class Mutex:
+          def __init__(self):
+              self.sem = Semaphore(1)
+              self.owner = None
+
+          def lock(self, tid):
+              if self.sem.wait(tid):
+                  self.owner = tid
+                  return True
+              return False
+
+          def unlock(self, tid):
+              if self.owner is None or self.owner != tid:
+                  raise RuntimeError("unlock by a thread that does not hold the lock")
+              woken = self.sem.signal()
+              self.owner = woken
+              return woken
+    explanation: |
+      A mutex is a binary semaphore plus **ownership**. The ownership check catches a common bug (releasing a lock you never took) and enables features like priority inheritance, since the kernel knows whom to boost. Python's `threading.RLock` adds a counter on top so that the owner can lock repeatedly.
+
+  - id: critical-section
+    title: Protect a counter
+    difficulty: 3
+    prompt: |
+      A small cooperative kernel runs threads written as generators that yield requests: `("step",)` allows a switch, `("wait", sem)` waits on a semaphore and `("signal", sem)` signals it. Write the generator function `counter_thread(shared, sem, times)`. It performs `times` increments of `shared["n"]`; each increment must **wait** on `sem`, read the value, `("step",)` (so a switch could happen mid-update), write the value plus one, then **signal** `sem`. With a binary semaphore the final count must be exactly right however the threads are scheduled.
+    starter: |
+      def counter_thread(shared, sem, times):
+          for _ in range(times):
+              yield ("step",)
+    tests:
+      - name: protected by a binary semaphore
+        code: |
+          from collections import deque
+          class Semaphore:
+              def __init__(self, value):
+                  self.value, self.queue = value, deque()
+              def wait(self, t):
+                  if self.value > 0:
+                      self.value -= 1
+                      return True
+                  self.queue.append(t)
+                  return False
+              def signal(self):
+                  if self.queue:
+                      return self.queue.popleft()
+                  self.value += 1
+          def run(threads):
+              ready, blocked = deque(threads), 0
+              while ready:
+                  t = ready.popleft()
+                  try:
+                      req = next(t)
+                  except StopIteration:
+                      continue
+                  if req[0] == "step":
+                      ready.append(t)
+                  elif req[0] == "wait":
+                      if req[1].wait(t):
+                          ready.append(t)
+                      else:
+                          blocked += 1
+                  else:
+                      w = req[1].signal()
+                      if w is not None:
+                          blocked -= 1
+                          ready.append(w)
+                      ready.append(t)
+              return blocked
+          for n_threads, times in ((1, 5), (2, 4), (3, 3), (5, 2)):
+              shared, sem = {"n": 0}, Semaphore(1)
+              stuck = run([counter_thread(shared, sem, times) for _ in range(n_threads)])
+              assert stuck == 0 and shared["n"] == n_threads * times, (n_threads, times, shared)
+              assert sem.value == 1 and not sem.queue
+      - name: the step really is inside the critical section
+        code: |
+          from collections import deque
+          class Semaphore:
+              def __init__(self, value):
+                  self.value, self.queue = value, deque()
+              def wait(self, t):
+                  if self.value > 0:
+                      self.value -= 1
+                      return True
+                  self.queue.append(t)
+                  return False
+              def signal(self):
+                  if self.queue:
+                      return self.queue.popleft()
+                  self.value += 1
+          shared, sem = {"n": 0}, Semaphore(5)
+          ready = deque(counter_thread(shared, sem, 3) for _ in range(3))
+          while ready:
+              t = ready.popleft()
+              try:
+                  req = next(t)
+              except StopIteration:
+                  continue
+              if req[0] == "wait":
+                  assert req[1].wait(t)
+                  ready.append(t)
+              elif req[0] == "signal":
+                  req[1].signal()
+                  ready.append(t)
+              else:
+                  ready.append(t)
+          assert shared["n"] < 9, "with a semaphore that lets everyone in, updates must be lost"
+    hints:
+      - "Each loop turn: `yield (\"wait\", sem)`, `tmp = shared[\"n\"]`, `yield (\"step\",)`, `shared[\"n\"] = tmp + 1`, `yield (\"signal\", sem)`."
+      - "Do the read and the write between the wait and the signal."
+    solution: |
+      def counter_thread(shared, sem, times):
+          for _ in range(times):
+              yield ("wait", sem)
+              tmp = shared["n"]
+              yield ("step",)
+              shared["n"] = tmp + 1
+              yield ("signal", sem)
+    explanation: |
+      The same code that loses updates when the semaphore admits everyone (second test) is exactly right when the semaphore admits one at a time. The structure `wait ... signal` around a critical section is the entire recipe. Making sure it is released on every path, including errors, is why Python offers `with lock:`.
+
+  - id: bounded-buffer
+    title: Producers and consumers
+    difficulty: 4
+    prompt: |
+      Using the request protocol from the previous exercise, write two generator functions. `producer(items, buf, empty, full, mutex)` adds each of `items` to the list `buf`, and `consumer(n, buf, empty, full, mutex, out)` removes `n` items from the front of `buf` (`buf.pop(0)`) and appends each to the list `out`. The semaphores are `empty` (free slots, initially the capacity), `full` (filled slots, initially 0) and `mutex` (initially 1). The buffer must never overflow its capacity, no item may be lost or duplicated, and the threads must never deadlock. Mind the order of the `wait` calls.
+    starter: |
+      def producer(items, buf, empty, full, mutex):
+          for item in items:
+              yield ("step",)
+
+
+      def consumer(n, buf, empty, full, mutex, out):
+          for _ in range(n):
+              yield ("step",)
+    tests:
+      - name: single producer and consumer
+        code: |
+          from collections import deque
+          class Semaphore:
+              def __init__(self, value):
+                  self.value, self.queue = value, deque()
+              def wait(self, t):
+                  if self.value > 0:
+                      self.value -= 1
+                      return True
+                  self.queue.append(t)
+                  return False
+              def signal(self):
+                  if self.queue:
+                      return self.queue.popleft()
+                  self.value += 1
+          class Buf(list):
+              peak = 0
+              def append(self, x):
+                  super().append(x)
+                  self.peak = max(self.peak, len(self))
+          def run(threads):
+              ready, blocked = deque(threads), 0
+              while ready:
+                  t = ready.popleft()
+                  try:
+                      req = next(t)
+                  except StopIteration:
+                      continue
+                  if req[0] == "step":
+                      ready.append(t)
+                  elif req[0] == "wait":
+                      if req[1].wait(t):
+                          ready.append(t)
+                      else:
+                          blocked += 1
+                  else:
+                      w = req[1].signal()
+                      if w is not None:
+                          blocked -= 1
+                          ready.append(w)
+                      ready.append(t)
+              return blocked
+          for cap in (1, 2, 5):
+              buf, out = Buf(), []
+              e, f, m = Semaphore(cap), Semaphore(0), Semaphore(1)
+              items = list(range(10))
+              stuck = run([producer(items, buf, e, f, m), consumer(10, buf, e, f, m, out)])
+              assert stuck == 0 and out == items, (cap, out)
+              assert buf.peak <= cap and buf == []
+      - name: consumer starts first and several producers
+        code: |
+          from collections import deque
+          class Semaphore:
+              def __init__(self, value):
+                  self.value, self.queue = value, deque()
+              def wait(self, t):
+                  if self.value > 0:
+                      self.value -= 1
+                      return True
+                  self.queue.append(t)
+                  return False
+              def signal(self):
+                  if self.queue:
+                      return self.queue.popleft()
+                  self.value += 1
+          class Buf(list):
+              peak = 0
+              def append(self, x):
+                  super().append(x)
+                  self.peak = max(self.peak, len(self))
+          def run(threads):
+              ready, blocked = deque(threads), 0
+              while ready:
+                  t = ready.popleft()
+                  try:
+                      req = next(t)
+                  except StopIteration:
+                      continue
+                  if req[0] == "step":
+                      ready.append(t)
+                  elif req[0] == "wait":
+                      if req[1].wait(t):
+                          ready.append(t)
+                      else:
+                          blocked += 1
+                  else:
+                      w = req[1].signal()
+                      if w is not None:
+                          blocked -= 1
+                          ready.append(w)
+                      ready.append(t)
+              return blocked
+          for cap in (1, 2, 3):
+              buf, out = Buf(), []
+              e, f, m = Semaphore(cap), Semaphore(0), Semaphore(1)
+              threads = [consumer(12, buf, e, f, m, out)]
+              for p in range(3):
+                  threads.append(producer([(p, i) for i in range(4)], buf, e, f, m))
+              stuck = run(threads)
+              assert stuck == 0, "deadlock"
+              assert sorted(out) == sorted((p, i) for p in range(3) for i in range(4))
+              for p in range(3):
+                  assert [x for x in out if x[0] == p] == [(p, i) for i in range(4)]
+              assert buf.peak <= cap
+    hints:
+      - "Producer, for each item: `yield (\"wait\", empty)`, `yield (\"wait\", mutex)`, `buf.append(item)`, `yield (\"signal\", mutex)`, `yield (\"signal\", full)`."
+      - "Consumer, `n` times: wait on `full`, then `mutex`, then `out.append(buf.pop(0))`, then signal `mutex`, then signal `empty`."
+      - "Always wait on the *counting* semaphore (empty or full) **before** the mutex, and release the mutex before signalling the counting one."
+    solution: |
+      def producer(items, buf, empty, full, mutex):
+          for item in items:
+              yield ("wait", empty)
+              yield ("wait", mutex)
+              buf.append(item)
+              yield ("signal", mutex)
+              yield ("signal", full)
+
+
+      def consumer(n, buf, empty, full, mutex, out):
+          for _ in range(n):
+              yield ("wait", full)
+              yield ("wait", mutex)
+              out.append(buf.pop(0))
+              yield ("signal", mutex)
+              yield ("signal", empty)
+    explanation: |
+      Each semaphore has one job: `empty` counts free slots and stops producers when the buffer is full, `full` counts items and stops consumers when it is empty, and `mutex` protects the list itself. The mutex is held only for the quick append or pop, never while sleeping on `empty` or `full`; that ordering is what prevents deadlock. In real Python code you would simply use `queue.Queue`.
+
+  - id: cas
+    title: Lock-free increment
+    difficulty: 3
+    prompt: |
+      Write `cas(shared, key, expected, new)`, which atomically sets `shared[key] = new` and returns `True` if `shared[key] == expected`, or leaves it alone and returns `False` otherwise. (It is one function call here, so treat it as atomic.) Then write the thread generator `cas_increment(shared)`, which increments `shared["n"]` **without any lock**: loop to read the current value into `old`, `yield` (a switch may happen), then try `cas(shared, "n", old, old + 1)`; stop when it succeeds, and retry from the read if it fails.
+    starter: |
+      def cas(shared, key, expected, new):
+          pass
+
+
+      def cas_increment(shared):
+          yield
+    tests:
+      - name: cas semantics
+        code: |
+          d = {"x": 5}
+          assert cas(d, "x", 5, 6) is True and d == {"x": 6}
+          assert cas(d, "x", 5, 7) is False and d == {"x": 6}
+          assert cas(d, "x", 6, 6) is True
+      - name: no lost updates under random schedules
+        code: |
+          import random
+          assert "cas(" in source
+          rng = random.Random(7)
+          retried = False
+          for trial in range(300):
+              shared = {"n": 0}
+              k = rng.randint(2, 5)
+              gens = [cas_increment(shared) for _ in range(k)]
+              alive = list(range(k))
+              steps = 0
+              while alive:
+                  i = rng.choice(alive)
+                  steps += 1
+                  assert steps < 1000, "a thread never finishes"
+                  try:
+                      next(gens[i])
+                  except StopIteration:
+                      alive.remove(i)
+              assert shared["n"] == k, (trial, shared)
+              if steps > 2 * k:
+                  retried = True
+          assert retried, "some schedule should force a retry"
+    hints:
+      - "`cas`: compare, and if equal assign and return True; otherwise return False."
+      - "`cas_increment`: `while True:` read `old = shared[\"n\"]`, `yield`, then `if cas(shared, \"n\", old, old + 1): return`."
+    solution: |
+      def cas(shared, key, expected, new):
+          if shared[key] == expected:
+              shared[key] = new
+              return True
+          return False
+
+
+      def cas_increment(shared):
+          while True:
+              old = shared["n"]
+              yield
+              if cas(shared, "n", old, old + 1):
+                  return
+    explanation: |
+      If another thread changed the value between the read and the CAS, the CAS fails and the loop retries with fresh data. Some thread always makes progress, so the whole system never gets stuck, which is the defining property of **lock-free** algorithms. Hardware CAS instructions (`lock cmpxchg` on x86) power atomic counters, lock-free queues and the internals of most language runtimes.
+
+commonMistakes:
+  - title: Waiting with an if instead of a while
+    explanation: |
+      A condition may no longer hold by the time a woken thread runs. Re-check it in a loop.
+  - title: Taking the mutex before waiting on a counting semaphore
+    explanation: |
+      Holding the mutex while sleeping blocks everyone who could wake you: deadlock. Wait on `empty` or `full` first, then lock.
+  - title: Forgetting to release a lock on an error path
+    explanation: |
+      An exception inside the critical section leaves the lock held forever. Use `with lock:` or `try/finally`.
+  - title: Holding a lock during slow work
+    explanation: |
+      Network or disk calls inside a critical section stall every other thread that needs the lock. Copy what you need, release, then do the slow part.
+  - title: Locking different data with different locks inconsistently
+    explanation: |
+      If one code path protects a variable with lock A and another with lock B, nothing protects it. Each shared variable needs one lock that is always used.
+  - title: Using a spinlock for long waits
+    explanation: |
+      Spinning burns CPU. Use it only when the wait is shorter than a context switch.
+
+summary:
+  - "A critical-section solution must give **mutual exclusion**, **progress** and **bounded waiting**. A **mutex** (lock) provides mutual exclusion; keep its sections short and always release it (`with lock:`)."
+  - "Locks are built on **atomic hardware instructions** like test-and-set and **compare-and-swap**. A **spinlock** busy-waits; a sleeping lock lets the kernel run another thread. CAS enables **lock-free** retries."
+  - "A **semaphore** is a counter plus a wait queue: `wait` decrements or sleeps, `signal` wakes the first sleeper or increments. Value 1 is a mutex, value N limits access, value 0 signals an event."
+  - "**Bounded buffer:** `empty` (free slots), `full` (items) and `mutex`. Wait on the counting semaphore before the mutex, or you can deadlock."
+  - "A **monitor** bundles data with a lock; a **condition variable** lets a thread sleep until a condition is true. Always `wait()` in a `while` loop."
+  - "Prefer high-level tools (queues, thread pools, message passing), share little, and acquire multiple locks in one fixed order."
+next: |
+  Locks fix races but create a new danger: threads that **wait for each other forever**. Lesson 10.6 studies **deadlock**: the four conditions that cause it, how to draw and search a wait-for graph, Dijkstra's banker's algorithm for avoiding it, and the dining philosophers.
+
+quiz:
+  - type: mcq
+    question: What does a binary semaphore (initial value 1) provide?
+    options: ["Mutual exclusion", "Parallel speed-up", "Faster memory access", "Process creation"]
+    answer: 0
+    explanation: "Only one thread at a time can pass wait; the others sleep until it signals."
+  - type: mcq
+    question: A semaphore is initialised to 3. Four threads call wait. What happens?
+    options: [
+      "Three continue and the fourth sleeps until someone calls signal",
+      "All four continue",
+      "None continue",
+      "The fourth thread is killed"
+    ]
+    answer: 0
+    explanation: "Each wait takes one unit. With none left, the fourth thread is put on the queue."
+  - type: mcq
+    question: Why should a condition variable's wait be inside a while loop?
+    options: [
+      "The condition may be false again when the thread runs, or the wake-up may be spurious",
+      "To make the thread run faster",
+      "While loops are required in Python",
+      "To avoid using a lock"
+    ]
+    answer: 0
+    explanation: "Re-checking the condition after waking makes the code correct under all schedules."
+  - type: mcq
+    question: In the bounded-buffer solution, why must a producer wait on empty before taking the mutex?
+    options: [
+      "Otherwise it could hold the mutex while asleep, so no consumer could ever make room",
+      "Because empty is faster",
+      "Because mutex is optional",
+      "Because producers have priority"
+    ]
+    answer: 0
+    explanation: "Sleeping while holding the mutex blocks the very threads that would wake it: a deadlock."
+  - type: mcq
+    question: What does compare-and-swap do?
+    options: [
+      "Atomically sets a value to a new one only if it still equals the expected old value",
+      "Sorts two values",
+      "Copies a file",
+      "Swaps two threads"
+    ]
+    answer: 0
+    explanation: "It succeeds only if nobody changed the value since it was read, which lets threads retry instead of locking."
+  - type: mcq
+    question: What is a main drawback of a spinlock?
+    options: [
+      "A waiting thread burns CPU time while it spins",
+      "It cannot provide mutual exclusion",
+      "It only works with one thread",
+      "It needs a semaphore"
+    ]
+    answer: 0
+    explanation: "It's fine for very short waits on multi-core machines, but wasteful for long ones."
+  - type: code
+    question: |
+      Write `safe_add(lock_log, value)`, a function that records the order of lock operations. It should append `"acquire"` to `lock_log`, then append `("add", value)`, then append `"release"`, and make sure `"release"` is appended even if `value` is `None` (in which case it must raise `ValueError` after the acquire, instead of appending the add).
+    starter: |
+      def safe_add(lock_log, value):
+          pass
+    tests:
+      - name: order and exception safety
+        code: |
+          log = []
+          safe_add(log, 5)
+          assert log == ["acquire", ("add", 5), "release"]
+          log = []
+          try:
+              safe_add(log, None)
+              assert False
+          except ValueError:
+              pass
+          assert log == ["acquire", "release"]
+    solution: |
+      def safe_add(lock_log, value):
+          lock_log.append("acquire")
+          try:
+              if value is None:
+                  raise ValueError("no value")
+              lock_log.append(("add", value))
+          finally:
+              lock_log.append("release")

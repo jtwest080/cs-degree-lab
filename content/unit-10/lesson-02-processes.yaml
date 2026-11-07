@@ -1,0 +1,791 @@
+id: u10-processes
+title: Processes and Their Lifecycle
+minutes: 55
+objective: |
+  Understand a **process** as a running program with its own memory, registers and open files. Learn what the OS records about each one, the states a process moves through, how `fork`, `exec`, `wait` and `exit` create and end processes, and what a context switch costs.
+outcomes:
+  - Distinguish a program from a process, and describe a process's memory layout
+  - Describe the contents of a process control block (PCB)
+  - Draw the five-state process model and list the events behind each transition
+  - Explain how fork and exec create new processes, and how wait and exit end them
+  - Define zombie and orphan processes and say how the OS handles each
+  - Describe what a context switch saves and restores, and why it is not free
+
+sections:
+  - heading: Program versus process
+    body: |
+      A **program** is a passive file on disk: instructions and data, waiting. A **process** is a program **in execution**: the same code, plus everything the OS needs to run it. You can run the same program many times at once. Open three terminals and run `python3` in each, and you have three processes of one program, each with its own variables and its own place in the code.
+
+      Each process lives in its own **address space**, a private view of memory (Lesson 10.7 shows how the OS builds that illusion). A typical layout, from low addresses to high:
+
+      | Region | Contents |
+      |---|---|
+      | **Text** | the machine code (read-only) |
+      | **Data** | global and static variables |
+      | **Heap** | memory from `malloc` (Lesson 9.7); grows upward |
+      | *(free space)* | |
+      | **Stack** | call frames and local variables (Lesson 9.2); grows downward |
+
+      The heap and stack grow toward each other. A process cannot see another process's memory at all: address 1000 in one process is a different piece of RAM from address 1000 in another. This isolation is why one crashing program cannot corrupt another.
+
+  - heading: The process control block
+    body: |
+      The kernel keeps a record for every process called the **process control block (PCB)** (Linux calls it `task_struct`). It holds everything needed to stop the process and later resume it exactly where it left off:
+
+      - **Process ID (pid)** and the **parent's pid (ppid)**.
+      - The **state** (below).
+      - Saved **CPU registers**, including the **program counter** and stack pointer (Lesson 9.9).
+      - **Memory management info**: the page tables that define its address space (Lesson 10.7).
+      - **Scheduling info**: priority, how much CPU it has used.
+      - **Open files**: its file-descriptor table (Lesson 10.1).
+      - **Owner** (user id), permissions, current directory, signal handlers.
+
+      The kernel keeps all PCBs in a **process table**. On Linux you can read it in `/proc`; `ps` and `top` display it.
+
+  - heading: Process states
+    body: |
+      At any moment a process is in one of a few **states**. The classic model has five:
+
+      | State | Meaning |
+      |---|---|
+      | **new** | being created; the PCB exists but the process isn't yet admitted |
+      | **ready** | able to run, waiting in line for a CPU |
+      | **running** | currently executing on a CPU |
+      | **waiting** (blocked) | cannot continue until something happens, such as a disk read finishing or input arriving |
+      | **terminated** | finished; the PCB is waiting to be cleaned up |
+
+      And the legal transitions:
+
+      ```text
+      new ──admit──▶ ready ──dispatch──▶ running ──exit──▶ terminated
+                       ▲  ◀──preempt (timer)──┘  │
+                       │                         │ I/O or event wait
+                       └──── I/O done ◀── waiting ◀┘
+      ```
+
+      Note what is **not** possible: a waiting process never goes straight to running (it becomes ready first, then the scheduler picks it), and a ready process never moves to waiting (only a running process can ask for I/O). With one CPU, at most one process is running at any moment, but many may be ready or waiting. Choosing which ready process runs next is **scheduling** (Lesson 10.3).
+
+      Processes spend a lot of time waiting. A text editor sits blocked on keyboard input nearly all the time. This is what makes multitasking pay off: while one process waits for the disk, another can use the CPU.
+
+  - heading: Context switches
+    body: |
+      To move the CPU from process A to process B the kernel performs a **context switch**:
+
+      1. Save A's registers (program counter, stack pointer, general registers) into **A's PCB**.
+      2. Update A's state (to ready if preempted, or waiting if it blocked).
+      3. Pick B with the scheduler.
+      4. Load B's registers from **B's PCB**, switch to B's address space, and set B to running.
+
+      From B's point of view nothing happened: it resumes right where it was. The cost is real, though. Saving and restoring registers takes microseconds; switching address spaces can flush the CPU's translation cache (the TLB, Lesson 10.7) and cause cache misses afterwards. Time spent switching is pure **overhead**, since no user program makes progress during it. That is why a scheduler can't switch too often.
+
+  - heading: Creating and ending processes
+    body: |
+      On Unix, a process is created by copying an existing one.
+
+      - **`fork()`** creates a new process, the **child**, that is a near-exact copy of the caller, the **parent**: the same code, a copy of the memory, the same open files. It returns **twice**: in the parent it returns the child's pid, and in the child it returns 0. (Real systems use **copy-on-write**, Lesson 10.8, so the copy costs almost nothing until someone writes.)
+      - **`exec()`** replaces the calling process's code and memory with a different program. The pid stays the same. A shell runs a command by `fork` (make a child), then `exec` in the child (become the new program).
+      - **`exit(status)`** ends a process, closing its files and freeing its memory.
+      - **`wait()`** lets a parent block until a child exits and collect its **exit status**.
+
+      Every process except the first has a parent, so processes form a **tree**. `pstree` shows it: `init` (pid 1) at the root, then login shells, then your commands.
+
+      ```python
+      import os
+      pid = os.fork()
+      if pid == 0:
+          os.execvp("ls", ["ls", "-l"])    # child becomes ls
+      else:
+          os.waitpid(pid, 0)               # parent waits for it
+      ```
+
+      Windows uses a different design (`CreateProcess` starts a new program directly), but the ideas of parent, child, exit status and wait are the same.
+
+  - heading: Zombies and orphans
+    body: |
+      Two special cases follow from the parent/child relationship.
+
+      - A **zombie** is a process that has **exited** but whose parent hasn't yet called `wait`. It has released its memory, but its PCB stays so that the parent can still read the exit status. A zombie uses almost nothing, but it occupies a slot in the process table; a parent that never waits can fill the table with them. When the parent finally calls `wait`, the zombie is **reaped** and disappears.
+      - An **orphan** is a live process whose parent has exited. The kernel **reparents** it to `init` (pid 1), which calls `wait` in a loop, so orphans are cleaned up properly when they finish.
+
+      A **daemon** is a process that runs in the background, deliberately detached from any terminal: web servers, schedulers, the print spooler.
+
+      **Signals.** A process can also be interrupted by a **signal**, a tiny message from the kernel or another process: `SIGINT` (Ctrl+C), `SIGTERM` (polite request to quit), `SIGKILL` (immediate termination, cannot be caught or ignored), `SIGSTOP` (pause, also uncatchable), `SIGCHLD` (a child ended). A process may install a **handler** for most signals; if it doesn't, the default action applies.
+
+examples:
+  - title: The five-state model as a table
+    intro: "A dictionary of allowed moves is all the OS needs to catch impossible transitions."
+    code: |
+      ALLOWED = {
+          "new": {"ready"},
+          "ready": {"running"},
+          "running": {"ready", "waiting", "terminated"},
+          "waiting": {"ready"},
+          "terminated": set(),
+      }
+
+
+      class Process:
+          def __init__(self, pid):
+              self.pid = pid
+              self.state = "new"
+              self.history = ["new"]
+
+          def move(self, new_state):
+              if new_state not in ALLOWED[self.state]:
+                  raise ValueError(f"{self.state} -> {new_state} is not allowed")
+              self.state = new_state
+              self.history.append(new_state)
+
+
+      p = Process(42)
+      for step in ["ready", "running", "waiting", "ready", "running", "terminated"]:
+          p.move(step)
+      print(" > ".join(p.history))
+
+      q = Process(43)
+      q.move("ready")
+      try:
+          q.move("waiting")
+      except ValueError as error:
+          print("error:", error)
+    output: |
+      new > ready > running > waiting > ready > running > terminated
+      error: ready -> waiting is not allowed
+    lines:
+      - line: 1
+        note: "Each state lists the states it may move to. Terminated is a dead end."
+      - line: 18
+        note: "A transition not in the table is a bug in the kernel or the caller, and is rejected."
+      - line: 31
+        note: "A ready process cannot wait, because it is not running, so it cannot be doing I/O."
+  - title: Context switching with saved registers
+    intro: "Two programs share one CPU. Each has a PCB holding its saved counter. Switching saves one and loads the other."
+    code: |
+      class PCB:
+          def __init__(self, name, limit):
+              self.name = name
+              self.limit = limit
+              self.regs = {"pc": 0, "acc": 0}
+
+
+      class CPU:
+          def __init__(self):
+              self.regs = {"pc": 0, "acc": 0}
+              self.running = None
+              self.switches = 0
+
+          def switch_to(self, pcb):
+              if self.running is not None:
+                  self.running.regs = dict(self.regs)    # save
+              self.regs = dict(pcb.regs)                 # load
+              self.running = pcb
+              self.switches += 1
+
+          def step(self):
+              self.regs["pc"] += 1
+              self.regs["acc"] += self.running.limit    # each step adds a program-specific amount
+
+
+      a = PCB("A", 10)
+      b = PCB("B", 100)
+      cpu = CPU()
+      for pcb in [a, b, a, b, a]:
+          cpu.switch_to(pcb)
+          cpu.step()
+          cpu.step()
+          print(pcb.name, "ran, now pc =", cpu.regs["pc"], "acc =", cpu.regs["acc"])
+      cpu.switch_to(a)
+      print("B saved:", b.regs, "A saved:", a.regs)
+      print("switches:", cpu.switches)
+    output: |
+      A ran, now pc = 2 acc = 20
+      B ran, now pc = 2 acc = 200
+      A ran, now pc = 4 acc = 40
+      B ran, now pc = 4 acc = 400
+      A ran, now pc = 6 acc = 60
+      B saved: {'pc': 4, 'acc': 400} A saved: {'pc': 6, 'acc': 60}
+      switches: 6
+    lines:
+      - line: 13
+        note: "Save the outgoing process's registers into its PCB. dict() makes a copy, since the CPU's own registers will change."
+      - line: 14
+        note: "Load the incoming process's registers. If it ran before, it resumes with its old pc and acc."
+      - line: 31
+        note: "Each process's counter continues from where it stopped, even though the other ran in between."
+  - title: A process table with fork, exit and wait
+    intro: "A small kernel table showing how zombies are created and reaped, and how orphans are adopted by process 1."
+    code: |
+      class Table:
+          def __init__(self):
+              self.procs = {1: {"ppid": 0, "state": "running", "status": None}}
+              self.next_pid = 2
+
+          def fork(self, parent):
+              pid = self.next_pid
+              self.next_pid += 1
+              self.procs[pid] = {"ppid": parent, "state": "ready", "status": None}
+              return pid
+
+          def exit(self, pid, status):
+              self.procs[pid]["state"] = "zombie"
+              self.procs[pid]["status"] = status
+              for p in self.procs.values():
+                  if p["ppid"] == pid:
+                      p["ppid"] = 1           # orphans are adopted by init
+
+          def wait(self, parent):
+              for pid in sorted(self.procs):
+                  p = self.procs[pid]
+                  if p["ppid"] == parent and p["state"] == "zombie":
+                      del self.procs[pid]
+                      return pid, p["status"]
+              return None
+
+          def show(self):
+              return {pid: (p["ppid"], p["state"]) for pid, p in sorted(self.procs.items())}
+
+
+      t = Table()
+      shell = t.fork(1)
+      child = t.fork(shell)
+      grandchild = t.fork(child)
+      print("start:   ", t.show())
+      t.exit(child, 7)
+      print("exited:  ", t.show())
+      print("wait:    ", t.wait(shell))
+      print("reaped:  ", t.show())
+      t.exit(grandchild, 0)
+      print("init waits:", t.wait(1))
+    output: |
+      start:    {1: (0, 'running'), 2: (1, 'ready'), 3: (2, 'ready'), 4: (3, 'ready')}
+      exited:   {1: (0, 'running'), 2: (1, 'ready'), 3: (2, 'zombie'), 4: (1, 'ready')}
+      wait:     (3, 7)
+      reaped:   {1: (0, 'running'), 2: (1, 'ready'), 4: (1, 'ready')}
+      init waits: (4, 0)
+    lines:
+      - line: 13
+        note: "The process becomes a zombie: its PCB stays until the parent collects the status."
+      - line: 16
+        note: "The orphan's parent field now points at process 1."
+      - line: 25
+        note: "wait finds a zombie child, removes it from the table and returns its pid and exit status."
+      - line: 45
+        note: "The grandchild was adopted by process 1, so process 1 is the one that reaps it."
+  - title: fork and exec in real Python
+    intro: "On Linux and macOS this is how a shell starts a command. It is not run here, because the browser has no fork."
+    runnable: false
+    code: |
+      import os, sys
+
+      pid = os.fork()
+      if pid == 0:
+          # child: same code, but fork returned 0
+          print("child", os.getpid(), "parent", os.getppid())
+          os.execvp("echo", ["echo", "hello from exec"])
+          sys.exit(1)   # only reached if exec failed
+      else:
+          # parent: fork returned the child's pid
+          finished, status = os.waitpid(pid, 0)
+          print("parent saw child", finished, "exit with", os.WEXITSTATUS(status))
+    lines:
+      - line: 3
+        note: "After this line, two processes are running this same code. They differ in what fork returned."
+      - line: 7
+        note: "exec replaces this process's program. Nothing after a successful exec in the child ever runs."
+      - line: 12
+        note: "waitpid blocks until the child exits and returns its status. Without it the child would be a zombie."
+
+playground:
+  prompt: |
+    Add a "kill" operation to the process table example that terminates a process and everything below it in the tree, or modify the state machine so that waiting processes can also be terminated by a signal. Which transitions would you add to the table?
+  code: |
+    ALLOWED = {"new": {"ready"}, "ready": {"running"}, "running": {"ready", "waiting", "terminated"}, "waiting": {"ready"}, "terminated": set()}
+
+    def reachable(start):
+        seen, stack = set(), [start]
+        while stack:
+            s = stack.pop()
+            if s not in seen:
+                seen.add(s)
+                stack.extend(ALLOWED[s])
+        return seen
+
+    for state in ALLOWED:
+        print(f"{state:11} can eventually reach {sorted(reachable(state))}")
+
+exercises:
+  - id: state-machine
+    title: A process state machine
+    difficulty: 2
+    prompt: |
+      Write `final_state(events)`. A process starts in state `"new"`. `events` is a list of event names, each of which moves it to a new state: `"admit"` (new to ready), `"dispatch"` (ready to running), `"preempt"` (running to ready), `"block"` (running to waiting), `"wake"` (waiting to ready) and `"exit"` (running to terminated). Return the final state as a string. If an event is not allowed in the current state (for example `"dispatch"` while waiting), raise `ValueError`. An unknown event name also raises `ValueError`.
+    starter: |
+      def final_state(events):
+          pass
+    tests:
+      - name: valid sequences
+        code: |
+          assert final_state([]) == "new"
+          assert final_state(["admit"]) == "ready"
+          assert final_state(["admit", "dispatch", "block", "wake", "dispatch", "exit"]) == "terminated"
+          assert final_state(["admit", "dispatch", "preempt", "dispatch", "preempt"]) == "ready"
+      - name: invalid sequences
+        code: |
+          for bad in (["dispatch"], ["admit", "block"], ["admit", "dispatch", "block", "dispatch"],
+                      ["admit", "dispatch", "exit", "dispatch"], ["admit", "wake"], ["admit", "fly"]):
+              try:
+                  final_state(bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+    hints:
+      - "A dictionary keyed by `(state, event)` mapping to the new state is the cleanest design."
+      - "If `(state, event)` is not a key, raise `ValueError`."
+    solution: |
+      MOVES = {
+          ("new", "admit"): "ready",
+          ("ready", "dispatch"): "running",
+          ("running", "preempt"): "ready",
+          ("running", "block"): "waiting",
+          ("waiting", "wake"): "ready",
+          ("running", "exit"): "terminated",
+      }
+
+
+      def final_state(events):
+          state = "new"
+          for event in events:
+              if (state, event) not in MOVES:
+                  raise ValueError(f"{event} not allowed in {state}")
+              state = MOVES[(state, event)]
+          return state
+    explanation: |
+      The whole life cycle is a table lookup. This pattern, a **finite state machine**, appears everywhere: network connections, parsers, game characters, and (in Unit 15) the model of computation itself.
+
+  - id: proc-table
+    title: A process table
+    difficulty: 4
+    prompt: |
+      Write the class `ProcessTable`. Process 1 (`init`) exists at the start, with state `"running"`. `fork(parent)` creates a new process with the next pid (2, 3, 4, ... never reused), state `"ready"` and `ppid` equal to `parent`; it returns the new pid. The child gets its **own copy** of the parent's `memory` dictionary (changing one must not affect the other). It raises `ProcessLookupError` if `parent` does not exist or is a zombie. `set_memory(pid, key, value)` writes to a process's memory, and `get_memory(pid, key)` reads it (`None` if missing). `exit(pid, status=0)` turns a process into a `"zombie"` with that status, and **reparents** all its children (live or zombie) to process 1; exiting process 1 raises `ValueError`. `wait(pid)` looks at the children of `pid`: if there is a zombie child, remove the one with the lowest pid from the table and return `(child_pid, status)`; otherwise, if it has live children return `None` (it would block); with no children at all raise `ChildProcessError`. `children(pid)` returns the sorted list of child pids. `tree()` returns a list of lines for the whole tree starting at process 1, each line `"  " * depth + f"{pid} {state}"`, with children in pid order.
+    starter: |
+      class ProcessTable:
+          def __init__(self):
+              pass
+
+          def fork(self, parent):
+              pass
+
+          def set_memory(self, pid, key, value):
+              pass
+
+          def get_memory(self, pid, key):
+              pass
+
+          def exit(self, pid, status=0):
+              pass
+
+          def wait(self, pid):
+              pass
+
+          def children(self, pid):
+              pass
+
+          def tree(self):
+              pass
+    tests:
+      - name: fork and memory copy
+        code: |
+          t = ProcessTable()
+          t.set_memory(1, "x", 10)
+          a = t.fork(1)
+          b = t.fork(1)
+          assert (a, b) == (2, 3)
+          assert t.get_memory(a, "x") == 10
+          t.set_memory(a, "x", 99)
+          assert t.get_memory(1, "x") == 10 and t.get_memory(b, "x") == 10 and t.get_memory(a, "x") == 99
+          assert t.get_memory(a, "nothing") is None
+          assert t.children(1) == [2, 3]
+          c = t.fork(a)
+          assert c == 4 and t.children(a) == [4]
+          try:
+              t.fork(77)
+              assert False
+          except ProcessLookupError:
+              pass
+      - name: exit wait and zombies
+        code: |
+          t = ProcessTable()
+          a = t.fork(1)
+          b = t.fork(a)
+          c = t.fork(a)
+          assert t.wait(a) is None          # children alive
+          t.exit(c, 5)
+          t.exit(b, 3)
+          assert t.wait(a) == (b, 3)          # lowest pid first
+          assert t.wait(a) == (c, 5)
+          try:
+              t.wait(a)
+              assert False
+          except ChildProcessError:
+              pass
+          try:
+              t.fork(c)
+              assert False, "a reaped process is gone"
+          except ProcessLookupError:
+              pass
+      - name: orphans are adopted by init
+        code: |
+          t = ProcessTable()
+          a = t.fork(1)
+          b = t.fork(a)
+          c = t.fork(b)
+          t.exit(b, 1)
+          assert t.children(a) == [b] and t.children(b) == []
+          assert t.children(1) == [a, c]       # c adopted by init
+          t.exit(c, 9)
+          assert t.wait(1) == (c, 9)
+          try:
+              t.fork(b)
+              assert False, "zombie cannot fork"
+          except ProcessLookupError:
+              pass
+          try:
+              t.exit(1)
+              assert False
+          except ValueError:
+              pass
+      - name: tree
+        code: |
+          t = ProcessTable()
+          a = t.fork(1)
+          b = t.fork(1)
+          c = t.fork(a)
+          d = t.fork(c)
+          t.exit(d, 0)
+          assert t.tree() == ["1 running", "  2 ready", "    4 ready", "      5 zombie", "  3 ready"]
+          t.exit(a, 0)
+          assert t.tree() == ["1 running", "  2 zombie", "  3 ready", "  4 ready", "    5 zombie"]
+    hints:
+      - "Store each process as a dictionary with `ppid`, `state`, `status` and `memory`. Use `dict(parent_memory)` to copy."
+      - "`exit` loops over all processes: if a process's `ppid` is the exiting pid, set it to 1."
+      - "`wait`: gather `sorted(pid for each child)`, filter the zombies, and `del` the first. Distinguish 'no children at all' from 'children but none dead yet'."
+      - "`tree` is a recursive walk: print the process, then recurse on `children(pid)` with depth + 1. Zombies appear in the tree too until they are reaped."
+    solution: |
+      class ProcessTable:
+          def __init__(self):
+              self.procs = {1: {"ppid": 0, "state": "running", "status": None, "memory": {}}}
+              self.next_pid = 2
+
+          def fork(self, parent):
+              if parent not in self.procs or self.procs[parent]["state"] == "zombie":
+                  raise ProcessLookupError(parent)
+              pid = self.next_pid
+              self.next_pid += 1
+              self.procs[pid] = {
+                  "ppid": parent,
+                  "state": "ready",
+                  "status": None,
+                  "memory": dict(self.procs[parent]["memory"]),
+              }
+              return pid
+
+          def set_memory(self, pid, key, value):
+              self.procs[pid]["memory"][key] = value
+
+          def get_memory(self, pid, key):
+              return self.procs[pid]["memory"].get(key)
+
+          def exit(self, pid, status=0):
+              if pid == 1:
+                  raise ValueError("init cannot exit")
+              self.procs[pid]["state"] = "zombie"
+              self.procs[pid]["status"] = status
+              for p in self.procs.values():
+                  if p["ppid"] == pid:
+                      p["ppid"] = 1
+
+          def children(self, pid):
+              return sorted(c for c, p in self.procs.items() if p["ppid"] == pid)
+
+          def wait(self, pid):
+              kids = self.children(pid)
+              if not kids:
+                  raise ChildProcessError(pid)
+              for c in kids:
+                  if self.procs[c]["state"] == "zombie":
+                      status = self.procs[c]["status"]
+                      del self.procs[c]
+                      return c, status
+              return None
+
+          def tree(self):
+              lines = []
+
+              def walk(pid, depth):
+                  lines.append("  " * depth + f"{pid} {self.procs[pid]['state']}")
+                  for c in self.children(pid):
+                      walk(c, depth + 1)
+
+              walk(1, 0)
+              return lines
+    explanation: |
+      Three rules from the lesson fall out of ordinary data structure operations: the child's independent memory comes from copying the dictionary, orphans are adopted by rewriting one field, and zombies exist simply because `exit` marks a row instead of deleting it. Deleting happens only in `wait`, which is exactly why a parent that never waits leaks table slots.
+
+  - id: ctx-switch
+    title: Context switching
+    difficulty: 3
+    prompt: |
+      A `PCB` has a `name`, a `state` (`"ready"` initially) and a `regs` dictionary. Write the class `Dispatcher` that owns the CPU registers `cpu` (a dictionary, initially `{"pc": 0, "sp": 0}`). `dispatch(pcb)` makes `pcb` the running process: if another process is running, **save** `cpu` into its `regs` (a copy) and set its state to `"ready"` (or `"waiting"` if `block=True` was passed); then **load** `pcb.regs` into `cpu` (a copy) and set `pcb.state = "running"`. Dispatching the process that is already running does nothing and does not count as a switch. Keep a counter `switches` of real switches, and `running` (the current PCB, or `None`). `block_current()` saves the running process into its PCB, sets its state to `"waiting"` and leaves the CPU with no running process (`running` is `None`).
+    starter: |
+      class PCB:
+          def __init__(self, name, regs=None):
+              self.name = name
+              self.state = "ready"
+              self.regs = dict(regs) if regs else {"pc": 0, "sp": 0}
+
+
+      class Dispatcher:
+          def __init__(self):
+              pass
+
+          def dispatch(self, pcb, block=False):
+              pass
+
+          def block_current(self):
+              pass
+    tests:
+      - name: save and restore
+        code: |
+          a, b = PCB("a"), PCB("b", {"pc": 500, "sp": 9000})
+          d = Dispatcher()
+          d.dispatch(a)
+          d.cpu["pc"] = 7
+          d.cpu["sp"] = 100
+          d.dispatch(b)
+          assert a.regs == {"pc": 7, "sp": 100} and a.state == "ready"
+          assert d.cpu == {"pc": 500, "sp": 9000} and b.state == "running" and d.running is b
+          d.cpu["pc"] = 501
+          d.dispatch(a)
+          assert b.regs["pc"] == 501 and d.cpu == {"pc": 7, "sp": 100}
+          assert d.switches == 3
+      - name: copies not references
+        code: |
+          a, b = PCB("a"), PCB("b")
+          d = Dispatcher()
+          d.dispatch(a)
+          d.cpu["pc"] = 1
+          d.dispatch(b)
+          d.cpu["pc"] = 99          # must not change a
+          assert a.regs["pc"] == 1
+          d.dispatch(a)
+          d.cpu["pc"] = 2           # must not change b's saved regs
+          assert b.regs["pc"] == 99
+      - name: same process and blocking
+        code: |
+          a, b = PCB("a"), PCB("b")
+          d = Dispatcher()
+          d.dispatch(a)
+          d.dispatch(a)
+          assert d.switches == 1
+          d.cpu["pc"] = 5
+          d.block_current()
+          assert a.state == "waiting" and a.regs["pc"] == 5 and d.running is None
+          d.dispatch(b)
+          assert b.state == "running" and a.state == "waiting"
+          d.dispatch(a, block=True)
+          assert b.state == "waiting" and a.state == "running"
+    hints:
+      - "A switch has three steps: save the old registers, update the old state, load the new registers."
+      - "Use `dict(self.cpu)` so the PCB gets its own copy instead of sharing the CPU's dictionary."
+      - "`dispatch` of the already-running PCB should return immediately without counting."
+    solution: |
+      class PCB:
+          def __init__(self, name, regs=None):
+              self.name = name
+              self.state = "ready"
+              self.regs = dict(regs) if regs else {"pc": 0, "sp": 0}
+
+
+      class Dispatcher:
+          def __init__(self):
+              self.cpu = {"pc": 0, "sp": 0}
+              self.running = None
+              self.switches = 0
+
+          def dispatch(self, pcb, block=False):
+              if self.running is pcb:
+                  return
+              if self.running is not None:
+                  self.running.regs = dict(self.cpu)
+                  self.running.state = "waiting" if block else "ready"
+              self.cpu = dict(pcb.regs)
+              pcb.state = "running"
+              self.running = pcb
+              self.switches += 1
+
+          def block_current(self):
+              if self.running is not None:
+                  self.running.regs = dict(self.cpu)
+                  self.running.state = "waiting"
+                  self.running = None
+    explanation: |
+      The copy matters: if the PCB kept a reference to the CPU's dictionary, the next process's changes would overwrite the saved state. In hardware, the same care is taken by writing the registers to the PCB's memory. A real kernel does this in a few dozen carefully written assembly instructions.
+
+  - id: signals
+    title: Delivering signals
+    difficulty: 3
+    prompt: |
+      Write `deliver(signal, handlers)` that decides what happens to a process when it receives a signal. `handlers` is a dictionary mapping signal names to **handler functions** the process has installed. Return a pair `(action, result)`: if the process has a handler and the signal is catchable, call it with the signal name, and return `("handled", whatever it returned)`. Otherwise use the default action: `SIGKILL` and `SIGSTOP` can **never** be handled or ignored, and return `("killed", None)` and `("stopped", None)`. `SIGTERM` and `SIGINT` default to `("terminated", None)`. `SIGCHLD` and `SIGWINCH` default to `("ignored", None)`. Any other signal name raises `ValueError`. A handler installed for `SIGKILL` or `SIGSTOP` is silently ignored.
+    starter: |
+      def deliver(signal, handlers):
+          pass
+    tests:
+      - name: defaults
+        code: |
+          assert deliver("SIGTERM", {}) == ("terminated", None)
+          assert deliver("SIGINT", {}) == ("terminated", None)
+          assert deliver("SIGCHLD", {}) == ("ignored", None)
+          assert deliver("SIGWINCH", {}) == ("ignored", None)
+          assert deliver("SIGKILL", {}) == ("killed", None)
+          assert deliver("SIGSTOP", {}) == ("stopped", None)
+      - name: handlers
+        code: |
+          calls = []
+          def on_int(sig):
+              calls.append(sig)
+              return "saved work"
+          h = {"SIGINT": on_int, "SIGKILL": lambda s: "nope", "SIGSTOP": lambda s: "nope"}
+          assert deliver("SIGINT", h) == ("handled", "saved work") and calls == ["SIGINT"]
+          assert deliver("SIGKILL", h) == ("killed", None)
+          assert deliver("SIGSTOP", h) == ("stopped", None)
+          assert deliver("SIGTERM", h) == ("terminated", None)
+          assert calls == ["SIGINT"]
+      - name: unknown signal
+        code: |
+          try:
+              deliver("SIGFOO", {})
+              assert False
+          except ValueError:
+              pass
+    hints:
+      - "Keep two tables: the set of uncatchable signals, and the dictionary of default actions."
+      - "Check for an unknown signal first. Then, if it is catchable and in `handlers`, call it."
+    solution: |
+      UNCATCHABLE = {"SIGKILL", "SIGSTOP"}
+      DEFAULTS = {
+          "SIGKILL": "killed",
+          "SIGSTOP": "stopped",
+          "SIGTERM": "terminated",
+          "SIGINT": "terminated",
+          "SIGCHLD": "ignored",
+          "SIGWINCH": "ignored",
+      }
+
+
+      def deliver(signal, handlers):
+          if signal not in DEFAULTS:
+              raise ValueError("unknown signal " + signal)
+          if signal not in UNCATCHABLE and signal in handlers:
+              return "handled", handlers[signal](signal)
+          return DEFAULTS[signal], None
+    explanation: |
+      `SIGKILL` cannot be caught precisely so that the administrator always has a way to stop a runaway process. That is also why you should try `SIGTERM` first: it lets a program save its work and clean up, while `kill -9` gives it no chance.
+
+commonMistakes:
+  - title: Confusing a program with a process
+    explanation: |
+      A program is a file. A process is a running instance with its own memory, registers and state. One program can have many processes.
+  - title: Treating fork as creating a brand new program
+    explanation: |
+      `fork` makes a copy of the caller. `exec` is what loads a different program. Shells use both.
+  - title: Forgetting to wait for children
+    explanation: |
+      A child that exits before its parent waits becomes a zombie and keeps a process-table slot. Call `wait` (or handle `SIGCHLD`).
+  - title: Thinking a waiting process can run immediately
+    explanation: |
+      When the event it was waiting for happens, the process becomes **ready**, not running. The scheduler still has to choose it.
+  - title: Ignoring the cost of context switches
+    explanation: |
+      Switching saves and restores state and disturbs caches. Switching every microsecond would leave no time for real work.
+
+summary:
+  - "A **process** is a program in execution with its own address space (text, data, heap, stack), registers, open files and state. Many processes can run the same program."
+  - "The kernel keeps a **process control block** for each process: pid, parent, state, saved registers, memory map, scheduling info and open files."
+  - "A process is **new**, **ready**, **running**, **waiting** or **terminated**. Only a running process can block, and a waiting process must become ready before it can run again."
+  - "A **context switch** saves one process's registers in its PCB and loads another's. It is pure overhead."
+  - "`fork` copies a process, `exec` replaces its program, `exit` ends it and `wait` collects its status. An exited process whose parent hasn't waited is a **zombie**; a process whose parent died is an **orphan**, adopted by init."
+  - "**Signals** send small notifications to processes; `SIGKILL` and `SIGSTOP` cannot be caught."
+next: |
+  Several processes are ready at once, but there is only one CPU (or a few). **Which one runs next, and for how long?** Lesson 10.3 compares the classic scheduling policies (first-come first-served, shortest job first, round robin and priorities), measures them, and shows that every choice trades fairness, speed and responsiveness against one another.
+
+quiz:
+  - type: mcq
+    question: What is the difference between a program and a process?
+    options: [
+      "A program is a passive file; a process is a running instance with its own memory and state",
+      "They are the same thing",
+      "A process is a file on disk and a program is in RAM",
+      "A program can only be run once"
+    ]
+    answer: 0
+    explanation: "A program becomes a process when the OS starts executing it."
+  - type: mcq
+    question: A running process starts reading a file from disk and has to wait. Which state change happens?
+    options: [
+      "running to waiting",
+      "running to ready",
+      "ready to waiting",
+      "running to terminated"
+    ]
+    answer: 0
+    explanation: "A process blocks on I/O from the running state, and becomes ready (not running) when the data arrives."
+  - type: mcq
+    question: What does fork() return in the child process?
+    options: ["0", "The parent's pid", "The child's own pid", "-1"]
+    answer: 0
+    explanation: "fork returns the child's pid in the parent and 0 in the child, so the code can tell them apart."
+  - type: mcq
+    question: What is a zombie process?
+    options: [
+      "A process that has exited but whose parent hasn't collected its exit status yet",
+      "A process that cannot be killed",
+      "A process using 100 percent of the CPU",
+      "A process whose parent has exited"
+    ]
+    answer: 0
+    explanation: "The kernel keeps its PCB until the parent calls wait. A process whose parent died is an orphan."
+  - type: mcq
+    question: What does the kernel save in the PCB during a context switch?
+    options: [
+      "The CPU registers, including the program counter",
+      "The entire contents of RAM",
+      "The program's source code",
+      "Nothing, the process restarts later"
+    ]
+    answer: 0
+    explanation: "Saving the registers lets the process resume exactly where it stopped."
+  - type: mcq
+    question: Why can't SIGKILL be caught or ignored?
+    options: [
+      "So that an administrator can always terminate a misbehaving process",
+      "Because it is too fast",
+      "Because only the kernel can send it",
+      "Because processes have no signal handlers"
+    ]
+    answer: 0
+    explanation: "A handler could be buggy or malicious. SIGKILL guarantees a way out."
+  - type: code
+    question: |
+      Write `ready_after(states)`. `states` is a dictionary mapping process names to one of `"ready"`, `"running"`, `"waiting"`, `"terminated"`. Return the sorted list of names of processes that are **ready**.
+    starter: |
+      def ready_after(states):
+          pass
+    tests:
+      - name: ready
+        code: |
+          assert ready_after({}) == []
+          assert ready_after({"b": "ready", "a": "ready", "c": "running", "d": "waiting", "e": "terminated"}) == ["a", "b"]
+          assert ready_after({"x": "waiting"}) == []
+    solution: |
+      def ready_after(states):
+          return sorted(name for name, state in states.items() if state == "ready")

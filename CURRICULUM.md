@@ -15,7 +15,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 7 | Data Structures II | ✅ Complete (Phase 6) | 9 | 45 | Help Desk |
 | 8 | Algorithms II | ✅ Complete (Phase 7) | 9 | 41 | Route Planner |
 | 9 | Computer Systems (C) | ✅ Complete (Phase 8) | 9 | 37 | Mini CPU (assembler + emulator) |
-| 10 | Operating Systems | Planned | | | |
+| 10 | Operating Systems | ✅ Complete (Phase 9) | 9 | 41 | Mini Kernel (scheduler, page replacement, deadlock detector) |
 | 11 | Networking | Planned | | | |
 | 12 | Databases | Planned | | | |
 | 13 | Web Development | Planned | | | |
@@ -25,7 +25,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 77 lessons, 369 practice exercises, 77 lesson quizzes (462 multiple-choice questions + 77 coding questions), 9 unit projects, 553 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 86 lessons, 410 practice exercises, 86 lesson quizzes (516 multiple-choice questions + 86 coding questions), 10 unit projects, 664 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -174,6 +174,27 @@ All code runs in the browser with PicoC (a small C interpreter compiled to WebAs
 - Deep recursion (about 1000 frames) runs out of memory; no heap or undefined-behaviour detection.
 - Test semantics for C: a test `code` is JavaScript with `output`, `status`, `error` and `source`; `append` replaces the learner's `main` (renamed `learner_main`). `scripts/verify_c.mjs` checks examples, solutions and starters; `scripts/autofill_c.mjs` fills `output: AUTO` placeholders.
 
+## Unit 10: Operating Systems ✅
+
+Python again. Pyodide has no threads or `fork`, so every OS idea is **simulated**: plain classes for kernels and file systems, and generators that `yield` at switch points for concurrency, run by a deterministic kernel that interprets request tuples such as `("step",)`, `("wait", sem)` and `("signal", sem)`. Examples must be deterministic and identical on desktop Python and Pyodide (no `sys.platform`, threads or `fork`; use `runnable: false` for such snippets).
+
+| Lesson | Id | Teaches |
+|---|---|---|
+| 10.1 What an Operating System Does | `u10-os-overview` | kernel vs user mode, system calls and traps, file descriptors, strace-style tracing, boot order |
+| 10.2 Processes | `u10-processes` | process states, PCB and context switch, fork/exit/wait, zombies and orphans, signals |
+| 10.3 CPU Scheduling | `u10-scheduling` | FCFS, SJF, SRTF, round robin, turnaround/waiting/response metrics |
+| 10.4 Threads and Races | `u10-concurrency` | concurrency vs parallelism, interleavings, races, check-then-act, Amdahl's law |
+| 10.5 Synchronization | `u10-synchronization` | semaphores, mutexes, critical sections, bounded buffer, compare-and-swap |
+| 10.6 Deadlock | `u10-deadlock` | wait-for graphs, Coffman conditions, banker's algorithm, lock ordering |
+| 10.7 Memory Management | `u10-memory` | allocators (first/best/worst fit, coalescing), paging, address translation, two-level tables, TLB, fragmentation |
+| 10.8 Virtual Memory | `u10-virtual-memory` | demand paging, FIFO/LRU/optimal/clock, Belady's anomaly, working sets, thrashing |
+| 10.9 File Systems and Storage | `u10-filesystems` | inodes and block pointers, paths and links, permissions, journaling, disk scheduling |
+| Project | | Mini Kernel: round-robin/FCFS scheduler, page-replacement counter (FIFO/LRU/OPT) and deadlock detector driven by a workload file |
+
+111 glossary terms.
+
+**Gotchas for later Python units:** a project test function cannot be named `run`; test code shares no state with the learner's other exercises, so include reference helpers inside each test; avoid float knife-edges in tests; state tie-breaking rules in prompts. `scripts/autofill_py.py <lesson.yaml>` fills `output: |` + `AUTO` placeholders.
+
 ## How the units connect (prerequisite check)
 
 Before writing each unit, check that everything it relies on has already been taught, and note deliberate callbacks.
@@ -271,6 +292,8 @@ Deliberate forward references in Unit 8: NP-completeness of 0/1 knapsack and sub
 
 **Unit 10 can assume:** all of Units 1 to 9, including C (pointers, structs, malloc/free, bit operations, stack frames and calling conventions), how programs are compiled and linked, assembly basics and the fetch-decode-execute cycle, and a working bytecode VM (the Mini CPU project). Unit 10 (Python again) should explain processes, scheduling, virtual memory, files and concurrency, and can simulate these with Python code.
 
+**Unit 11 can assume:** all of Units 1 to 10, including processes, threads and system calls, file descriptors and pipes, scheduling and queues, synchronisation and deadlock, virtual memory, and file systems. Unit 11 (Python) should simulate protocols and networks with plain classes and deterministic code, since browsers cannot open raw sockets.
+
 ## Plan for remaining units (to refine before each phase)
 
 - **10 OS**, **11 Networking**, **12 Databases** (sql.js in browser), **13 Web Development** (JS sandbox already supported by the runner), **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
@@ -290,3 +313,4 @@ Deliberate forward references in Unit 8: NP-completeness of 0/1 knapsack and sub
 - **Phase 6 (2026-10-25):** complete Unit 7 (9 lessons, 45 exercises, 9 quizzes, Help Desk project, 41 glossary terms). Lessons and projects now load on demand (main bundle 2.4 MB → 1.1 MB). Fixed a 4.2 test that newer Python versions passed by accident (now times the function instead).
 - **Phase 7 (2026-11-07):** complete Unit 8 (9 lessons, 41 exercises, 9 quizzes, Route Planner project, 47 glossary terms). App features added since Phase 6: installable PWA (manifest, generated service worker, update banner), GitHub Pages deploy, Windows/Mac desktop builds (Electron, `desktop/`), an Ask Claude button on every lesson, and a Listen button with natural recorded voice (Kokoro `am_michael`, generated by the "Record lesson voice" workflow into the `audio` branch; clips are named by a hash of the paragraph text, with the browser voice as a fallback). The verifier now also checks that `outcomes` and `summary` entries are plain strings (quote any text containing a colon and a space). Project test code can't define a function called `run` (the test harness has its own).
 - **Phase 8 (2026-11-07):** complete Unit 9 (9 lessons, 37 exercises, 9 quizzes, Mini CPU project, 58 glossary terms). New framework features: in-browser C (PicoC WebAssembly in a worker, C tag and syntax highlighting in the editor, `language: c` units and projects with JavaScript test code over the program output), and `scripts/verify_c.mjs` added to `npm run verify`. The Input button is hidden for C.
+- **Phase 9 (2026-11-07):** complete Unit 10 (9 lessons, 41 exercises, 9 quizzes, Mini Kernel project, 111 glossary terms). OS concepts are simulated in Python; `scripts/autofill_py.py` added.

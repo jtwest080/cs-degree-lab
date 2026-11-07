@@ -1,0 +1,629 @@
+id: u10-deadlock
+title: Deadlock
+minutes: 55
+objective: |
+  Understand **deadlock**: a set of threads each waiting for something only another in the set can provide. Learn the four conditions that cause it, find deadlocks by searching a wait-for graph, prevent them with lock ordering, and avoid them with the banker's algorithm.
+outcomes:
+  - State the four necessary conditions for deadlock and show how breaking each one prevents it
+  - Build a wait-for graph from lock ownership and find the deadlocked threads
+  - Use a global lock order to prevent circular waits, and spot AB-BA lock orders in code
+  - Apply the banker's algorithm to decide whether a state is safe and whether to grant a request
+  - Solve the dining philosophers problem without deadlock
+  - Distinguish deadlock, livelock and starvation
+
+sections:
+  - heading: What is deadlock?
+    body: |
+      Two cars meet on a one-lane bridge, each waiting for the other to back up. Neither can move, and neither ever will. In a computer, a set of threads is **deadlocked** when every one of them is waiting for a resource held by another thread in the set. Since each waits for another, none can ever release anything, so none ever proceeds.
+
+      The smallest example uses two locks:
+
+      ```text
+      Thread 1:  lock(A); lock(B); ...; unlock(B); unlock(A)
+      Thread 2:  lock(B); lock(A); ...; unlock(A); unlock(B)
+      ```
+
+      If thread 1 takes A and thread 2 takes B before either takes its second lock, then thread 1 waits for B (held by 2) and thread 2 waits for A (held by 1). Neither lock is ever released. If they happen to run one after the other the program works fine, which is why deadlocks lurk in tested code and appear once in a million runs on a customer's machine.
+
+      Deadlock can involve any resource that is held exclusively: locks, files, database rows (databases detect and abort such transactions), printers, network connections, memory pages.
+
+  - heading: The four necessary conditions
+    body: |
+      In 1971 Coffman, Elphick and Shoshani showed that deadlock can occur **only if all four** of these hold at once:
+
+      1. **Mutual exclusion**: a resource can be held by only one thread at a time.
+      2. **Hold and wait**: a thread holding some resources can wait for others.
+      3. **No preemption**: a resource cannot be forcibly taken from the thread holding it; only the holder can release it.
+      4. **Circular wait**: there is a cycle of threads, each waiting for a resource held by the next.
+
+      That list is useful because it gives four different ways to **prevent** deadlock: make sure at least one condition can never hold.
+
+      | Break this condition | By | Cost |
+      |---|---|---|
+      | Mutual exclusion | making resources shareable (read-only data, lock-free structures) | not possible for things like printers |
+      | Hold and wait | taking all locks at once, or releasing everything before waiting | lower concurrency; a thread may need to know all its locks in advance |
+      | No preemption | letting the OS or a timeout take a lock back (`lock.acquire(timeout=1)`, then roll back and retry) | work to undo; risk of livelock |
+      | Circular wait | a **global order** on locks: always acquire in increasing order | simple and cheap: the usual choice |
+
+      **Lock ordering** is the practical weapon. Number every lock (or sort by name or address) and require that any thread holding lock *k* may only request locks with numbers greater than *k*. Then a cycle of waits is impossible, since following the waits would need numbers to increase around a loop. Code review rule: whenever you see code that takes two locks, ask "who takes them in the other order?"
+
+  - heading: Detecting deadlock with a wait-for graph
+    body: |
+      A **resource-allocation graph** has nodes for threads and resources, with an edge from a resource to the thread that holds it, and from a thread to the resource it wants. When every resource has a single instance, you can simplify it into a **wait-for graph** with only threads: an edge **T1 → T2** means "T1 is waiting for something T2 holds".
+
+      **A cycle in the wait-for graph means deadlock** (for single-instance resources). The threads on the cycle can never proceed, and any thread waiting (even indirectly) for them is stuck too. Finding cycles is the depth-first search you know from Lesson 7.8: from each node, follow edges and see whether you can get back to the starting node.
+
+      Databases do exactly this. When the wait-for graph gets a cycle, the DBMS picks a **victim** transaction, aborts it (rolling back its changes, which breaks the no-preemption condition) and lets the others continue. General-purpose operating systems usually **ignore** the problem (jokingly called the **ostrich algorithm**), because deadlocks are rare and detecting them has a cost; the programmer is expected to avoid them. If a deadlock does happen, recovery means killing a process or rolling back.
+
+  - heading: Avoidance and the banker's algorithm
+    body: |
+      Prevention restricts how locks are requested. **Avoidance** instead lets threads request freely but only **grants a request if the system will still be safe** afterwards. It needs advance knowledge: each thread declares its **maximum** need for each resource type.
+
+      A state is **safe** if there is some order, a **safe sequence**, in which the threads can all run to completion: each thread in turn can get everything it might still ask for from what is currently free plus what earlier threads have returned. An **unsafe** state doesn't mean deadlock has happened, only that it *might*; the system can no longer guarantee that it won't.
+
+      Dijkstra's **banker's algorithm** (named for a banker who never lends out cash that would leave him unable to satisfy his customers) works with *m* resource types:
+
+      - `available`: how many units of each type are free.
+      - `max`: each thread's maximum claim. `allocation`: what each thread holds now.
+      - `need = max − allocation`.
+
+      **Safety check:** set `work = available`. Repeatedly find an unfinished thread whose `need ≤ work`; pretend it finishes and returns its allocation (`work += allocation`). If all threads can finish, the state is safe; if you get stuck with some unfinished, it's unsafe.
+
+      **Request check** for thread *T* asking for `request`: (1) if `request > need`, error (it exceeded its stated maximum); (2) if `request > available`, *T* must wait; (3) otherwise **pretend** to grant it and run the safety check; if safe, grant it; if not, make *T* wait.
+
+      The banker's algorithm is rarely used in real systems, as threads rarely know their maximum needs, and checking costs time. But it is the clearest example of avoidance, and the idea of keeping the system in a "safe state" returns in capacity planning and in cloud schedulers.
+
+  - heading: Dining philosophers
+    body: |
+      Five philosophers sit around a table, with one fork between each pair of neighbours (five forks in all). A philosopher needs **both** adjacent forks to eat, thinks otherwise, and puts both forks down after eating. The obvious protocol, "pick up the left fork, then the right fork", **deadlocks** if all five pick up their left fork at the same moment: each holds one fork and waits for a fork held by the neighbour, a circular wait.
+
+      Solutions, each breaking a different condition:
+
+      - **Ordering.** Number the forks 0 to 4 and have every philosopher pick up the lower-numbered fork first. The last philosopher (between fork 4 and fork 0) therefore takes fork 0 first, which breaks the cycle.
+      - **A waiter.** Allow at most four philosophers to sit down at once (a semaphore with value 4): someone can always eat.
+      - **All or nothing.** Pick up both forks atomically, or put back the first if the second is unavailable (but beware of livelock).
+
+  - heading: Livelock and starvation
+    body: |
+      Not every "nothing happens" bug is a deadlock.
+
+      - **Livelock**: threads are not blocked, but keep reacting to each other without making progress, like two people in a corridor who both step aside the same way, repeatedly. A backing-off lock protocol where both threads release and retry in lockstep is a livelock. The cure is **randomised back-off**, as in Ethernet.
+      - **Starvation**: a thread is ready to proceed but is never chosen, because others keep going first (unfair locks, strict priorities; Lesson 10.3). Fairness (FIFO queues) and aging fix it.
+
+      Unlike deadlock, in livelock and starvation other threads may be running perfectly well, so the symptoms are different: deadlocked threads use **no CPU**; livelocked threads use **a lot**.
+
+      **Debugging tip.** If a program hangs, take a thread dump (`jstack` for Java, `py-spy dump` or `faulthandler.dump_traceback` for Python, `gdb` for C). Look for threads blocked on locks held by each other. The lock cycle is usually visible.
+
+examples:
+  - title: A deadlock found in the wait-for graph
+    intro: "Each thread holds one lock and wants another. Build the graph, then search for threads that can reach themselves."
+    code: |
+      holds = {"A": "T1", "B": "T2", "C": "T3"}          # lock -> thread holding it
+      wants = {"T1": "B", "T2": "C", "T3": "A", "T4": "A"}  # thread -> lock it waits for
+
+
+      def wait_for_graph(holds, wants):
+          graph = {t: [] for t in set(holds.values()) | set(wants)}
+          for thread, lock in wants.items():
+              owner = holds.get(lock)
+              if owner is not None and owner != thread:
+                  graph[thread].append(owner)
+          return graph
+
+
+      def reachable(graph, start):
+          seen, stack = set(), list(graph[start])
+          while stack:
+              node = stack.pop()
+              if node not in seen:
+                  seen.add(node)
+                  stack.extend(graph[node])
+          return seen
+
+
+      graph = wait_for_graph(holds, wants)
+      for thread in sorted(graph):
+          print(thread, "waits for", graph[thread])
+      stuck = [t for t in sorted(graph) if t in reachable(graph, t)]
+      print("deadlocked (on a cycle):", stuck)
+      blocked_behind = [t for t in sorted(graph) if t not in stuck and reachable(graph, t) & set(stuck)]
+      print("also stuck, waiting on the cycle:", blocked_behind)
+    output: |
+      T1 waits for ['T2']
+      T2 waits for ['T3']
+      T3 waits for ['T1']
+      T4 waits for ['T1']
+      deadlocked (on a cycle): ['T1', 'T2', 'T3']
+      also stuck, waiting on the cycle: ['T4']
+    lines:
+      - line: 1
+        note: "Lock A is held by T1, B by T2, C by T3."
+      - line: 2
+        note: "T1 wants B (held by T2), T2 wants C (held by T3), T3 wants A (held by T1): a circle. T4 also wants A."
+      - line: 25
+        note: "A thread is deadlocked if it can reach itself by following wait-for edges."
+      - line: 27
+        note: "T4 is not on the cycle but waits for a lock held by a deadlocked thread, so it will never run either."
+  - title: The banker's algorithm
+    intro: "Five threads and three resource types (the textbook example). Is the state safe, and which requests may be granted?"
+    code: |
+      def need_of(max_need, alloc):
+          return [m - a for m, a in zip(max_need, alloc)]
+
+
+      def safe_sequence(available, max_need, allocation):
+          work = list(available)
+          unfinished = set(max_need)
+          order = []
+          while unfinished:
+              for t in sorted(unfinished):
+                  if all(n <= w for n, w in zip(need_of(max_need[t], allocation[t]), work)):
+                      work = [w + a for w, a in zip(work, allocation[t])]
+                      unfinished.remove(t)
+                      order.append(t)
+                      break
+              else:
+                  return None
+          return order
+
+
+      available = [3, 3, 2]
+      max_need = {"P0": [7, 5, 3], "P1": [3, 2, 2], "P2": [9, 0, 2], "P3": [2, 2, 2], "P4": [4, 3, 3]}
+      allocation = {"P0": [0, 1, 0], "P1": [2, 0, 0], "P2": [3, 0, 2], "P3": [2, 1, 1], "P4": [0, 0, 2]}
+
+      print("safe sequence:", safe_sequence(available, max_need, allocation))
+
+
+      def try_grant(thread, request):
+          if any(r > n for r, n in zip(request, need_of(max_need[thread], allocation[thread]))):
+              return "error: asked for more than its maximum"
+          if any(r > a for r, a in zip(request, available)):
+              return "must wait: not enough free"
+          new_available = [a - r for a, r in zip(available, request)]
+          new_alloc = dict(allocation)
+          new_alloc[thread] = [a + r for a, r in zip(allocation[thread], request)]
+          ok = safe_sequence(new_available, max_need, new_alloc) is not None
+          return "granted" if ok else "denied: would leave the system unsafe"
+
+
+      print("P1 asks for [1, 0, 2]:", try_grant("P1", [1, 0, 2]))
+      print("P4 asks for [3, 3, 0]:", try_grant("P4", [3, 3, 0]))
+      print("P0 asks for [0, 0, 3]:", try_grant("P0", [0, 0, 3]))
+    output: |
+      safe sequence: ['P1', 'P3', 'P0', 'P2', 'P4']
+      P1 asks for [1, 0, 2]: granted
+      P4 asks for [3, 3, 0]: denied: would leave the system unsafe
+      P0 asks for [0, 0, 3]: must wait: not enough free
+    lines:
+      - line: 2
+        note: "need = maximum claim minus what the thread already holds."
+      - line: 7
+        note: "work is what is free right now. A thread whose entire remaining need fits in work can be run to completion."
+      - line: 11
+        note: "Once it finishes, it returns everything it held, so work grows."
+      - line: 15
+        note: "No unfinished thread can finish: the state is unsafe."
+      - line: 39
+        note: "P4's request fits in what is free, but granting it would leave nobody able to finish, so the banker refuses even though nothing is wrong yet. P0 simply asks for more than is free and must wait."
+  - title: Dining philosophers
+    intro: "If every philosopher grabs the left fork first, all five hold one fork each: a perfect cycle. Ordering the forks breaks it."
+    code: |
+      N = 5
+
+
+      def left(i):
+          return i
+
+
+      def right(i):
+          return (i + 1) % N
+
+
+      def first_moves(order_by_number):
+          """Philosophers 0..4 each try to pick up their first fork; whoever gets one then wants the second."""
+          holds, wants = {}, {}
+          for i in range(N):
+              forks = sorted([left(i), right(i)]) if order_by_number else [left(i), right(i)]
+              if forks[0] not in holds:
+                  holds[forks[0]] = i
+                  wants[i] = forks[1]
+              else:
+                  wants[i] = forks[0]          # first fork is taken: wait for it
+          return holds, wants
+
+
+      def cycle_exists(holds, wants):
+          waits_for = {}
+          for philosopher, fork in wants.items():
+              if fork in holds:
+                  waits_for[philosopher] = holds[fork]
+          for start in range(N):
+              node, steps = start, 0
+              while node in waits_for and steps <= N:
+                  node = waits_for[node]
+                  steps += 1
+                  if node == start:
+                      return True
+          return False
+
+
+      for label, ordered in (("left fork first", False), ("lower-numbered fork first", True)):
+          holds, wants = first_moves(ordered)
+          print(f"{label:27} deadlock possible: {cycle_exists(holds, wants)}")
+    output: |
+      left fork first             deadlock possible: True
+      lower-numbered fork first   deadlock possible: False
+    lines:
+      - line: 15
+        note: "With ordering, philosopher 4 has forks 4 and 0 and sorts them, so wants fork 0 first. Philosopher 0 already took it."
+      - line: 19
+        note: "Philosopher 4 waits for fork 0 while holding nothing, so the chain of waits ends at philosopher 3, who can get fork 4 and eat. No cycle forms."
+      - line: 32
+        note: "Follow 'waits for' links from each philosopher; coming back to the start means a cycle."
+  - title: Avoiding deadlock in real Python
+    intro: "Two practical techniques: a fixed lock order, and a timeout with retry. Not run here, because the browser has no threads."
+    runnable: false
+    code: |
+      import threading
+
+      lock_a, lock_b = threading.Lock(), threading.Lock()
+
+      # 1. Always take locks in one global order (here: by id)
+      def transfer(src_lock, dst_lock, do_transfer):
+          first, second = sorted([src_lock, dst_lock], key=id)
+          with first:
+              with second:
+                  do_transfer()
+
+      # 2. Break "no preemption": give up and retry if the second lock takes too long
+      def try_both(a, b, work):
+          while True:
+              with a:
+                  if b.acquire(timeout=0.1):
+                      try:
+                          work()
+                          return
+                      finally:
+                          b.release()
+              # a is released here, so the other thread can proceed; retry (add random delay in practice)
+    lines:
+      - line: 7
+        note: "Sorting by a fixed key means two threads that want the same pair always lock them in the same order, however the call was written."
+      - line: 13
+        note: "acquire(timeout=...) returns False instead of waiting forever. We then release a and try again."
+
+playground:
+  prompt: |
+    Extend the dining-philosophers example to find which philosophers can eat if everyone follows the ordering rule and philosopher 0 is already holding fork 0 and fork 1. Or change the banker's state by lowering `available` to `[1, 1, 1]` and see whether the state is still safe.
+  code: |
+    def can_reach_cycle(graph):
+        for start in graph:
+            seen, stack = set(), list(graph[start])
+            while stack:
+                n = stack.pop()
+                if n == start:
+                    return True
+                if n not in seen:
+                    seen.add(n)
+                    stack.extend(graph.get(n, []))
+        return False
+
+    print(can_reach_cycle({"a": ["b"], "b": ["c"], "c": []}))
+    print(can_reach_cycle({"a": ["b"], "b": ["c"], "c": ["a"]}))
+
+exercises:
+  - id: wait-for
+    title: Building the wait-for graph
+    difficulty: 3
+    prompt: |
+      Write `wait_for_graph(holds, wants)`. `holds` maps each **lock** to the thread that holds it (locks nobody holds are absent). `wants` maps a **thread** to the lock it is waiting for, or to `None` if it is not waiting. Return a dictionary with an entry for **every thread** that appears in `holds` (as a holder) or in `wants` (as a key). Each value is the sorted list of threads it is waiting for: the holder of the wanted lock, if there is one and it is a different thread (a thread waiting for a lock it already holds, or for a free lock, waits for nobody here).
+    starter: |
+      def wait_for_graph(holds, wants):
+          pass
+    tests:
+      - name: cycle
+        code: |
+          holds = {"A": "T1", "B": "T2", "C": "T3"}
+          wants = {"T1": "B", "T2": "C", "T3": "A", "T4": "A"}
+          assert wait_for_graph(holds, wants) == {"T1": ["T2"], "T2": ["T3"], "T3": ["T1"], "T4": ["T1"]}
+      - name: free locks and idle threads
+        code: |
+          holds = {"A": "T1", "B": "T2"}
+          wants = {"T1": None, "T2": "A", "T3": "Z", "T4": "B"}
+          g = wait_for_graph(holds, wants)
+          assert g == {"T1": [], "T2": ["T1"], "T3": [], "T4": ["T2"]}
+          assert wait_for_graph({}, {}) == {}
+          assert wait_for_graph({"A": "T1"}, {"T1": "A"}) == {"T1": []}
+    hints:
+      - "Start with `{t: [] for t in set(holds.values()) | set(wants)}`."
+      - "For each `(thread, lock)` in `wants`: `owner = holds.get(lock)`; if it is not None and not the thread itself, add it."
+      - "Sort each list (and avoid duplicates)."
+    solution: |
+      def wait_for_graph(holds, wants):
+          graph = {t: [] for t in set(holds.values()) | set(wants)}
+          for thread, lock in wants.items():
+              owner = holds.get(lock) if lock is not None else None
+              if owner is not None and owner != thread:
+                  graph[thread].append(owner)
+          return {t: sorted(set(v)) for t, v in graph.items()}
+    explanation: |
+      This is the data an operating system or database keeps to detect deadlock: who holds each lock and who is waiting. Turning "locks" into "threads waiting for threads" collapses the two kinds of node into one so that cycle detection becomes a plain graph search.
+
+  - id: find-deadlock
+    title: Finding the deadlocked threads
+    difficulty: 3
+    prompt: |
+      Write `deadlocked(wait_for)`, where `wait_for` maps every thread to the list of threads it is waiting for (as built by the previous exercise). Return the **sorted list of threads that lie on a cycle**, meaning those that can reach themselves by following wait-for edges. Threads that merely wait for a deadlocked thread, but are not themselves on a cycle, are **not** included. Return `[]` if there is no deadlock. Also write `all_stuck(wait_for)`, which returns the sorted list of every thread that can **never proceed**: the deadlocked threads plus every thread that can reach a deadlocked thread.
+    starter: |
+      def deadlocked(wait_for):
+          pass
+
+
+      def all_stuck(wait_for):
+          pass
+    tests:
+      - name: cycles
+        code: |
+          g = {"A": ["B"], "B": ["C"], "C": ["A"], "D": ["A"], "E": []}
+          assert deadlocked(g) == ["A", "B", "C"]
+          assert all_stuck(g) == ["A", "B", "C", "D"]
+          assert deadlocked({"A": ["B"], "B": []}) == [] and all_stuck({"A": ["B"], "B": []}) == []
+          assert deadlocked({}) == [] and all_stuck({}) == []
+      - name: self loops and two cycles
+        code: |
+          g = {"X": ["X"], "Y": ["Z"], "Z": ["Y"], "W": ["X", "Y"], "V": []}
+          assert deadlocked(g) == ["X", "Y", "Z"]
+          assert all_stuck(g) == ["W", "X", "Y", "Z"]
+      - name: larger graph
+        code: |
+          n = 2000
+          g = {i: [i + 1] for i in range(n - 1)}
+          g[n - 1] = [n // 2]
+          assert deadlocked(g) == sorted(range(n // 2, n))
+          assert all_stuck(g) == list(range(n))
+    hints:
+      - "A helper `reach(start)` that returns the set of threads reachable from `start` (iterative DFS with a stack) solves both."
+      - "`deadlocked`: threads `t` with `t in reach(t)`."
+      - "`all_stuck`: threads `t` that are deadlocked or whose `reach(t)` contains a deadlocked thread."
+      - "Use a stack, not recursion, so that long chains do not overflow."
+    solution: |
+      def _reach(wait_for, start):
+          seen = set()
+          stack = list(wait_for.get(start, []))
+          while stack:
+              node = stack.pop()
+              if node not in seen:
+                  seen.add(node)
+                  stack.extend(wait_for.get(node, []))
+          return seen
+
+
+      def deadlocked(wait_for):
+          return sorted(t for t in wait_for if t in _reach(wait_for, t))
+
+
+      def all_stuck(wait_for):
+          dead = set(deadlocked(wait_for))
+          return sorted(t for t in wait_for if t in dead or _reach(wait_for, t) & dead)
+    explanation: |
+      Any thread that can eventually reach a cycle is doomed: to proceed it needs a thread that never will. This is why killing one thread on the cycle often frees a whole crowd. Doing a reachability search from every node is O(V·(V+E)); a single pass of strongly connected components (Tarjan's algorithm) finds all cycles in O(V+E), and is what a real detector would use.
+
+  - id: bankers
+    title: The banker's algorithm
+    difficulty: 4
+    prompt: |
+      Write `is_safe(available, max_need, allocation)` and `can_grant(thread, request, available, max_need, allocation)`. The arguments are as in the lesson: `available` is a list with one number per resource type; `max_need` and `allocation` map each thread to such a list. `is_safe` returns a **safe sequence** (a list of threads) or `None` if the state is unsafe. To make the answer unique, at every step choose the **alphabetically first** unfinished thread whose remaining need fits in the currently free resources. `can_grant` raises `ValueError` if `request` exceeds the thread's remaining need (`max_need − allocation`), returns `False` if it exceeds `available` or if granting it would make the state unsafe, and `True` otherwise. It must not change its arguments.
+    starter: |
+      def is_safe(available, max_need, allocation):
+          pass
+
+
+      def can_grant(thread, request, available, max_need, allocation):
+          pass
+    tests:
+      - name: textbook state
+        code: |
+          av = [3, 3, 2]
+          mx = {"P0": [7, 5, 3], "P1": [3, 2, 2], "P2": [9, 0, 2], "P3": [2, 2, 2], "P4": [4, 3, 3]}
+          al = {"P0": [0, 1, 0], "P1": [2, 0, 0], "P2": [3, 0, 2], "P3": [2, 1, 1], "P4": [0, 0, 2]}
+          assert is_safe(av, mx, al) == ["P1", "P3", "P0", "P2", "P4"]
+          assert is_safe([0, 0, 0], {"A": [1, 0, 0], "B": [0, 1, 0]}, {"A": [0, 1, 0], "B": [1, 0, 0]}) is None
+          assert is_safe([1], {}, {}) == []
+      - name: requests
+        code: |
+          av = [3, 3, 2]
+          mx = {"P0": [7, 5, 3], "P1": [3, 2, 2], "P2": [9, 0, 2], "P3": [2, 2, 2], "P4": [4, 3, 3]}
+          al = {"P0": [0, 1, 0], "P1": [2, 0, 0], "P2": [3, 0, 2], "P3": [2, 1, 1], "P4": [0, 0, 2]}
+          import copy
+          before = copy.deepcopy((av, mx, al))
+          assert can_grant("P1", [1, 0, 2], av, mx, al) is True
+          assert can_grant("P4", [3, 3, 0], av, mx, al) is False      # fits in what is free, but unsafe
+          assert can_grant("P0", [0, 0, 3], av, mx, al) is False      # more than is free
+          assert can_grant("P0", [0, 2, 0], av, mx, al) is True
+          try:
+              can_grant("P1", [2, 0, 0], av, mx, al)                 # needs only 1 more of resource 0
+              assert False
+          except ValueError:
+              pass
+          assert (av, mx, al) == before
+      - name: single resource
+        code: |
+          mx = {"A": [10], "B": [4], "C": [9]}
+          al = {"A": [5], "B": [2], "C": [2]}
+          assert is_safe([3], mx, al) == ["B", "A", "C"]
+          assert can_grant("C", [1], [3], mx, al) is False
+          assert can_grant("A", [1], [3], mx, al) is True
+    hints:
+      - "`need = [m - a for m, a in zip(max_need[t], allocation[t])]`, and a thread fits if every need entry is `<= work`."
+      - "Loop: look through `sorted(unfinished)`; take the first that fits, add its allocation to `work`, and record it. If none fits, return `None`."
+      - "`can_grant`: do the two error checks, then build a **copy** of `allocation` with the request added and `available` reduced, and call `is_safe`."
+    solution: |
+      def is_safe(available, max_need, allocation):
+          work = list(available)
+          unfinished = set(max_need)
+          order = []
+          while unfinished:
+              for t in sorted(unfinished):
+                  need = [m - a for m, a in zip(max_need[t], allocation[t])]
+                  if all(n <= w for n, w in zip(need, work)):
+                      work = [w + a for w, a in zip(work, allocation[t])]
+                      unfinished.remove(t)
+                      order.append(t)
+                      break
+              else:
+                  return None
+          return order
+
+
+      def can_grant(thread, request, available, max_need, allocation):
+          need = [m - a for m, a in zip(max_need[thread], allocation[thread])]
+          if any(r > n for r, n in zip(request, need)):
+              raise ValueError("request exceeds the thread's maximum claim")
+          if any(r > a for r, a in zip(request, available)):
+              return False
+          new_available = [a - r for a, r in zip(available, request)]
+          new_allocation = {t: list(v) for t, v in allocation.items()}
+          new_allocation[thread] = [a + r for a, r in zip(new_allocation[thread], request)]
+          return is_safe(new_available, max_need, new_allocation) is not None
+    explanation: |
+      The key insight is that safety is checked on a *pretend* future: grant provisionally, then ask whether everyone could still finish in some order. Copying the data before changing it keeps the real state untouched if the answer is no. The cost is O(m·n²) per check for n threads and m resource types, which is why real operating systems avoid it.
+
+  - id: lock-order
+    title: Spotting AB-BA lock orders
+    difficulty: 3
+    prompt: |
+      Code review for deadlocks: write `ab_ba_pairs(sequences)`. `sequences` maps each thread to the **list of locks it acquires, in order** (assume it keeps holding every lock it has taken until the end). A pair of locks `x` and `y` is **dangerous** if some thread takes `x` before `y` while a **different** thread takes `y` before `x`. Return the sorted list of dangerous pairs, each written as `(smaller, larger)`. A single thread that happens to take the same two locks in both orders (listing a lock twice) does not count by itself.
+    starter: |
+      def ab_ba_pairs(sequences):
+          pass
+    tests:
+      - name: simple cases
+        code: |
+          assert ab_ba_pairs({"T1": ["A", "B"], "T2": ["B", "A"]}) == [("A", "B")]
+          assert ab_ba_pairs({"T1": ["A", "B"], "T2": ["A", "B", "C"]}) == []
+          assert ab_ba_pairs({}) == []
+          assert ab_ba_pairs({"T1": ["A"], "T2": ["A"]}) == []
+      - name: three threads
+        code: |
+          seq = {"T1": ["A", "B", "C"], "T2": ["C", "B"], "T3": ["B", "A"]}
+          assert ab_ba_pairs(seq) == [("A", "B"), ("B", "C")]
+      - name: needs two different threads
+        code: |
+          assert ab_ba_pairs({"T1": ["A", "B", "A"]}) == []
+          assert ab_ba_pairs({"T1": ["A", "B", "A"], "T2": ["B", "C"]}) == []
+    hints:
+      - "For every thread and every `i < j`, record that this thread takes `seq[i]` before `seq[j]`: `before[(seq[i], seq[j])]` is a set of threads."
+      - "A pair is dangerous when `before[(x, y)]` and `before[(y, x)]` both exist and contain threads that are not the same single thread."
+      - "Collect `(min(x, y), max(x, y))` into a set and sort it at the end."
+    solution: |
+      def ab_ba_pairs(sequences):
+          before = {}
+          for thread, seq in sequences.items():
+              for i in range(len(seq)):
+                  for j in range(i + 1, len(seq)):
+                      before.setdefault((seq[i], seq[j]), set()).add(thread)
+          dangerous = set()
+          for (x, y), first in before.items():
+              second = before.get((y, x), set())
+              if any(a != b for a in first for b in second):
+                  dangerous.add((min(x, y), max(x, y)))
+          return sorted(dangerous)
+    explanation: |
+      This is a miniature of what static analysers and the Linux kernel's `lockdep` tool do: record the order in which locks are taken and warn when two orders conflict, **before** the bad interleaving ever happens. It finds the bug from a single run that happened not to deadlock. The cure is to agree on one global order and make the analyser enforce it.
+
+commonMistakes:
+  - title: Taking two locks in different orders in different places
+    explanation: |
+      The AB-BA pattern is the commonest deadlock. Pick a global order (for example by name or id) and always follow it.
+  - title: Holding a lock while calling unknown code
+    explanation: |
+      A callback or overridden method may try to take another lock, in an order you never planned. Release your lock before calling out, or document the order.
+  - title: Calling a function that takes the same lock again
+    explanation: |
+      A thread that locks a non-reentrant lock it already holds deadlocks with itself. Use a reentrant lock (`RLock`) or restructure.
+  - title: Retrying in lockstep
+    explanation: |
+      Two threads that both back off and retry at the same moment can livelock. Add a random delay.
+  - title: Thinking a hung program must be deadlocked
+    explanation: |
+      It could also be livelock, starvation, an infinite loop, or waiting on a slow network. Check whether the threads use CPU and what each is blocked on.
+  - title: Believing an unsafe state is a deadlock
+    explanation: |
+      Unsafe means deadlock is possible, not that it has happened. The banker refuses unsafe grants to stay on the safe side.
+
+summary:
+  - "**Deadlock** is a set of threads each waiting for a resource held by another in the set, so none can ever proceed. Deadlocked threads use no CPU."
+  - "It needs all four **Coffman conditions**: mutual exclusion, hold and wait, no preemption and circular wait. Break any one and deadlock is impossible."
+  - "A **global lock order** prevents circular waits and is the standard practical defence; `acquire(timeout=...)` and rollback break no-preemption."
+  - "A **cycle in the wait-for graph** means deadlock for single-instance resources. Databases detect it and abort a victim; most operating systems ignore it (the ostrich algorithm)."
+  - "The **banker's algorithm** avoids deadlock: grant a request only if a **safe sequence** still exists. It needs maximum claims in advance, so it is rare in practice."
+  - "**Dining philosophers** show the problem and its fixes (ordering, a waiter, all-or-nothing). **Livelock** (busy but no progress) and **starvation** (never chosen) are different failures."
+next: |
+  So far the processes have shared a CPU. They also have to share **memory**, and each process needs to believe it has a large, private, contiguous address space. Lesson 10.7 begins memory management: contiguous allocation and fragmentation, then **paging**, page tables and the address translation hardware, which uses the bit operations from Unit 9.
+
+quiz:
+  - type: mcq
+    question: Which is NOT one of the four necessary conditions for deadlock?
+    options: ["Starvation", "Mutual exclusion", "Hold and wait", "Circular wait"]
+    answer: 0
+    explanation: "The four conditions are mutual exclusion, hold and wait, no preemption and circular wait."
+  - type: mcq
+    question: Thread 1 locks A then B; Thread 2 locks B then A. What is the standard fix?
+    options: [
+      "Make both threads take the locks in the same global order",
+      "Add more threads",
+      "Use a faster CPU",
+      "Lock A twice"
+    ]
+    answer: 0
+    explanation: "A consistent order makes a cycle of waits impossible."
+  - type: mcq
+    question: What does a cycle in a wait-for graph (single-instance resources) show?
+    options: ["A deadlock", "A memory leak", "A safe state", "A race condition"]
+    answer: 0
+    explanation: "Every thread on the cycle waits for the next, so none can ever continue."
+  - type: mcq
+    question: In the banker's algorithm, what is a "safe state"?
+    options: [
+      "One in which some order exists in which every thread can run to completion",
+      "One in which no thread is waiting",
+      "One in which all resources are free",
+      "One in which there is only one thread"
+    ]
+    answer: 0
+    explanation: "A safe sequence guarantees everyone can finish, so deadlock cannot occur if you stay safe."
+  - type: mcq
+    question: Five philosophers each pick up their left fork at the same time. What happens?
+    options: [
+      "Deadlock: each holds one fork and waits for the neighbour's",
+      "Everyone eats",
+      "Livelock",
+      "Starvation of one philosopher only"
+    ]
+    answer: 0
+    explanation: "A circular wait forms around the table."
+  - type: mcq
+    question: How does a livelocked program differ from a deadlocked one?
+    options: [
+      "Livelocked threads keep running (using CPU) but make no progress",
+      "Livelocked threads are blocked and use no CPU",
+      "There is no difference",
+      "Livelock only happens with one thread"
+    ]
+    answer: 0
+    explanation: "Deadlocked threads sleep forever; livelocked threads keep reacting to each other without getting anywhere."
+  - type: code
+    question: |
+      Write `lock_order(locks)` that returns the given lock names sorted into the single global order to acquire them in (alphabetical, ignoring duplicates).
+    starter: |
+      def lock_order(locks):
+          pass
+    tests:
+      - name: order
+        code: |
+          assert lock_order(["B", "A", "C", "A"]) == ["A", "B", "C"]
+          assert lock_order([]) == []
+          assert lock_order(["x"]) == ["x"]
+    solution: |
+      def lock_order(locks):
+          return sorted(set(locks))

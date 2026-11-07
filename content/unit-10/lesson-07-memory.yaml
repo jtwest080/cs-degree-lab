@@ -1,0 +1,757 @@
+id: u10-memory
+title: Memory Management and Paging
+minutes: 60
+objective: |
+  See how the OS gives every process a private address space on top of shared physical memory. Compare contiguous allocation (and its fragmentation) with **paging**, translate virtual addresses to physical ones with page tables and bit operations, and measure what a TLB does for speed.
+outcomes:
+  - Explain why programs use virtual addresses and what the MMU does
+  - Allocate memory with first-fit, best-fit and worst-fit, and measure internal and external fragmentation
+  - Split a virtual address into page number and offset, and translate it using a page table
+  - Compute the size of single-level and two-level page tables
+  - Explain how a TLB speeds translation, and compute effective access time
+  - Describe protection bits and shared pages
+
+sections:
+  - heading: Why virtual memory addresses?
+    body: |
+      Early computers ran one program at a time, which used physical addresses directly. With many processes the problems appear at once: where in RAM does each program go, what if two programs want the same addresses, how do you stop one program reading or writing another's memory, and what if the programs together need more memory than the machine has?
+
+      The solution is a layer of indirection, the oldest trick in computing. Every process uses **virtual addresses** (also called logical addresses): its code and data appear to live at addresses starting from 0, in a private address space. A piece of hardware, the **memory management unit (MMU)**, translates each virtual address to a **physical address** in RAM as the instruction executes, using tables the OS maintains. The process never sees physical addresses.
+
+      This gives:
+
+      - **Isolation / protection**: a process can only name addresses the OS has mapped for it. An attempt to touch anything else raises a fault (a *segmentation fault* in Unix).
+      - **Relocation**: the OS can put a process anywhere in RAM, and even move it, without the process noticing.
+      - **Sharing**: two processes can map the same physical memory (shared libraries, shared memory) at different virtual addresses.
+      - **More memory than RAM** (next lesson): not every virtual page has to be in RAM at once.
+      - **Convenience**: every program can be compiled assuming the same layout.
+
+  - heading: Contiguous allocation and fragmentation
+    body: |
+      The simplest scheme gives each process one **contiguous block** of physical memory, with a **base** register (where it starts) and a **limit** register (how long it is). The MMU adds the base to every virtual address and traps if the address is beyond the limit.
+
+      The OS must then track free **holes** and choose one when a process arrives. Common placement strategies:
+
+      - **First fit**: the first hole that is big enough (fast; tends to chew up the start of memory).
+      - **Best fit**: the smallest hole that fits (leaves the smallest leftover, but leaves tiny useless slivers and needs a search).
+      - **Worst fit**: the largest hole (leftover is large enough to be useful, but destroys big holes).
+
+      Simulations show first fit and best fit perform similarly, and both beat worst fit.
+
+      Whatever you choose, memory becomes riddled with unusable holes as processes come and go. This is **external fragmentation**: enough total free memory exists, but not in one piece. A 100 KB request fails even though 300 KB is free, as three 100 KB − 1 byte holes. Freed neighbouring holes must be **coalesced** (merged) to fight it. The brute-force cure is **compaction** (sliding everything together), which costs a lot of copying.
+
+      Contiguous allocation has another weakness: a process must fit in one block, and growing (the heap, the stack) requires moving. Paging removes both problems.
+
+  - heading: Paging
+    body: |
+      **Paging** cuts memory into fixed-size pieces. Virtual memory is divided into **pages** and physical memory into **frames** of the same size (commonly **4 KB** = 4096 bytes). Any page can go in any frame, so a process's memory need not be contiguous in RAM. Because all pieces are the same size, there is **no external fragmentation**: any free frame is as good as any other.
+
+      The OS keeps a **page table** for each process: an array indexed by page number, giving the frame number holding that page (plus flag bits). Translating an address is bit manipulation (Lesson 9.8):
+
+      ```text
+      virtual address  = | page number | offset |
+                           (high bits)   (low bits)
+
+      page size 4096 = 2^12  ->  offset = the low 12 bits
+      page number    = vaddr >> 12
+      offset         = vaddr & 0xFFF
+      frame          = page_table[page number]
+      physical addr  = (frame << 12) | offset
+      ```
+
+      Example: virtual address `0x1234` with 4 KB pages has page number 1 and offset `0x234`. If page 1 lives in frame 7, the physical address is `(7 << 12) | 0x234 = 0x7234`.
+
+      Each page table entry (PTE) also holds flag bits:
+
+      - **Valid / present**: is the page mapped (in RAM)? If not, the access causes a **page fault** and the OS takes over (Lesson 10.8).
+      - **Read / write / execute**: permissions. Code pages are read-only and executable; data pages are not executable. This blocks many attacks (a buffer overflow that injects code can't run it).
+      - **Dirty**: written since it was loaded. **Accessed**: used recently.
+      - **User / supervisor**: whether user code may access it.
+
+      **Internal fragmentation.** Memory is handed out in whole pages, so the last page of every region is partly wasted. A 4097-byte request takes two 4 KB pages and wastes 4095 bytes. On average, half a page per region is wasted, which is why page sizes are a compromise: small pages waste little but make big page tables; large pages (2 MB, 1 GB "huge pages") make small tables but waste more.
+
+  - heading: Page table size and multi-level tables
+    body: |
+      A flat page table can be huge. With 32-bit addresses and 4 KB pages there are 2²⁰ ≈ 1 million pages, so a table of 4-byte entries takes **4 MB per process**. With 64-bit addresses the flat table would be astronomically large, and most of it would describe unused address space.
+
+      The fix is a **multi-level page table**, a tree (like a trie, Lesson 7.7). A 32-bit address is split into three fields (the classic x86 layout): 10 bits for the **directory** index, 10 bits for the **table** index, 12 bits of offset.
+
+      ```text
+      | dir (10) | table (10) | offset (12) |
+      ```
+
+      The top-level directory has 1024 entries, each pointing to a second-level table of 1024 entries, but a second-level table **exists only if that part of the address space is used**. A small program with a little code, heap and stack needs a directory plus maybe three or four small tables, a few tens of KB instead of 4 MB. x86-64 uses **four** levels (9 bits each); newer CPUs offer five.
+
+      The price: translation now takes several memory reads, one per level. Hardware makes this tolerable with a cache.
+
+  - heading: The TLB
+    body: |
+      Reading a page table entry from RAM for every memory access would at least double (or with four levels, quintuple) the cost of every load and store. The **translation lookaside buffer (TLB)** is a small, very fast cache inside the CPU holding recently used translations (page number to frame). Typical sizes: 64 to 2048 entries.
+
+      - **TLB hit**: translation takes about a cycle; just one memory access follows.
+      - **TLB miss**: the hardware (or on some architectures the OS) walks the page table, then loads the entry into the TLB, evicting an old one (often least recently used).
+
+      The **effective access time** is a weighted average. With hit ratio *h*, TLB lookup time *t* and memory access time *m*, using a single-level page table:
+
+      **EAT = h × (t + m) + (1 − h) × (t + 2m)**
+
+      With *t* = 10 ns, *m* = 100 ns and h = 90%: 0.9 × 110 + 0.1 × 210 = **120 ns**, only 20% slower than raw memory instead of 100% slower. TLBs work because programs have **locality of reference**: they tend to reuse the same few pages over and over (Lesson 1.6). On a context switch the TLB entries of the old process are invalid, so either the TLB is flushed or entries are tagged with a process id; this is part of the hidden cost of context switches (Lesson 10.2).
+
+      **Sharing and copy-on-write.** Because mapping is by table, two processes can map the same frame. Shared libraries (such as libc) are loaded once and mapped into every process read-only. After `fork` (Lesson 10.2), parent and child share all frames, marked read-only; only when one writes does the OS copy that single page. That's why `fork` is cheap.
+
+examples:
+  - title: A memory allocator and fragmentation
+    intro: "Allocate and free blocks in 1000 bytes of memory, then compare first-fit, best-fit and worst-fit on the same holes."
+    code: |
+      def place(holes, size, strategy):
+          fits = [h for h in holes if h[1] >= size]
+          if not fits:
+              return None
+          if strategy == "first":
+              return fits[0]
+          if strategy == "best":
+              return min(fits, key=lambda h: (h[1], h[0]))
+          return max(fits, key=lambda h: (h[1], -h[0]))
+
+
+      def allocate(holes, size, strategy):
+          hole = place(holes, size, strategy)
+          if hole is None:
+              return None, holes
+          start, length = hole
+          rest = [h for h in holes if h != hole]
+          if length > size:
+              rest.append((start + size, length - size))
+          return start, sorted(rest)
+
+
+      holes = [(200, 300), (600, 400)]     # two free regions after some blocks were freed
+      for strategy in ("first", "best", "worst"):
+          start, after = allocate(holes, 250, strategy)
+          print(f"{strategy:5} fit puts the 250-byte block at {start}; holes now {after}")
+      print()
+      free = sum(length for _, length in holes)
+      print("external fragmentation: total free", free, "but largest hole", max(length for _, length in holes))
+      print("a 700-byte request:", allocate(holes, 700, "first")[0])
+    output: |
+      first fit puts the 250-byte block at 200; holes now [(450, 50), (600, 400)]
+      best  fit puts the 250-byte block at 200; holes now [(450, 50), (600, 400)]
+      worst fit puts the 250-byte block at 600; holes now [(200, 300), (850, 150)]
+
+      external fragmentation: total free 700 but largest hole 400
+      a 700-byte request: None
+    lines:
+      - line: 5
+        note: "First fit takes the first hole in address order that is large enough."
+      - line: 7
+        note: "Best fit takes the smallest sufficient hole, hoping to waste little."
+      - line: 9
+        note: "Worst fit takes the biggest hole, so the leftover is still useful."
+      - line: 31
+        note: "700 bytes are free in total, but split into two holes, so the request fails. That is external fragmentation."
+  - title: Splitting a virtual address
+    intro: "The page number and offset are just the high and low bits of the address. Shifts and masks do the work."
+    code: |
+      PAGE_SIZE = 4096
+      OFFSET_BITS = 12                     # 2**12 == 4096
+      page_table = [5, 7, None, 3]         # page -> frame, None = not in memory
+
+
+      def translate(vaddr):
+          page = vaddr >> OFFSET_BITS
+          offset = vaddr & (PAGE_SIZE - 1)
+          if page >= len(page_table) or page_table[page] is None:
+              return f"page fault on page {page}"
+          frame = page_table[page]
+          return (frame << OFFSET_BITS) | offset
+
+
+      for vaddr in (0x0000, 0x0FFF, 0x1000, 0x1234, 0x2000, 0x3ABC, 0x9000):
+          result = translate(vaddr)
+          shown = hex(result) if isinstance(result, int) else result
+          print(f"virtual {vaddr:#06x} (page {vaddr >> 12}, offset {vaddr & 0xFFF:#05x}) -> {shown}")
+    output: |
+      virtual 0x0000 (page 0, offset 0x000) -> 0x5000
+      virtual 0x0fff (page 0, offset 0xfff) -> 0x5fff
+      virtual 0x1000 (page 1, offset 0x000) -> 0x7000
+      virtual 0x1234 (page 1, offset 0x234) -> 0x7234
+      virtual 0x2000 (page 2, offset 0x000) -> page fault on page 2
+      virtual 0x3abc (page 3, offset 0xabc) -> 0x3abc
+      virtual 0x9000 (page 9, offset 0x000) -> page fault on page 9
+    lines:
+      - line: 7
+        note: "Shift right by 12 to drop the offset: what remains is the page number."
+      - line: 8
+        note: "A mask of 4095 (twelve 1-bits) keeps just the offset."
+      - line: 12
+        note: "The frame number replaces the page number; the offset passes through unchanged."
+      - line: 21
+        note: "Page 2 is not in memory and page 9 is outside the table: both cause faults that the OS must handle."
+  - title: Page table sizes
+    intro: "Why a flat page table is too large, and how two levels save memory for a small program."
+    code: |
+      PAGE = 4096
+      ENTRY = 4                                   # bytes per page table entry
+
+      flat_pages = 2 ** 32 // PAGE
+      print("flat table, 32-bit addresses:", flat_pages, "entries =", flat_pages * ENTRY // 1024, "KB per process")
+
+      # a small program uses: 3 pages of code at the bottom, 10 of heap, 5 of stack at the top
+      used_regions = [(0, 3), (1024, 10), (1024 * 1023, 5)]   # (first page, page count)
+      second_level_tables = set()
+      for first_page, count in used_regions:
+          for page in range(first_page, first_page + count):
+              second_level_tables.add(page >> 10)             # which 1024-entry table holds it
+      two_level_bytes = (1 + len(second_level_tables)) * 1024 * ENTRY
+      print("two-level table:", len(second_level_tables), "second-level tables + 1 directory =", two_level_bytes // 1024, "KB")
+
+      # 64-bit addresses, 48 bits used
+      print("flat table with 48-bit addresses would need", 2 ** 36 * 8 // 2 ** 30, "GB per process")
+    output: |
+      flat table, 32-bit addresses: 1048576 entries = 4096 KB per process
+      two-level table: 3 second-level tables + 1 directory = 16 KB
+      flat table with 48-bit addresses would need 512 GB per process
+    lines:
+      - line: 4
+        note: "4 GB divided into 4 KB pages: a million pages, and a 4 MB table, for every process."
+      - line: 12
+        note: "The page number's high 10 bits select the second-level table. Pages from the same neighbourhood share a table."
+      - line: 14
+        note: "Only the tables actually in use are allocated, so a small program needs 16 KB instead of 4 MB."
+      - line: 18
+        note: "Impractical: this is why 64-bit systems use four-level tables that are filled in only where needed."
+  - title: The TLB and effective access time
+    intro: "A tiny LRU cache of translations. Locality gives a high hit rate; a poor access pattern defeats it."
+    code: |
+      from collections import OrderedDict
+
+
+      def hit_rate(accesses, capacity):
+          tlb = OrderedDict()
+          hits = 0
+          for page in accesses:
+              if page in tlb:
+                  hits += 1
+                  tlb.move_to_end(page)
+              else:
+                  if len(tlb) >= capacity:
+                      tlb.popitem(last=False)
+                  tlb[page] = True
+          return hits / len(accesses)
+
+
+      def effective_time(h, tlb_ns=10, mem_ns=100):
+          return h * (tlb_ns + mem_ns) + (1 - h) * (tlb_ns + 2 * mem_ns)
+
+
+      loop_over_few_pages = [1, 2, 3] * 100                 # good locality
+      sweep_many_pages = list(range(1, 11)) * 30            # cycles through more pages than the TLB holds
+      for name, trace in (("tight loop", loop_over_few_pages), ("big sweep", sweep_many_pages)):
+          h = hit_rate(trace, capacity=4)
+          print(f"{name:10} hit rate {h:6.1%}  effective access time {effective_time(h):6.1f} ns")
+    output: |
+      tight loop hit rate  99.0%  effective access time  111.0 ns
+      big sweep  hit rate   0.0%  effective access time  210.0 ns
+    lines:
+      - line: 9
+        note: "A hit: refresh the entry's recency by moving it to the end."
+      - line: 12
+        note: "A miss with a full TLB: evict the least recently used entry (the front of the ordered dict)."
+      - line: 29
+        note: "Cycling through 10 pages with a 4-entry LRU cache misses every time. Locality, not size alone, decides the hit rate."
+
+playground:
+  prompt: |
+    Change the TLB capacity and the access patterns above. How big must the TLB be before the big sweep starts hitting? Then change PAGE_SIZE to 1024 or 16384 in the address-splitting example (remember to change OFFSET_BITS too) and see how the page and offset change for the same address.
+  code: |
+    address = 0xDEADBEEF
+    for bits in (10, 12, 16):
+        print(f"{1 << bits:6}-byte pages: page {address >> bits:#x}, offset {address & ((1 << bits) - 1):#x}")
+
+exercises:
+  - id: allocator
+    title: A memory allocator
+    difficulty: 4
+    prompt: |
+      Write the class `MemoryManager`. `MemoryManager(size)` starts with one free hole `(0, size)`. The attribute `holes` is a list of `(start, length)` tuples sorted by start, with adjacent holes always merged. `alloc(name, size, strategy="first")` allocates a block called `name` using `"first"`, `"best"` (smallest sufficient hole, ties go to the lowest address) or `"worst"` (largest hole, ties go to the lowest address) fit, and returns the start address, or `None` if no hole is big enough. It raises `ValueError` for a duplicate name, a size below 1, or an unknown strategy. The block is taken from the **beginning** of the chosen hole. `free(name)` returns a block to the free list and **coalesces** it with adjacent holes (`KeyError` for an unknown name). `free_space()` is the total free bytes, `largest_hole()` the size of the biggest hole (0 if none), and `fragmentation()` is `1 - largest_hole / free_space` rounded to 3 places (0.0 when nothing is free).
+    starter: |
+      class MemoryManager:
+          def __init__(self, size):
+              pass
+
+          def alloc(self, name, size, strategy="first"):
+              pass
+
+          def free(self, name):
+              pass
+
+          def free_space(self):
+              pass
+
+          def largest_hole(self):
+              pass
+
+          def fragmentation(self):
+              pass
+    tests:
+      - name: first fit and coalescing
+        code: |
+          m = MemoryManager(1000)
+          assert m.alloc("A", 200) == 0 and m.alloc("B", 300) == 200
+          assert m.alloc("C", 100) == 500 and m.alloc("D", 150) == 600
+          assert m.holes == [(750, 250)]
+          m.free("B")
+          m.free("D")
+          assert m.holes == [(200, 300), (600, 400)]
+          m.free("C")
+          assert m.holes == [(200, 800)]
+          m.free("A")
+          assert m.holes == [(0, 1000)] and m.free_space() == 1000
+      - name: three strategies
+        code: |
+          def setup():
+              m = MemoryManager(1000)
+              for n, s in (("A", 200), ("B", 300), ("C", 100), ("D", 150)):
+                  m.alloc(n, s)
+              m.free("B")
+              m.free("D")
+              return m
+          m = setup()
+          assert m.alloc("E", 250, "first") == 200 and m.holes == [(450, 50), (600, 400)]
+          assert m.fragmentation() == 0.111 and m.alloc("F", 400, "first") == 600
+          m = setup()
+          assert m.alloc("E", 250, "best") == 200
+          m = setup()
+          assert m.alloc("E", 250, "worst") == 600 and m.holes == [(200, 300), (850, 150)]
+          assert m.alloc("F", 400, "worst") is None
+          assert m.largest_hole() == 300 and m.free_space() == 450
+          m = setup()
+          assert m.alloc("G", 300, "best") == 200 and m.holes == [(600, 400)]
+      - name: errors and empty
+        code: |
+          m = MemoryManager(100)
+          assert m.fragmentation() == 0.0
+          m.alloc("A", 100)
+          assert m.holes == [] and m.largest_hole() == 0 and m.fragmentation() == 0.0
+          assert m.alloc("B", 1) is None
+          for bad in (lambda: m.alloc("A", 1), lambda: m.alloc("Z", 0), lambda: m.alloc("Z", 5, "random")):
+              try:
+                  bad()
+                  assert False
+              except ValueError:
+                  pass
+          try:
+              m.free("nope")
+              assert False
+          except KeyError:
+              pass
+      - name: random operations keep invariants
+        code: |
+          import random
+          rng = random.Random(9)
+          m = MemoryManager(500)
+          live = {}
+          for i in range(300):
+              if live and rng.random() < 0.45:
+                  name = rng.choice(sorted(live))
+                  m.free(name)
+                  del live[name]
+              else:
+                  size = rng.randint(1, 60)
+                  start = m.alloc(f"b{i}", size, rng.choice(["first", "best", "worst"]))
+                  if start is not None:
+                      live[f"b{i}"] = (start, size)
+              spans = sorted(list(live.values()) + m.holes)
+              assert spans[0][0] == 0 if spans else True
+              pos = 0
+              for s, l in spans:
+                  assert s == pos, "blocks and holes must tile memory exactly"
+                  pos += l
+              assert pos == 500
+              assert all(m.holes[k][0] + m.holes[k][1] < m.holes[k + 1][0] for k in range(len(m.holes) - 1)), "holes must be merged"
+    hints:
+      - "Keep `self.holes` (sorted list of tuples) and `self.blocks` (name to `(start, size)`)."
+      - "Choose the hole by filtering `fits = [h for h in self.holes if h[1] >= size]`, then use `fits[0]`, `min(..., key=(length, start))` or `max(..., key=(length, -start))`."
+      - "After taking the block from the start of the hole, put back `(start + size, length - size)` if anything is left, and sort."
+      - "`free`: add the hole, sort, then sweep once merging every hole that starts exactly where the previous one ends."
+    solution: |
+      class MemoryManager:
+          def __init__(self, size):
+              self.size = size
+              self.holes = [(0, size)]
+              self.blocks = {}
+
+          def alloc(self, name, size, strategy="first"):
+              if name in self.blocks or size < 1:
+                  raise ValueError("bad request")
+              if strategy not in ("first", "best", "worst"):
+                  raise ValueError("unknown strategy")
+              fits = [h for h in self.holes if h[1] >= size]
+              if not fits:
+                  return None
+              if strategy == "first":
+                  hole = fits[0]
+              elif strategy == "best":
+                  hole = min(fits, key=lambda h: (h[1], h[0]))
+              else:
+                  hole = max(fits, key=lambda h: (h[1], -h[0]))
+              start, length = hole
+              self.holes.remove(hole)
+              if length > size:
+                  self.holes.append((start + size, length - size))
+                  self.holes.sort()
+              self.blocks[name] = (start, size)
+              return start
+
+          def free(self, name):
+              start, size = self.blocks.pop(name)
+              self.holes.append((start, size))
+              self.holes.sort()
+              merged = [self.holes[0]]
+              for s, length in self.holes[1:]:
+                  last_start, last_length = merged[-1]
+                  if last_start + last_length == s:
+                      merged[-1] = (last_start, last_length + length)
+                  else:
+                      merged.append((s, length))
+              self.holes = merged
+
+          def free_space(self):
+              return sum(length for _, length in self.holes)
+
+          def largest_hole(self):
+              return max((length for _, length in self.holes), default=0)
+
+          def fragmentation(self):
+              free = self.free_space()
+              if free == 0:
+                  return 0.0
+              return round(1 - self.largest_hole() / free, 3)
+    explanation: |
+      The random test is a real invariant check: at every step, blocks and holes must exactly tile memory with no gaps or overlaps, and no two holes may touch. Coalescing on `free` is what keeps external fragmentation from getting worse than it must be. malloc implementations (Lesson 9.7) use these very ideas, usually with extra structure for speed.
+
+  - id: translate
+    title: Address translation
+    difficulty: 3
+    prompt: |
+      Write `translate(vaddr, page_size, page_table)`. `page_size` is a power of two, and `page_table` is a list indexed by page number whose entries are frame numbers, or `None` for pages that are not in memory. Use shifts and masks, not division. Return the physical address. If the page number is beyond the end of the table or its entry is `None`, raise `PageFault` with the page number as its argument. Also write `split_address(vaddr, page_size)` returning `(page_number, offset)`.
+    starter: |
+      class PageFault(Exception):
+          pass
+
+
+      def split_address(vaddr, page_size):
+          pass
+
+
+      def translate(vaddr, page_size, page_table):
+          pass
+    tests:
+      - name: split
+        code: |
+          assert split_address(0x1234, 4096) == (1, 0x234)
+          assert split_address(0, 4096) == (0, 0)
+          assert split_address(4095, 4096) == (0, 4095)
+          assert split_address(4096, 4096) == (1, 0)
+          assert split_address(1000, 256) == (3, 232)
+          assert split_address(0xDEADBEEF, 1 << 16) == (0xDEAD, 0xBEEF)
+      - name: translate
+        code: |
+          table = [5, 7, None, 3]
+          assert translate(0x0000, 4096, table) == 5 * 4096
+          assert translate(0x1234, 4096, table) == 0x7234
+          assert translate(0x3FFF, 4096, table) == 3 * 4096 + 0xFFF
+          assert translate(100, 256, [9]) == 9 * 256 + 100
+      - name: faults
+        code: |
+          table = [5, 7, None, 3]
+          for addr, page in ((0x2000, 2), (0x2FFF, 2), (0x4000, 4), (0x123456, 0x123456 >> 12)):
+              try:
+                  translate(addr, 4096, table)
+                  assert False
+              except PageFault as e:
+                  assert e.args == (page,), e.args
+          assert translate(0, 4096, [0]) == 0          # frame 0 is a valid frame
+    hints:
+      - "`offset_bits = page_size.bit_length() - 1` gives 12 for 4096."
+      - "page = `vaddr >> offset_bits`, offset = `vaddr & (page_size - 1)`."
+      - "Frame number 0 is valid, so test `is None`, not truthiness."
+    solution: |
+      class PageFault(Exception):
+          pass
+
+
+      def split_address(vaddr, page_size):
+          bits = page_size.bit_length() - 1
+          return vaddr >> bits, vaddr & (page_size - 1)
+
+
+      def translate(vaddr, page_size, page_table):
+          bits = page_size.bit_length() - 1
+          page, offset = split_address(vaddr, page_size)
+          if page >= len(page_table) or page_table[page] is None:
+              raise PageFault(page)
+          return (page_table[page] << bits) | offset
+    explanation: |
+      This is exactly the work the MMU does in hardware on every memory reference, in a handful of gate delays. Frame 0 being valid is a classic bug source: `if not entry` would treat it as a fault. In real page tables a separate **valid bit** avoids the ambiguity.
+
+  - id: two-level
+    title: Two-level translation
+    difficulty: 4
+    prompt: |
+      A 32-bit address is split into a 10-bit directory index, a 10-bit table index and a 12-bit offset. Write `translate2(vaddr, directory)`, where `directory` is a dictionary mapping a directory index to a second-level table (a dictionary mapping a table index to a frame number). Return the physical address `(frame << 12) | offset`. If the directory entry or the table entry is missing, raise `PageFault` with the pair `(dir_index, table_index)`. Also write `table_bytes(directory, entry_size=4)`, the memory used by the page tables: one 1024-entry directory plus one 1024-entry table for each directory entry present, with each entry `entry_size` bytes.
+    starter: |
+      class PageFault(Exception):
+          pass
+
+
+      def translate2(vaddr, directory):
+          pass
+
+
+      def table_bytes(directory, entry_size=4):
+          pass
+    tests:
+      - name: translate
+        code: |
+          d = {1: {3: 0x55}, 0: {0: 7, 1: 8}, 1023: {1023: 0xFFFFF}}
+          assert translate2(0x00403ABC, d) == (0x55 << 12) | 0xABC
+          assert translate2(0x00000123, d) == (7 << 12) | 0x123
+          assert translate2(0x00001000, d) == 8 << 12
+          assert translate2(0xFFFFFFFF, d) == (0xFFFFF << 12) | 0xFFF
+      - name: faults
+        code: |
+          d = {1: {3: 0x55}}
+          for addr, key in ((0x00000000, (0, 0)), (0x00404000, (1, 4)), (0x80000000, (512, 0)), (0x00402000, (1, 2))):
+              try:
+                  translate2(addr, d)
+                  assert False, hex(addr)
+              except PageFault as e:
+                  assert e.args == (key,), (hex(addr), e.args)
+      - name: table sizes
+        code: |
+          assert table_bytes({}) == 4096
+          assert table_bytes({0: {}, 1: {}}) == 3 * 4096
+          assert table_bytes({0: {1: 1}, 5: {2: 2}, 1023: {}}, entry_size=8) == 4 * 1024 * 8
+    hints:
+      - "`d = (vaddr >> 22) & 0x3FF`, `t = (vaddr >> 12) & 0x3FF`, `offset = vaddr & 0xFFF`."
+      - "Check `d in directory` before looking inside it."
+      - "`table_bytes` is `(1 + len(directory)) * 1024 * entry_size`."
+    solution: |
+      class PageFault(Exception):
+          pass
+
+
+      def translate2(vaddr, directory):
+          d = (vaddr >> 22) & 0x3FF
+          t = (vaddr >> 12) & 0x3FF
+          offset = vaddr & 0xFFF
+          if d not in directory or t not in directory[d]:
+              raise PageFault((d, t))
+          return (directory[d][t] << 12) | offset
+
+
+      def table_bytes(directory, entry_size=4):
+          return (1 + len(directory)) * 1024 * entry_size
+    explanation: |
+      Dictionaries stand in for the sparse trees a real OS builds. Notice how little memory the sparse table needs compared with the flat 4 MB: only the directory and the tables that hold something exist. The extra cost is two memory reads per translation instead of one, which the TLB hides.
+
+  - id: tlb
+    title: TLB hit rate
+    difficulty: 3
+    prompt: |
+      Write `tlb_stats(accesses, capacity)`, where `accesses` is a list of page numbers and `capacity` is the number of entries in a TLB that evicts the **least recently used** entry when full. Return `(hits, misses)`. Both a hit and a miss count as a use of that page. Then write `effective_access_time(hit_rate, tlb_ns, mem_ns)` using EAT = h × (t + m) + (1 − h) × (t + 2m), rounded to 2 decimal places.
+    starter: |
+      def tlb_stats(accesses, capacity):
+          pass
+
+
+      def effective_access_time(hit_rate, tlb_ns, mem_ns):
+          pass
+    tests:
+      - name: hits and misses
+        code: |
+          assert tlb_stats([], 4) == (0, 0)
+          assert tlb_stats([1, 2, 1, 3, 1, 2, 4, 1], 2) == (2, 6)
+          assert tlb_stats([1, 2, 3] * 3, 3) == (6, 3)
+          assert tlb_stats([1, 2, 3, 1, 2, 3], 2) == (0, 6)      # LRU thrashes on a cycle
+          assert tlb_stats([5, 5, 5, 5], 1) == (3, 1)
+      - name: effective time
+        code: |
+          assert effective_access_time(0.9, 10, 100) == 120.0
+          assert effective_access_time(1.0, 10, 100) == 110.0
+          assert effective_access_time(0.0, 10, 100) == 210.0
+          assert effective_access_time(0.98, 2, 80) == 83.6
+      - name: capacity helps
+        code: |
+          trace = [1, 2, 3, 4, 1, 2, 5, 1, 2, 3, 4, 5] * 5
+          rates = [tlb_stats(trace, c)[0] for c in range(1, 8)]
+          assert rates == sorted(rates), "more entries should never reduce LRU hits"
+    hints:
+      - "`collections.OrderedDict` keeps order: `move_to_end(page)` marks it most recently used and `popitem(last=False)` removes the least recently used."
+      - "On a miss with `len(tlb) >= capacity`, evict first, then insert."
+    solution: |
+      from collections import OrderedDict
+
+
+      def tlb_stats(accesses, capacity):
+          tlb = OrderedDict()
+          hits = misses = 0
+          for page in accesses:
+              if page in tlb:
+                  hits += 1
+                  tlb.move_to_end(page)
+              else:
+                  misses += 1
+                  if len(tlb) >= capacity:
+                      tlb.popitem(last=False)
+                  tlb[page] = True
+          return hits, misses
+
+
+      def effective_access_time(hit_rate, tlb_ns, mem_ns):
+          return round(hit_rate * (tlb_ns + mem_ns) + (1 - hit_rate) * (tlb_ns + 2 * mem_ns), 2)
+    explanation: |
+      The cyclic trace over three pages with a two-entry TLB is LRU's worst case: each access evicts exactly the page that is needed next, so nothing ever hits. This "cache thrashing" is also why code that scans a big array repeatedly can be much slower than the same work done in blocks that fit in cache.
+
+  - id: fragmentation
+    title: Internal fragmentation
+    difficulty: 2
+    prompt: |
+      Memory is handed out in whole pages. Write `paging_waste(sizes, page_size)`, where `sizes` is a list of request sizes in bytes. Return `(pages, wasted_bytes)`: the total number of pages needed (each request rounded up to whole pages) and the total bytes lost to internal fragmentation (the unused part of each last page). Also write `best_page_size(sizes, candidates)`, which returns the candidate page size with the **least wasted bytes**, ties going to the smaller page size.
+    starter: |
+      def paging_waste(sizes, page_size):
+          pass
+
+
+      def best_page_size(sizes, candidates):
+          pass
+    tests:
+      - name: waste
+        code: |
+          assert paging_waste([], 4096) == (0, 0)
+          assert paging_waste([1000, 4096, 4097, 1], 4096) == (5, 11286)
+          assert paging_waste([4096, 8192], 4096) == (3, 0)
+          assert paging_waste([10], 16) == (1, 6)
+      - name: best size
+        code: |
+          sizes = [100, 3000, 5000, 70, 900]
+          assert best_page_size(sizes, [64, 512, 4096]) == 64
+          assert best_page_size([4096, 8192], [4096, 8192, 512]) == 512
+          assert best_page_size([100], [128, 256]) == 128
+    hints:
+      - "Pages for one request: `(size + page_size - 1) // page_size` (ceiling division)."
+      - "Waste for one request: `pages * page_size - size`."
+      - "`min(candidates, key=lambda p: (paging_waste(sizes, p)[1], p))`."
+    solution: |
+      def paging_waste(sizes, page_size):
+          pages = 0
+          waste = 0
+          for size in sizes:
+              n = (size + page_size - 1) // page_size
+              pages += n
+              waste += n * page_size - size
+          return pages, waste
+
+
+      def best_page_size(sizes, candidates):
+          return min(candidates, key=lambda p: (paging_waste(sizes, p)[1], p))
+    explanation: |
+      Waste alone would always choose the smallest page, so real designs weigh it against page-table size and TLB reach (bigger pages cover more memory per TLB entry). That's why operating systems offer 4 KB pages for ordinary data and 2 MB or 1 GB "huge pages" for databases and virtual machines.
+
+commonMistakes:
+  - title: Mixing up pages and frames
+    explanation: |
+      Pages belong to the virtual address space; frames belong to physical memory. The page table maps pages to frames.
+  - title: Treating frame number 0 as "missing"
+    explanation: |
+      Frame 0 is a perfectly good frame. Use an explicit valid bit or compare with None.
+  - title: Forgetting the offset is unchanged
+    explanation: |
+      Only the page number is translated. The low bits pass straight through.
+  - title: Confusing internal and external fragmentation
+    explanation: |
+      Internal: waste inside an allocated block (the unused tail of a page). External: free memory scattered in pieces too small to use. Paging eliminates external fragmentation but has internal.
+  - title: Believing the TLB is just a bigger cache of data
+    explanation: |
+      It caches address translations, not the data itself. A TLB miss costs a page-table walk even if the data is in the CPU's data cache.
+  - title: Assuming a bigger page size is always better
+    explanation: |
+      Bigger pages shrink page tables and raise TLB reach, but waste more memory per allocation and make copy-on-write copies bigger.
+
+summary:
+  - "Each process uses **virtual addresses**, which the **MMU** translates to **physical addresses** using tables set up by the OS. This gives isolation, relocation, sharing and (next lesson) more memory than RAM."
+  - "Contiguous allocation uses base and limit registers and a free list (**first, best, worst fit**). It suffers **external fragmentation**, partly cured by coalescing and compaction."
+  - "**Paging** splits memory into equal pages and frames. A virtual address is `page number | offset`; the **page table** maps page to frame, and `physical = (frame << offset_bits) | offset`. It has no external fragmentation but some **internal fragmentation**."
+  - "Page-table entries carry **valid, permission, dirty and accessed** bits. An access to an invalid page causes a **page fault**."
+  - "A flat table for 32-bit addresses is 4 MB per process; **multi-level tables** allocate only the parts in use (x86-64 uses four levels)."
+  - "The **TLB** caches translations: EAT = h(t+m) + (1−h)(t+2m). **Copy-on-write** shares frames after `fork` until someone writes."
+next: |
+  Paging makes it easy to keep only some of a program's pages in RAM and the rest on disk. Lesson 10.8 covers **virtual memory** proper: demand paging, handling page faults, and the **page replacement algorithms** (FIFO, LRU, optimal and clock) that decide which page to evict, including a surprising anomaly where giving a program more memory makes it fault more.
+
+quiz:
+  - type: mcq
+    question: A system uses 4 KB pages. Which virtual address is on page 3, offset 0x10?
+    options: ["0x3010", "0x1030", "0x0310", "0x30010"]
+    answer: 0
+    explanation: "Page 3 starts at 3 × 4096 = 0x3000, and adding the offset 0x10 gives 0x3010."
+  - type: mcq
+    question: What is external fragmentation?
+    options: [
+      "Enough total free memory exists, but it is split into pieces too small to satisfy a request",
+      "Wasted space inside the last page of an allocation",
+      "A page that has been swapped out",
+      "A TLB miss"
+    ]
+    answer: 0
+    explanation: "Contiguous allocation suffers from it; paging avoids it."
+  - type: mcq
+    question: A process requests 10,000 bytes on a system with 4096-byte pages. How many bytes are wasted by internal fragmentation?
+    options: ["2288", "0", "4096", "1808"]
+    answer: 0
+    explanation: "10,000 bytes need 3 pages (12,288 bytes), so 12,288 − 10,000 = 2,288 are wasted."
+  - type: mcq
+    question: Why do systems use multi-level page tables?
+    options: [
+      "To avoid allocating table space for the large unused parts of the address space",
+      "To make translation faster in every case",
+      "To avoid needing a TLB",
+      "Because pages are different sizes"
+    ]
+    answer: 0
+    explanation: "A sparse tree needs far less memory than one flat table, at the cost of extra lookups per miss."
+  - type: mcq
+    question: What does a TLB hit save?
+    options: [
+      "A walk through the page table in memory",
+      "A disk read",
+      "A context switch",
+      "A system call"
+    ]
+    answer: 0
+    explanation: "The TLB caches recent translations, so the hardware skips the page-table accesses."
+  - type: mcq
+    question: After fork, why is it cheap for parent and child to have separate memory?
+    options: [
+      "They share the same frames, marked read-only, and a page is copied only when one writes it",
+      "fork does not copy anything and the child has no memory",
+      "The child uses the parent's registers",
+      "Memory is copied lazily by the disk"
+    ]
+    answer: 0
+    explanation: "That's copy-on-write: the copy happens only for pages that are actually modified."
+  - type: code
+    question: |
+      Write `page_and_offset(vaddr)` for 4096-byte pages, returning the pair `(page_number, offset)` using shifts and masks.
+    starter: |
+      def page_and_offset(vaddr):
+          pass
+    tests:
+      - name: split
+        code: |
+          assert page_and_offset(0) == (0, 0)
+          assert page_and_offset(8191) == (1, 4095)
+          assert page_and_offset(0x12345) == (0x12, 0x345)
+    solution: |
+      def page_and_offset(vaddr):
+          return vaddr >> 12, vaddr & 0xFFF
