@@ -1,0 +1,383 @@
+id: u12-transactions
+title: "Transactions and ACID"
+minutes: 50
+objective: |
+  Keep data correct when things go wrong: group statements into transactions with BEGIN, COMMIT and ROLLBACK, explain the ACID properties, recognise the problems caused by concurrent users (lost updates, dirty and non-repeatable reads), and understand locks, isolation levels and how logging makes crashes safe.
+outcomes:
+  - Explain why a bank transfer needs a transaction
+  - Use BEGIN, COMMIT, ROLLBACK and SAVEPOINT
+  - State what atomicity, consistency, isolation and durability each guarantee
+  - Describe lost updates and other concurrency anomalies, and fix a read-modify-write with a single UPDATE
+  - Explain at a high level how locking and a write-ahead log provide isolation and durability
+
+prelude: |
+  CREATE TABLE account (
+    id INTEGER PRIMARY KEY,
+    owner TEXT NOT NULL,
+    balance INTEGER NOT NULL CHECK (balance >= 0)
+  );
+  CREATE TABLE transfer_log (
+    id INTEGER PRIMARY KEY,
+    from_id INTEGER, to_id INTEGER, amount INTEGER
+  );
+  INSERT INTO account (id, owner, balance) VALUES (1,'Ada',500),(2,'Ben',300),(3,'Chloe',0);
+
+sections:
+  - heading: Why one statement is not enough
+    body: |
+      Moving 100 from Ada to Ben takes (at least) two changes: subtract 100 from Ada, add 100 to Ben. Between them there is a moment when 100 has vanished from the world. If the program crashes there, or the power fails, or the second statement is rejected, the money is gone and nobody can say what happened. Real systems have many such multi-step changes: placing an order (create the order, reduce the stock, charge the card), or enrolling a student (insert the enrollment, reduce the seat count).
+
+      A **transaction** groups statements into one logical unit that either happens **completely or not at all**. You mark it with:
+
+      ```sql
+      BEGIN;
+      UPDATE account SET balance = balance - 100 WHERE id = 1;
+      UPDATE account SET balance = balance + 100 WHERE id = 2;
+      COMMIT;     -- make everything permanent
+      ```
+
+      `COMMIT` makes all the changes permanent at once. `ROLLBACK` undoes everything since `BEGIN`, as if it never happened. If a statement inside breaks a constraint you roll back and no half-done work remains. Outside an explicit transaction, each statement is its own tiny automatic transaction (which is why a single `UPDATE` of a thousand rows never stops halfway).
+
+  - heading: ACID
+    body: |
+      The guarantees a database makes about transactions are summarised as **ACID**:
+
+      - **Atomicity**: all of a transaction's changes happen, or none do. There is no visible half-way state, even after a crash.
+      - **Consistency**: a transaction moves the database from one valid state to another. Constraints (`CHECK`, `FOREIGN KEY`, `UNIQUE`) are checked, and a transaction that would violate one fails. Rules the database cannot express (the total money in the system is constant) are the programmer's duty; atomicity is what makes them achievable.
+      - **Isolation**: concurrent transactions do not see each other's unfinished work; the result is as if they ran one at a time (to a degree you can choose, below).
+      - **Durability**: once COMMIT returns, the change survives power failure and crashes.
+
+      A bank transfer is the classic example, but the same needs appear in booking a seat, writing a blog post with its tags, or moving a student between sections. Whenever a business fact is stored in more than one row, wrap the change in a transaction.
+
+  - heading: Problems with concurrency
+    body: |
+      A busy database serves many users at once. Without isolation, their statements interleave and produce surprising results. The classic anomalies:
+
+      - **Dirty read**: you read data another transaction has changed but not yet committed; if it rolls back, you acted on something that never existed.
+      - **Non-repeatable read**: you read a row twice in one transaction and get different answers because someone committed a change in between.
+      - **Phantom**: you run the same query twice and a new row matching your condition appears the second time.
+      - **Lost update**: two transactions read the same value, both compute a new value from it, and both write; the second write overwrites the first and one change disappears.
+
+      The lost update is the one that hurts most in practice. Suppose two clerks each add 50 to a balance of 100. Both read 100, both write 150, and the balance is 150 instead of 200. The fix is to do the **read and the write in a single statement** so the database applies it atomically to the current value: `UPDATE account SET balance = balance + 50 WHERE id = 1`. Do **not** read the balance into your program, add in your program, and write back.
+
+  - heading: How databases provide it
+    body: |
+      **Isolation** is usually implemented with **locks**: a transaction that writes a row holds a lock until it commits, and others who need that row wait. Too much locking makes users queue, so databases offer **isolation levels**, trading safety for speed: *read uncommitted* (dirty reads possible), *read committed* (no dirty reads; PostgreSQL's default), *repeatable read*, and *serializable* (the strongest: the result equals some one-at-a-time order). Many systems use **multiversion concurrency control (MVCC)**: readers see a consistent snapshot while writers create new versions, so readers never block writers. SQLite is simple: one writer at a time for the whole database, which is plenty for an app but not for a busy web site.
+
+      **Locks bring a risk you met in the operating systems unit: deadlock.** Transaction A locks row 1 and wants row 2; B holds row 2 and wants row 1. Databases detect the cycle and abort one transaction (the **victim**), which your program must be ready to retry. Keeping a transaction's rows locked briefly, and always touching rows in the same order, avoids most deadlocks.
+
+      **Durability and atomicity** are usually implemented with a **write-ahead log (WAL)**. Before changing the data pages, the database appends a record of the change to a log file and forces it to disk. If it crashes, on restart it **replays** committed changes from the log that had not reached the data files, and **undoes** those of transactions that never committed. The log is written sequentially (fast) while the data files are updated lazily. This is the same journaling idea as the file system in Lesson 10.9.
+
+      Two practical rules: keep transactions **short** (never wait for a human in the middle of one), and remember that long transactions hold locks and block others.
+
+examples:
+  - title: A successful transfer
+    intro: "Both updates are made permanent together. The total stays 800."
+    code: |
+      BEGIN;
+      UPDATE account SET balance = balance - 100 WHERE id = 1;
+      UPDATE account SET balance = balance + 100 WHERE id = 2;
+      INSERT INTO transfer_log (from_id, to_id, amount) VALUES (1, 2, 100);
+      COMMIT;
+
+      SELECT owner, balance, (SELECT SUM(balance) FROM account) AS total
+      FROM account ORDER BY id;
+    output: |
+      owner | balance | total
+      ------+---------+------
+      Ada   | 400     | 800
+      Ben   | 400     | 800
+      Chloe | 0       | 800
+    lines:
+      - line: 1
+        note: "Nothing is permanent until COMMIT."
+      - line: 4
+        note: "The audit log row is part of the same unit of work."
+      - line: 5
+        note: "COMMIT makes all three changes durable together."
+  - title: ROLLBACK undoes everything
+    intro: "We start a transfer, change our mind, and roll back. The balances are as before."
+    code: |
+      BEGIN;
+      UPDATE account SET balance = balance - 400 WHERE id = 1;
+      UPDATE account SET balance = balance + 400 WHERE id = 3;
+      ROLLBACK;
+
+      SELECT owner, balance FROM account ORDER BY id;
+    output: |
+      owner | balance
+      ------+--------
+      Ada   | 500
+      Ben   | 300
+      Chloe | 0
+    lines:
+      - line: 4
+        note: "Both updates disappear as if they had never run."
+  - title: A constraint protects the total
+    intro: "Ben only has 300. The second update would make a balance negative, which the CHECK constraint forbids, so the statement fails."
+    code: |
+      BEGIN;
+      UPDATE account SET balance = balance + 500 WHERE id = 1;
+      UPDATE account SET balance = balance - 500 WHERE id = 2;
+      COMMIT;
+    expectError: true
+    error: "CHECK constraint failed: balance >= 0"
+    lines:
+      - line: 3
+        note: "300 - 500 would be negative. The statement fails. Because it ran inside a transaction, a program must now ROLLBACK, undoing Ada's +500 as well; otherwise it would leave money created from nothing."
+  - title: Savepoints
+    intro: "A SAVEPOINT marks a place inside a transaction that you can roll back to without abandoning the whole transaction."
+    code: |
+      BEGIN;
+      UPDATE account SET balance = balance - 50 WHERE id = 1;
+      SAVEPOINT before_bonus;
+      UPDATE account SET balance = balance + 1000 WHERE id = 3;
+      ROLLBACK TO before_bonus;
+      UPDATE account SET balance = balance + 50 WHERE id = 3;
+      COMMIT;
+
+      SELECT owner, balance FROM account ORDER BY id;
+    output: |
+      owner | balance
+      ------+--------
+      Ada   | 450
+      Ben   | 300
+      Chloe | 50
+    lines:
+      - line: 3
+        note: "Mark a point we may want to return to."
+      - line: 5
+        note: "Only the bonus is undone; the first update stays in the transaction."
+  - title: The lost update, and its fix
+    intro: "Two clerks each add 50. We simulate both reading the balance first (the unsafe way), then show the atomic way."
+    code: |
+      -- Unsafe: both clerks read the same value, compute in the program, write back.
+      CREATE TEMP TABLE reads AS SELECT balance AS seen FROM account WHERE id = 1;
+      UPDATE account SET balance = (SELECT seen FROM reads) + 50 WHERE id = 1;  -- clerk 1
+      UPDATE account SET balance = (SELECT seen FROM reads) + 50 WHERE id = 1;  -- clerk 2
+      SELECT 'unsafe' AS method, balance FROM account WHERE id = 1
+      UNION ALL
+      SELECT 'safe', (SELECT seen FROM reads) + 50 + 50;
+    output: |
+      method | balance
+      -------+--------
+      unsafe | 550
+      safe   | 600
+    lines:
+      - line: 2
+        note: "Both clerks saw the same starting balance, 500."
+      - line: 4
+        note: "The second write is computed from the stale value, so the first clerk's 50 is lost."
+      - line: 7
+        note: "Applying the change inside the database, balance = balance + 50, twice, would give 600. Compute in the database, not in your program."
+  - title: Atomic change inside the database
+    intro: "The same two additions written as single statements cannot lose an update."
+    code: |
+      UPDATE account SET balance = balance + 50 WHERE id = 1;
+      UPDATE account SET balance = balance + 50 WHERE id = 1;
+      SELECT balance FROM account WHERE id = 1;
+    output: |
+      balance
+      -------
+      600
+    lines:
+      - line: 1
+        note: "The database reads and writes the current value in one step."
+
+playground:
+  prompt: |
+    Write a transaction that moves 200 from Ada to Chloe and logs it. Then change it so the amount is 900 and see what the CHECK constraint says. What state is the database in afterwards?
+  code: |
+    BEGIN;
+    UPDATE account SET balance = balance - 200 WHERE id = 1;
+    UPDATE account SET balance = balance + 200 WHERE id = 3;
+    COMMIT;
+    SELECT * FROM account;
+
+exercises:
+  - id: do-transfer
+    title: Transfer money
+    difficulty: 2
+    prompt: |
+      In one transaction, move **150** from account 2 (Ben) to account 3 (Chloe) and record it in `transfer_log` (`from_id`, `to_id`, `amount`). Commit.
+    starter: |
+      -- write your transaction here
+    tests:
+      - name: balances
+        code: |
+          const r = query("SELECT id, balance FROM account ORDER BY id");
+          if (JSON.stringify(r) !== JSON.stringify([[1, 500], [2, 150], [3, 150]])) throw new Error("Expected balances 500, 150, 150 but got " + JSON.stringify(r));
+      - name: logged
+        code: |
+          const r = query("SELECT from_id, to_id, amount FROM transfer_log");
+          if (JSON.stringify(r) !== JSON.stringify([[2, 3, 150]])) throw new Error("Expected one log row (2, 3, 150), got " + JSON.stringify(r));
+      - name: committed
+        code: |
+          if (!/COMMIT/i.test(source)) throw new Error("Remember to COMMIT");
+    hints:
+      - "BEGIN; two UPDATEs; INSERT INTO transfer_log; COMMIT;"
+    solution: |
+      BEGIN;
+      UPDATE account SET balance = balance - 150 WHERE id = 2;
+      UPDATE account SET balance = balance + 150 WHERE id = 3;
+      INSERT INTO transfer_log (from_id, to_id, amount) VALUES (2, 3, 150);
+      COMMIT;
+    explanation: "Three changes that belong together are wrapped in one transaction."
+  - id: rollback-bad
+    title: Roll back a mistake
+    difficulty: 2
+    prompt: |
+      Start a transaction, subtract 100 from account 1, then add 100 to account **9** (a mistake: that account does not exist, so the money would go nowhere). Realise the error and **roll back**. At the end the balances must be unchanged and the transaction closed.
+    starter: |
+      -- write your statements here
+    tests:
+      - name: unchanged
+        code: |
+          const r = query("SELECT id, balance FROM account ORDER BY id");
+          if (JSON.stringify(r) !== JSON.stringify([[1, 500], [2, 300], [3, 0]])) throw new Error("Balances must be unchanged, got " + JSON.stringify(r));
+      - name: used rollback
+        code: |
+          if (!/ROLLBACK/i.test(source)) throw new Error("Use ROLLBACK");
+    hints:
+      - "BEGIN; UPDATE ... id = 1; UPDATE ... id = 9; ROLLBACK;"
+    solution: |
+      BEGIN;
+      UPDATE account SET balance = balance - 100 WHERE id = 1;
+      UPDATE account SET balance = balance + 100 WHERE id = 9;
+      ROLLBACK;
+    explanation: "The money subtracted from Ada would have vanished. ROLLBACK restores the state before BEGIN."
+  - id: safe-interest
+    title: A safe update
+    difficulty: 2
+    prompt: |
+      Add **10% interest** (rounded down to a whole number) to every account with a balance above 0, using a **single UPDATE** that computes from the current balance. Use `CAST(balance * 0.10 AS INTEGER)` for the interest.
+    starter: |
+      -- write your statement here
+    tests:
+      - name: balances
+        code: |
+          const r = query("SELECT id, balance FROM account ORDER BY id");
+          if (JSON.stringify(r) !== JSON.stringify([[1, 550], [2, 330], [3, 0]])) throw new Error("Expected 550, 330, 0 but got " + JSON.stringify(r));
+      - name: one statement
+        code: |
+          if ((source.match(/UPDATE/gi) || []).length !== 1) throw new Error("Use exactly one UPDATE statement");
+    hints:
+      - "`UPDATE account SET balance = balance + CAST(balance * 0.10 AS INTEGER) WHERE balance > 0;`"
+    solution: |
+      UPDATE account
+      SET balance = balance + CAST(balance * 0.10 AS INTEGER)
+      WHERE balance > 0;
+    explanation: "Reading and writing the balance inside one statement keeps the update atomic, so it cannot be lost to a concurrent change."
+  - id: savepoint-task
+    title: Undo only the second step
+    difficulty: 3
+    prompt: |
+      In a single transaction: first subtract **50** from account 1. Then create a savepoint `s1`, add **9999** to account 3 (by mistake), roll back to `s1`, and finally add **50** to account 2. Commit.
+    starter: |
+      -- write your transaction here
+    tests:
+      - name: balances
+        code: |
+          const r = query("SELECT id, balance FROM account ORDER BY id");
+          if (JSON.stringify(r) !== JSON.stringify([[1, 450], [2, 350], [3, 0]])) throw new Error("Expected 450, 350, 0 but got " + JSON.stringify(r));
+      - name: savepoint used
+        code: |
+          if (!/SAVEPOINT\s+s1/i.test(source) || !/ROLLBACK\s+TO\s+(SAVEPOINT\s+)?s1/i.test(source)) throw new Error("Use SAVEPOINT s1 and ROLLBACK TO s1");
+    hints:
+      - "BEGIN; UPDATE...; SAVEPOINT s1; UPDATE...; ROLLBACK TO s1; UPDATE...; COMMIT;"
+    solution: |
+      BEGIN;
+      UPDATE account SET balance = balance - 50 WHERE id = 1;
+      SAVEPOINT s1;
+      UPDATE account SET balance = balance + 9999 WHERE id = 3;
+      ROLLBACK TO s1;
+      UPDATE account SET balance = balance + 50 WHERE id = 2;
+      COMMIT;
+    explanation: "ROLLBACK TO undoes work after the savepoint only, so the first update and the final one both survive."
+
+commonMistakes:
+  - title: "Reading a value, computing in the program, writing it back"
+    explanation: "Another user can change the row in between and one update is lost. Write `SET balance = balance + x` so the database does it atomically."
+  - title: "Leaving a transaction open"
+    explanation: "Forgetting COMMIT or ROLLBACK keeps locks held and blocks other users. Keep transactions short and always end them."
+  - title: "Waiting for user input inside a transaction"
+    explanation: "A person can take minutes to answer. Hold locks only while doing database work."
+  - title: "Assuming each statement in a script commits separately"
+    explanation: "After BEGIN, nothing is permanent until COMMIT. If the program stops first, the work is rolled back."
+
+summary:
+  - "A transaction groups statements so they happen completely or not at all: BEGIN, then COMMIT or ROLLBACK."
+  - "ACID: atomicity, consistency, isolation, durability."
+  - "Concurrency can cause dirty reads, non-repeatable reads, phantoms and lost updates; isolation levels trade safety for speed."
+  - "Do the read and the write in one statement (balance = balance + x) to avoid lost updates."
+  - "Locks or MVCC provide isolation; a write-ahead log provides atomicity and durability across crashes; deadlocks are detected and one transaction is retried."
+next: u12-indexes
+
+quiz:
+  - type: mcq
+    question: Which statement undoes every change since BEGIN?
+    options: ["ROLLBACK", "COMMIT", "SAVEPOINT", "UNDO"]
+    answer: 0
+    explanation: "ROLLBACK discards all changes made in the current transaction."
+  - type: mcq
+    question: What does atomicity guarantee?
+    options: [
+      "All of a transaction's changes happen or none do",
+      "Transactions run one at a time",
+      "Data is stored on disk",
+      "Queries are fast"
+    ]
+    answer: 0
+    explanation: "There is no visible half-done state."
+  - type: mcq
+    question: What does durability guarantee?
+    options: [
+      "A committed change survives a crash",
+      "Rows are never deleted",
+      "Locks are never needed",
+      "Constraints are checked"
+    ]
+    answer: 0
+    explanation: "Once COMMIT returns, the data is safe, thanks to the log."
+  - type: mcq
+    question: Two users read a balance of 100 and each write back 150 after adding 50. Which anomaly is this?
+    options: ["Lost update", "Dirty read", "Phantom", "Deadlock"]
+    answer: 0
+    explanation: "One of the two additions has been overwritten."
+  - type: mcq
+    question: What is the best way to add 50 to a balance safely?
+    options: [
+      "UPDATE account SET balance = balance + 50 WHERE id = 1",
+      "Read the balance, add 50 in the program, then UPDATE to the new value",
+      "DELETE the row and INSERT it again",
+      "Run it twice to be sure"
+    ]
+    answer: 0
+    explanation: "A single statement reads and writes the current value atomically."
+  - type: mcq
+    question: What does a write-ahead log do?
+    options: [
+      "Records changes before the data files change, so a crash can be recovered from",
+      "Stores backups on another computer",
+      "Sorts the rows",
+      "Encrypts the database"
+    ]
+    answer: 0
+    explanation: "On restart, committed changes are replayed and uncommitted ones are undone."
+  - type: code
+    question: |
+      In one transaction, add **25** to every account balance and insert a row in `transfer_log` with `from_id` NULL, `to_id` NULL and `amount` 75 (a bonus note). Commit.
+    starter: |
+      -- write your transaction here
+    tests:
+      - name: state
+        code: |
+          const r = query("SELECT id, balance FROM account ORDER BY id");
+          if (JSON.stringify(r) !== JSON.stringify([[1, 525], [2, 325], [3, 25]])) throw new Error("Got " + JSON.stringify(r));
+          const l = query("SELECT amount FROM transfer_log");
+          if (JSON.stringify(l) !== JSON.stringify([[75]])) throw new Error("Expected one log row with amount 75");
+    solution: |
+      BEGIN;
+      UPDATE account SET balance = balance + 25;
+      INSERT INTO transfer_log (from_id, to_id, amount) VALUES (NULL, NULL, 75);
+      COMMIT;

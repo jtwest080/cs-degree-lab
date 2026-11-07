@@ -1,0 +1,379 @@
+id: u12-indexes
+title: "Indexes, Query Plans and Safe SQL"
+minutes: 55
+objective: |
+  Make queries fast and safe: understand how an index (a B-tree) turns a scan into a search, read query plans with EXPLAIN QUERY PLAN, create single-column, composite and unique indexes, know what makes an index useful or useless, and prevent SQL injection with parameters.
+outcomes:
+  - Explain why scanning a big table is slow and how a B-tree index avoids it
+  - Create indexes and read EXPLAIN QUERY PLAN to see whether they are used
+  - Choose columns and column order for composite indexes, and recognise queries an index cannot help
+  - Describe the costs of indexes and the idea of a covering index
+  - Explain SQL injection and prevent it with parameterised queries
+
+prelude: |
+  CREATE TABLE event (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    day INTEGER NOT NULL,
+    amount INTEGER NOT NULL
+  );
+  WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+  INSERT INTO event (id, user_id, kind, day, amount)
+  SELECT i, (i * 37) % 500, CASE i % 4 WHEN 0 THEN 'login' WHEN 1 THEN 'view' WHEN 2 THEN 'buy' ELSE 'logout' END,
+         (i * 7) % 365, (i * 13) % 100
+  FROM n;
+
+sections:
+  - heading: The cost of scanning
+    body: |
+      The `event` table in this lesson's database has 3,000 rows (real tables have millions or billions). To answer `SELECT * FROM event WHERE user_id = 42` the database has no clue where user 42's rows are, so it must read **every row** and check each one: a **full table scan**. The work grows in proportion to the table size. Double the data, double the time.
+
+      An **index** is an extra data structure that finds rows by the value of a column without scanning, like the index at the back of a textbook: instead of reading every page for "Dijkstra", you look the word up in a sorted list and jump to the page numbers. The database keeps the index in sync as rows change.
+
+      Most databases implement an index as a **B-tree** (balanced tree), a sorted tree where each node holds many keys, so that it is only a few levels deep. With a branching factor of a few hundred, a billion rows need only about four levels. Looking up a value means reading about four nodes: **logarithmic** time instead of linear. The tree is sorted, so an index also supports **range** searches (`day BETWEEN 100 AND 110`) and returns rows already in order, which can save a sort. You met the same idea in the data structures unit; this is where it earns its living. (Hash indexes exist, but are only good for equality.)
+
+  - heading: Creating indexes and reading plans
+    body: |
+      ```sql
+      CREATE INDEX idx_event_user ON event (user_id);
+      ```
+
+      You do not tell a query to use an index. The **query planner** decides, estimating the cost of each way to run the query, and chooses. To see its decision, put `EXPLAIN QUERY PLAN` in front:
+
+      ```sql
+      EXPLAIN QUERY PLAN SELECT * FROM event WHERE user_id = 42;
+      ```
+
+      Before the index the plan says `SCAN event` (every row); afterwards `SEARCH event USING INDEX idx_event_user (user_id=?)`. Learn these two words. In PostgreSQL and MySQL the command is `EXPLAIN` (or `EXPLAIN ANALYZE` to also measure real time). Reading plans is the main skill of performance tuning: **measure and look, do not guess**.
+
+      Two things get an index automatically: a **primary key** and a **`UNIQUE` constraint**. A `UNIQUE` index also enforces the rule. A lookup by `id` is therefore always fast. *Foreign key* columns are not indexed by default in most databases, but joins and deletes constantly search by them, so they usually deserve an index.
+
+  - heading: Composite indexes and what defeats an index
+    body: |
+      An index can cover **several columns**: `CREATE INDEX idx_kind_day ON event (kind, day)` sorts rows by `kind`, and within each kind by `day`, like a phone book sorted by last name then first name. **Column order matters.** It helps queries that give the *leftmost* columns: `WHERE kind = 'buy'` and `WHERE kind = 'buy' AND day = 10`, and a range on the last used column `WHERE kind = 'buy' AND day > 300`. It does not help `WHERE day = 10` alone (just as a phone book is no use for finding everyone called Anna). Put equality columns first and the range column last.
+
+      Things that stop an index being used:
+      - **Applying a function to the column**: `WHERE ABS(amount) = 5` or `WHERE day + 1 = 100` must compute for every row. Rewrite as `WHERE day = 99`, or create an index on the expression.
+      - **A leading wildcard**: `LIKE '%abc'` cannot use the sort order; `LIKE 'abc%'` can (in databases with suitable collation settings).
+      - **Low selectivity**: if `kind` has only four values, each matching a quarter of the table, the planner may rightly prefer scanning, since jumping back and forth for a quarter of all rows is slower than reading them in order.
+      - **A type mismatch** between the column and the value.
+
+      If an index contains *all* the columns a query needs, the database can answer from the index alone and never touch the table. That is a **covering index**.
+
+  - heading: The price of indexes
+    body: |
+      Indexes are not free. Each one takes **space**, and every `INSERT`, `DELETE` and `UPDATE` of an indexed column must also update the index, so heavy writing gets slower with each index added. The rule: index the columns you search, join and sort by in your real queries, check the plan to confirm they help, and drop indexes nobody uses. Do not index every column "just in case". Tables you only read (reports) can carry many indexes; tables that take thousands of writes a second carry few.
+
+      Other ways of making queries fast: select only the columns you need instead of `SELECT *`; filter early; avoid doing a query inside a loop in your program (the "N+1 queries" mistake: one query per row instead of one join); and use `LIMIT` with an ordered index for paging.
+
+  - heading: SQL injection and using SQL from programs
+    body: |
+      Programs usually build queries from user input. The dangerous way is to paste the input into the SQL text:
+
+      ```python
+      sql = "SELECT * FROM student WHERE name = '" + name + "'"
+      ```
+
+      If a user types `x' OR '1'='1`, the text becomes `... WHERE name = 'x' OR '1'='1'` and returns every student. Worse input, such as `'; DROP TABLE student; --`, can change or destroy data or leak other tables. This is **SQL injection**, one of the most common and costly security holes in history. The cause is mixing **code** (SQL) and **data** (the user's text) in one string.
+
+      The fix is **parameterised queries** (prepared statements): send the SQL with placeholders and the values separately. The database treats the values only as data, never as SQL:
+
+      ```python
+      cursor.execute("SELECT * FROM student WHERE name = ?", (name,))
+      ```
+
+      Every language's database library offers this (`?` or `:name` or `$1`). Never build SQL with string formatting or concatenation. Also run the application with a database account that has only the permissions it needs, so that even a mistake cannot drop tables. Parameters also let the database reuse the plan for repeated queries.
+
+      That completes the tour: you can model data, define it, write queries from simple to subtle, change it safely, and make it fast. The unit project asks you to do all of it.
+
+examples:
+  - title: A scan
+    intro: "Without an index, the plan is a full scan of the event table."
+    code: |
+      EXPLAIN QUERY PLAN
+      SELECT * FROM event WHERE user_id = 42;
+    output: |
+      plan
+      ----------
+      SCAN event
+    lines:
+      - line: 2
+        note: "The plan says SCAN event: all 3,000 rows are examined."
+  - title: The index changes the plan
+    intro: "Create the index, then ask for the plan again."
+    code: |
+      CREATE INDEX idx_event_user ON event (user_id);
+      EXPLAIN QUERY PLAN
+      SELECT * FROM event WHERE user_id = 42;
+    output: |
+      plan
+      ---------------------------------------------------
+      SEARCH event USING INDEX idx_event_user (user_id=?)
+    lines:
+      - line: 1
+        note: "A B-tree sorted by user_id."
+      - line: 3
+        note: "Now the plan says SEARCH ... USING INDEX: it jumps straight to user 42's rows. The query is the same; only the plan changed."
+  - title: Column order in a composite index
+    intro: "An index on (kind, day) serves a query on kind, but not one on day alone."
+    code: |
+      CREATE INDEX idx_kind_day ON event (kind, day);
+      EXPLAIN QUERY PLAN SELECT COUNT(*) FROM event WHERE kind = 'buy' AND day > 300;
+    output: |
+      plan
+      -----------------------------------------------------------------
+      SEARCH event USING COVERING INDEX idx_kind_day (kind=? AND day>?)
+    lines:
+      - line: 2
+        note: "Equality on the first column, range on the second: the whole condition is answered by the index. Because COUNT(*) needs no other column, the table is not even read (a covering use)."
+  - title: An index that cannot be used
+    intro: "A calculation on the column hides it from the index. Rewrite the condition so the bare column is compared."
+    code: |
+      CREATE INDEX idx_day ON event (day);
+      EXPLAIN QUERY PLAN SELECT * FROM event WHERE day + 1 = 100;
+    output: |
+      plan
+      ----------
+      SCAN event
+    lines:
+      - line: 2
+        note: "day + 1 = 100 is computed per row, so the plan is a SCAN. The equivalent day = 99 would use idx_day."
+  - title: Same answer, different cost
+    intro: "Results do not change when you add an index, only the work done. Rows for user 42:"
+    code: |
+      CREATE INDEX idx_event_user ON event (user_id);
+      SELECT COUNT(*) AS events, SUM(amount) AS total
+      FROM event WHERE user_id = 42;
+    output: |
+      events | total
+      -------+------
+      6      | 348
+    lines:
+      - line: 1
+        note: "Indexes are an optimisation: dropping this line leaves the answer identical."
+  - title: Injection in action
+    intro: "A query built by pasting text. The 'user input' closes the quote and adds a condition that is always true."
+    code: |
+      SELECT 'SELECT * FROM student WHERE name = ''' || 'x'' OR ''1''=''1' || '''' AS built_sql;
+    output: |
+      built_sql
+      -------------------------------------------------
+      SELECT * FROM student WHERE name = 'x' OR '1'='1'
+    runnable: false
+    lines:
+      - line: 1
+        note: "The result is: SELECT * FROM student WHERE name = 'x' OR '1'='1'. The second half is always true, so every row matches. With a placeholder the whole input stays a plain string that happens to contain quotes."
+
+playground:
+  prompt: |
+    Run EXPLAIN QUERY PLAN on a query that filters by kind. Create an index on kind and look again. Then try a query ordering by day with and without an index on day.
+  code: |
+    EXPLAIN QUERY PLAN
+    SELECT * FROM event WHERE kind = 'buy' ORDER BY day LIMIT 5;
+
+exercises:
+  - id: index-user
+    title: Add the missing index
+    difficulty: 2
+    prompt: |
+      Queries on `event` constantly filter by `user_id`. Create an index named `idx_user` on `user_id`.
+    starter: |
+      -- write your statement here
+    tests:
+      - name: index exists
+        code: |
+          const r = query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'event' AND name = 'idx_user'");
+          if (r.length !== 1) throw new Error("There is no index named idx_user on event");
+      - name: on the right column
+        code: |
+          const cols = query("SELECT name FROM pragma_index_info('idx_user')").map((r) => r[0]);
+          if (JSON.stringify(cols) !== JSON.stringify(["user_id"])) throw new Error("idx_user must be on user_id only");
+    hints:
+      - "`CREATE INDEX idx_user ON event (user_id);`"
+    solution: |
+      CREATE INDEX idx_user ON event (user_id);
+    explanation: "One statement; from now on the planner can use it for lookups by user."
+  - id: composite
+    title: A composite index for a common query
+    difficulty: 3
+    prompt: |
+      A report runs `SELECT SUM(amount) FROM event WHERE kind = ? AND day BETWEEN ? AND ?` all day. Create one index named `idx_report` that lets the database answer it by searching on `kind` and then the `day` range (and, ideally, also holds `amount`, so the table is not read: a covering index).
+    starter: |
+      -- write your statement here
+    tests:
+      - name: columns in order
+        code: |
+          const cols = query("SELECT name FROM pragma_index_info('idx_report') ORDER BY seqno").map((r) => r[0]);
+          if (JSON.stringify(cols) !== JSON.stringify(["kind", "day", "amount"])) throw new Error("Expected columns kind, day, amount in that order, got " + JSON.stringify(cols));
+      - name: planner uses it
+        code: |
+          const plan = query("EXPLAIN QUERY PLAN SELECT SUM(amount) FROM event WHERE kind = 'buy' AND day BETWEEN 10 AND 50").map((r) => r[3]).join(" ");
+          if (!/COVERING INDEX idx_report/.test(plan)) throw new Error("The plan should use idx_report as a covering index; got: " + plan);
+    hints:
+      - "Put the equality column first, the range column second, and the extra column last."
+      - "`CREATE INDEX idx_report ON event (kind, day, amount);`"
+    solution: |
+      CREATE INDEX idx_report ON event (kind, day, amount);
+    explanation: "Equality first, range second lets the index narrow the search; including amount means no table lookups are needed."
+  - id: fix-query
+    title: Make the query index friendly
+    difficulty: 3
+    prompt: |
+      There is an index on `day`. This query cannot use it: `SELECT COUNT(*) FROM event WHERE day * 2 = 100`. Create the index `idx_day` on `day` and then run an equivalent query that **can** use it, returning the same count as one column called `n`.
+    starter: |
+      -- write your statements here
+    tests:
+      - name: index
+        code: |
+          if (query("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_day'").length !== 1) throw new Error("Create idx_day");
+      - name: result
+        code: |
+          expectColumns(["n"]);
+          expectRows([[query("SELECT COUNT(*) FROM event WHERE day * 2 = 100")[0][0]]]);
+      - name: no arithmetic on the column
+        code: |
+          if (/day\s*[*+\-\/]/i.test(source.replace(/CREATE INDEX[^;]*;/i, ""))) throw new Error("Compare the bare column day with a value");
+    hints:
+      - "day * 2 = 100 means day = 50."
+    solution: |
+      CREATE INDEX idx_day ON event (day);
+      SELECT COUNT(*) AS n FROM event WHERE day = 50;
+    explanation: "Move the arithmetic to the constant side so the stored column is compared directly."
+  - id: unique-email
+    title: Enforce with a unique index
+    difficulty: 3
+    prompt: |
+      Create a new table `member(id INTEGER PRIMARY KEY, email TEXT NOT NULL)` and a **unique index** named `uq_member_email` on `email`. Then insert two members with the emails `a@x.org` and `b@x.org`.
+    starter: |
+      -- write your statements here
+    tests:
+      - name: rows
+        code: |
+          const r = query("SELECT email FROM member ORDER BY email");
+          if (JSON.stringify(r) !== JSON.stringify([["a@x.org"], ["b@x.org"]])) throw new Error("Expected the two members, got " + JSON.stringify(r));
+      - name: unique
+        code: |
+          const r = query("SELECT \"unique\" FROM pragma_index_list('member') WHERE name = 'uq_member_email'");
+          if (r.length !== 1 || r[0][0] !== 1) throw new Error("uq_member_email should be a UNIQUE index");
+    hints:
+      - "`CREATE UNIQUE INDEX uq_member_email ON member (email);`"
+    solution: |
+      CREATE TABLE member (id INTEGER PRIMARY KEY, email TEXT NOT NULL);
+      CREATE UNIQUE INDEX uq_member_email ON member (email);
+      INSERT INTO member (email) VALUES ('a@x.org'), ('b@x.org');
+    explanation: "A unique index both speeds up lookups by email and refuses duplicates."
+  - id: top-users
+    title: Query for the busiest users
+    difficulty: 3
+    prompt: |
+      Return the three users with the most `buy` events: `user_id` and `buys`, most buys first, ties by `user_id`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["user_id", "buys"]);
+      - name: rows
+        code: |
+          expectRows(query("SELECT user_id, COUNT(*) FROM event WHERE kind = 'buy' GROUP BY user_id ORDER BY 2 DESC, 1 LIMIT 3"));
+          if (rows.length !== 3) throw new Error("Expected 3 rows");
+    hints:
+      - "WHERE kind = 'buy', GROUP BY user_id, ORDER BY buys DESC, user_id, LIMIT 3."
+    solution: |
+      SELECT user_id, COUNT(*) AS buys
+      FROM event
+      WHERE kind = 'buy'
+      GROUP BY user_id
+      ORDER BY buys DESC, user_id
+      LIMIT 3;
+    explanation: "Filter first, group, then sort and limit: the order of evaluation from Lesson 12.4."
+
+commonMistakes:
+  - title: "Indexing every column"
+    explanation: "Each index slows writes and uses space. Index what real queries filter, join and sort by."
+  - title: "Wrapping an indexed column in a function"
+    explanation: "`WHERE LOWER(name) = 'ada'` cannot use an index on name. Store normalised data or create an index on the expression."
+  - title: "Putting the range column first in a composite index"
+    explanation: "Equality columns come first, the range column last. A range on the first column stops the later columns from narrowing the search."
+  - title: "Building SQL with string concatenation"
+    explanation: "It invites SQL injection. Always use parameters (? placeholders)."
+    wrong: |
+      "SELECT * FROM student WHERE name = '" + name + "'"
+    right: |
+      cursor.execute("SELECT * FROM student WHERE name = ?", (name,))
+
+summary:
+  - "Without an index a query scans every row; a B-tree index finds rows in logarithmic time and supports ranges and ordering."
+  - "EXPLAIN QUERY PLAN shows SCAN or SEARCH ... USING INDEX; measure instead of guessing."
+  - "In a composite index put equality columns first and the range column last; functions on the column, leading wildcards and low selectivity defeat an index."
+  - "Indexes cost space and slow writes; a covering index answers from the index alone."
+  - "Never build SQL from user text; use parameterised queries to prevent SQL injection."
+next: |
+  That completes the tour of databases, from tables and queries to design, transactions and speed. The Unit 12 project puts the pieces together: you will turn a messy flat export into a clean, constrained, indexed **registrar database** and report on it.
+
+quiz:
+  - type: mcq
+    question: What does a full table scan do?
+    options: ["Reads every row and tests the condition", "Reads only the index", "Sorts the table", "Locks the table forever"]
+    answer: 0
+    explanation: "Without a usable index the database must examine each row."
+  - type: mcq
+    question: What data structure do most database indexes use?
+    options: ["A B-tree", "A linked list", "A stack", "A queue"]
+    answer: 0
+    explanation: "B-trees are shallow, sorted and need few disk reads per lookup."
+  - type: mcq
+    question: Which query can use an index on (kind, day)?
+    options: [
+      "WHERE kind = 'buy' AND day > 300",
+      "WHERE day = 10",
+      "WHERE day + 1 = 10",
+      "WHERE LOWER(kind) = 'buy'"
+    ]
+    answer: 0
+    explanation: "It starts with the leftmost column. The others skip kind or hide the column in an expression."
+  - type: mcq
+    question: What is a disadvantage of adding many indexes?
+    options: [
+      "Inserts, updates and deletes become slower",
+      "Queries return wrong results",
+      "Foreign keys stop working",
+      "Transactions cannot be used"
+    ]
+    answer: 0
+    explanation: "Every write must also update each index."
+  - type: mcq
+    question: What is the safe way to put user input into a query?
+    options: [
+      "A parameter placeholder with the value passed separately",
+      "String concatenation with quotes escaped by hand",
+      "Replacing quote characters with spaces",
+      "Running the query twice"
+    ]
+    answer: 0
+    explanation: "Parameters keep data from being interpreted as SQL."
+  - type: mcq
+    question: What does EXPLAIN QUERY PLAN output SCAN event tell you?
+    options: [
+      "The whole table is read",
+      "An index is used",
+      "The query failed",
+      "The table is locked"
+    ]
+    answer: 0
+    explanation: "SCAN means the database reads all rows; SEARCH ... USING INDEX means it used an index."
+  - type: code
+    question: |
+      Create an index `idx_kind` on `event(kind)`, then return the number of `login` events as `n`.
+    starter: |
+      -- write your statements here
+    tests:
+      - name: index and result
+        code: |
+          if (query("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_kind'").length !== 1) throw new Error("Create idx_kind");
+          expectColumns(["n"]);
+          expectRows([[750]]);
+    solution: |
+      CREATE INDEX idx_kind ON event (kind);
+      SELECT COUNT(*) AS n FROM event WHERE kind = 'login';

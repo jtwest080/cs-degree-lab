@@ -1,0 +1,474 @@
+id: u12-aggregation
+title: "Aggregation and Grouping"
+minutes: 55
+objective: |
+  Summarise many rows into few: use COUNT, SUM, AVG, MIN and MAX, group rows with GROUP BY, filter groups with HAVING, understand how NULL affects aggregates, and combine aggregation with joins without counting rows twice.
+outcomes:
+  - Use the aggregate functions and explain how they treat NULL
+  - Group rows with GROUP BY and filter the groups with HAVING
+  - Explain the difference between WHERE and HAVING, and the full order of evaluation
+  - Combine joins with aggregation and avoid double counting
+  - Use window functions such as RANK and a running total to compute without collapsing rows
+
+prelude: |
+  CREATE TABLE department (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    building TEXT
+  );
+  CREATE TABLE student (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    major_id INTEGER REFERENCES department(id),
+    year INTEGER,
+    gpa REAL,
+    email TEXT
+  );
+  CREATE TABLE course (
+    code TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    dept_id INTEGER REFERENCES department(id),
+    credits INTEGER
+  );
+  CREATE TABLE enrollment (
+    student_id INTEGER REFERENCES student(id),
+    course_code TEXT REFERENCES course(code),
+    term TEXT,
+    grade TEXT,
+    PRIMARY KEY (student_id, course_code, term)
+  );
+  INSERT INTO department VALUES (1,'Computer Science','Gates Hall'),(2,'Mathematics','Euler Building'),(3,'Physics','Newton Hall'),(4,'History',NULL);
+  INSERT INTO student VALUES
+   (1,'Ada Lovelace',1,3,3.9,'ada@uni.edu'),
+   (2,'Alan Turing',1,4,3.8,'alan@uni.edu'),
+   (3,'Grace Hopper',1,2,3.7,'grace@uni.edu'),
+   (4,'Emmy Noether',2,3,3.95,'emmy@uni.edu'),
+   (5,'Carl Gauss',2,1,3.5,NULL),
+   (6,'Marie Curie',3,4,3.85,'marie@uni.edu'),
+   (7,'Isaac Newton',3,2,3.2,'isaac@uni.edu'),
+   (8,'Hannah Arendt',4,3,3.6,'hannah@uni.edu'),
+   (9,'Linus Pauling',NULL,1,3.0,NULL),
+   (10,'Katherine Johnson',2,2,3.9,'katherine@uni.edu'),
+   (11,'Donald Knuth',1,1,3.4,'don@uni.edu'),
+   (12,'Barbara Liskov',1,3,NULL,'barbara@uni.edu');
+  INSERT INTO course VALUES ('CS101','Intro to Programming',1,4),('CS201','Data Structures',1,4),('CS301','Databases',1,3),('CS401','Compilers',1,3),('MA101','Calculus I',2,4),('MA201','Linear Algebra',2,3),('PH101','Mechanics',3,4),('HI101','World History',4,3);
+  INSERT INTO enrollment VALUES
+   (1,'CS101','F23','A'),(1,'CS201','S24','A'),(1,'CS301','F24','A'),(1,'MA201','F24','B'),
+   (2,'CS101','F22','A'),(2,'CS201','S23','A'),(2,'CS301','F23','B'),(2,'CS401','S24','A'),
+   (3,'CS101','F24','B'),(3,'MA101','F24','A'),
+   (4,'MA101','F22','A'),(4,'MA201','S23','A'),(4,'PH101','F23','B'),
+   (5,'MA101','F24','B'),(5,'CS101','F24','C'),
+   (6,'PH101','F22','A'),(6,'MA101','S23','A'),(6,'CS101','F23','B'),
+   (7,'PH101','F24','C'),(7,'MA101','F24','C'),
+   (8,'HI101','F23','A'),(8,'CS101','S24','B'),
+   (9,'HI101','F24',NULL),(9,'CS101','F24',NULL),
+   (10,'MA101','F24','A'),(10,'CS101','F24','A'),
+   (11,'CS101','F24','B');
+
+sections:
+  - heading: Aggregate functions
+    body: |
+      So far each input row produced one output row. An **aggregate function** collapses many rows into one value:
+
+      | Function | Result |
+      |---|---|
+      | `COUNT(*)` | the number of rows |
+      | `COUNT(col)` | the number of rows where col is **not NULL** |
+      | `COUNT(DISTINCT col)` | the number of different non-NULL values |
+      | `SUM(col)`, `AVG(col)` | total and mean of the non-NULL values |
+      | `MIN(col)`, `MAX(col)` | smallest and largest non-NULL value |
+
+      Aggregates **ignore NULL**. With twelve students and one missing GPA, `COUNT(*)` is 12 but `COUNT(gpa)` is 11, and `AVG(gpa)` divides by 11, not 12. If every value is NULL, `SUM` and `AVG` return NULL (and `COUNT(col)` returns 0). Without a GROUP BY, an aggregate query returns exactly **one row** for the whole table, even if the table is empty. Mixing an aggregate with an ordinary column (`SELECT name, MAX(gpa)`) is meaningless: which name? Some databases refuse; SQLite picks an arbitrary row and says nothing, so do not do it.
+
+  - heading: GROUP BY
+    body: |
+      To summarise **each category separately**, add `GROUP BY`. The database sorts the rows into groups, one per distinct value of the grouping columns, and the aggregates are computed once per group:
+
+      ```sql
+      SELECT year, COUNT(*) AS students, ROUND(AVG(gpa), 2) AS avg_gpa
+      FROM student
+      GROUP BY year;
+      ```
+
+      The rule that keeps queries meaningful: every column in the SELECT list must either be in the GROUP BY or be inside an aggregate function. You can group by several columns (`GROUP BY major_id, year`) and each distinct combination becomes a group. NULL values form a group of their own. Groups come back in no particular order, so add `ORDER BY` when you need one; you may sort by an aggregate (`ORDER BY COUNT(*) DESC`).
+
+  - heading: WHERE versus HAVING
+    body: |
+      Sometimes you want to keep only some groups: "years with more than two students". You cannot write that in `WHERE`, because WHERE runs *before* the groups exist. `HAVING` filters groups *after* aggregation:
+
+      ```sql
+      SELECT year, COUNT(*) AS n FROM student
+      WHERE gpa IS NOT NULL      -- filters rows, before grouping
+      GROUP BY year
+      HAVING COUNT(*) > 2;       -- filters groups, after aggregating
+      ```
+
+      The full order in which the database evaluates a query is therefore: **FROM and JOIN**, then **WHERE**, then **GROUP BY**, then **HAVING**, then **SELECT**, then **DISTINCT**, then **ORDER BY**, then **LIMIT**. This single list explains most "why can't I use that here?" questions. For example, a column alias defined in SELECT is not available in WHERE (SELECT has not run yet) though SQLite lets you use it in ORDER BY. As a habit, filter rows in WHERE whenever you can, because discarding rows early is cheaper than grouping them first.
+
+  - heading: Aggregating across joins
+    body: |
+      Aggregation and joins combine naturally: join the tables first, then group the wide rows. "How many students are enrolled in each course?" joins `course` with `enrollment` and groups by course:
+
+      ```sql
+      SELECT c.title, COUNT(e.student_id) AS enrolled
+      FROM course c
+      LEFT JOIN enrollment e ON e.course_code = c.code
+      GROUP BY c.code, c.title;
+      ```
+
+      Notice two details. Using a **LEFT JOIN** and counting a column from the right table (`COUNT(e.student_id)`, not `COUNT(*)`) gives 0 for a course with no enrollments, because `COUNT(*)` would count the single NULL-filled row as 1. And the name is grouped along with the code to make the SELECT legal.
+
+      Beware **double counting**. If you join a student to *both* their enrollments and some other many-valued table, every enrollment row is repeated once per row of the other table, and `SUM` or `COUNT` inflate. Aggregate each many-side separately (in a subquery, next lesson) and then combine, or use `COUNT(DISTINCT ...)`.
+
+  - heading: Window functions
+    body: |
+      GROUP BY collapses rows. Sometimes you want a per-group number *next to* every row: each student's GPA beside their department's average, or each student's rank. **Window functions** do this: an aggregate or ranking function followed by `OVER (...)`, which describes the window of rows to look at, without removing any rows.
+
+      ```sql
+      SELECT name, gpa,
+             RANK() OVER (ORDER BY gpa DESC) AS place,
+             ROUND(AVG(gpa) OVER (PARTITION BY major_id), 2) AS dept_avg
+      FROM student;
+      ```
+
+      `PARTITION BY` splits the rows into independent groups (like GROUP BY, but all rows stay); `ORDER BY` inside OVER orders each partition. `ROW_NUMBER()` numbers rows 1, 2, 3...; `RANK()` gives ties the same number and skips ahead (1, 1, 3); `DENSE_RANK()` does not skip (1, 1, 2). `SUM(x) OVER (ORDER BY ...)` is a **running total**. Window functions are evaluated after WHERE, GROUP BY and HAVING, so you cannot filter on them directly; wrap the query in a subquery to do that (next lesson).
+
+examples:
+  - title: Summarising the whole table
+    intro: "COUNT(*) versus COUNT(column): NULLs are skipped."
+    code: |
+      SELECT COUNT(*) AS students,
+             COUNT(gpa) AS with_gpa,
+             COUNT(email) AS with_email,
+             ROUND(AVG(gpa), 3) AS avg_gpa,
+             MIN(gpa) AS lowest,
+             MAX(gpa) AS highest
+      FROM student;
+    output: |
+      students | with_gpa | with_email | avg_gpa | lowest | highest
+      ---------+----------+------------+---------+--------+--------
+      12       | 11       | 10         | 3.618   | 3      | 3.95
+    lines:
+      - line: 1
+        note: "COUNT(*) counts rows. The other counts skip NULLs, so they are smaller."
+      - line: 4
+        note: "The average divides by the 11 real GPAs, not by 12 students."
+      - line: 3
+        note: "The whole table is one group, so there is exactly one result row."
+  - title: One row per group
+    intro: "Students per year, with an average. HAVING keeps only the larger groups."
+    code: |
+      SELECT year,
+             COUNT(*) AS students,
+             ROUND(AVG(gpa), 2) AS avg_gpa
+      FROM student
+      GROUP BY year
+      HAVING COUNT(*) >= 3
+      ORDER BY year;
+    output: |
+      year | students | avg_gpa
+      -----+----------+--------
+      1    | 3        | 3.3
+      2    | 3        | 3.6
+      3    | 4        | 3.82
+    lines:
+      - line: 5
+        note: "Every non-aggregated column in SELECT (year) must be in GROUP BY."
+      - line: 6
+        note: "HAVING runs after grouping, so it can test an aggregate. WHERE could not."
+  - title: Joining then grouping
+    intro: "Number of enrollments and the average of the known grades per course. We turn letters into points with CASE."
+    code: |
+      SELECT c.code,
+             COUNT(e.student_id) AS enrolled,
+             ROUND(AVG(CASE e.grade WHEN 'A' THEN 4 WHEN 'B' THEN 3 WHEN 'C' THEN 2 END), 2) AS avg_points
+      FROM course c
+      LEFT JOIN enrollment e ON e.course_code = c.code
+      GROUP BY c.code
+      ORDER BY enrolled DESC, c.code;
+    output: |
+      code  | enrolled | avg_points
+      ------+----------+-----------
+      CS101 | 9        | 3.25
+      MA101 | 6        | 3.5
+      PH101 | 3        | 3
+      CS201 | 2        | 4
+      CS301 | 2        | 3.5
+      HI101 | 2        | 4
+      MA201 | 2        | 3.5
+      CS401 | 1        | 4
+    lines:
+      - line: 2
+        note: "Counting a right-table column gives 0, not 1, for an empty course."
+      - line: 3
+        note: "CASE without an ELSE returns NULL for a missing grade, and AVG skips NULLs."
+  - title: Several grouping columns
+    intro: "Each distinct pair of department and year is its own group, and the missing major is a group too."
+    code: |
+      SELECT major_id, year, COUNT(*) AS n
+      FROM student
+      GROUP BY major_id, year
+      HAVING n > 1
+      ORDER BY major_id, year;
+    output: |
+      major_id | year | n
+      ---------+------+--
+      1        | 3    | 2
+    lines:
+      - line: 4
+        note: "SQLite lets HAVING use the alias n. Standard SQL does not, so many databases need COUNT(*) > 1."
+  - title: Double counting
+    intro: "Joining enrollments to courses and then summing credits counts a course once per enrollment. Compare with the correct distinct total."
+    code: |
+      SELECT COUNT(*) AS enrollment_rows,
+             SUM(c.credits) AS inflated_credits,
+             (SELECT SUM(credits) FROM course) AS real_credits
+      FROM enrollment e
+      JOIN course c ON c.code = e.course_code;
+    output: |
+      enrollment_rows | inflated_credits | real_credits
+      ----------------+------------------+-------------
+      27              | 101              | 28
+    lines:
+      - line: 2
+        note: "Each course's credits are added once for every enrollment, which is not the same as a course total."
+  - title: Ranking with window functions
+    intro: "Rank students by GPA within their major while keeping every row. Ties share a rank."
+    code: |
+      SELECT name, major_id, gpa,
+             RANK() OVER (PARTITION BY major_id ORDER BY gpa DESC) AS place
+      FROM student
+      WHERE major_id IN (1, 2) AND gpa IS NOT NULL
+      ORDER BY major_id, place, name;
+    output: |
+      name              | major_id | gpa  | place
+      ------------------+----------+------+------
+      Ada Lovelace      | 1        | 3.9  | 1
+      Alan Turing       | 1        | 3.8  | 2
+      Grace Hopper      | 1        | 3.7  | 3
+      Donald Knuth      | 1        | 3.4  | 4
+      Emmy Noether      | 2        | 3.95 | 1
+      Katherine Johnson | 2        | 3.9  | 2
+      Carl Gauss        | 2        | 3.5  | 3
+    lines:
+      - line: 2
+        note: "PARTITION BY restarts the ranking for each major; no rows are collapsed."
+      - line: 3
+        note: "The window function runs after WHERE, so only the filtered rows are ranked."
+
+playground:
+  prompt: |
+    Count the students per department name (join first). Then add HAVING to keep only departments with more than one student. Finally try a window function: a running total of credits ordered by course code.
+  code: |
+    SELECT code, credits,
+           SUM(credits) OVER (ORDER BY code) AS running_total
+    FROM course
+    ORDER BY code;
+
+exercises:
+  - id: avg-by-year
+    title: Average GPA per year
+    difficulty: 2
+    prompt: |
+      Return `year` and `avg_gpa` (the average `gpa`, rounded to 2 decimals) for each year, ordered by `year`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["year", "avg_gpa"]);
+      - name: rows
+        code: |
+          if (rows.length !== 4) throw new Error("Expected 4 years, got " + rows.length);
+          expectRows(query("SELECT year, ROUND(AVG(gpa), 2) FROM student GROUP BY year ORDER BY year"));
+    hints:
+      - "`GROUP BY year`."
+      - "`ROUND(AVG(gpa), 2) AS avg_gpa`."
+    solution: |
+      SELECT year, ROUND(AVG(gpa), 2) AS avg_gpa
+      FROM student
+      GROUP BY year
+      ORDER BY year;
+    explanation: "One group per year; AVG ignores Barbara's missing GPA."
+  - id: big-majors
+    title: Departments with several students
+    difficulty: 3
+    prompt: |
+      Return the department `name` and `students` (the number of students majoring in it) for departments with **at least 2** students, most students first, ties by name.
+    starter: |
+      -- write your query here
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["name", "students"]);
+      - name: rows
+        code: |
+          expectRows([["Computer Science", 5], ["Mathematics", 3], ["Physics", 2]]);
+    hints:
+      - "Join `student` to `department`, then `GROUP BY d.name`."
+      - "Filter groups with `HAVING COUNT(*) >= 2`."
+    solution: |
+      SELECT d.name, COUNT(*) AS students
+      FROM student s
+      JOIN department d ON d.id = s.major_id
+      GROUP BY d.id, d.name
+      HAVING COUNT(*) >= 2
+      ORDER BY students DESC, d.name;
+    explanation: "Join first, then group, then filter groups. History has one student and is removed by HAVING."
+  - id: enrolled-counts
+    title: Enrollments per course, including empty ones
+    difficulty: 3
+    prompt: |
+      For **every course**, return `code` and `enrolled`, the number of enrollments in term `F24` only (0 if none). Order by `enrolled` descending, then `code`.
+    starter: |
+      SELECT c.code, COUNT(*) AS enrolled
+      FROM course c
+      LEFT JOIN enrollment e ON e.course_code = c.code AND e.term = 'F24'
+      GROUP BY c.code
+      ORDER BY enrolled DESC, c.code;
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["code", "enrolled"]);
+      - name: counts
+        code: |
+          const m = Object.fromEntries(rows);
+          if (rows.length !== 8) throw new Error("Every course must appear (8 rows)");
+          if (m["CS101"] !== 5) throw new Error("CS101 had 5 enrollments in F24, got " + m["CS101"]);
+          if (m["CS201"] !== 0) throw new Error("CS201 had none in F24, so it should show 0, not " + m["CS201"]);
+      - name: order
+        code: |
+          expectRows(query("SELECT c.code, COUNT(e.student_id) FROM course c LEFT JOIN enrollment e ON e.course_code = c.code AND e.term = 'F24' GROUP BY c.code ORDER BY 2 DESC, c.code"));
+    hints:
+      - "The starter counts the NULL-filled row as 1 for empty courses. COUNT(*) counts rows, not matches."
+      - "Count a column from the right table: `COUNT(e.student_id)`."
+    solution: |
+      SELECT c.code, COUNT(e.student_id) AS enrolled
+      FROM course c
+      LEFT JOIN enrollment e ON e.course_code = c.code AND e.term = 'F24'
+      GROUP BY c.code
+      ORDER BY enrolled DESC, c.code;
+    explanation: "COUNT of a right-hand column ignores the NULL created by the LEFT JOIN, so unmatched courses get 0."
+  - id: gpa-points
+    title: Grade points per student
+    difficulty: 4
+    prompt: |
+      Compute each student's average **grade points** over their graded enrollments (A=4, B=3, C=2; ungraded rows are ignored). Return `name` and `points` rounded to 2 decimals, for students with **at least 3 graded** enrollments, best first, ties by name.
+    starter: |
+      -- write your query here
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["name", "points"]);
+      - name: rows
+        code: |
+          expectRows([["Alan Turing", 3.75], ["Ada Lovelace", 3.75], ["Emmy Noether", 3.67], ["Marie Curie", 3.67]].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)));
+    hints:
+      - "Join student and enrollment; turn grades into numbers with CASE (a missing grade becomes NULL, and AVG skips it)."
+      - "`HAVING COUNT(e.grade) >= 3` counts only graded rows."
+    solution: |
+      SELECT s.name,
+             ROUND(AVG(CASE e.grade WHEN 'A' THEN 4 WHEN 'B' THEN 3 WHEN 'C' THEN 2 END), 2) AS points
+      FROM student s
+      JOIN enrollment e ON e.student_id = s.id
+      GROUP BY s.id, s.name
+      HAVING COUNT(e.grade) >= 3
+      ORDER BY points DESC, s.name;
+    explanation: "COUNT(e.grade) skips the NULL grades, so it is exactly the number of graded rows."
+  - id: rank-courses
+    title: Rank each student's courses
+    difficulty: 4
+    prompt: |
+      For every enrollment of student 2 (Alan), return `course_code`, `term` and `n`, a running count that numbers his enrollments from 1 in order of `term`, then `course_code`. Use a window function. Order by `n`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["course_code", "term", "n"]);
+      - name: rows
+        code: |
+          expectRows([["CS101", "F22", 1], ["CS301", "F23", 2], ["CS201", "S23", 3], ["CS401", "S24", 4]]);
+    hints:
+      - "`ROW_NUMBER() OVER (ORDER BY term, course_code) AS n`."
+      - "Filter with `WHERE student_id = 2` (the window sees only filtered rows)."
+    solution: |
+      SELECT course_code, term,
+             ROW_NUMBER() OVER (ORDER BY term, course_code) AS n
+      FROM enrollment
+      WHERE student_id = 2
+      ORDER BY n;
+    explanation: "ROW_NUMBER numbers the rows of the window in the order given inside OVER. Text terms like F22 sort alphabetically, which is a reminder that term codes need care."
+
+commonMistakes:
+  - title: "Putting an aggregate in WHERE"
+    explanation: "WHERE runs before grouping, so `WHERE COUNT(*) > 2` is an error. Use HAVING."
+    wrong: |
+      SELECT year FROM student WHERE COUNT(*) > 2 GROUP BY year;
+    right: |
+      SELECT year FROM student GROUP BY year HAVING COUNT(*) > 2;
+  - title: "Selecting a column that is neither grouped nor aggregated"
+    explanation: "`SELECT name, MAX(gpa) ... GROUP BY year` has no single name per group. SQLite returns an arbitrary one without warning."
+  - title: "COUNT(*) after a LEFT JOIN"
+    explanation: "It counts the NULL-filled row as one. Count a right-table key to get 0."
+  - title: "Averaging rows that should not count"
+    explanation: "AVG ignores NULL but not zeros. If missing data is stored as 0, it drags the average down."
+
+summary:
+  - "Aggregates collapse rows into one value and ignore NULL; COUNT(*) counts rows, COUNT(col) counts non-NULL values."
+  - "GROUP BY makes one group per distinct combination; every selected column must be grouped or aggregated."
+  - "WHERE filters rows before grouping, HAVING filters groups after."
+  - "Evaluation order: FROM/JOIN, WHERE, GROUP BY, HAVING, SELECT, DISTINCT, ORDER BY, LIMIT."
+  - "Window functions with OVER add per-group numbers (rank, running total) without collapsing rows."
+next: u12-subqueries
+
+quiz:
+  - type: mcq
+    question: A table has 10 rows and 4 of them have NULL in column x. What is COUNT(x)?
+    options: ["6", "10", "4", "0"]
+    answer: 0
+    explanation: "COUNT(column) counts non-NULL values only."
+  - type: mcq
+    question: Which clause can filter on COUNT(*) > 2?
+    options: ["HAVING", "WHERE", "FROM", "ORDER BY only"]
+    answer: 0
+    explanation: "HAVING is evaluated after grouping, so it can test aggregates."
+  - type: mcq
+    question: How does AVG treat NULL values?
+    options: ["It ignores them", "It treats them as 0", "It returns NULL if any value is NULL", "It raises an error"]
+    answer: 0
+    explanation: "Only non-NULL values are averaged. The count they are divided by excludes NULLs."
+  - type: mcq
+    question: What does `SELECT COUNT(*) FROM student WHERE 1 = 0` return?
+    options: ["One row containing 0", "No rows", "NULL", "An error"]
+    answer: 0
+    explanation: "Aggregates without GROUP BY always produce one row, even for no input rows."
+  - type: mcq
+    question: Which is evaluated first?
+    options: ["WHERE", "HAVING", "SELECT", "ORDER BY"]
+    answer: 0
+    explanation: "FROM/JOIN, then WHERE, then GROUP BY, HAVING, SELECT, ORDER BY."
+  - type: mcq
+    question: What is the difference between a window function and GROUP BY?
+    options: [
+      "A window function keeps every row",
+      "A window function removes duplicate rows",
+      "GROUP BY keeps every row",
+      "They are the same"
+    ]
+    answer: 0
+    explanation: "GROUP BY returns one row per group; OVER computes per-group values next to each original row."
+  - type: code
+    question: |
+      Return the number of enrollments (as `n`) for each `term`, with columns `term` and `n`, ordered by `term`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: rows
+        code: |
+          expectRows([["F22", 3], ["F23", 5], ["F24", 13], ["S23", 3], ["S24", 3]]);
+    solution: |
+      SELECT term, COUNT(*) AS n
+      FROM enrollment
+      GROUP BY term
+      ORDER BY term;

@@ -24,6 +24,12 @@ function Example({ ex, index, language, lessonId, prelude }) {
           <pre>{ex.output.replace(/\n$/, '')}</pre>
         </div>
       )}
+      {ex.error && (
+        <div className="output static">
+          <div className="output-label" style={{ color: 'var(--bad, #c0392b)' }}>Error</div>
+          <pre>{ex.error}</pre>
+        </div>
+      )}
       {ex.lines?.length > 0 && (
         <div className="line-notes">
           <div className="line-notes-title">Line by line</div>

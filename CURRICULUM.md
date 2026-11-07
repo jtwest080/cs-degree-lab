@@ -17,7 +17,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 9 | Computer Systems (C) | ✅ Complete (Phase 8) | 9 | 37 | Mini CPU (assembler + emulator) |
 | 10 | Operating Systems | ✅ Complete (Phase 9) | 9 | 41 | Mini Kernel (scheduler, page replacement, deadlock detector) |
 | 11 | Networking | ✅ Complete (Phase 10) | 9 | 44 | Mini Network Toolkit (subnets, routing, DNS cache, TCP reassembly, URLs) |
-| 12 | Databases | Planned | | | |
+| 12 | Databases | ✅ Complete (Phase 11) | 9 | 41 | Campus Registrar Database (clean, constrain, index and report on a messy export) |
 | 13 | Web Development | Planned | | | |
 | 14 | Software Engineering | Planned | | | |
 | 15 | Theory of Computation | Planned | | | |
@@ -25,7 +25,7 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 95 lessons, 454 practice exercises, 95 lesson quizzes (570 multiple-choice questions + 95 coding questions), 11 unit projects, 801 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 104 lessons, 495 practice exercises, 104 lesson quizzes (624 multiple-choice questions + 104 coding questions), 12 unit projects, 912 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -317,13 +317,36 @@ Python again. Browsers cannot open raw sockets, so every protocol is **simulated
 
 **Unit 12 can assume:** all of Units 1 to 11, including networking (layers, IP, TCP, DNS, HTTP, sockets, TLS), and the Python used so far (classes, generators, `struct`, `json`, `hashlib`). Unit 12 (Databases) needs SQL in the browser: add sql.js (SQLite compiled to WebAssembly) as a new language runner, like Pyodide and PicoC, with `language: sql` units, a result-table view and SQL test code that compares result sets. Verify with a new `scripts/verify_sql.mjs` and add it to `npm run verify`.
 
+## Unit 12: Databases ✅
+
+Language: SQL (SQLite compiled to WebAssembly by sql.js, running in a worker). Every lesson shares a small university database (department, student, course, enrollment) given as the lesson `prelude`; Lessons 12.7 to 12.9 use their own preludes.
+
+| Lesson | Id | Teaches |
+|---|---|---|
+| 12.1 Tables, Keys and Your First Queries | `u12-relational` | DBMS vs files, relational model, primary/foreign keys, SELECT/WHERE/ORDER BY/LIMIT/DISTINCT, NULL and three-valued logic |
+| 12.2 Filtering, Expressions and CASE | `u12-filtering` | LIKE/IN/BETWEEN, AND/OR precedence, functions, integer division, CASE, ISO dates |
+| 12.3 Joining Tables | `u12-joins` | inner/left/cross joins, aliases, link tables, self joins, anti-joins, ON vs WHERE |
+| 12.4 Aggregation and Grouping | `u12-aggregation` | COUNT/SUM/AVG, GROUP BY, HAVING, evaluation order, double counting, window functions |
+| 12.5 Subqueries, CTEs and Set Operations | `u12-subqueries` | scalar/list/table subqueries, correlated, EXISTS, WITH, recursive CTEs, UNION/INTERSECT/EXCEPT |
+| 12.6 Changing Data and Defining Tables | `u12-modifying` | INSERT/UPDATE/DELETE, CREATE TABLE, constraints, foreign keys, ALTER, views |
+| 12.7 Database Design and Normalization | `u12-design` | ER modelling, anomalies, functional dependencies, 1NF-3NF, lossless splits, denormalisation |
+| 12.8 Transactions and ACID | `u12-transactions` | BEGIN/COMMIT/ROLLBACK/SAVEPOINT, ACID, concurrency anomalies, lost updates, locks/MVCC, write-ahead log |
+| 12.9 Indexes, Query Plans and Safe SQL | `u12-indexes` | B-trees, EXPLAIN QUERY PLAN, composite and covering indexes, SQL injection and parameters |
+| Project | | Campus Registrar Database: normalised tables with constraints, cleaned load, view, index, transactional withdrawal, ranked report |
+
+111 glossary terms (duplicates such as "Join" and "Index" are not repeated).
+
+**SQL runner (new in Phase 11):** `language: sql`. `src/lib/sqlEngine.js` (sql.js with the wasm inlined, so it works offline and in Node) runs the lesson/exercise `prelude` in a fresh in-memory database, then the learner's SQL; the output is the text table of the **last** statement that returns rows (EXPLAIN QUERY PLAN shows only its plan column). Test code is JavaScript with `output, error, columns, rows, source`, plus `query(sql)` (reads the learner's finished database), `expectRows(rows, ordered=true)` and `expectColumns(names)`. Examples that must fail use `expectError: true` and an `error:` line (shown in the lesson and checked). `scripts/verify_sql.mjs` (part of `npm run verify`) and `scripts/autofill_sql.mjs` mirror the C versions. Gotchas: remove any `output: |` block from an `expectError` example before autofill; SQLite returns ROUND results as REAL and integer division truncates; `PRAGMA foreign_keys = ON` is needed per run.
+
+**Unit 13 can assume:** everything through Unit 12, including HTTP/URLs/REST (Unit 11) and SQL/SQL injection (Unit 12).
+
 ## Plan for remaining units (to refine before each phase)
 
-- **10 OS**, **11 Networking**, **12 Databases** (sql.js in browser), **13 Web Development** (JS sandbox already supported by the runner), **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
+- **13 Web Development** (JS sandbox already supported by the runner), **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
 
 ## Technical notes for later phases
 
-- The JavaScript runner (`src/workers/js.worker.js`) is already wired up for Unit 13; SQL (sql.js) still needs adding. C runs through PicoC (see Unit 9).
+- The JavaScript runner (`src/workers/js.worker.js`) is already wired up for Unit 13; SQL runs through sql.js (see Unit 12). C runs through PicoC (see Unit 9).
 - Lessons and projects now load on demand (Phase 6): the main bundle holds only a generated index (`virtual:content-index` in `vite.config.js`: titles, exercise ids, quiz MCQs for the review deck), and each full lesson/project is its own small chunk loaded by `useLesson`/`useProject` in `src/lib/content.js`. Main bundle: about 1.1 MB. When publishing, send every chunk in `dist/assets` (and null any that disappeared).
 
 ## Phase log
@@ -338,3 +361,4 @@ Python again. Browsers cannot open raw sockets, so every protocol is **simulated
 - **Phase 8 (2026-11-07):** complete Unit 9 (9 lessons, 37 exercises, 9 quizzes, Mini CPU project, 58 glossary terms). New framework features: in-browser C (PicoC WebAssembly in a worker, C tag and syntax highlighting in the editor, `language: c` units and projects with JavaScript test code over the program output), and `scripts/verify_c.mjs` added to `npm run verify`. The Input button is hidden for C.
 - **Phase 9 (2026-11-07):** complete Unit 10 (9 lessons, 41 exercises, 9 quizzes, Mini Kernel project, 111 glossary terms). OS concepts are simulated in Python; `scripts/autofill_py.py` added.
 - **Phase 10 (2026-11-07):** complete Unit 11 (9 lessons, 44 exercises, 9 quizzes, Mini Network Toolkit project, 137 glossary terms). Networking simulated in Python.
+- **Phase 11 (2026-11-07):** complete Unit 12 (9 lessons, 41 exercises, 9 quizzes, Campus Registrar Database project, 111 glossary terms). New framework feature: in-browser SQL (sql.js/SQLite in a worker, SQL tag and editor highlighting, `language: sql` units, `verify_sql.mjs`, `autofill_sql.mjs`, error-example display).

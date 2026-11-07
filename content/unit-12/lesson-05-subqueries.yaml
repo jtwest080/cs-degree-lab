@@ -1,0 +1,485 @@
+id: u12-subqueries
+title: "Subqueries, CTEs and Set Operations"
+minutes: 55
+objective: |
+  Build bigger questions out of smaller ones: put a query inside another (scalar, list and table subqueries), correlate a subquery with the outer row, test existence with EXISTS, name steps with WITH (common table expressions), and combine results with UNION, INTERSECT and EXCEPT.
+outcomes:
+  - Use scalar, IN and table (FROM) subqueries
+  - Write a correlated subquery and explain how it runs once per outer row
+  - Use EXISTS and NOT EXISTS, and say why NOT EXISTS is safer than NOT IN
+  - Name intermediate results with WITH and chain several of them
+  - Combine result sets with UNION, UNION ALL, INTERSECT and EXCEPT
+
+prelude: |
+  CREATE TABLE department (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    building TEXT
+  );
+  CREATE TABLE student (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    major_id INTEGER REFERENCES department(id),
+    year INTEGER,
+    gpa REAL,
+    email TEXT
+  );
+  CREATE TABLE course (
+    code TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    dept_id INTEGER REFERENCES department(id),
+    credits INTEGER
+  );
+  CREATE TABLE enrollment (
+    student_id INTEGER REFERENCES student(id),
+    course_code TEXT REFERENCES course(code),
+    term TEXT,
+    grade TEXT,
+    PRIMARY KEY (student_id, course_code, term)
+  );
+  INSERT INTO department VALUES (1,'Computer Science','Gates Hall'),(2,'Mathematics','Euler Building'),(3,'Physics','Newton Hall'),(4,'History',NULL);
+  INSERT INTO student VALUES
+   (1,'Ada Lovelace',1,3,3.9,'ada@uni.edu'),
+   (2,'Alan Turing',1,4,3.8,'alan@uni.edu'),
+   (3,'Grace Hopper',1,2,3.7,'grace@uni.edu'),
+   (4,'Emmy Noether',2,3,3.95,'emmy@uni.edu'),
+   (5,'Carl Gauss',2,1,3.5,NULL),
+   (6,'Marie Curie',3,4,3.85,'marie@uni.edu'),
+   (7,'Isaac Newton',3,2,3.2,'isaac@uni.edu'),
+   (8,'Hannah Arendt',4,3,3.6,'hannah@uni.edu'),
+   (9,'Linus Pauling',NULL,1,3.0,NULL),
+   (10,'Katherine Johnson',2,2,3.9,'katherine@uni.edu'),
+   (11,'Donald Knuth',1,1,3.4,'don@uni.edu'),
+   (12,'Barbara Liskov',1,3,NULL,'barbara@uni.edu');
+  INSERT INTO course VALUES ('CS101','Intro to Programming',1,4),('CS201','Data Structures',1,4),('CS301','Databases',1,3),('CS401','Compilers',1,3),('MA101','Calculus I',2,4),('MA201','Linear Algebra',2,3),('PH101','Mechanics',3,4),('HI101','World History',4,3);
+  INSERT INTO enrollment VALUES
+   (1,'CS101','F23','A'),(1,'CS201','S24','A'),(1,'CS301','F24','A'),(1,'MA201','F24','B'),
+   (2,'CS101','F22','A'),(2,'CS201','S23','A'),(2,'CS301','F23','B'),(2,'CS401','S24','A'),
+   (3,'CS101','F24','B'),(3,'MA101','F24','A'),
+   (4,'MA101','F22','A'),(4,'MA201','S23','A'),(4,'PH101','F23','B'),
+   (5,'MA101','F24','B'),(5,'CS101','F24','C'),
+   (6,'PH101','F22','A'),(6,'MA101','S23','A'),(6,'CS101','F23','B'),
+   (7,'PH101','F24','C'),(7,'MA101','F24','C'),
+   (8,'HI101','F23','A'),(8,'CS101','S24','B'),
+   (9,'HI101','F24',NULL),(9,'CS101','F24',NULL),
+   (10,'MA101','F24','A'),(10,'CS101','F24','A'),
+   (11,'CS101','F24','B');
+
+sections:
+  - heading: A query inside a query
+    body: |
+      Any `SELECT` can appear inside another. The inner one is a **subquery**, written in parentheses. It comes in three useful shapes, depending on what it returns:
+
+      - A **scalar subquery** returns one row with one column, and can be used wherever a single value could: `WHERE gpa > (SELECT AVG(gpa) FROM student)` finds students above average. If it returns more than one row SQLite quietly uses the first, which is a bug waiting to happen; make sure it returns exactly one.
+      - A **list subquery** returns one column of many rows and is used with `IN`: `WHERE major_id IN (SELECT id FROM department WHERE building LIKE '%Hall')`.
+      - A **table subquery** returns a full result and is used in the `FROM` clause as if it were a table (it needs an alias): `FROM (SELECT year, AVG(gpa) AS avg_gpa FROM student GROUP BY year) AS y`. This is the way to filter on a window function or aggregate, or to aggregate twice, such as "the average of the per-year averages".
+
+      Subqueries let you ask a question in steps: first compute the number you need, then use it. Often a join does the same job; use whichever reads more clearly.
+
+  - heading: Correlated subqueries and EXISTS
+    body: |
+      A subquery that mentions a column of the **outer** query is **correlated**. It cannot be computed once; conceptually it is re-run for every outer row:
+
+      ```sql
+      SELECT s.name, s.gpa
+      FROM student s
+      WHERE s.gpa > (SELECT AVG(gpa) FROM student WHERE major_id = s.major_id);
+      ```
+
+      "Students whose GPA is above the average of **their own** major." For each student the inner query averages only that student's major. (Databases are clever and often avoid literally repeating the work, but the meaning is "for each row".)
+
+      `EXISTS (subquery)` is true when the subquery returns **at least one row**; what it selects does not matter (people write `SELECT 1`). It is the natural way to say "has some matching row":
+
+      ```sql
+      SELECT name FROM student s
+      WHERE EXISTS (SELECT 1 FROM enrollment e WHERE e.student_id = s.id AND e.grade = 'A');
+      ```
+
+      `NOT EXISTS` finds rows with **no** match, the clean version of the LEFT JOIN anti-join. It is also safer than `NOT IN`: if the list inside `NOT IN (...)` contains a single NULL, no row can pass (last lesson's trap), whereas NOT EXISTS has no such problem.
+
+  - heading: "WITH: naming the steps"
+    body: |
+      Deeply nested subqueries are hard to read. A **common table expression (CTE)**, introduced by `WITH`, gives a subquery a name, defined before the main query that uses it:
+
+      ```sql
+      WITH per_student AS (
+        SELECT student_id, COUNT(*) AS courses
+        FROM enrollment
+        GROUP BY student_id
+      )
+      SELECT s.name, p.courses
+      FROM student s JOIN per_student p ON p.student_id = s.id
+      WHERE p.courses >= 4;
+      ```
+
+      Read top to bottom like a recipe: compute `per_student`, then use it. You can define several CTEs separated by commas, and later ones may use earlier ones. A CTE exists only for that one statement. Think of it as a temporary, named view of your own making.
+
+      A CTE can also be **recursive**: it refers to itself, which is how SQL walks trees and counts. `WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT x FROM n;` produces 1 to 5. The first part is the starting row, the part after UNION ALL is the step, and it repeats until the step produces nothing. Recursive CTEs follow chains such as "manager of a manager of...", and you will use one in the project.
+
+  - heading: Combining results with set operations
+    body: |
+      Two queries that return the same number of columns can be combined row-wise:
+
+      | Operator | Result |
+      |---|---|
+      | `A UNION B` | rows in A or B, duplicates removed |
+      | `A UNION ALL B` | all rows of both, duplicates kept (and faster, since nothing is compared) |
+      | `A INTERSECT B` | rows in both |
+      | `A EXCEPT B` | rows in A that are not in B |
+
+      Columns are matched by **position**, not name, and the names of the result come from the first query. `ORDER BY` goes once, at the very end. Set operations treat NULLs as equal to each other (unlike `=`), and the "remove duplicates" versions are really set operations in the mathematical sense. A typical use: "students who took a CS course but never a Math course" is `EXCEPT`; "students who took both" is `INTERSECT`; "all names that appear as a student or as a department" is `UNION`.
+
+examples:
+  - title: A scalar subquery
+    intro: "Students with a GPA above the overall average. The inner query runs once and produces one number."
+    code: |
+      SELECT name, gpa
+      FROM student
+      WHERE gpa > (SELECT AVG(gpa) FROM student)
+      ORDER BY gpa DESC;
+    output: |
+      name              | gpa
+      ------------------+-----
+      Emmy Noether      | 3.95
+      Ada Lovelace      | 3.9
+      Katherine Johnson | 3.9
+      Marie Curie       | 3.85
+      Alan Turing       | 3.8
+      Grace Hopper      | 3.7
+    lines:
+      - line: 3
+        note: "The parenthesised query is replaced by its single value, 3.618..., before the outer comparison happens."
+  - title: IN with a list subquery
+    intro: "Names of students majoring in a department housed in a building ending in Hall."
+    code: |
+      SELECT name
+      FROM student
+      WHERE major_id IN (SELECT id FROM department WHERE building LIKE '%Hall')
+      ORDER BY name;
+    output: |
+      name
+      --------------
+      Ada Lovelace
+      Alan Turing
+      Barbara Liskov
+      Donald Knuth
+      Grace Hopper
+      Isaac Newton
+      Marie Curie
+    lines:
+      - line: 3
+        note: "The subquery returns the list (1, 3). Departments without a building (NULL) are not matched by LIKE."
+  - title: A correlated subquery
+    intro: "Above the average of their own major. Linus (no major) and Barbara (no GPA) cannot qualify."
+    code: |
+      SELECT s.name, s.major_id, s.gpa
+      FROM student s
+      WHERE s.gpa > (SELECT AVG(gpa) FROM student WHERE major_id = s.major_id)
+      ORDER BY s.major_id, s.name;
+    output: |
+      name              | major_id | gpa
+      ------------------+----------+-----
+      Ada Lovelace      | 1        | 3.9
+      Alan Turing       | 1        | 3.8
+      Emmy Noether      | 2        | 3.95
+      Katherine Johnson | 2        | 3.9
+      Marie Curie       | 3        | 3.85
+    lines:
+      - line: 3
+        note: "s.major_id comes from the outer row, so the inner average is recomputed for each student's own major."
+  - title: EXISTS and NOT EXISTS
+    intro: "Students who earned at least one A, and students who never took any CS course."
+    code: |
+      SELECT 'has an A' AS kind, COUNT(*) AS n
+      FROM student s
+      WHERE EXISTS (SELECT 1 FROM enrollment e WHERE e.student_id = s.id AND e.grade = 'A')
+      UNION ALL
+      SELECT 'no CS course', COUNT(*)
+      FROM student s
+      WHERE NOT EXISTS (
+        SELECT 1 FROM enrollment e
+        WHERE e.student_id = s.id AND e.course_code LIKE 'CS%'
+      );
+    output: |
+      kind         | n
+      -------------+--
+      has an A     | 7
+      no CS course | 3
+    lines:
+      - line: 3
+        note: "EXISTS stops at the first matching row, so it never builds the whole list."
+      - line: 4
+        note: "UNION ALL stacks the two one-row results."
+      - line: 7
+        note: "NOT EXISTS keeps students for whom the inner query finds nothing."
+  - title: A table subquery and a CTE
+    intro: "The average of the per-year averages, written two ways. The CTE reads top to bottom."
+    code: |
+      WITH per_year AS (
+        SELECT year, AVG(gpa) AS avg_gpa
+        FROM student
+        GROUP BY year
+      )
+      SELECT ROUND(AVG(avg_gpa), 3) AS avg_of_avgs,
+             (SELECT ROUND(AVG(gpa), 3) FROM student) AS plain_avg
+      FROM per_year;
+    output: |
+      avg_of_avgs | plain_avg
+      ------------+----------
+      3.635       | 3.618
+    lines:
+      - line: 1
+        note: "The CTE names an intermediate result."
+      - line: 6
+        note: "Aggregating twice is the textbook use. The two answers differ because the years have different sizes."
+  - title: Recursive CTE
+    intro: "Count 1 to 5 and then build a table of factorials, using the result of the previous row."
+    code: |
+      WITH RECURSIVE f(n, fact) AS (
+        SELECT 1, 1
+        UNION ALL
+        SELECT n + 1, fact * (n + 1) FROM f WHERE n < 6
+      )
+      SELECT n, fact FROM f;
+    output: |
+      n | fact
+      --+-----
+      1 | 1
+      2 | 2
+      3 | 6
+      4 | 24
+      5 | 120
+      6 | 720
+    lines:
+      - line: 2
+        note: "The anchor row starts the recursion."
+      - line: 4
+        note: "The step reads the previous row from f itself. The WHERE stops it."
+  - title: Set operations
+    intro: "Which students took both CS101 and MA101, and who took CS101 but not MA101?"
+    code: |
+      SELECT student_id FROM enrollment WHERE course_code = 'CS101'
+      INTERSECT
+      SELECT student_id FROM enrollment WHERE course_code = 'MA101'
+      ORDER BY student_id;
+    output: |
+      student_id
+      ----------
+      3
+      5
+      6
+      10
+    lines:
+      - line: 2
+        note: "INTERSECT keeps only ids present in both results. Replace it with EXCEPT to get the ones in the first but not the second."
+
+playground:
+  prompt: |
+    Change INTERSECT to EXCEPT in the query below and predict the rows before you run it. Then write the same question using EXISTS.
+  code: |
+    SELECT student_id FROM enrollment WHERE course_code = 'CS101'
+    INTERSECT
+    SELECT student_id FROM enrollment WHERE course_code = 'MA101'
+    ORDER BY student_id;
+
+exercises:
+  - id: above-avg-credits
+    title: Courses above average credits
+    difficulty: 2
+    prompt: |
+      Return `code` of every course with **more credits than the average** course, ordered by `code`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: rows
+        code: |
+          expectRows([["CS101"], ["CS201"], ["MA101"], ["PH101"]]);
+    hints:
+      - "The average credits is `(SELECT AVG(credits) FROM course)`."
+      - "Compare with `credits > (...)`."
+    solution: |
+      SELECT code
+      FROM course
+      WHERE credits > (SELECT AVG(credits) FROM course)
+      ORDER BY code;
+    explanation: "The scalar subquery gives 3.5, then the outer filter keeps the 4-credit courses."
+  - id: best-in-major
+    title: Top of each major
+    difficulty: 4
+    prompt: |
+      Return `name`, `major_id` and `gpa` for each student whose GPA is the **highest in their own major** (ties all count). Use a correlated subquery. Order by `major_id`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["name", "major_id", "gpa"]);
+      - name: rows
+        code: |
+          expectRows([["Ada Lovelace", 1, 3.9], ["Emmy Noether", 2, 3.95], ["Marie Curie", 3, 3.85], ["Hannah Arendt", 4, 3.6]]);
+    hints:
+      - "Compare each student's gpa with `(SELECT MAX(gpa) FROM student WHERE major_id = s.major_id)`."
+      - "Students with no major have a NULL major_id and match nothing, which is fine."
+    solution: |
+      SELECT s.name, s.major_id, s.gpa
+      FROM student s
+      WHERE s.gpa = (SELECT MAX(gpa) FROM student WHERE major_id = s.major_id)
+      ORDER BY s.major_id;
+    explanation: "The inner MAX is recomputed for every outer student using that student's own major."
+  - id: never-failed
+    title: Students with an A who never got a C
+    difficulty: 3
+    prompt: |
+      Return the `name` of every student who has **at least one A** and **no C** among their grades. Use EXISTS and NOT EXISTS. Order by `name`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: rows
+        code: |
+          expectRows(query("SELECT name FROM student WHERE id IN (SELECT student_id FROM enrollment WHERE grade = 'A') AND id NOT IN (SELECT student_id FROM enrollment WHERE grade = 'C') ORDER BY name"));
+          if (rows.length !== 7) throw new Error("Expected 7 students, got " + rows.length);
+    hints:
+      - "`WHERE EXISTS (SELECT 1 FROM enrollment e WHERE e.student_id = s.id AND e.grade = 'A')`."
+      - "Add `AND NOT EXISTS (... e.grade = 'C')`."
+    solution: |
+      SELECT s.name
+      FROM student s
+      WHERE EXISTS (SELECT 1 FROM enrollment e WHERE e.student_id = s.id AND e.grade = 'A')
+        AND NOT EXISTS (SELECT 1 FROM enrollment e WHERE e.student_id = s.id AND e.grade = 'C')
+      ORDER BY s.name;
+    explanation: "Two independent existence tests joined by AND. Both are correlated through s.id."
+  - id: cte-busy
+    title: Busy students with a CTE
+    difficulty: 3
+    prompt: |
+      Using a CTE, find students who took **more courses than the average student who has enrollments**. Return `name` and `courses`, most courses first, ties by name.
+    starter: |
+      -- write your query here
+    tests:
+      - name: columns
+        code: |
+          expectColumns(["name", "courses"]);
+      - name: rows
+        code: |
+          expectRows([["Alan Turing", 4], ["Ada Lovelace", 4]].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).concat([["Emmy Noether", 3], ["Marie Curie", 3]]));
+    hints:
+      - "`WITH counts AS (SELECT student_id, COUNT(*) AS courses FROM enrollment GROUP BY student_id)`."
+      - "Compare with `(SELECT AVG(courses) FROM counts)` in the main query."
+    solution: |
+      WITH counts AS (
+        SELECT student_id, COUNT(*) AS courses
+        FROM enrollment
+        GROUP BY student_id
+      )
+      SELECT s.name, c.courses
+      FROM counts c
+      JOIN student s ON s.id = c.student_id
+      WHERE c.courses > (SELECT AVG(courses) FROM counts)
+      ORDER BY c.courses DESC, s.name;
+    explanation: "The CTE is used twice: once to get each student's count and once to average them."
+  - id: only-cs
+    title: CS students who skipped math
+    difficulty: 4
+    prompt: |
+      Return the `student_id` of students who took at least one course whose code starts with `CS` but **never** one starting with `MA`. Use `EXCEPT`. Order by `student_id`.
+    starter: |
+      -- write your query here
+    tests:
+      - name: rows
+        code: |
+          expectRows([[2], [8], [9], [11]]);
+    hints:
+      - "First query: `SELECT student_id FROM enrollment WHERE course_code LIKE 'CS%'`."
+      - "Second query: the same with `'MA%'`. Put EXCEPT between them."
+    solution: |
+      SELECT student_id FROM enrollment WHERE course_code LIKE 'CS%'
+      EXCEPT
+      SELECT student_id FROM enrollment WHERE course_code LIKE 'MA%'
+      ORDER BY student_id;
+    explanation: "EXCEPT keeps rows of the first result that do not appear in the second, with duplicates removed."
+
+commonMistakes:
+  - title: "Using NOT IN when the list may contain NULL"
+    explanation: "`x NOT IN (SELECT col ...)` returns nothing if any value in the list is NULL. Use NOT EXISTS."
+  - title: "A scalar subquery that returns several rows"
+    explanation: "SQLite silently takes the first row. Make sure the subquery is an aggregate or filters on a unique key."
+  - title: "Forgetting the alias on a subquery in FROM"
+    explanation: "A subquery in FROM acts as a table and some databases insist on a name: `FROM (SELECT ...) AS t`."
+  - title: "UNION when you meant UNION ALL"
+    explanation: "UNION removes duplicates, which costs time and may remove rows you wanted to keep. Use UNION ALL unless you need distinct rows."
+
+summary:
+  - "A subquery is a SELECT in parentheses: scalar (one value), list (for IN) or table (in FROM)."
+  - "A correlated subquery uses a column of the outer query and is evaluated for each outer row."
+  - "EXISTS tests for at least one matching row; NOT EXISTS is safer than NOT IN when NULLs are possible."
+  - "WITH names intermediate results; WITH RECURSIVE repeats a step until nothing new appears."
+  - "UNION, INTERSECT and EXCEPT combine queries by position; UNION ALL keeps duplicates."
+next: u12-modifying
+
+quiz:
+  - type: mcq
+    question: What kind of subquery is `(SELECT AVG(gpa) FROM student)` in `WHERE gpa > (...)`?
+    options: ["A scalar subquery", "A list subquery", "A recursive subquery", "A table subquery"]
+    answer: 0
+    explanation: "It returns exactly one value, so it can be used where a single value is expected."
+  - type: mcq
+    question: What makes a subquery correlated?
+    options: [
+      "It refers to a column of the outer query",
+      "It uses GROUP BY",
+      "It returns more than one row",
+      "It is inside a CTE"
+    ]
+    answer: 0
+    explanation: "Because it depends on the current outer row, it is evaluated per outer row."
+  - type: mcq
+    question: Why is NOT EXISTS often safer than NOT IN?
+    options: [
+      "A NULL in the NOT IN list makes the test unknown for every row",
+      "NOT EXISTS is always faster",
+      "NOT IN is not allowed in SQLite",
+      "NOT EXISTS sorts the rows"
+    ]
+    answer: 0
+    explanation: "x NOT IN (..., NULL) can never be true, which silently returns no rows."
+  - type: mcq
+    question: What is a CTE?
+    options: [
+      "A named subquery defined with WITH for one statement",
+      "A table stored permanently",
+      "An index",
+      "A kind of join"
+    ]
+    answer: 0
+    explanation: "A common table expression names an intermediate result, used only by the statement that follows."
+  - type: mcq
+    question: What does `A EXCEPT B` return?
+    options: ["Rows of A that do not appear in B", "Rows in both", "Rows in B only", "All rows of both"]
+    answer: 0
+    explanation: "EXCEPT subtracts the second result from the first."
+  - type: mcq
+    question: Which is true of UNION ALL compared with UNION?
+    options: [
+      "It keeps duplicates and does not need to compare rows",
+      "It removes duplicates",
+      "It requires the same column names",
+      "It sorts the result"
+    ]
+    answer: 0
+    explanation: "UNION ALL just stacks the results."
+  - type: code
+    question: |
+      Return the `title` of every course that has **no enrollments in term `F23`**, ordered by `title`. Use NOT EXISTS.
+    starter: |
+      -- write your query here
+    tests:
+      - name: rows
+        code: |
+          expectRows([["Calculus I"], ["Compilers"], ["Data Structures"], ["Linear Algebra"]].concat([]).sort());
+    solution: |
+      SELECT c.title
+      FROM course c
+      WHERE NOT EXISTS (
+        SELECT 1 FROM enrollment e WHERE e.course_code = c.code AND e.term = 'F23'
+      )
+      ORDER BY c.title;

@@ -1,0 +1,292 @@
+title: Campus Registrar Database
+brief: |-
+  You are building the **registration database for a small college** from a messy export. The old system gave you one flat table, `raw_registration`, with a row per enrollment: the student's name and email, the course code, title and credits, the term and the grade. It is dirty: emails and course codes come in mixed case with stray spaces, the same enrollment appears more than once, and an ungraded course has an empty string `''` instead of a real missing value.
+
+  Write **one SQL script** that:
+
+  1. Creates three clean tables with proper constraints: `student(id, name, email)`, `course(code, title, credits)` and `enrollment(student_id, course_code, term, grade)`.
+  2. Loads them from `raw_registration`, cleaning as it goes.
+  3. Creates a view `v_transcript` and an index `idx_enrollment_course`.
+  4. Processes a withdrawal inside a transaction.
+  5. Ends with a report query: one row per course, ranked by popularity.
+
+  **Exact requirements:**
+
+  - `student`: `id INTEGER PRIMARY KEY` (auto-assigned), `name` and `email` both `NOT NULL`, `email` declared `UNIQUE`. One row per distinct email after lower-casing and trimming. The name is the trimmed name.
+  - `course`: `code TEXT PRIMARY KEY` (upper case, trimmed), `title` `NOT NULL`, `credits INTEGER NOT NULL` with a `CHECK` that it is greater than 0.
+  - `enrollment`: `student_id` and `course_code` are foreign keys to the other two tables, `term` is required, `grade` is `NULL` or one of `'A','B','C','D','F'` (a `CHECK`), and the primary key is `(student_id, course_code, term)`. Duplicate rows in the raw data become **one** enrollment. Empty-string grades become `NULL`.
+  - `v_transcript` has the columns `student` (name), `email`, `course` (code), `title`, `term`, `grade`, one row per enrollment.
+  - `idx_enrollment_course` is an index on `enrollment(course_code)`, so that finding everyone in a course does not scan the table.
+  - **Withdrawal:** the student `bo@campus.edu` withdraws from all courses in term `F24`. Create a table `withdrawal_log(student_id, course_code, term)`. In **one transaction** (`BEGIN` ... `COMMIT`) copy those enrollments into the log, then delete them from `enrollment`.
+  - **Report** (the last statement): columns `code`, `enrolled` (current enrollments, 0 if none), `avg_points` (average of the graded enrollments, with A=4, B=3, C=2, D=1, F=0, rounded to 2 decimals, `NULL` if none are graded) and `popularity` (`RANK()` by `enrolled`, highest first). Every course appears. Order by `popularity`, then `code`.
+
+  Only the result of the **last** statement is shown, so the report must come last.
+prelude: |
+  CREATE TABLE raw_registration (
+    student_name TEXT, student_email TEXT, course_code TEXT,
+    course_title TEXT, credits INTEGER, term TEXT, grade TEXT
+  );
+  INSERT INTO raw_registration VALUES
+    ('Bo Chen', 'bo@campus.edu', 'ph101', 'Physics', 4, 'F23', 'B'),
+    ('Di Okafor', ' di@campus.edu ', 'CS320', 'Databases', 3, 'F24', ''),
+    ('Di Okafor', 'di@campus.edu', ' CS210', 'Algorithms', 4, 'S24', 'C'),
+    ('Fay Novak', 'FAY@CAMPUS.EDU', 'CS101 ', 'Intro Programming', 4, 'F24', ''),
+    ('Di Okafor', 'DI@CAMPUS.EDU', 'CS101', 'Intro Programming', 4, 'S24', 'D'),
+    ('Fay Novak', 'Fay@campus.edu', 'CS210', 'Algorithms', 4, 'F23', 'A'),
+    ('Di Okafor', ' di@campus.edu ', 'CS101 ', 'Intro Programming', 4, 'S24', 'D'),
+    ('Cy Dube', 'Cy@campus.edu', 'ar100', 'Art History', 2, 'F23', 'C'),
+    ('Fay Novak', ' fay@campus.edu ', ' AR100', 'Art History', 2, 'S24', 'A'),
+    ('Eli Park', 'Eli@campus.edu', 'cs210', 'Algorithms', 4, 'S24', 'A'),
+    ('Eli Park', 'ELI@CAMPUS.EDU', ' CS101', 'Intro Programming', 4, 'F24', ''),
+    ('Gus Weber', 'GUS@CAMPUS.EDU', 'CS320 ', 'Databases', 3, 'F24', 'C'),
+    ('Di Okafor', 'di@campus.edu', 'PH101', 'Physics', 4, 'F23', 'D'),
+    ('Eli Park', 'Eli@campus.edu', 'PH101 ', 'Physics', 4, 'S24', 'B'),
+    ('Ana Ruiz', 'ana@campus.edu', ' AR100', 'Art History', 2, 'S24', 'D'),
+    ('Hana Ito', ' hana@campus.edu ', 'AR100 ', 'Art History', 2, 'S24', 'A'),
+    ('Bo Chen', 'BO@CAMPUS.EDU', 'CS210', 'Algorithms', 4, 'S24', 'B'),
+    ('Di Okafor', 'DI@CAMPUS.EDU', ' AR100', 'Art History', 2, 'F24', ''),
+    ('Fay Novak', 'Fay@campus.edu', 'cs101', 'Intro Programming', 4, 'F24', ''),
+    ('Cy Dube', 'cy@campus.edu', 'ma110', 'Calculus', 4, 'F23', 'B'),
+    ('Fay Novak', 'fay@campus.edu', ' CS210', 'Algorithms', 4, 'F23', 'A'),
+    ('Bo Chen', 'bo@campus.edu', ' CS101', 'Intro Programming', 4, 'F23', 'A'),
+    ('Bo Chen', ' bo@campus.edu ', ' MA110', 'Calculus', 4, 'F24', 'B'),
+    ('Fay Novak', 'fay@campus.edu', 'PH101 ', 'Physics', 4, 'F23', 'C'),
+    ('Hana Ito', 'HANA@CAMPUS.EDU', ' CS320', 'Databases', 3, 'S24', 'D'),
+    ('Ana Ruiz', ' ana@campus.edu ', 'cs320', 'Databases', 3, 'S24', 'A'),
+    ('Gus Weber', 'gus@campus.edu', 'AR100', 'Art History', 2, 'S24', 'B'),
+    ('Gus Weber', 'gus@campus.edu', ' PH101', 'Physics', 4, 'S24', 'B'),
+    ('Cy Dube', 'Cy@campus.edu', 'CS101 ', 'Intro Programming', 4, 'S24', 'A'),
+    ('Hana Ito', 'hana@campus.edu', 'ma110', 'Calculus', 4, 'F23', 'B'),
+    ('Bo Chen', 'BO@CAMPUS.EDU', 'CS320', 'Databases', 3, 'F24', 'A'),
+    ('Gus Weber', 'gus@campus.edu', 'cs210', 'Algorithms', 4, 'F23', 'B'),
+    ('Eli Park', 'ELI@CAMPUS.EDU', 'cs320', 'Databases', 3, 'S24', 'A'),
+    ('Ana Ruiz', ' ana@campus.edu ', 'cs101', 'Intro Programming', 4, 'S24', 'D'),
+    ('Bo Chen', ' bo@campus.edu ', ' CS210', 'Algorithms', 4, 'S24', 'B'),
+    ('Hana Ito', ' hana@campus.edu ', ' CS320', 'Databases', 3, 'S24', 'D'),
+    ('Fay Novak', 'Fay@campus.edu', 'cs320', 'Databases', 3, 'F24', ''),
+    ('Gus Weber', 'gus@campus.edu', 'CS101 ', 'Intro Programming', 4, 'S24', 'C'),
+    ('Cy Dube', 'Cy@campus.edu', ' CS320', 'Databases', 3, 'S24', 'C'),
+    ('Ana Ruiz', 'ANA@CAMPUS.EDU', 'ph101', 'Physics', 4, 'S24', 'B'),
+    ('Cy Dube', ' cy@campus.edu ', ' PH101', 'Physics', 4, 'F24', ''),
+    ('Eli Park', 'eli@campus.edu', ' MA110', 'Calculus', 4, 'S24', 'C');
+steps:
+- title: Design the tables
+  body: Write the three CREATE TABLE statements first, with every constraint from the list. `PRAGMA foreign_keys = ON;` first makes the database check your foreign keys while you load data (Lesson 12.6).
+- title: Clean and load
+  body: '`LOWER(TRIM(email))` makes emails comparable. `GROUP BY` the cleaned values to remove duplicates, and `NULLIF(TRIM(grade), '''')` turns an empty grade into NULL. Load `student` first (ids are assigned for you), then `course`, then join back to `student` on the cleaned email to get each `student_id` (Lessons 12.3 and 12.7).'
+- title: View and index
+  body: The view is the three-table join from Lesson 12.6 with aliases for the column names. The index is one `CREATE INDEX` (Lesson 12.9). Check the plan of `SELECT * FROM enrollment WHERE course_code = 'CS101'` to see it used.
+- title: The withdrawal
+  body: 'Wrap two statements in `BEGIN; ... COMMIT;`: an `INSERT ... SELECT` into `withdrawal_log`, then a `DELETE` with the same condition (Lesson 12.8). Look up Bo''s id with a subquery on the email.'
+- title: The report
+  body: Count with `COUNT(e.student_id)` after a `LEFT JOIN` so that empty courses show 0 (Lesson 12.4). Turn grades into points with `CASE` (a missing grade becomes NULL and `AVG` skips it), compute it in a CTE, and rank in the outer query with `RANK() OVER (ORDER BY enrolled DESC)`.
+checklist:
+- text: The student table has the right keys and constraints
+  test: student table is well formed
+- text: The course table has the right keys and a credits check
+  test: course table is well formed
+- text: The enrollment table has a composite key, foreign keys and a grade check
+  test: enrollment has keys and checks
+- text: Students are cleaned and de-duplicated
+  test: students are loaded and cleaned
+- text: Courses are cleaned and de-duplicated
+  test: courses are loaded and cleaned
+- text: Enrollments are de-duplicated and grades fixed
+  test: enrollments are loaded without duplicates
+- text: The v_transcript view joins the tables
+  test: v_transcript joins everything
+- text: The course index exists and is used
+  test: the index is used
+- text: The withdrawal is logged
+  test: the withdrawal was logged
+- text: The withdrawal removes the enrollments in a transaction
+  test: the withdrawal removed the enrollments
+- text: The report has the right columns
+  test: the report has the right columns
+- text: The report rows are correct
+  test: the report is correct
+starter: |
+  -- Campus Registrar: write your whole script here.
+  -- The raw data is in the table raw_registration. Try:
+  --   SELECT * FROM raw_registration;
+
+  -- 1. Tables
+
+  -- 2. Load the cleaned data
+
+  -- 3. View and index
+
+  -- 4. The withdrawal (inside a transaction)
+
+  -- 5. The report (must be the last statement)
+tests:
+- name: student table is well formed
+  code: |2
+
+    const info = query("SELECT name, \"notnull\", pk FROM pragma_table_info('student') ORDER BY cid");
+    const names = info.map((r) => r[0]);
+    for (const n of ["id", "name", "email"]) if (!names.includes(n)) throw new Error("student needs a column named " + n);
+    const get = (n) => info.find((r) => r[0] === n);
+    if (get("id")[2] !== 1) throw new Error("student.id must be the primary key");
+    if (get("name")[1] !== 1 || get("email")[1] !== 1) throw new Error("name and email must be NOT NULL");
+    const uq = query("SELECT COUNT(*) FROM pragma_index_list('student') WHERE \"unique\" = 1 AND origin = 'u'");
+    if (uq[0][0] < 1) throw new Error("email must be declared UNIQUE");
+- name: course table is well formed
+  code: |2
+
+    const info = query("SELECT name, \"notnull\", pk FROM pragma_table_info('course') ORDER BY cid");
+    const names = info.map((r) => r[0]);
+    for (const n of ["code", "title", "credits"]) if (!names.includes(n)) throw new Error("course needs a column named " + n);
+    if (info.find((r) => r[0] === "code")[2] !== 1) throw new Error("course.code must be the primary key");
+    let rejected = false;
+    try { query("INSERT INTO course (code, title, credits) VALUES ('ZZ999', 'Bad', 0)"); } catch (e) { rejected = true; }
+    if (!rejected) throw new Error("credits must be CHECKed to be greater than 0");
+- name: enrollment has keys and checks
+  code: |2
+
+    const pk = query("SELECT name FROM pragma_table_info('enrollment') WHERE pk > 0 ORDER BY pk").map((r) => r[0]);
+    if (JSON.stringify(pk) !== JSON.stringify(["student_id", "course_code", "term"])) throw new Error("The primary key must be (student_id, course_code, term), got " + JSON.stringify(pk));
+    const fk = query("SELECT \"table\", \"from\" FROM pragma_foreign_key_list('enrollment') ORDER BY \"from\"");
+    if (JSON.stringify(fk) !== JSON.stringify([["course", "course_code"], ["student", "student_id"]])) throw new Error("enrollment needs foreign keys to student and course, got " + JSON.stringify(fk));
+    let rejected = false;
+    try { query("INSERT INTO enrollment VALUES (1, 'CS101', 'F99', 'Z')"); } catch (e) { rejected = true; }
+    if (!rejected) throw new Error("grade must be one of A, B, C, D, F, or NULL");
+- name: students are loaded and cleaned
+  code: |2
+
+    const r = query("SELECT email FROM student ORDER BY email").map((x) => x[0]);
+    const want = ["ana@campus.edu", "bo@campus.edu", "cy@campus.edu", "di@campus.edu", "eli@campus.edu", "fay@campus.edu", "gus@campus.edu", "hana@campus.edu"];
+    if (JSON.stringify(r) !== JSON.stringify(want)) throw new Error("Expected the " + want.length + " distinct, lower-case, trimmed emails, got " + JSON.stringify(r));
+    const names = query("SELECT name FROM student ORDER BY email").map((x) => x[0]);
+    const wn = ["Ana Ruiz", "Bo Chen", "Cy Dube", "Di Okafor", "Eli Park", "Fay Novak", "Gus Weber", "Hana Ito"];
+    if (JSON.stringify(names) !== JSON.stringify(wn)) throw new Error("Names should be trimmed and attached to the right email, got " + JSON.stringify(names));
+- name: courses are loaded and cleaned
+  code: |2
+
+    const r = query("SELECT code, title, credits FROM course ORDER BY code");
+    const want = [["AR100", "Art History", 2], ["CS101", "Intro Programming", 4], ["CS210", "Algorithms", 4], ["CS320", "Databases", 3], ["MA110", "Calculus", 4], ["PH101", "Physics", 4]];
+    if (JSON.stringify(r) !== JSON.stringify(want)) throw new Error("Expected " + JSON.stringify(want) + " but got " + JSON.stringify(r));
+- name: enrollments are loaded without duplicates
+  code: |2
+
+    const n = query("SELECT COUNT(*) FROM v_transcript")[0][0] + 2;
+    if (n !== 37) throw new Error("Expected 37 distinct enrollments before the withdrawal, found " + n);
+    const empty = query("SELECT COUNT(*) FROM enrollment WHERE grade = ''")[0][0];
+    if (empty !== 0) throw new Error("A missing grade must be NULL, not an empty string");
+    const upper = query("SELECT COUNT(*) FROM enrollment WHERE course_code <> UPPER(TRIM(course_code))")[0][0];
+    if (upper !== 0) throw new Error("Course codes must be upper case and trimmed");
+- name: v_transcript joins everything
+  code: |2
+
+    const cols = query("SELECT name FROM pragma_table_info('v_transcript') ORDER BY cid").map((r) => r[0]);
+    if (JSON.stringify(cols) !== JSON.stringify(["student", "email", "course", "title", "term", "grade"])) throw new Error("v_transcript needs the columns student, email, course, title, term, grade; got " + JSON.stringify(cols));
+    const t = query("SELECT type FROM sqlite_master WHERE name = 'v_transcript'");
+    if (t.length !== 1 || t[0][0] !== "view") throw new Error("v_transcript must be a VIEW");
+    const a = query("SELECT student, course, term FROM v_transcript WHERE email = 'ana@campus.edu' ORDER BY course, term");
+    const want = [["Ana Ruiz", "AR100", "S24"], ["Ana Ruiz", "CS101", "S24"], ["Ana Ruiz", "CS320", "S24"], ["Ana Ruiz", "PH101", "S24"]];
+    if (JSON.stringify(a) !== JSON.stringify(want)) throw new Error("Ana's transcript should be " + JSON.stringify(want) + " but is " + JSON.stringify(a));
+- name: the index is used
+  code: |2
+
+    const idx = query("SELECT name FROM pragma_index_info('idx_enrollment_course')").map((r) => r[0]);
+    if (JSON.stringify(idx) !== JSON.stringify(["course_code"])) throw new Error("Create idx_enrollment_course on enrollment(course_code)");
+    const plan = query("EXPLAIN QUERY PLAN SELECT * FROM enrollment WHERE course_code = 'CS101'").map((r) => r[3]).join(" ");
+    if (!/idx_enrollment_course/.test(plan)) throw new Error("The planner should use the index for course_code lookups; plan: " + plan);
+- name: the withdrawal was logged
+  code: |2
+
+    const log = query("SELECT student_id, course_code, term FROM withdrawal_log ORDER BY course_code");
+    const want = [[2, "CS320", "F24"], [2, "MA110", "F24"]];
+    if (JSON.stringify(log) !== JSON.stringify(want)) throw new Error("withdrawal_log should be " + JSON.stringify(want) + " but is " + JSON.stringify(log));
+- name: the withdrawal removed the enrollments
+  code: |2
+
+    const left = query("SELECT COUNT(*) FROM enrollment WHERE term = 'F24' AND student_id = 2")[0][0];
+    if (left !== 0) throw new Error("Bo Chen still has F24 enrollments");
+    const total = query("SELECT COUNT(*) FROM enrollment")[0][0];
+    if (total !== 35) throw new Error("Only Bo's F24 enrollments should be removed; expected 35 rows, found " + total);
+    if (!/BEGIN/i.test(source) || !/COMMIT/i.test(source)) throw new Error("Do the withdrawal inside BEGIN ... COMMIT");
+- name: the report has the right columns
+  code: |2
+
+    expectColumns(["code", "enrolled", "avg_points", "popularity"]);
+- name: the report is correct
+  code: |2
+
+    expectRows([["CS101", 7, 2.4, 1], ["CS320", 7, 2.6, 1], ["PH101", 7, 2.5, 1], ["AR100", 6, 2.8, 4], ["CS210", 5, 3.2, 5], ["MA110", 3, 2.67, 6]]);
+solution: |
+  -- 1. Clean tables with constraints
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE student (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE
+  );
+  CREATE TABLE course (
+    code TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    credits INTEGER NOT NULL CHECK (credits > 0)
+  );
+  CREATE TABLE enrollment (
+    student_id INTEGER NOT NULL REFERENCES student(id),
+    course_code TEXT NOT NULL REFERENCES course(code),
+    term TEXT NOT NULL,
+    grade TEXT CHECK (grade IN ('A','B','C','D','F')),
+    PRIMARY KEY (student_id, course_code, term)
+  );
+
+  -- 2. Load the cleaned data
+  INSERT INTO student (name, email)
+    SELECT MIN(TRIM(student_name)), LOWER(TRIM(student_email))
+    FROM raw_registration
+    GROUP BY LOWER(TRIM(student_email))
+    ORDER BY LOWER(TRIM(student_email));
+  INSERT INTO course (code, title, credits)
+    SELECT UPPER(TRIM(course_code)), MIN(course_title), MIN(credits)
+    FROM raw_registration
+    GROUP BY UPPER(TRIM(course_code));
+  INSERT INTO enrollment (student_id, course_code, term, grade)
+    SELECT s.id, UPPER(TRIM(r.course_code)), r.term, MAX(NULLIF(TRIM(r.grade), ''))
+    FROM raw_registration r
+    JOIN student s ON s.email = LOWER(TRIM(r.student_email))
+    GROUP BY s.id, UPPER(TRIM(r.course_code)), r.term;
+
+  -- 3. A view and an index
+  CREATE VIEW v_transcript AS
+    SELECT s.name AS student, s.email, c.code AS course, c.title, e.term, e.grade
+    FROM enrollment e
+    JOIN student s ON s.id = e.student_id
+    JOIN course c ON c.code = e.course_code;
+  CREATE INDEX idx_enrollment_course ON enrollment (course_code);
+
+  -- 4. Bo Chen withdraws from every F24 course, in one transaction
+  CREATE TABLE withdrawal_log (student_id INTEGER, course_code TEXT, term TEXT);
+  BEGIN;
+  INSERT INTO withdrawal_log (student_id, course_code, term)
+    SELECT e.student_id, e.course_code, e.term
+    FROM enrollment e JOIN student s ON s.id = e.student_id
+    WHERE s.email = 'bo@campus.edu' AND e.term = 'F24';
+  DELETE FROM enrollment
+    WHERE term = 'F24'
+      AND student_id = (SELECT id FROM student WHERE email = 'bo@campus.edu');
+  COMMIT;
+
+  -- 5. The report (must be the last statement)
+  WITH per_course AS (
+    SELECT c.code,
+           COUNT(e.student_id) AS enrolled,
+           ROUND(AVG(CASE e.grade WHEN 'A' THEN 4 WHEN 'B' THEN 3 WHEN 'C' THEN 2 WHEN 'D' THEN 1 WHEN 'F' THEN 0 END), 2) AS avg_points
+    FROM course c
+    LEFT JOIN enrollment e ON e.course_code = c.code
+    GROUP BY c.code
+  )
+  SELECT code, enrolled, avg_points,
+         RANK() OVER (ORDER BY enrolled DESC) AS popularity
+  FROM per_course
+  ORDER BY popularity, code;
+stretch:
+- Add a `CHECK` that `term` looks like a letter followed by two digits, using `GLOB 'F[0-9][0-9]'`-style patterns, and extend the loading to reject bad terms.
+- Add a `capacity` column to `course` and a trigger (or a query) that prevents enrolling more students than seats.
+- Create a view `v_gpa` with each student's average grade points, using a window function to also show the rank within the college.
+- Write the report again using only a view per step and compare the query plans.
+- Use a recursive CTE to produce a calendar of the terms F23, S24, F24 and join the enrollments onto it.

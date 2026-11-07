@@ -3,6 +3,7 @@ import CodeMirror from '@uiw/react-codemirror';
 import { python } from '@codemirror/lang-python';
 import { javascript } from '@codemirror/lang-javascript';
 import { cpp } from '@codemirror/lang-cpp';
+import { sql, SQLite } from '@codemirror/lang-sql';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { indentUnit } from '@codemirror/language';
 import { EditorView } from '@codemirror/view';
@@ -10,7 +11,7 @@ import { onPythonStatus, preloadPython, runCode } from '../lib/runner.js';
 import { getState, update } from '../lib/progress.js';
 import { useDarkMode } from '../lib/useDarkMode.js';
 
-const LANGS = { python: () => python(), javascript: () => javascript(), c: () => cpp() };
+const LANGS = { python: () => python(), javascript: () => javascript(), c: () => cpp(), sql: () => sql({ dialect: SQLite }) };
 
 /** Shows "Loading Python…" while the runtime downloads the first time. */
 export function PythonStatus() {
@@ -90,7 +91,7 @@ export default function CodeEditor({
   return (
     <div className="editor">
       <div className="editor-toolbar">
-        <span className="lang-tag">{language === 'javascript' ? 'JavaScript' : language === 'c' ? 'C' : 'Python'}</span>
+        <span className="lang-tag">{language === 'javascript' ? 'JavaScript' : language === 'c' ? 'C' : language === 'sql' ? 'SQL' : 'Python'}</span>
         <PythonStatus />
         <span className="spacer" />
         {language === 'python' && (

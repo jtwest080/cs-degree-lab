@@ -43,7 +43,7 @@ function check(where, item, prelude) {
 
 const units = yaml.load(readFileSync(join(root, 'content/curriculum.yaml'), 'utf8')).units;
 for (const u of units) {
-  if (u.language === 'c') continue; // C units are checked by verify_c.mjs
+  if (u.language === 'c' || u.language === 'sql') continue; // checked by verify_c.mjs / verify_sql.mjs
   const dir = join(root, 'content', `unit-${String(u.number).padStart(2, '0')}`);
   if (!existsSync(dir)) continue;
   for (const f of readdirSync(dir).filter((f) => f.startsWith('lesson-')).sort()) {

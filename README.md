@@ -4,7 +4,7 @@ An interactive, university-level computer science course that runs entirely in y
 
 Every lesson has a learning objective, a full explanation with analogies, worked examples explained line by line, an in-browser code editor, 3 to 5 auto-tested exercises with hints and locked solutions, a common-mistakes section, a summary, and a quiz. Pass a quiz with 80% or more to unlock the next lesson.
 
-Python runs locally in the browser via [Pyodide](https://pyodide.org) (Python compiled to WebAssembly). C (Unit 9) runs the same way, through [PicoC](https://gitlab.com/zsaleeba/picoc), a small C interpreter compiled to WebAssembly and vendored in `src/vendor/picoc.js` (MIT licence). No account, server or paid service is needed, and progress is saved in your browser.
+Python runs locally in the browser via [Pyodide](https://pyodide.org) (Python compiled to WebAssembly). C (Unit 9) runs the same way, through [PicoC](https://gitlab.com/zsaleeba/picoc), a small C interpreter compiled to WebAssembly and vendored in `src/vendor/picoc.js` (MIT licence). SQL (Unit 12) runs in a worker through [sql.js](https://sql.js.org), SQLite compiled to WebAssembly (MIT licence). No account, server or paid service is needed, and progress is saved in your browser.
 
 ## Running it
 
@@ -44,6 +44,7 @@ This runs every lesson through two checkers:
 - `scripts/verify_content.py` (desktop Python): checks each lesson has every required section, every worked example prints exactly the output the lesson shows, every reference solution passes its tests, every starter does *not* already pass, quiz answers are valid, and glossary terms point at real lessons.
 - `scripts/verify_pyodide.mjs` (Node + Pyodide): reruns the solutions, starters and examples in the exact Python runtime the browser uses.
 - `scripts/verify_c.mjs` (Node + PicoC): checks every C example's output, solution and starter in the same engine the browser uses.
+- `scripts/verify_sql.mjs` (Node + sql.js): the same check for every SQL example, solution and starter.
 
 Run it after editing any lesson.
 
