@@ -19,13 +19,13 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 11 | Networking | ✅ Complete (Phase 10) | 9 | 44 | Mini Network Toolkit (subnets, routing, DNS cache, TCP reassembly, URLs) |
 | 12 | Databases | ✅ Complete (Phase 11) | 9 | 41 | Campus Registrar Database (clean, constrain, index and report on a messy export) |
 | 13 | Web Development | ✅ Complete (Phase 12) | 9 | 41 | Task Manager Page (HTML + CSS + JS, tested in a real browser engine) |
-| 14 | Software Engineering | Planned | | | |
+| 14 | Software Engineering | ✅ Complete (Phase 13) | 9 | 37 | Mini Git (commits, branches, merge base and three-way merge) |
 | 15 | Theory of Computation | Planned | | | |
 | 16 | Security | Planned | | | |
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 113 lessons, 536 practice exercises, 113 lesson quizzes (678 multiple-choice questions + 113 coding questions), 13 unit projects, 991 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 122 lessons, 573 practice exercises, 122 lesson quizzes (732 multiple-choice questions + 122 coding questions), 14 unit projects, 1121 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -363,9 +363,29 @@ Languages: HTML/CSS/JS in a sandboxed iframe (`language: html`, lessons 13.1-13.
 
 **Unit 14 can assume:** everything through Unit 13 (JavaScript and Python, SQL, HTTP, the web stack).
 
+## Unit 14: Software Engineering ✅
+
+Language: Python (Pyodide). All code is run and checked by the same Python engine as earlier Python units.
+
+| Lesson | id | Topics |
+|---|---|---|
+| 14.1 What Software Engineering Is: Process and Requirements | `u14-process` | life cycle, waterfall vs agile, requirements, user stories, acceptance criteria, MoSCoW, velocity, burndown |
+| 14.2 Version Control: How Git Works | `u14-git` | content-addressed objects, commit graph, branches, merge base, three-way merge |
+| 14.3 Testing: Proving Code Works | `u14-testing` | testing pyramid, arrange/act/assert, stubs/fakes/mocks, TDD, coverage |
+| 14.4 Design Principles and Refactoring | `u14-design` | cohesion/coupling, SOLID, code smells, refactoring, dependency injection |
+| 14.5 Design Patterns | `u14-patterns` | strategy, observer, factory, decorator, adapter, iterator |
+| 14.6 Software Architecture | `u14-architecture` | layers, dependency rule, monolith vs microservices, queues, API versioning |
+| 14.7 Debugging, Logging and Reliability | `u14-reliability` | bisecting, logging, retries/backoff, idempotency, circuit breaker, SLOs |
+| 14.8 Code Quality, CI/CD and Technical Debt | `u14-quality` | linting, cyclomatic complexity with `ast`, pipelines, canary/blue-green/flags, technical debt |
+| 14.9 Teams, Estimation and Professional Ethics | `u14-teams` | critical path, PERT, Brooks's law, licences, privacy, bias, ethics |
+
+**Project: Mini Git.** Learners implement a `Repo` class: content-addressed commits, branches, `log`, `merge_base`, fast-forward and a three-way merge with conflict detection. 13 checklist items, 12 tests.
+
+**Unit 15 can assume:** everything through Unit 14 (software engineering practice, testing, git ideas, graphs/DAGs from Unit 7).
+
 ## Plan for remaining units (to refine before each phase)
 
-- **14 Software Engineering**, **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
+- **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
 
 ## Technical notes for later phases
 
@@ -386,3 +406,4 @@ Languages: HTML/CSS/JS in a sandboxed iframe (`language: html`, lessons 13.1-13.
 - **Phase 10 (2026-11-07):** complete Unit 11 (9 lessons, 44 exercises, 9 quizzes, Mini Network Toolkit project, 137 glossary terms). Networking simulated in Python.
 - **Phase 11 (2026-11-07):** complete Unit 12 (9 lessons, 41 exercises, 9 quizzes, Campus Registrar Database project, 111 glossary terms). New framework feature: in-browser SQL (sql.js/SQLite in a worker, SQL tag and editor highlighting, `language: sql` units, `verify_sql.mjs`, `autofill_sql.mjs`, error-example display).
 - **Phase 12 (2026-11-07):** complete Unit 13 (9 lessons, 41 exercises, 9 quizzes, Task Manager Page project, 79 glossary terms). New framework features: in-browser HTML/CSS/JS runner with live preview and DOM tests (`verify_html.mjs`), async JavaScript engine with virtual timers and a pretend fetch API (`verify_js.mjs`).
+- **Phase 13 (2026-11-07/08):** complete Unit 14 (9 lessons, 37 exercises, 9 quizzes, Mini Git project, 130 glossary terms). No new framework features; all Python.

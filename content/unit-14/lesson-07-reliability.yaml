@@ -1,0 +1,448 @@
+id: u14-reliability
+title: "Debugging, Logging and Reliability"
+minutes: 60
+objective: |
+  Learn how to find bugs systematically and how to build software that keeps working when things go wrong: the scientific method of debugging, logging levels, retries with backoff, idempotency, timeouts and circuit breakers, and the measures teams use to define reliability.
+outcomes:
+  - Debug by reproducing, isolating and testing hypotheses
+  - Use logging levels and structured messages instead of print
+  - Implement retries with exponential backoff and explain why idempotency matters
+  - Explain timeouts, circuit breakers and graceful degradation
+  - Compute availability and error budgets from a service level objective
+
+sections:
+  - heading: Debugging as science
+    body: |
+      Debugging is not guessing and changing things until it works. It is the scientific method. **Reproduce** the bug reliably, ideally as a failing automated test (Lesson 14.3), which also becomes the regression test afterwards. **Isolate** it by narrowing down: which input, which function, which version? **Bisecting** (halve the search space repeatedly, like binary search in Unit 7) is the key technique: `git bisect` finds the commit that introduced a bug by testing commits half-way between known good and bad. Form a **hypothesis** ("the list is empty when it reaches line 20"), **test** it by printing a value, using a debugger breakpoint or reading carefully, and revise. Explaining the problem aloud to someone (or a rubber duck) is surprisingly effective, since it forces you to state your assumptions, and the bug is usually in one of them.
+
+      Read the error message and **stack trace** from the bottom: the last line says what went wrong, the frames above say where it was called from. Change one thing at a time. When you find the cause, ask whether the same mistake exists elsewhere, fix the cause and not the symptom, and add the test.
+
+  - heading: Logging
+    body: |
+      When software runs on a server, you cannot attach a debugger. You rely on **logs**: a record of what happened. Use a logging library rather than `print`: it adds timestamps, severity **levels** (DEBUG detailed, INFO normal events, WARNING odd but handled, ERROR a failed operation, CRITICAL the system is in trouble), and lets you route and filter output. Log **enough to reconstruct what happened**: what operation, which ids, what failed and why. Do not log secrets or personal data. **Structured logs** (key=value or JSON) are easy for machines to search. A **correlation id** attached to every message for one request lets you follow it across services. Too much logging buries signals and costs money; too little leaves you blind.
+
+      **Monitoring** goes further: **metrics** (counts, rates, latencies) are graphed over time, and **alerts** notify a person when something is wrong. **Tracing** follows one request across many services. Together these are called **observability**: being able to ask new questions about a running system.
+
+  - heading: Designing for failure
+    body: |
+      In any system with many parts and networks (Unit 9), failures are normal: servers crash, calls time out, disks fill. Reliable software expects this.
+
+      - **Timeouts**: never wait forever for another service. Set a limit.
+      - **Retries**: a transient failure (a dropped packet) often succeeds on the second try. Use **exponential backoff**: wait 1 s, then 2, then 4, with a little random **jitter**, so thousands of clients do not retry at the same moment and overload a struggling server. Cap the attempts.
+      - **Idempotency**: an operation is **idempotent** if doing it twice has the same effect as doing it once. Retrying is only safe for those. "Set the balance to 100" is idempotent; "add 10" is not, so a retried payment can charge twice. Give each request a unique **idempotency key**, which the server remembers, to make it safe.
+      - **Circuit breaker**: after repeated failures, stop calling the broken service for a while ("open" the circuit), fail fast, then cautiously try one request ("half-open") to see if it recovered. This protects both sides.
+      - **Graceful degradation**: when a part fails, keep the rest useful (show cached data, hide the recommendations) instead of an error page.
+
+      Teams define reliability with numbers: a **service level objective (SLO)**, such as "99.9% of requests succeed each month". 99.9% allows about 43 minutes of downtime a month; 99.99% allows about 4. The gap is the **error budget**: while it lasts, ship features; when it is spent, focus on stability. After an incident a team holds a **blameless post-mortem**: it asks what in the system and process allowed the mistake, not who made it.
+
+examples:
+  - title: Bisecting to find a bad version
+    intro: "Binary search over versions finds the first bad one in about log2(n) tests, which is what git bisect does."
+    code: |
+      versions = list(range(1, 101))
+      first_bad = 37
+
+      def is_bad(v):
+          return v >= first_bad
+
+      lo, hi, tests = 0, len(versions) - 1, 0
+      while lo < hi:
+          mid = (lo + hi) // 2
+          tests += 1
+          if is_bad(versions[mid]):
+              hi = mid
+          else:
+              lo = mid + 1
+      print("first bad version:", versions[lo])
+      print("tests needed:", tests)
+    output: |
+      first bad version: 37
+      tests needed: 7
+    lines:
+      - line: 10
+        note: "Test the middle: if it is bad, the culprit is at or before it, otherwise after."
+      - line: 17
+        note: "7 tests instead of up to 100."
+  - title: Logging levels
+    intro: "The standard logging module records level, name and message, and filters below a threshold."
+    code: |
+      import logging, io
+
+      stream = io.StringIO()
+      handler = logging.StreamHandler(stream)
+      handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+      log = logging.getLogger("shop")
+      log.handlers = [handler]
+      log.propagate = False
+      log.setLevel(logging.INFO)
+
+      log.debug("cart contents %s", [1, 2])
+      log.info("order %s placed", 42)
+      log.warning("stock low for item %s", 7)
+      log.error("payment failed for order %s", 42)
+      print(stream.getvalue().strip())
+    output: |
+      INFO shop: order 42 placed
+      WARNING shop: stock low for item 7
+      ERROR shop: payment failed for order 42
+    lines:
+      - line: 9
+        note: "The level is INFO, so the DEBUG line is dropped."
+      - line: 11
+        note: "Pass values as arguments so formatting only happens if the line is kept."
+  - title: Retry with exponential backoff
+    intro: "Wait longer between attempts. The delays are returned instead of sleeping so the example runs instantly."
+    code: |
+      def call_with_retry(fn, attempts=4, base=1.0):
+          delays = []
+          for attempt in range(attempts):
+              try:
+                  return fn(), delays
+              except ConnectionError:
+                  if attempt == attempts - 1:
+                      raise
+                  delays.append(base * 2 ** attempt)
+
+      state = {"n": 0}
+      def flaky():
+          state["n"] += 1
+          if state["n"] < 3:
+              raise ConnectionError("timeout")
+          return "data"
+
+      print(call_with_retry(flaky))
+    output: |
+      ('data', [1.0, 2.0])
+    lines:
+      - line: 9
+        note: "1 second, then 2, then 4: the wait doubles each time."
+      - line: 7
+        note: "After the last attempt, give up and let the error propagate."
+  - title: Idempotency keys
+    intro: "A retried payment must not charge twice. The server remembers keys it has already handled."
+    code: |
+      balance = {"ana": 100}
+      seen = {}
+
+      def charge(key, user, amount):
+          if key in seen:
+              return seen[key]                     # replay the saved result
+          balance[user] -= amount
+          seen[key] = "charged " + str(amount)
+          return seen[key]
+
+      print(charge("req-1", "ana", 30))
+      print(charge("req-1", "ana", 30))            # a retry of the same request
+      print(charge("req-2", "ana", 30))
+      print(balance)
+    output: |
+      charged 30
+      charged 30
+      charged 30
+      {'ana': 40}
+    lines:
+      - line: 5
+        note: "A key seen before means this is a retry, so do nothing new."
+      - line: 14
+        note: "Only two real charges, though three requests arrived."
+  - title: A circuit breaker
+    intro: "After too many failures stop calling the service for a while."
+    code: |
+      class Breaker:
+          def __init__(self, limit):
+              self.limit, self.failures, self.open = limit, 0, False
+
+          def call(self, fn):
+              if self.open:
+                  return "fast fail (circuit open)"
+              try:
+                  result = fn()
+                  self.failures = 0
+                  return result
+              except Exception:
+                  self.failures += 1
+                  if self.failures >= self.limit:
+                      self.open = True
+                  return "error"
+
+      def down():
+          raise RuntimeError("service down")
+
+      b = Breaker(2)
+      print([b.call(down) for _ in range(4)])
+    output: |
+      ['error', 'error', 'fast fail (circuit open)', 'fast fail (circuit open)']
+    lines:
+      - line: 6
+        note: "While open, calls are refused instantly without touching the broken service."
+      - line: 14
+        note: "Two failures trip the breaker."
+  - title: Availability and error budget
+    intro: "Convert a percentage target into allowed downtime."
+    code: |
+      minutes_per_month = 30 * 24 * 60
+      for slo in (99.0, 99.9, 99.99):
+          allowed = minutes_per_month * (100 - slo) / 100
+          print(slo, "% allows", round(allowed, 1), "minutes down per month")
+    output: |
+      99.0 % allows 432.0 minutes down per month
+      99.9 % allows 43.2 minutes down per month
+      99.99 % allows 4.3 minutes down per month
+    lines:
+      - line: 3
+        note: "Each extra nine cuts the allowed downtime by ten."
+
+playground:
+  prompt: |
+    Change the bisect example so the first bad version is 1, then 100. How does the number of tests change?
+  code: |
+    lo, hi = 0, 99
+    print((lo + hi) // 2)
+
+exercises:
+  - id: bisect-bad
+    title: Find the first bad version
+    difficulty: 3
+    prompt: |
+      Write `first_bad(n, is_bad)` for versions `1..n`, where `is_bad(v)` is `False` for every version before some point and `True` from then on. Return `(version, tests)`: the first bad version and how many times you called `is_bad`. Use binary search, so for `n = 100` no more than 7 calls are needed. Assume at least version `n` is bad.
+    starter: |
+      def first_bad(n, is_bad):
+          pass
+    tests:
+      - name: finds it
+        code: |
+          for target in (1, 2, 37, 99, 100):
+              calls = []
+              def bad(v, t=target):
+                  calls.append(v)
+                  return v >= t
+              v, tests = first_bad(100, bad)
+              assert v == target, (v, target)
+              assert tests == len(calls) and tests <= 7, (tests, target)
+      - name: single
+        code: |
+          assert first_bad(1, lambda v: True) == (1, 0)
+    hints:
+      - "Keep `lo = 1`, `hi = n`; while `lo < hi` test the middle."
+      - "When the middle is bad, `hi = mid`; otherwise `lo = mid + 1`."
+    solution: |
+      def first_bad(n, is_bad):
+          lo, hi, tests = 1, n, 0
+          while lo < hi:
+              mid = (lo + hi) // 2
+              tests += 1
+              if is_bad(mid):
+                  hi = mid
+              else:
+                  lo = mid + 1
+          return lo, tests
+    explanation: "Halving the range each time needs about log2(n) tests."
+  - id: backoff-delays
+    title: Backoff schedule
+    difficulty: 2
+    prompt: |
+      Write `backoff_delays(attempts, base=1.0, cap=30.0)` returning the list of waits between attempts: there are `attempts - 1` waits, the first is `base`, each double the last, but never more than `cap`. For `attempts <= 1` return an empty list.
+    starter: |
+      def backoff_delays(attempts, base=1.0, cap=30.0):
+          pass
+    tests:
+      - name: schedule
+        code: |
+          assert backoff_delays(5) == [1.0, 2.0, 4.0, 8.0]
+          assert backoff_delays(8, 1.0, 10.0) == [1.0, 2.0, 4.0, 8.0, 10.0, 10.0, 10.0]
+          assert backoff_delays(3, 0.5) == [0.5, 1.0]
+          assert backoff_delays(1) == [] and backoff_delays(0) == []
+    hints:
+      - "`min(cap, base * 2 ** i)` for `i` from 0."
+    solution: |
+      def backoff_delays(attempts, base=1.0, cap=30.0):
+          return [min(cap, base * 2 ** i) for i in range(max(0, attempts - 1))]
+    explanation: "The cap stops waits growing without limit."
+  - id: idempotent-store
+    title: Idempotent requests
+    difficulty: 3
+    prompt: |
+      Write a class `Account` with `balance` starting at 0, and `deposit(key, amount)` that adds `amount` only the first time a given `key` is seen. Always return the balance after the call. A repeated key changes nothing.
+    starter: |
+      class Account:
+          pass
+    tests:
+      - name: idempotent
+        code: |
+          a = Account()
+          assert a.deposit("k1", 50) == 50
+          assert a.deposit("k1", 50) == 50
+          assert a.deposit("k2", 20) == 70
+          assert a.deposit("k2", 999) == 70
+          assert a.balance == 70
+    hints:
+      - "Keep a `set` of keys already processed."
+    solution: |
+      class Account:
+          def __init__(self):
+              self.balance = 0
+              self._seen = set()
+
+          def deposit(self, key, amount):
+              if key not in self._seen:
+                  self._seen.add(key)
+                  self.balance += amount
+              return self.balance
+    explanation: "Recording the key makes a safe retry produce the same outcome as one attempt."
+  - id: circuit-breaker
+    title: A circuit breaker with recovery
+    difficulty: 4
+    prompt: |
+      Write `CircuitBreaker(limit, cooldown)`. `call(fn, now)` takes the current time as a number. While closed, call `fn()`: on success reset failures and return its result; on an exception count a failure, return `"error"`, and when failures reach `limit` open the circuit and remember `now`. While open, return `"open"` without calling `fn`, until `now - opened_at >= cooldown`, then allow one trial call: success closes the circuit, a failure opens it again at the new `now`.
+    starter: |
+      class CircuitBreaker:
+          pass
+    tests:
+      - name: opens and recovers
+        code: |
+          cb = CircuitBreaker(2, 10)
+          def bad(): raise RuntimeError()
+          def good(): return "ok"
+          assert cb.call(bad, 0) == "error"
+          assert cb.call(bad, 1) == "error"
+          assert cb.call(good, 2) == "open"
+          assert cb.call(good, 10) == "open"
+          assert cb.call(good, 11) == "ok"
+          assert cb.call(good, 12) == "ok"
+      - name: trial failure reopens
+        code: |
+          cb = CircuitBreaker(1, 5)
+          def bad(): raise RuntimeError()
+          assert cb.call(bad, 0) == "error"
+          assert cb.call(bad, 3) == "open"
+          assert cb.call(bad, 5) == "error"
+          assert cb.call(bad, 6) == "open"
+          assert cb.call(lambda: 1, 10) == 1
+    hints:
+      - "Track `failures` and `opened_at` (None when closed)."
+      - "A trial after the cooldown is an ordinary call, but a failure must reopen immediately, so set failures to the limit."
+    solution: |
+      class CircuitBreaker:
+          def __init__(self, limit, cooldown):
+              self.limit, self.cooldown = limit, cooldown
+              self.failures = 0
+              self.opened_at = None
+
+          def call(self, fn, now):
+              if self.opened_at is not None:
+                  if now - self.opened_at < self.cooldown:
+                      return "open"
+                  self.failures = self.limit - 1      # one trial: any failure re-trips
+                  self.opened_at = None
+              try:
+                  result = fn()
+              except Exception:
+                  self.failures += 1
+                  if self.failures >= self.limit:
+                      self.opened_at = now
+                  return "error"
+              self.failures = 0
+              return result
+    explanation: "Half-open is the cautious trial: one failure trips it again at once."
+  - id: availability
+    title: Downtime from an SLO
+    difficulty: 2
+    prompt: |
+      Write `allowed_downtime_minutes(slo_percent, days=30)` returning the minutes of downtime the target allows, rounded to 1 decimal. Write `budget_left(slo_percent, used_minutes, days=30)` returning the minutes of error budget left, rounded to 1 decimal (it may be negative).
+    starter: |
+      def allowed_downtime_minutes(slo_percent, days=30):
+          pass
+
+      def budget_left(slo_percent, used_minutes, days=30):
+          pass
+    tests:
+      - name: slo
+        code: |
+          assert allowed_downtime_minutes(99.9) == 43.2
+          assert allowed_downtime_minutes(99.0) == 432.0
+          assert allowed_downtime_minutes(99.99) == 4.3
+          assert allowed_downtime_minutes(99.9, days=7) == 10.1
+      - name: budget
+        code: |
+          assert budget_left(99.9, 10) == 33.2
+          assert budget_left(99.9, 50) == -6.8
+    hints:
+      - "`days * 24 * 60 * (100 - slo) / 100`."
+    solution: |
+      def allowed_downtime_minutes(slo_percent, days=30):
+          return round(days * 24 * 60 * (100 - slo_percent) / 100, 1)
+
+
+      def budget_left(slo_percent, used_minutes, days=30):
+          return round(allowed_downtime_minutes(slo_percent, days) - used_minutes, 1)
+    explanation: "Each extra nine cuts the budget tenfold, so higher targets cost much more."
+
+commonMistakes:
+  - title: "Changing code at random"
+    explanation: "Form a hypothesis, test it, and change one thing at a time."
+  - title: "Retrying non-idempotent operations"
+    explanation: "A retried charge can happen twice. Use idempotency keys."
+  - title: "Retry storms"
+    explanation: "Immediate, unlimited retries from many clients overload a struggling service. Back off with jitter and cap the attempts."
+  - title: "Logging secrets"
+    explanation: "Passwords, tokens and personal data in logs become a security leak."
+  - title: "Blaming people after an incident"
+    explanation: "Blame hides information. Ask how the system allowed the mistake."
+
+summary:
+  - "Debug scientifically: reproduce, isolate (bisect), hypothesise and test, then fix the cause and add a regression test."
+  - "Use logging levels, structured messages and correlation ids; metrics, alerts and traces make a system observable."
+  - "Expect failure: timeouts, retries with backoff and jitter, idempotency keys, circuit breakers and graceful degradation."
+  - "SLOs set the reliability target; the error budget balances speed and stability; post-mortems are blameless."
+next: u14-quality
+
+quiz:
+  - type: mcq
+    question: What does bisecting do when hunting a bug?
+    options: ["Halves the search space repeatedly", "Tests every version in order", "Deletes half the code", "Rewrites the program"]
+    answer: 0
+    explanation: "Binary search finds the first bad version in about log2(n) tests."
+  - type: mcq
+    question: Which log level fits 'payment failed for order 42'?
+    options: ["ERROR", "DEBUG", "INFO", "TRACE"]
+    answer: 0
+    explanation: "An operation failed."
+  - type: mcq
+    question: Why add jitter to retry delays?
+    options: ["So clients don't all retry at the same moment", "To make waits shorter", "To hide errors", "To avoid logging"]
+    answer: 0
+    explanation: "Synchronised retries can overwhelm a recovering service."
+  - type: mcq
+    question: Which operation is idempotent?
+    options: ["Set balance to 100", "Add 10 to balance", "Append a row", "Send an email"]
+    answer: 0
+    explanation: "Doing it twice has the same effect as once."
+  - type: mcq
+    question: What does an open circuit breaker do?
+    options: ["Fails fast without calling the broken service", "Calls the service faster", "Restarts the server", "Deletes data"]
+    answer: 0
+    explanation: "It protects the failing service and the caller."
+  - type: mcq
+    question: Roughly how much downtime per 30-day month does a 99.9% SLO allow?
+    options: ["About 43 minutes", "About 7 hours", "About 4 minutes", "None"]
+    answer: 0
+    explanation: "0.1% of 43,200 minutes is 43.2."
+  - type: code
+    question: |
+      Write `retry_count(outcomes)` where `outcomes` is a list of booleans (`True` means the attempt succeeded). Return how many attempts were made until and including the first success, or `len(outcomes)` if none succeeded.
+    starter: |
+      def retry_count(outcomes):
+          pass
+    tests:
+      - name: attempts
+        code: |
+          assert retry_count([False, False, True, True]) == 3
+          assert retry_count([True]) == 1
+          assert retry_count([False, False]) == 2
+          assert retry_count([]) == 0
+    solution: |
+      def retry_count(outcomes):
+          for i, ok in enumerate(outcomes, 1):
+              if ok:
+                  return i
+          return len(outcomes)

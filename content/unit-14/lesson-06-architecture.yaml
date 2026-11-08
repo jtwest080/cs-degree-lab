@@ -1,0 +1,358 @@
+id: u14-architecture
+title: "Software Architecture"
+minutes: 60
+objective: |
+  Learn how large systems are organised: layers, modules and boundaries, monolith versus microservices, the dependency rule, APIs between components, and how to record and weigh architectural trade-offs.
+outcomes:
+  - Explain what architecture is and why it is about hard-to-change decisions
+  - Describe layered, client-server, event-driven and microservice styles with trade-offs
+  - Enforce a dependency rule between layers and detect violations
+  - Explain coupling through APIs and the value of stable interfaces
+  - Record a decision with its context and consequences
+
+sections:
+  - heading: What architecture is
+    body: |
+      **Software architecture** is the set of big decisions about how a system is divided into parts and how those parts communicate, the decisions that are expensive to change later. Choosing a database, splitting into services, deciding what runs on the client or server: these shape what the system can do easily and what it can barely do. It is mostly about **quality attributes** (Lesson 14.1): performance, scalability, security, reliability, maintainability. There is no best architecture, only trade-offs against your requirements. A team of three building a prototype and a bank processing millions of payments need different answers, and the right answer for the first is usually the simpler one.
+
+      The central tool is **modularity**: divide the system so that each part has a clear job and a small public **interface** hiding its internals (**information hiding**). Good boundaries let teams work in parallel and replace one part without disturbing the rest. Bad boundaries create a **big ball of mud** where everything depends on everything.
+
+  - heading: Common styles
+    body: |
+      **Layered architecture** arranges code in horizontal layers, each depending only on the one below: *presentation* (UI), *business logic* (rules), *data access* (database). The **dependency rule** is that dependencies point one way (down, or inward toward the business rules), so you can swap the UI or database without rewriting the rules, and test the rules with no database at all. A layer that reaches around its neighbour (the UI querying the database directly) breaks the structure.
+
+      **Client-server** splits a system between many clients and a server holding shared data and logic (Unit 9, Unit 13). **Event-driven** architecture has components publish events and others react (the observer pattern at system scale, Lesson 14.5), often through a message queue: producers and consumers are decoupled in time and knowledge, but the flow is harder to follow and debug. **Pipes and filters** passes data through a chain of transformations (like Unix pipes, Unit 8).
+
+      A **monolith** deploys everything as one unit: simple to build, test and run, and often right for a small team. **Microservices** split the system into many small independently deployed services, each with its own data, talking over the network. Benefits: teams deploy independently, parts scale separately, a fault can be isolated. Costs: network calls are slow and fail (Unit 9), data is spread across services, testing and operating are far harder. Many teams adopt microservices too early; a well-structured **modular monolith** can be split later if needed.
+
+  - heading: Interfaces and trade-offs
+    body: |
+      Components talk through **APIs**: a documented contract of what you can ask and what you get back. Stable, versioned APIs let each side change independently; breaking an API breaks everyone using it. Design them so the common thing is easy, the contract is explicit (inputs, outputs, errors), and old callers keep working (**backward compatibility**). Prefer to expose what a component *does*, not how it stores things.
+
+      Every choice trades one quality for another: caching speeds reads but risks stale data; splitting services scales better but adds network failure; strict security adds friction. Architects write **architecture decision records (ADRs)**: short notes giving the *context*, the *decision* and its *consequences*, so later teams understand why. Diagrams help (boxes for components, arrows for dependencies; the C4 model draws them at four zoom levels), but code and ADRs are the real record. Finally, architecture **erodes** as quick fixes add forbidden dependencies, so teams automate checks, like the dependency checker below, to keep the structure honest.
+
+examples:
+  - title: Layers with a dependency rule
+    intro: "Each layer only calls the layer below. The business rule knows nothing about the web or the database implementation."
+    code: |
+      # data layer
+      DB = {1: {"name": "Ana", "balance": 120}}
+      def load_account(i):
+          return DB[i]
+      def save_account(i, acct):
+          DB[i] = acct
+
+      # business layer
+      def withdraw(i, amount):
+          acct = dict(load_account(i))
+          if amount > acct["balance"]:
+              raise ValueError("insufficient funds")
+          acct["balance"] -= amount
+          save_account(i, acct)
+          return acct["balance"]
+
+      # presentation layer
+      def handle_request(path):
+          _, i, amount = path.split("/")
+          try:
+              return "OK balance " + str(withdraw(int(i), int(amount)))
+          except ValueError as e:
+              return "ERROR " + str(e)
+
+      print(handle_request("/1/50"))
+      print(handle_request("/1/500"))
+    output: |
+      OK balance 70
+      ERROR insufficient funds
+    lines:
+      - line: 9
+        note: "The rule works through load/save, not through the database directly."
+      - line: 19
+        note: "The presentation layer only parses the request and calls the business layer."
+  - title: Checking the dependency rule
+    intro: "Layers have a number; a module may only depend on the same layer or lower. A tiny architecture linter."
+    code: |
+      LAYER = {"ui": 3, "service": 2, "data": 1}
+      DEPENDS = [("ui", "service"), ("service", "data"), ("ui", "data"), ("data", "service")]
+
+      violations = []
+      for src, dst in DEPENDS:
+          if LAYER[dst] > LAYER[src]:
+              violations.append((src, dst, "calls upward"))
+          elif LAYER[src] - LAYER[dst] > 1:
+              violations.append((src, dst, "skips a layer"))
+      for v in violations:
+          print(v)
+    output: |
+      ('ui', 'data', 'skips a layer')
+      ('data', 'service', 'calls upward')
+    lines:
+      - line: 6
+        note: "Data calling service is a dependency pointing the wrong way."
+      - line: 8
+        note: "UI reaching straight to data skips the business layer."
+  - title: A message queue decouples time
+    intro: "The producer adds work and carries on; a consumer handles it later."
+    code: |
+      from collections import deque
+
+      queue = deque()
+      results = []
+
+      def place_order(item):
+          queue.append({"item": item})
+          return "accepted " + item
+
+      def worker():
+          while queue:
+              job = queue.popleft()
+              results.append("shipped " + job["item"])
+
+      print(place_order("book"))
+      print(place_order("pen"))
+      print("queued:", len(queue))
+      worker()
+      print(results)
+    output: |
+      accepted book
+      accepted pen
+      queued: 2
+      ['shipped book', 'shipped pen']
+    lines:
+      - line: 7
+        note: "The producer returns at once without waiting for shipping."
+      - line: 18
+        note: "A worker drains the queue later, maybe on another machine."
+  - title: Versioned API response
+    intro: "Keep the old shape available so existing clients do not break."
+    code: |
+      user = {"first": "Ana", "last": "Lee", "email": "ana@example.com"}
+
+      def get_user_v1(u):
+          return {"name": u["first"] + " " + u["last"]}
+
+      def get_user_v2(u):
+          return {"first": u["first"], "last": u["last"], "email": u["email"]}
+
+      ROUTES = {"/v1/user": get_user_v1, "/v2/user": get_user_v2}
+      for path in ("/v1/user", "/v2/user"):
+          print(path, ROUTES[path](user))
+    output: |
+      /v1/user {'name': 'Ana Lee'}
+      /v2/user {'first': 'Ana', 'last': 'Lee', 'email': 'ana@example.com'}
+    lines:
+      - line: 9
+        note: "Old clients keep calling v1 while new ones move to v2."
+
+playground:
+  prompt: |
+    Add a new "cache" layer between service and data in the layer checker. Which existing dependency now becomes a violation by skipping a layer?
+  code: |
+    LAYER = {"ui": 4, "service": 3, "cache": 2, "data": 1}
+    print(LAYER["service"] - LAYER["data"])
+
+exercises:
+  - id: layer-check
+    title: Check layer dependencies
+    difficulty: 3
+    prompt: |
+      Write `check_layers(layers, deps)`. `layers` is a list of layer names from top to bottom (e.g. `["ui", "service", "data"]`). `deps` is a list of `(src, dst)` pairs. A dependency is allowed only if `dst` is the same layer or the layer directly below `src`. Return the list of violating pairs in the order they appear.
+    starter: |
+      def check_layers(layers, deps):
+          pass
+    tests:
+      - name: violations
+        code: |
+          layers = ["ui", "service", "data"]
+          deps = [("ui", "service"), ("service", "data"), ("ui", "data"), ("data", "service"), ("service", "service")]
+          assert check_layers(layers, deps) == [("ui", "data"), ("data", "service")]
+          assert check_layers(layers, [("ui", "service")]) == []
+          assert check_layers(layers, []) == []
+    hints:
+      - "Use `layers.index(name)`. Allowed when `index(dst) - index(src)` is 0 or 1."
+    solution: |
+      def check_layers(layers, deps):
+          pos = {name: i for i, name in enumerate(layers)}
+          return [(s, d) for s, d in deps if pos[d] - pos[s] not in (0, 1)]
+    explanation: "Positions turn the rule into arithmetic: dependencies must go down by zero or one."
+  - id: topo-modules
+    title: Build order of modules
+    difficulty: 4
+    prompt: |
+      Write `build_order(deps)` where `deps` maps each module to the list of modules it depends on. Return a list in which every module comes after its dependencies. When several modules are ready, choose them in alphabetical order. Raise `ValueError("cycle")` if the dependencies contain a cycle.
+    starter: |
+      def build_order(deps):
+          pass
+    tests:
+      - name: order
+        code: |
+          d = {"app": ["lib", "util"], "lib": ["util"], "util": [], "docs": []}
+          assert build_order(d) == ["docs", "util", "lib", "app"], build_order(d)
+          assert build_order({"a": [], "b": ["a"]}) == ["a", "b"]
+          assert build_order({}) == []
+      - name: cycle
+        code: |
+          try:
+              build_order({"a": ["b"], "b": ["a"]})
+              assert False
+          except ValueError as e:
+              assert str(e) == "cycle"
+    hints:
+      - "Repeat: pick the alphabetically first module not yet built whose dependencies are all built. If none is ready but modules remain, it is a cycle."
+    solution: |
+      def build_order(deps):
+          done = []
+          remaining = set(deps)
+          while remaining:
+              ready = sorted(m for m in remaining if all(d in done for d in deps[m]))
+              if not ready:
+                  raise ValueError("cycle")
+              done.append(ready[0])
+              remaining.remove(ready[0])
+          return done
+    explanation: "A topological sort (Unit 7). Dependencies in a healthy architecture form a graph with no cycles."
+  - id: simple-queue
+    title: A work queue
+    difficulty: 3
+    prompt: |
+      Write `WorkQueue` with `submit(job)` (adds a job), `process(handler)` which calls `handler(job)` for each queued job in the order submitted until the queue is empty and returns the list of handler results, and `__len__` for the jobs waiting.
+    starter: |
+      class WorkQueue:
+          pass
+    tests:
+      - name: queue
+        code: |
+          q = WorkQueue()
+          q.submit(1)
+          q.submit(2)
+          q.submit(3)
+          assert len(q) == 3
+          assert q.process(lambda j: j * 10) == [10, 20, 30]
+          assert len(q) == 0
+          assert q.process(lambda j: j) == []
+    hints:
+      - "A `collections.deque` and `popleft()` give first-in, first-out."
+    solution: |
+      from collections import deque
+
+
+      class WorkQueue:
+          def __init__(self):
+              self._jobs = deque()
+
+          def submit(self, job):
+              self._jobs.append(job)
+
+          def process(self, handler):
+              results = []
+              while self._jobs:
+                  results.append(handler(self._jobs.popleft()))
+              return results
+
+          def __len__(self):
+              return len(self._jobs)
+    explanation: "Producers and consumers only share the queue, not each other."
+  - id: api-versions
+    title: Backward-compatible API
+    difficulty: 3
+    prompt: |
+      Write `handle(version, user)` where `user` has keys `first`, `last`, `email`. For `"v1"` return `{"name": "<first> <last>"}`; for `"v2"` return `{"first": ..., "last": ..., "email": ...}`. For any other version raise `ValueError("unsupported version")`.
+    starter: |
+      def handle(version, user):
+          pass
+    tests:
+      - name: versions
+        code: |
+          u = {"first": "Ana", "last": "Lee", "email": "a@x.com"}
+          assert handle("v1", u) == {"name": "Ana Lee"}
+          assert handle("v2", u) == {"first": "Ana", "last": "Lee", "email": "a@x.com"}
+          try:
+              handle("v3", u)
+              assert False
+          except ValueError as e:
+              assert str(e) == "unsupported version"
+    hints:
+      - "A dictionary from version to function works nicely."
+    solution: |
+      def handle(version, user):
+          if version == "v1":
+              return {"name": user["first"] + " " + user["last"]}
+          if version == "v2":
+              return {"first": user["first"], "last": user["last"], "email": user["email"]}
+          raise ValueError("unsupported version")
+    explanation: "Keeping v1 working lets old clients migrate on their own schedule."
+
+commonMistakes:
+  - title: "Microservices on day one"
+    explanation: "A small team pays the network and operations cost with little benefit. Start with a well-structured monolith."
+  - title: "Letting layers skip or call upward"
+    explanation: "Shortcuts accumulate until the structure is meaningless. Check the rule automatically."
+  - title: "Breaking an API without versioning"
+    explanation: "Everyone depending on it breaks. Add, deprecate, then remove."
+  - title: "No record of why"
+    explanation: "Without decision records, later teams reverse good decisions or fear changing bad ones."
+
+summary:
+  - "Architecture is the set of hard-to-change decisions about parts and their communication, judged against quality attributes."
+  - "Layers depend one way; the dependency rule lets you swap and test parts independently."
+  - "Monoliths are simple; microservices trade simplicity for independent deployment; queues and events decouple components."
+  - "Stable, versioned APIs allow parts to change separately; write decision records and automate structure checks."
+next: u14-reliability
+
+quiz:
+  - type: mcq
+    question: What is architecture mostly about?
+    options: ["Decisions that are expensive to change later", "Choosing variable names", "Formatting code", "Writing documentation only"]
+    answer: 0
+    explanation: "The big structural choices shape everything built afterwards."
+  - type: mcq
+    question: In a layered architecture, which direction should dependencies go?
+    options: ["Downward toward data and rules, not upward", "Any direction", "Only upward", "Between UI and data directly"]
+    answer: 0
+    explanation: "One-way dependencies allow swapping a layer."
+  - type: mcq
+    question: What is a real cost of microservices?
+    options: ["Network calls and operating many services", "No way to scale", "Teams cannot deploy independently", "Only one language allowed"]
+    answer: 0
+    explanation: "Distributed systems are harder to test, run and debug."
+  - type: mcq
+    question: What does a message queue give you?
+    options: ["Producers and consumers decoupled in time", "Faster CPUs", "Stronger passwords", "Automatic tests"]
+    answer: 0
+    explanation: "The producer continues without waiting for the work."
+  - type: mcq
+    question: Why version an API?
+    options: ["So existing clients keep working while it changes", "To make it slower", "To hide it", "To avoid documentation"]
+    answer: 0
+    explanation: "Breaking changes go in a new version."
+  - type: mcq
+    question: What does an architecture decision record contain?
+    options: ["Context, decision and consequences", "Only the code", "A list of bugs", "The team's salaries"]
+    answer: 0
+    explanation: "It explains why a choice was made."
+  - type: code
+    question: |
+      Write `has_cycle(deps)` for a dictionary of module to list of dependencies. Return `True` if there is a dependency cycle, otherwise `False`.
+    starter: |
+      def has_cycle(deps):
+          pass
+    tests:
+      - name: cycles
+        code: |
+          assert has_cycle({"a": ["b"], "b": ["c"], "c": ["a"]}) is True
+          assert has_cycle({"a": ["a"]}) is True
+          assert has_cycle({"a": ["b"], "b": []}) is False
+          assert has_cycle({}) is False
+    solution: |
+      def has_cycle(deps):
+          done = set()
+          remaining = set(deps)
+          progress = True
+          while remaining and progress:
+              progress = False
+              for m in sorted(remaining):
+                  if all(d in done for d in deps[m]):
+                      done.add(m)
+                      remaining.discard(m)
+                      progress = True
+          return bool(remaining)
