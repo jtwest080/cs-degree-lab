@@ -20,12 +20,12 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 12 | Databases | ✅ Complete (Phase 11) | 9 | 41 | Campus Registrar Database (clean, constrain, index and report on a messy export) |
 | 13 | Web Development | ✅ Complete (Phase 12) | 9 | 41 | Task Manager Page (HTML + CSS + JS, tested in a real browser engine) |
 | 14 | Software Engineering | ✅ Complete (Phase 13) | 9 | 37 | Mini Git (commits, branches, merge base and three-way merge) |
-| 15 | Theory of Computation | Planned | | | |
+| 15 | Theory of Computation | ✅ Complete (Phase 14) | 9 | 36 | Computation Lab (regex parser and matcher, Turing machine, SAT solver, vertex cover) |
 | 16 | Security | Planned | | | |
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 122 lessons, 573 practice exercises, 122 lesson quizzes (732 multiple-choice questions + 122 coding questions), 14 unit projects, 1121 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 131 lessons, 609 practice exercises, 131 lesson quizzes (786 multiple-choice questions + 131 coding questions), 15 unit projects, 1202 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -383,9 +383,29 @@ Language: Python (Pyodide). All code is run and checked by the same Python engin
 
 **Unit 15 can assume:** everything through Unit 14 (software engineering practice, testing, git ideas, graphs/DAGs from Unit 7).
 
+## Unit 15: Theory of Computation ✅
+
+Language: Python (Pyodide). Machines, grammars and proofs are all executable.
+
+| Lesson | id | Topics |
+|---|---|---|
+| 15.1 Strings, Languages and Proofs | `u15-languages` | alphabets, strings, languages, shortlex order, induction, contradiction, diagonalisation |
+| 15.2 Deterministic Finite Automata | `u15-dfa` | DFA simulation, design, complement, product construction, minimisation |
+| 15.3 Nondeterministic Finite Automata | `u15-nfa` | NFAs, epsilon closure, subset construction, exponential blow-up |
+| 15.4 Regular Expressions and the Pumping Lemma | `u15-regex` | regex semantics, Brzozowski derivatives, Thompson's construction, pumping lemma |
+| 15.5 Context-Free Grammars and Pushdown Automata | `u15-cfg` | derivations, parse trees, ambiguity, PDAs, Chomsky normal form, CYK |
+| 15.6 Turing Machines and the Church-Turing Thesis | `u15-turing` | TM simulator, programming TMs, variants, universal machines |
+| 15.7 Computability and the Halting Problem | `u15-computability` | counting argument, halting problem, reductions, Rice's theorem |
+| 15.8 Complexity: P, NP and Verification | `u15-complexity` | polynomial vs exponential, P, NP, certificates and verifiers, SAT, subset sum, Hamiltonian path |
+| 15.9 NP-Completeness and Coping with Hard Problems | `u15-npcomplete` | reductions, Cook-Levin, 3-SAT to independent set, DPLL, vertex cover approximation, heuristics |
+
+**Project: Computation Lab.** Learners write a regex parser (`parse_regex`), a derivative-based matcher (`regex_match`), a Turing machine runner (`run_tm`), a DPLL SAT solver (`solve_sat`), and a vertex-cover 2-approximation with a brute-force optimum. 12 checklist items, 12 tests.
+
+**Unit 16 can assume:** everything through Unit 15 (formal languages, Turing machines, undecidability, P/NP, reductions and hardness assumptions). Unit 16 uses hashing and number theory from Units 6 and 7, networking from Unit 11 and the web from Unit 13.
+
 ## Plan for remaining units (to refine before each phase)
 
-- **15 Theory of Computation**, **16 Security**, **17 AI & ML**, **18 Capstones**.
+- **16 Security**, **17 AI & ML**, **18 Capstones**.
 
 ## Technical notes for later phases
 
@@ -407,3 +427,4 @@ Language: Python (Pyodide). All code is run and checked by the same Python engin
 - **Phase 11 (2026-11-07):** complete Unit 12 (9 lessons, 41 exercises, 9 quizzes, Campus Registrar Database project, 111 glossary terms). New framework feature: in-browser SQL (sql.js/SQLite in a worker, SQL tag and editor highlighting, `language: sql` units, `verify_sql.mjs`, `autofill_sql.mjs`, error-example display).
 - **Phase 12 (2026-11-07):** complete Unit 13 (9 lessons, 41 exercises, 9 quizzes, Task Manager Page project, 79 glossary terms). New framework features: in-browser HTML/CSS/JS runner with live preview and DOM tests (`verify_html.mjs`), async JavaScript engine with virtual timers and a pretend fetch API (`verify_js.mjs`).
 - **Phase 13 (2026-11-07/08):** complete Unit 14 (9 lessons, 37 exercises, 9 quizzes, Mini Git project, 130 glossary terms). No new framework features; all Python.
+- **Phase 14 (2026-11-08/09):** complete Unit 15 (9 lessons, 36 exercises, 9 quizzes, Computation Lab project, 81 glossary terms). No new framework features; all Python.
