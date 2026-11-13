@@ -1,0 +1,540 @@
+id: u16-injection
+title: "Injection, Input Validation and Memory Safety"
+minutes: 60
+objective: |
+  Understand the most common root cause of vulnerabilities: treating data as code. You will see how SQL and command injection and path traversal work in miniature, how parameterised queries, allowlists and safe path handling defend against them, and how buffer overflows break memory safety in C. Everything is explained for defence, with safe in-memory simulations.
+outcomes:
+  - Explain injection as the confusion of data and code and give examples (SQL, command, path)
+  - Separate code from data with parameterised queries and argument lists
+  - Validate input with allowlists and canonicalise file paths to block traversal
+  - Explain buffer overflows, integer overflows and why memory-safe languages help
+  - Apply input validation, output encoding and least privilege together
+
+sections:
+  - heading: When data becomes code
+    body: |
+      Many of the worst vulnerabilities share one idea: **a program builds a command out of pieces of text, and some piece comes from an attacker**. If the attacker's text can change the *structure* of the command rather than just fill in a value, it is **injection**. The OWASP Top 10 list of web risks has had injection near the top for two decades.
+
+      **SQL injection** (Unit 12 warned about it): code builds `"SELECT * FROM users WHERE name = '" + name + "'"`. A name such as `x' OR '1'='1` closes the quote and adds a condition that is always true, returning every row; `'; DROP TABLE users; --` can be even worse. The database cannot tell which characters the developer meant as code and which came from the user, because both arrived in one string. **Command injection** is the same with a shell: `os.system("ping " + host)` runs whatever follows a `;` or `&&` in `host`. **Path traversal** uses `../` in a file name to climb out of the intended folder and read files such as `/etc/passwd`. **Cross-site scripting** (Lesson 16.6) injects HTML and JavaScript into pages. The pattern is always the same: **mixing untrusted data into a language that has control characters**.
+
+  - heading: Defences
+    body: |
+      The cure is to **keep code and data separate** so that data can never be interpreted as code.
+
+      - **Parameterised queries (prepared statements)**: send the SQL text with placeholders (`WHERE name = ?`) and the values separately. The database parses the structure first, and the values are only ever values, never syntax, whatever characters they contain. This is the primary SQL injection defence; escaping by hand is error-prone. ORMs use it for you.
+      - **Pass arguments as a list**, not as one shell string: `subprocess.run(["ping", "-c", "1", host])` has no shell, so `;` means nothing. If a shell is unavoidable, quote with `shlex.quote`.
+      - **Validate input with an allowlist**: define what is allowed (a hostname matches `[A-Za-z0-9.-]{1,253}`, an id is digits only, a role is one of three values) and reject everything else. Allowlists beat **denylists** (trying to list bad characters), because attackers find encodings you did not think of. Validate on the **server**, since browser checks can be bypassed. Validate **type, length, range and format**, and reject early.
+      - **Canonicalise before checking**: convert paths, URLs and Unicode to one standard form first, then check. For files, join the base folder with the user path, resolve `..` and symlinks, then confirm the result still starts with the base folder.
+      - **Least privilege**: the database account used by the web app should not be able to drop tables or read other schemas, so a flaw costs less. **Encode on output** for the context where data lands (HTML, URL, SQL, shell).
+
+      These layers cover each other's gaps: validation catches malformed input early, parameterisation protects the query even if validation has a hole, and least privilege limits the damage if both fail.
+
+  - heading: Memory safety
+    body: |
+      In C (Unit 9) an array has no bounds check. Writing past the end of a **fixed-size buffer** overwrites whatever sits next to it in memory: other variables, a saved return address on the stack, function pointers. A **buffer overflow** such as `strcpy(buf, user_input)` with a 16-byte `buf` and a longer input lets an attacker overwrite the return address and redirect execution into their own code (**stack smashing**). Related bugs: **use after free** (using memory after releasing it), **double free**, **integer overflow** (a length computed as `a * b` wraps around to a small number, a small buffer is allocated, then a large copy overflows it), and **format-string bugs** (`printf(user_input)`). Memory-safety bugs have caused roughly 70% of serious vulnerabilities in large C and C++ projects at Microsoft and Google, and many famous attacks such as the Morris worm (1988) and Heartbleed (2014, an over-read that leaked server memory).
+
+      Defences exist at several levels. **Write in a memory-safe language** (Python, Java, Go, Rust), where out-of-range access raises an error or is rejected at compile time; Rust adds ownership rules (Unit 10) that rule out use after free. In C use bounded functions (`strncpy`/`snprintf`, `strlcpy`), check every length, and compile with warnings, sanitizers (`-fsanitize=address`) and fuzzers (Lesson 16.8). Operating systems and compilers add **mitigations** that make exploits harder: **stack canaries** (a secret value before the return address, checked on return), **ASLR** (randomising addresses), **non-executable stacks (NX/DEP)**, and **control-flow integrity**. None of them is a substitute for correct code, because attackers chain bypasses.
+
+examples:
+  - title: String-built queries let data change the structure
+    intro: "A tiny SQL tokenizer shows the problem: the injected text changes the number of conditions, not just a value."
+    code: |
+      import re
+
+      def unsafe_query(name):
+          return "SELECT * FROM users WHERE name = '" + name + "'"
+
+      def tokens(sql):
+          return re.findall(r"'[^']*'|\w+|[=;()-]+", sql)
+
+      normal = unsafe_query("alice")
+      attack = unsafe_query("x' OR '1'='1")
+      print(normal)
+      print(attack)
+      print(len(tokens(normal)), "tokens vs", len(tokens(attack)), "tokens")
+      print("has OR:", "OR" in tokens(attack))
+    output: |
+      SELECT * FROM users WHERE name = 'alice'
+      SELECT * FROM users WHERE name = 'x' OR '1'='1'
+      7 tokens vs 11 tokens
+      has OR: True
+    lines:
+      - line: 4
+        note: "The user's text is pasted into the middle of the command."
+      - line: 12
+        note: "The attack input added a whole new condition. The query now matches every row."
+  - title: Parameterised queries keep data as data
+    intro: "A query builder that returns the SQL and the values separately. The values never touch the SQL text."
+    code: |
+      def safe_query(name):
+          return "SELECT * FROM users WHERE name = ?", (name,)
+
+      sql, params = safe_query("x' OR '1'='1")
+      print(sql)
+      print(params)
+
+      # a minimal 'database' that can only match rows by comparing values
+      users = [("alice", "admin"), ("bob", "user")]
+      def run(sql, params):
+          assert sql.count("?") == len(params)
+          return [row for row in users if row[0] == params[0]]
+
+      print(run(*safe_query("alice")))
+      print(run(*safe_query("x' OR '1'='1")))
+    output: |
+      SELECT * FROM users WHERE name = ?
+      ("x' OR '1'='1",)
+      [('alice', 'admin')]
+      []
+    lines:
+      - line: 2
+        note: "The SQL text is fixed at write time. Only values are filled in."
+      - line: 16
+        note: "The attack string is just an unusual name; no user has it, so nothing matches."
+  - title: Shell commands as argument lists
+    intro: "Compare how a shell sees a hostile argument with how a list-based call sees it. We only build the strings here, nothing is executed."
+    code: |
+      import shlex
+
+      host = "example.com; cat /etc/passwd"
+      naive = "ping -c 1 " + host
+      print("shell would run:", shlex.split(naive))        # ';' is a shell operator, so two commands run
+
+      quoted = "ping -c 1 " + shlex.quote(host)
+      print("quoted version: ", shlex.split(quoted))
+
+      argv = ["ping", "-c", "1", host]
+      print("argument list:  ", argv)
+    output: |
+      shell would run: ['ping', '-c', '1', 'example.com;', 'cat', '/etc/passwd']
+      quoted version:  ['ping', '-c', '1', 'example.com; cat /etc/passwd']
+      argument list:   ['ping', '-c', '1', 'example.com; cat /etc/passwd']
+    lines:
+      - line: 5
+        note: "A real shell treats the semicolon as the start of a second command."
+      - line: 8
+        note: "shlex.quote wraps the whole thing so the shell sees one harmless argument."
+      - line: 11
+        note: "Best of all: pass a list to subprocess.run and no shell is involved."
+  - title: Path traversal and canonicalisation
+    intro: "Resolve the path first, then check that it is still inside the allowed folder."
+    code: |
+      import posixpath
+
+      BASE = "/srv/app/uploads"
+
+      def safe_join(base, user_path):
+          full = posixpath.normpath(posixpath.join(base, user_path))
+          if full != base and not full.startswith(base + "/"):
+              raise ValueError("path escapes base")
+          return full
+
+      for p in ["report.txt", "docs/a.txt", "../../etc/passwd", "docs/../../secret", "/etc/passwd", "a/../b.txt"]:
+          try:
+              print(p, "->", safe_join(BASE, p))
+          except ValueError as e:
+              print(p, "-> rejected:", e)
+    output: |
+      report.txt -> /srv/app/uploads/report.txt
+      docs/a.txt -> /srv/app/uploads/docs/a.txt
+      ../../etc/passwd -> rejected: path escapes base
+      docs/../../secret -> rejected: path escapes base
+      /etc/passwd -> rejected: path escapes base
+      a/../b.txt -> /srv/app/uploads/b.txt
+    lines:
+      - line: 6
+        note: "normpath collapses '..' and '.', and join with an absolute path replaces the base."
+      - line: 7
+        note: "The check adds the slash so /srv/app/uploads-evil does not pass as a prefix."
+  - title: Allowlist validation
+    intro: "Define exactly what is valid and reject everything else."
+    code: |
+      import re
+
+      HOSTNAME = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+
+      def valid_host(h):
+          return bool(HOSTNAME.match(h))
+
+      def valid_role(r):
+          return r in {"viewer", "editor", "admin"}
+
+      def valid_id(s):
+          return s.isascii() and s.isdigit() and 1 <= len(s) <= 9
+
+      for h in ["example.com", "a-b.example.org", "bad host", "x;ls", "-start.com", "ok123"]:
+          print(h, valid_host(h))
+      print(valid_role("admin"), valid_role("root"), valid_id("42"), valid_id("4 2"), valid_id("٤٢"))
+    output: |
+      example.com True
+      a-b.example.org True
+      bad host False
+      x;ls False
+      -start.com False
+      ok123 True
+      True False True False False
+    lines:
+      - line: 3
+        note: "A pattern describing what a valid hostname looks like, rather than listing bad characters."
+      - line: 14
+        note: "Anything not matching is rejected, including look-alike Unicode digits."
+  - title: A buffer overflow in a simulated memory
+    intro: "A fixed buffer sits next to a 'permission' flag in a list standing in for memory. An unchecked copy overwrites the flag; a checked copy refuses."
+    code: |
+      def make_memory():
+          return {"buf": [0] * 8, "is_admin": 0}
+
+      def copy_unchecked(mem, data):
+          cells = mem["buf"] + [mem["is_admin"]]            # buf is followed by the flag in memory
+          for i, byte in enumerate(data):
+              if i < len(cells):
+                  cells[i] = byte
+          mem["buf"], mem["is_admin"] = cells[:8], cells[8]
+
+      def copy_checked(mem, data):
+          if len(data) > len(mem["buf"]):
+              raise ValueError("input too long")
+          for i, byte in enumerate(data):
+              mem["buf"][i] = byte
+
+      m = make_memory()
+      copy_unchecked(m, [65] * 9)
+      print("after 9 bytes, is_admin =", m["is_admin"])
+      m = make_memory()
+      try:
+          copy_checked(m, [65] * 9)
+      except ValueError as e:
+          print("rejected:", e, "| is_admin =", m["is_admin"])
+    output: |
+      after 9 bytes, is_admin = 65
+      rejected: input too long | is_admin = 0
+    lines:
+      - line: 6
+        note: "Nothing stops the ninth byte from landing in the next variable."
+      - line: 12
+        note: "One length check removes the entire vulnerability."
+
+playground:
+  prompt: |
+    Try the unsafe and safe versions with the input `'; DROP TABLE users; --` and count the tokens. Then write an allowlist check for a username that permits only letters, digits and underscore, 3 to 16 characters.
+  code: |
+    import re
+    print(bool(re.fullmatch(r"[A-Za-z0-9_]{3,16}", "alice_01")))
+
+exercises:
+  - id: param-builder
+    title: A parameterised query builder
+    difficulty: 3
+    prompt: |
+      Write `build_select(table, filters)` returning `(sql, params)`. `table` must match `[A-Za-z_][A-Za-z0-9_]*` (otherwise raise `ValueError`). `filters` is a dict from column name to value; each column must also match that pattern. The SQL is `SELECT * FROM <table>` followed by `WHERE col1 = ? AND col2 = ?` for the filters in dict order (no WHERE if empty), and `params` is the tuple of values in the same order. Values must never appear in the SQL text.
+    starter: |
+      import re
+
+      def build_select(table, filters):
+          pass
+    tests:
+      - name: building
+        code: |
+          assert build_select("users", {}) == ("SELECT * FROM users", ())
+          assert build_select("users", {"name": "x' OR '1'='1"}) == ("SELECT * FROM users WHERE name = ?", ("x' OR '1'='1",))
+          assert build_select("orders", {"user_id": 7, "status": "paid"}) == ("SELECT * FROM orders WHERE user_id = ? AND status = ?", (7, "paid"))
+      - name: rejects bad identifiers
+        code: |
+          for t, f in [("users; DROP TABLE x", {}), ("1users", {}), ("users", {"na me": 1}), ("users", {"a=1 OR 1": 2}), ("", {})]:
+              try:
+                  build_select(t, f)
+                  assert False, (t, f)
+              except ValueError:
+                  pass
+    hints:
+      - "Identifiers cannot be parameters, so check them with `re.fullmatch(r\"[A-Za-z_][A-Za-z0-9_]*\", name)`."
+    solution: |
+      import re
+
+      _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+      def build_select(table, filters):
+          if not _IDENT.fullmatch(table):
+              raise ValueError("bad table name")
+          for col in filters:
+              if not _IDENT.fullmatch(col):
+                  raise ValueError("bad column name")
+          sql = "SELECT * FROM " + table
+          if filters:
+              sql += " WHERE " + " AND ".join(col + " = ?" for col in filters)
+          return sql, tuple(filters.values())
+    explanation: "Values travel as parameters. Table and column names cannot be parameters, so they are checked against an allowlist pattern."
+  - id: safe-join
+    title: Block path traversal
+    difficulty: 3
+    prompt: |
+      Write `safe_join(base, user_path)` for POSIX paths. Join them, normalise with `posixpath.normpath`, and return the result only if it equals `base` or starts with `base + "/"`; otherwise raise `ValueError`. Assume `base` is absolute with no trailing slash. An absolute `user_path` replaces the base in `posixpath.join`, so it must be rejected unless it still lies inside `base`.
+    starter: |
+      import posixpath
+
+      def safe_join(base, user_path):
+          pass
+    tests:
+      - name: allowed
+        code: |
+          b = "/srv/app/uploads"
+          assert safe_join(b, "report.txt") == "/srv/app/uploads/report.txt"
+          assert safe_join(b, "docs/a/../b.txt") == "/srv/app/uploads/docs/b.txt"
+          assert safe_join(b, ".") == b
+          assert safe_join(b, "/srv/app/uploads/x") == "/srv/app/uploads/x"
+      - name: blocked
+        code: |
+          b = "/srv/app/uploads"
+          for bad in ["../secret", "../../etc/passwd", "docs/../../x", "/etc/passwd", "../uploads-evil/x", ".."]:
+              try:
+                  safe_join(b, bad)
+                  assert False, bad
+              except ValueError:
+                  pass
+    hints:
+      - "The prefix test needs the trailing slash so `/srv/app/uploads-evil` is not accepted."
+    solution: |
+      import posixpath
+
+
+      def safe_join(base, user_path):
+          full = posixpath.normpath(posixpath.join(base, user_path))
+          if full != base and not full.startswith(base + "/"):
+              raise ValueError("path escapes base")
+          return full
+    explanation: "Canonicalise first, check second. Checking the raw string for '..' misses encoded and indirect forms."
+  - id: allowlist
+    title: Allowlist validators
+    difficulty: 2
+    prompt: |
+      Write `valid_username(s)` (3 to 16 characters, only ASCII letters, digits and underscore, not starting with a digit), `valid_port(s)` (a string of ASCII digits with value 1 to 65535 and no leading zeros), and `valid_choice(value, allowed)` (True only if `value` is one of the `allowed` values). None of them may raise on any string input.
+    starter: |
+      import re
+
+      def valid_username(s):
+          pass
+
+      def valid_port(s):
+          pass
+
+      def valid_choice(value, allowed):
+          pass
+    tests:
+      - name: usernames
+        code: |
+          for ok in ["abc", "Alice_01", "a" * 16, "_x1"]:
+              assert valid_username(ok) is True, ok
+          for bad in ["ab", "a" * 17, "1abc", "al ice", "a;b", "名前abc", "", "bob\n", "a-b"]:
+              assert valid_username(bad) is False, bad
+      - name: ports and choices
+        code: |
+          for ok in ["1", "80", "65535", "8080"]:
+              assert valid_port(ok) is True, ok
+          for bad in ["0", "65536", "080", "-1", "1e3", "٨٠", "", " 80", "80 ", "99999999999"]:
+              assert valid_port(bad) is False, bad
+          assert valid_choice("admin", ["viewer", "admin"]) is True
+          assert valid_choice("root", ["viewer", "admin"]) is False
+          assert valid_choice("", ["viewer"]) is False
+    hints:
+      - "`re.fullmatch` ignores a trailing newline problem that `re.match` with `$` has."
+      - "For ports, check `s.isascii() and s.isdigit()` then the numeric range and `s[0] != '0'`."
+    solution: |
+      import re
+
+      _USER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,15}")
+
+
+      def valid_username(s):
+          return bool(_USER.fullmatch(s))
+
+
+      def valid_port(s):
+          if not (s.isascii() and s.isdigit()) or s[0] == "0":
+              return False
+          return 1 <= int(s) <= 65535
+
+
+      def valid_choice(value, allowed):
+          return value in set(allowed)
+    explanation: "Allowlists define exactly what is acceptable, so unknown tricks (Unicode digits, newlines) are rejected by default."
+  - id: bounded-copy
+    title: A bounds-checked copy
+    difficulty: 3
+    prompt: |
+      Simulate a C buffer as a list of `size` integers. Write `safe_copy(buffer, data, offset=0)` that copies the list `data` into `buffer` starting at `offset` and returns the number of items copied. It must raise `IndexError` (and change nothing) if `offset < 0`, or `offset + len(data) > len(buffer)`. Also write `checked_alloc_size(count, item_size, limit=2**32 - 1)` returning `count * item_size`, raising `ValueError` if `count` or `item_size` is negative or if the product exceeds `limit` (modelling a check for integer overflow).
+    starter: |
+      def safe_copy(buffer, data, offset=0):
+          pass
+
+      def checked_alloc_size(count, item_size, limit=2 ** 32 - 1):
+          pass
+    tests:
+      - name: copy
+        code: |
+          buf = [0] * 8
+          assert safe_copy(buf, [1, 2, 3], 2) == 3 and buf == [0, 0, 1, 2, 3, 0, 0, 0]
+          assert safe_copy(buf, [], 8) == 0
+          before = list(buf)
+          for data, off in [([9] * 9, 0), ([9, 9], 7), ([1], -1), ([1], 8)]:
+              try:
+                  safe_copy(buf, data, off)
+                  assert False, (data, off)
+              except IndexError:
+                  pass
+              assert buf == before
+      - name: alloc
+        code: |
+          assert checked_alloc_size(10, 4) == 40 and checked_alloc_size(0, 8) == 0
+          for c, s in [(-1, 4), (4, -1), (2 ** 31, 4), (2 ** 20, 2 ** 20)]:
+              try:
+                  checked_alloc_size(c, s)
+                  assert False, (c, s)
+              except ValueError:
+                  pass
+    hints:
+      - "Do all the checks before writing anything."
+    solution: |
+      def safe_copy(buffer, data, offset=0):
+          if offset < 0 or offset + len(data) > len(buffer):
+              raise IndexError("copy would overflow the buffer")
+          for i, x in enumerate(data):
+              buffer[offset + i] = x
+          return len(data)
+
+
+      def checked_alloc_size(count, item_size, limit=2 ** 32 - 1):
+          if count < 0 or item_size < 0:
+              raise ValueError("negative size")
+          total = count * item_size
+          if total > limit:
+              raise ValueError("size too large")
+          return total
+    explanation: "A single length check before copying removes the overflow. In C the multiplication itself can wrap around, so the check must happen before it, using the limit."
+  - id: injection-detector
+    title: Spot a structural change
+    difficulty: 4
+    prompt: |
+      A simple defensive test for SQL injection compares the *shape* of a query built from the user's input with the shape built from a harmless placeholder. Write `shape(sql)` returning the list of tokens of `sql` after replacing every single-quoted string and every number with the token `"?"`. Tokens are single-quoted strings (`'...'`), numbers, words, and runs of symbols `=<>!;()-,*`. Write `looks_injected(template, value)` where `template` has a `{}` placeholder inside quotes, e.g. `"SELECT * FROM users WHERE name = '{}'"`; return `True` if `shape(template.format(value)) != shape(template.format("x"))`.
+    starter: |
+      import re
+
+      def shape(sql):
+          pass
+
+      def looks_injected(template, value):
+          pass
+    tests:
+      - name: shape
+        code: |
+          assert shape("SELECT * FROM users WHERE id = 5 AND name = 'bob'") == ["SELECT", "*", "FROM", "users", "WHERE", "id", "=", "?", "AND", "name", "=", "?"]
+          assert shape("x = 'a b'") == ["x", "=", "?"]
+      - name: detection
+        code: |
+          t = "SELECT * FROM users WHERE name = '{}'"
+          assert looks_injected(t, "alice") is False
+          assert looks_injected(t, "o brien") is False
+          assert looks_injected(t, "x' OR '1'='1") is True
+          assert looks_injected(t, "'; DROP TABLE users; --") is True
+          assert looks_injected(t, "") is False
+    hints:
+      - "A regex alternation `'[^']*'|\\d+|\\w+|[=<>!;()\\-,*]+` finds the tokens in order. Put the quoted-string and number alternatives first."
+      - "Map matched strings and pure numbers to `\"?\"`."
+    solution: |
+      import re
+
+      _TOKEN = re.compile(r"'[^']*'|\d+|[A-Za-z_]\w*|[=<>!;()\-,*]+")
+
+
+      def shape(sql):
+          out = []
+          for tok in _TOKEN.findall(sql):
+              if tok.startswith("'") or tok.isdigit():
+                  out.append("?")
+              else:
+                  out.append(tok)
+          return out
+
+
+      def looks_injected(template, value):
+          return shape(template.format(value)) != shape(template.format("x"))
+    explanation: "Injected input changes the query's token structure, while ordinary values only change literals. Real defences use parameterised queries instead, but the idea shows what injection is."
+
+commonMistakes:
+  - title: "Building queries or commands by string concatenation"
+    explanation: "Use parameters or argument lists so data can never become code."
+  - title: "Denylists"
+    explanation: "Blocking 'bad characters' always misses a case. Define what is allowed."
+  - title: "Validating only in the browser"
+    explanation: "Attackers send requests directly. Always validate on the server."
+  - title: "Checking a path before canonicalising it"
+    explanation: "'..', symlinks and encodings can make an innocent-looking string point elsewhere. Resolve first, then check."
+  - title: "Trusting length fields from outside"
+    explanation: "Check sizes before copying or multiplying, and prefer memory-safe languages."
+
+summary:
+  - "Injection happens when untrusted data is interpreted as code: SQL, shell commands, file paths, HTML."
+  - "Separate code from data: parameterised queries, argument lists, output encoding."
+  - "Validate with allowlists on the server, canonicalise before checking, and run with least privilege."
+  - "Buffer overflows, use after free and integer overflows break memory safety in C; memory-safe languages and bounds checks prevent them."
+  - "Mitigations (canaries, ASLR, NX) raise the cost of exploits but do not replace correct code."
+next: u16-websec
+
+quiz:
+  - type: mcq
+    question: What is the root cause of SQL injection?
+    options: ["Untrusted data becomes part of the query's code", "A weak password", "An old browser", "Too many users"]
+    answer: 0
+    explanation: "The database cannot tell the developer's SQL from the attacker's text."
+  - type: mcq
+    question: What is the best primary defence against SQL injection?
+    options: ["Parameterised queries", "Deleting quotes from input", "Hiding the table names", "Longer passwords"]
+    answer: 0
+    explanation: "Values are sent separately from the SQL structure."
+  - type: mcq
+    question: Why is an allowlist better than a denylist?
+    options: ["It rejects everything unexpected, including tricks you did not think of", "It is shorter", "It is faster", "It needs no testing"]
+    answer: 0
+    explanation: "Attackers invent encodings that a denylist misses."
+  - type: mcq
+    question: What does ../../etc/passwd attempt?
+    options: ["Path traversal out of the intended folder", "SQL injection", "A buffer overflow", "Cross-site scripting"]
+    answer: 0
+    explanation: "Each .. climbs one directory."
+  - type: mcq
+    question: What does a buffer overflow let an attacker do?
+    options: ["Overwrite nearby memory such as a return address", "Read the source code", "Guess passwords faster", "Slow the network"]
+    answer: 0
+    explanation: "Writing past the end of a buffer corrupts adjacent data."
+  - type: mcq
+    question: Which is a memory-safe language?
+    options: ["Python", "C", "Assembly", "C with no bounds checks"]
+    answer: 0
+    explanation: "It checks bounds and manages memory for you."
+  - type: code
+    question: |
+      Write `quote_shell(arg)` returning `shlex.quote(arg)`, and `is_safe_arg(arg)` returning `True` if `arg` is non-empty and contains only letters, digits, dot, dash and underscore.
+    starter: |
+      import shlex, re
+
+      def quote_shell(arg):
+          pass
+
+      def is_safe_arg(arg):
+          pass
+    tests:
+      - name: quoting
+        code: |
+          assert quote_shell("a b") == "'a b'" and quote_shell("safe") == "safe"
+          assert quote_shell("x; rm") == "'x; rm'"
+          assert is_safe_arg("file-1.txt") and not is_safe_arg("a b") and not is_safe_arg("") and not is_safe_arg("x;y")
+    solution: |
+      import shlex, re
+
+
+      def quote_shell(arg):
+          return shlex.quote(arg)
+
+
+      def is_safe_arg(arg):
+          return bool(re.fullmatch(r"[A-Za-z0-9._-]+", arg))

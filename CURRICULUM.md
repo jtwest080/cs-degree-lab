@@ -21,11 +21,11 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 13 | Web Development | ✅ Complete (Phase 12) | 9 | 41 | Task Manager Page (HTML + CSS + JS, tested in a real browser engine) |
 | 14 | Software Engineering | ✅ Complete (Phase 13) | 9 | 37 | Mini Git (commits, branches, merge base and three-way merge) |
 | 15 | Theory of Computation | ✅ Complete (Phase 14) | 9 | 36 | Computation Lab (regex parser and matcher, Turing machine, SAT solver, vertex cover) |
-| 16 | Security | Planned | | | |
+| 16 | Security | ✅ Complete (Phase 15) | 9 | 44 | Security Toolkit (safe paths, HTML escaping, password hashing, signed cookies, parameterised queries, rate limiting) |
 | 17 | AI & Machine Learning | Planned | | | |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 131 lessons, 609 practice exercises, 131 lesson quizzes (786 multiple-choice questions + 131 coding questions), 15 unit projects, 1202 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 140 lessons, 653 practice exercises, 140 lesson quizzes (840 multiple-choice questions + 140 coding questions), 16 unit projects, 1286 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -403,9 +403,29 @@ Language: Python (Pyodide). Machines, grammars and proofs are all executable.
 
 **Unit 16 can assume:** everything through Unit 15 (formal languages, Turing machines, undecidability, P/NP, reductions and hardness assumptions). Unit 16 uses hashing and number theory from Units 6 and 7, networking from Unit 11 and the web from Unit 13.
 
+## Unit 16: Security ✅
+
+Language: Python (Pyodide). Everything is defensive and educational: attacks are shown only as small simulations so that the defence is clear. Databases are simulated (Pyodide has no `sqlite3`), and `hashlib.pbkdf2_hmac` is supplied by a pure-Python shim in `src/lib/harness.py` because Pyodide's `hashlib` lacks it.
+
+| Lesson | id | Topics |
+|---|---|---|
+| 16.1 The Security Mindset and Threat Modelling | `u16-mindset` | CIA triad, assets and attackers, attack surface, STRIDE, risk, social engineering |
+| 16.2 Symmetric Encryption | `u16-symmetric` | Kerckhoffs, classical ciphers and their breaking, one-time pad, stream and block ciphers, modes, nonces, authenticated encryption |
+| 16.3 Hashing, MACs and Passwords | `u16-hashing` | cryptographic hashes, collisions, salts, key stretching, HMAC, constant-time compare, password storage |
+| 16.4 Public-Key Cryptography, Signatures and TLS | `u16-publickey` | Diffie-Hellman, RSA, signatures, certificates and trust, TLS handshake, man-in-the-middle |
+| 16.5 Injection, Validation and Memory Safety | `u16-injection` | SQL and command injection, parameterised queries, allowlists, path traversal, buffer overflows, memory-safe languages |
+| 16.6 Web Security | `u16-websec` | same-origin policy, XSS and output encoding, CSP, CSRF tokens, signed cookies and flags, open redirects, SSRF, security headers |
+| 16.7 Authentication and Authorization | `u16-auth` | factors, HOTP/TOTP, rate limiting and back-off, RBAC/ABAC, IDOR, JWTs, OAuth |
+| 16.8 Secure Coding and the Supply Chain | `u16-secure` | design principles, secrets handling, dependency risk, lockfiles and hashes, SBOM, fuzzing |
+| 16.9 Defence, Monitoring, Privacy and Ethics | `u16-defence` | logging and detection, incident response, backups, pseudonymisation, k-anonymity, responsible disclosure, risk scoring |
+
+**Project: Security Toolkit.** Learners write `safe_join`, `escape_html`, `hash_password`/`verify_password`, `sign_cookie`/`load_cookie`, `build_select` and a `RateLimiter`. 12 checklist items, 12 tests.
+
+**Unit 17 can assume:** everything through Unit 16 (cryptography basics, hashing, web and application security, privacy). Unit 17 (AI and ML) needs only Python, probability and linear-algebra-style loops from Units 6 and 7; it should build small models from scratch with plain lists, because NumPy is not part of the base Pyodide runtime used here. It can mention adversarial examples, bias and privacy in ML as links back to this unit.
+
 ## Plan for remaining units (to refine before each phase)
 
-- **16 Security**, **17 AI & ML**, **18 Capstones**.
+- **17 AI & ML**, **18 Capstones**.
 
 ## Technical notes for later phases
 
@@ -428,3 +448,4 @@ Language: Python (Pyodide). Machines, grammars and proofs are all executable.
 - **Phase 12 (2026-11-07):** complete Unit 13 (9 lessons, 41 exercises, 9 quizzes, Task Manager Page project, 79 glossary terms). New framework features: in-browser HTML/CSS/JS runner with live preview and DOM tests (`verify_html.mjs`), async JavaScript engine with virtual timers and a pretend fetch API (`verify_js.mjs`).
 - **Phase 13 (2026-11-07/08):** complete Unit 14 (9 lessons, 37 exercises, 9 quizzes, Mini Git project, 130 glossary terms). No new framework features; all Python.
 - **Phase 14 (2026-11-08/09):** complete Unit 15 (9 lessons, 36 exercises, 9 quizzes, Computation Lab project, 81 glossary terms). No new framework features; all Python.
+- **Phase 15 (2026-11-13):** complete Unit 16 (9 lessons, 44 exercises, 9 quizzes, Security Toolkit project, 84 glossary terms). The Python test harness now provides `hashlib.pbkdf2_hmac` (missing in Pyodide).

@@ -1,0 +1,515 @@
+id: u16-hashing
+title: "Hashing, MACs and Storing Passwords"
+minutes: 60
+objective: |
+  Learn what cryptographic hash functions guarantee and how they are used for integrity, fingerprints, Merkle trees and message authentication, and why passwords must be stored with a salted, deliberately slow key-derivation function instead of a plain hash.
+outcomes:
+  - "State the properties of a cryptographic hash: preimage, second-preimage and collision resistance"
+  - Use SHA-256 and HMAC from Python's standard library and explain length-extension attacks
+  - Build a Merkle tree and verify membership with a short proof
+  - Explain why fast unsalted hashes are unsafe for passwords and how salts and slow KDFs help
+  - Implement and verify salted PBKDF2 password storage with constant-time comparison
+
+sections:
+  - heading: What a cryptographic hash promises
+    body: |
+      A **cryptographic hash function** maps any input to a fixed-size **digest** (SHA-256: 256 bits) and is built to be **one way** and **unpredictable**. You met hashing as a data-structure tool in Unit 7; the cryptographic version demands much more. Three properties:
+
+      - **Preimage resistance**: given a digest `h`, it is infeasible to find any input that hashes to `h`. (Finding it takes about 2ⁿ guesses for an n-bit hash.)
+      - **Second-preimage resistance**: given an input `x`, it is infeasible to find a different `x'` with the same hash.
+      - **Collision resistance**: it is infeasible to find *any* two different inputs with the same hash. The **birthday paradox** makes this easier than preimages: collisions appear after about 2^(n/2) tries (23 people share a birthday more often than not, the same effect). So an n-bit hash gives only n/2 bits of collision resistance, which is why 128-bit MD5 and the 160-bit SHA-1 are **broken** for collisions (attackers have produced two different PDFs with the same SHA-1) and why SHA-256 or SHA-3 should be used today.
+
+      Hashes also show the **avalanche effect**: changing one input bit flips about half of the output bits, so similar inputs have unrelated digests (Lesson 16.2). Uses: a **checksum or fingerprint** of a file (download integrity, `git` commit ids from Unit 14), **commitments** (publish the hash now, reveal the value later), **digital signatures** (sign the hash of a document, Lesson 16.4), and **deduplication**. A plain hash proves nothing about *who* made the data: anyone can recompute it. For that you need a key.
+
+  - heading: MACs, HMAC and Merkle trees
+    body: |
+      A **message authentication code** is a hash with a secret key: only someone who knows the key can produce a valid tag. It is tempting to build one as `H(key || message)`, but for hashes with the Merkle-Damgård structure (MD5, SHA-1, SHA-2) this is **vulnerable to length extension**: an attacker who sees `H(key || m)` can compute `H(key || m || padding || extra)` without knowing the key, because the digest is the internal state at the end of `m`. The standard fix is **HMAC**, which hashes twice with the key mixed in two different ways: `HMAC(k, m) = H((k ⊕ opad) || H((k ⊕ ipad) || m))`. Use `hmac.new(key, msg, "sha256")` and compare tags with `hmac.compare_digest`. SHA-3 and BLAKE2 do not have the length-extension flaw.
+
+      A **Merkle tree** hashes data in a binary tree: each leaf is the hash of a block, and each parent is the hash of its two children. The single **root** commits to all the data: changing any block changes the root. To prove that one block belongs to the tree you need only the **sibling hashes along the path to the root**, about log₂ n hashes instead of all n blocks. Merkle trees underlie git (a hash DAG), BitTorrent, certificate transparency logs, Amazon's DynamoDB repairs and blockchains.
+
+  - heading: Storing passwords
+    body: |
+      A site must check passwords without keeping them, because databases get stolen. **Never store passwords in plain text**, and never use encryption (a stolen key unlocks everything). Store a **hash** instead and compare. But a fast, plain hash is still weak. An attacker with the stolen hashes can **brute-force** offline at billions of guesses per second on a GPU, trying common passwords first (**dictionary attack**), and the same hash for the same password lets them crack all users with the same password at once. Precomputed tables of hashes (**rainbow tables**) make cracking instant.
+
+      Two defences. A **salt** is a random value, unique per user, stored beside the hash and mixed into the input: `H(salt || password)`. Equal passwords now produce different hashes, and precomputed tables are useless because the attacker must attack each user separately. (A salt is not secret.) Second, make each guess **slow** on purpose with a **key-derivation function** that repeats the work many times or needs lots of memory: **PBKDF2** (many iterations of HMAC), **bcrypt**, **scrypt** and **Argon2**, the current recommendation. Tune the cost so that one check takes around 100 milliseconds: a legitimate login hardly notices, but the attacker's guess rate falls from billions per second to thousands. Store the algorithm, the cost, the salt and the hash together, so you can raise the cost later and upgrade old records when users log in. A **pepper** is a secret value mixed in and kept *outside* the database (in a key vault), adding a layer if only the database leaks.
+
+      Defence beyond hashing: enforce a minimum length, check new passwords against lists of breached passwords, rate-limit and lock out repeated login failures, never tell attackers whether the username or the password was wrong, and offer multi-factor authentication (Lesson 16.7). Compare the stored hash to the computed one with `hmac.compare_digest`, not `==`.
+
+examples:
+  - title: Hash basics and the avalanche effect
+    intro: "SHA-256 gives a 64 hex character digest. Changing one character changes about half of the bits."
+    code: |
+      import hashlib
+
+      def digest(s):
+          return hashlib.sha256(s.encode()).hexdigest()
+
+      a, b = digest("hello world"), digest("hello worle")
+      print(a)
+      print(b)
+      bits_a, bits_b = bin(int(a, 16))[2:].zfill(256), bin(int(b, 16))[2:].zfill(256)
+      print("bits that differ:", sum(x != y for x, y in zip(bits_a, bits_b)), "of 256")
+      print(len(a), digest("") [:16])
+    output: |
+      b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+      0fc30e735a0228a31cbbb969988b4f50e02e737f979f091d7d224b765443f5d4
+      bits that differ: 140 of 256
+      64 e3b0c44298fc1c14
+    lines:
+      - line: 4
+        note: "The digest is always the same length, whatever the input size."
+      - line: 10
+        note: "About 128 bits differ for a one-character change."
+  - title: The birthday bound
+    intro: "Collisions need about the square root of the number of possible digests. Test with a hash cut down to 24 bits."
+    code: |
+      import hashlib, itertools
+
+      def short(i):
+          return hashlib.sha256(str(i).encode()).digest()[:3]          # keep only 24 bits
+
+      seen = {}
+      for i in itertools.count():
+          h = short(i)
+          if h in seen:
+              print("collision between", seen[h], "and", i, "after", i + 1, "tries")
+              break
+          seen[h] = i
+      print("2**12 =", 2 ** 12, "(the square root of 2**24)")
+    output: |
+      collision between 4163 and 8864 after 8865 tries
+      2**12 = 4096 (the square root of 2**24)
+    lines:
+      - line: 4
+        note: "A 24-bit hash has 16.7 million values but a collision appears after a few thousand."
+      - line: 13
+        note: "Collisions arrive near 2^(n/2); this is why hashes need n at least 256 for 128-bit collision security."
+  - title: Merkle tree and membership proof
+    intro: "The root commits to every leaf. A proof needs only the sibling hashes up the path."
+    code: |
+      import hashlib
+
+      def h(b):
+          return hashlib.sha256(b).digest()
+
+      def build(blocks):
+          level = [h(b) for b in blocks]
+          tree = [level]
+          while len(level) > 1:
+              if len(level) % 2:
+                  level = level + [level[-1]]
+              level = [h(level[i] + level[i + 1]) for i in range(0, len(level), 2)]
+              tree.append(level)
+          return tree
+
+      def proof(tree, index):
+          path = []
+          for level in tree[:-1]:
+              if len(level) % 2:
+                  level = level + [level[-1]]
+              sibling = index ^ 1
+              path.append((level[sibling], sibling < index))
+              index //= 2
+          return path
+
+      def verify(block, path, root):
+          cur = h(block)
+          for sibling, sibling_is_left in path:
+              cur = h(sibling + cur) if sibling_is_left else h(cur + sibling)
+          return cur == root
+
+      blocks = [b"a", b"b", b"c", b"d", b"e"]
+      tree = build(blocks)
+      root = tree[-1][0]
+      p = proof(tree, 2)
+      print(len(p), "hashes in the proof for", len(blocks), "blocks")
+      print(verify(b"c", p, root), verify(b"x", p, root))
+    output: |
+      3 hashes in the proof for 5 blocks
+      True False
+    lines:
+      - line: 11
+        note: "Odd levels duplicate the last hash so every node has a partner."
+      - line: 20
+        note: "Record each sibling and whether it sits on the left, so the verifier hashes in the right order."
+  - title: Why a plain hash fails for passwords
+    intro: "A dictionary attack on unsalted hashes, and how a salt stops it from cracking everyone at once."
+    code: |
+      import hashlib
+
+      def plain(pw):
+          return hashlib.sha256(pw.encode()).hexdigest()
+
+      def salted(pw, salt):
+          return hashlib.sha256(salt + pw.encode()).hexdigest()
+
+      users = {"ana": "sunshine", "bo": "sunshine", "cy": "x7!Qm2$pLr"}
+      wordlist = ["password", "123456", "sunshine", "letmein", "dragon"]
+
+      stolen = {u: plain(p) for u, p in users.items()}
+      table = {plain(w): w for w in wordlist}
+      print("one table cracks:", {u: table.get(h) for u, h in stolen.items()})
+
+      salts = {"ana": b"s1", "bo": b"s2", "cy": b"s3"}
+      stolen2 = {u: salted(p, salts[u]) for u, p in users.items()}
+      print("same password, different hashes:", stolen2["ana"] != stolen2["bo"])
+    output: |
+      one table cracks: {'ana': 'sunshine', 'bo': 'sunshine', 'cy': None}
+      same password, different hashes: True
+    lines:
+      - line: 14
+        note: "Two users with the same weak password are both cracked by one lookup."
+      - line: 19
+        note: "With salts the attacker has to hash the whole wordlist again for every user."
+  - title: Salted PBKDF2 storage and verification
+    intro: "Store algorithm, iterations, salt and hash together. Verification recomputes and compares in constant time."
+    code: |
+      import hashlib, hmac
+
+      def hash_password(password, salt, iterations=20000):
+          dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+          return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
+
+      def verify_password(password, stored):
+          algo, iterations, salt_hex, hash_hex = stored.split("$")
+          dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations))
+          return hmac.compare_digest(dk.hex(), hash_hex)
+
+      stored = hash_password("correct horse battery staple", b"\x01\x02\x03\x04\x05\x06\x07\x08")
+      print(stored[:40] + "...")
+      print(verify_password("correct horse battery staple", stored))
+      print(verify_password("Correct horse battery staple", stored))
+    output: |
+      pbkdf2_sha256$20000$0102030405060708$3bf...
+      True
+      False
+    lines:
+      - line: 4
+        note: "PBKDF2 repeats HMAC thousands of times, making each guess slow. Real systems use 200,000 or more iterations (or Argon2)."
+      - line: 5
+        note: "Keeping the parameters in the stored string lets you raise the cost later."
+      - line: 10
+        note: "compare_digest avoids leaking how many leading characters matched."
+  - title: HMAC versus a naive keyed hash
+    intro: "The naive H(key + message) can be extended by an attacker; HMAC cannot. Here we only show that the two tags differ and that HMAC detects changes."
+    code: |
+      import hashlib, hmac
+
+      key, msg = b"secret", b"amount=100&to=bob"
+      naive = hashlib.sha256(key + msg).hexdigest()
+      good = hmac.new(key, msg, hashlib.sha256).hexdigest()
+      print(naive == good)
+      tampered = b"amount=900&to=bob"
+      print(hmac.compare_digest(hmac.new(key, tampered, hashlib.sha256).hexdigest(), good))
+      print(hmac.compare_digest(hmac.new(key, msg, hashlib.sha256).hexdigest(), good))
+    output: |
+      False
+      False
+      True
+    lines:
+      - line: 5
+        note: "HMAC is a different construction from hashing the key and message together."
+      - line: 8
+        note: "Any change to the message gives a different tag."
+
+playground:
+  prompt: |
+    Time how long `hash_password` takes with 1,000 versus 100,000 iterations using `time.perf_counter()`. How many guesses per second does each setting allow an attacker, roughly?
+  code: |
+    import hashlib
+    print(hashlib.sha256(b"abc").hexdigest()[:16])
+
+exercises:
+  - id: file-fingerprint
+    title: Checksums
+    difficulty: 1
+    prompt: |
+      Write `sha256_hex(data)` returning the SHA-256 digest of the `bytes` `data` as a hex string, and `verify_checksum(data, expected)` returning `True` if the digest equals `expected` (compare with `hmac.compare_digest`).
+    starter: |
+      import hashlib, hmac
+
+      def sha256_hex(data):
+          pass
+
+      def verify_checksum(data, expected):
+          pass
+    tests:
+      - name: digests
+        code: |
+          assert sha256_hex(b"") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          assert sha256_hex(b"abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+          assert verify_checksum(b"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") is True
+          assert verify_checksum(b"abd", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") is False
+    hints:
+      - "`hashlib.sha256(data).hexdigest()`."
+    solution: |
+      import hashlib, hmac
+
+
+      def sha256_hex(data):
+          return hashlib.sha256(data).hexdigest()
+
+
+      def verify_checksum(data, expected):
+          return hmac.compare_digest(sha256_hex(data), expected)
+    explanation: "A published checksum lets you detect a corrupted or substituted download, provided the checksum itself came from a trusted place."
+  - id: birthday
+    title: Find a truncated collision
+    difficulty: 3
+    prompt: |
+      Write `find_collision(bits)` that hashes the strings `"0"`, `"1"`, `"2"`, ... with SHA-256, keeps only the top `bits` bits of each digest (as an integer, `int.from_bytes(digest, "big") >> (256 - bits)`), and returns `(i, j, n)` for the first pair of different numbers `i < j` whose truncated hashes are equal, where `n = j + 1` is the number of hashes computed. Write `expected_tries(bits)` returning `2 ** (bits / 2)`.
+    starter: |
+      import hashlib
+
+      def find_collision(bits):
+          pass
+
+      def expected_tries(bits):
+          pass
+    tests:
+      - name: collision
+        code: |
+          import hashlib
+          def trunc(i, bits):
+              return int.from_bytes(hashlib.sha256(str(i).encode()).digest(), "big") >> (256 - bits)
+          for bits in (8, 12, 16, 20):
+              i, j, n = find_collision(bits)
+              assert i < j and trunc(i, bits) == trunc(j, bits) and n == j + 1
+              assert all(trunc(k, bits) != trunc(m, bits) for m in range(j) for k in range(m)) if bits <= 12 else True
+          i, j, n = find_collision(24)
+          assert n < 20 * expected_tries(24) and n > expected_tries(24) / 20, n
+      - name: expected
+        code: |
+          assert expected_tries(16) == 256.0 and expected_tries(0) == 1.0
+    hints:
+      - "Keep a dictionary from truncated hash to the first `i` that produced it."
+    solution: |
+      import hashlib
+
+
+      def find_collision(bits):
+          seen = {}
+          i = 0
+          while True:
+              v = int.from_bytes(hashlib.sha256(str(i).encode()).digest(), "big") >> (256 - bits)
+              if v in seen:
+                  return seen[v], i, i + 1
+              seen[v] = i
+              i += 1
+
+
+      def expected_tries(bits):
+          return float(2 ** (bits / 2))
+    explanation: "Collisions are found after roughly the square root of the number of possible digests."
+  - id: merkle-root
+    title: Merkle root
+    difficulty: 4
+    prompt: |
+      Write `merkle_root(blocks)` for a list of `bytes`. Hash each block with SHA-256 for the leaves. While there is more than one node in the level, if the level has an odd number of nodes duplicate the last one, then replace each pair `(a, b)` by `sha256(a + b)`. Return the root as a hex string. An empty list returns `sha256(b"")` as hex; a single block returns the hex of its leaf hash. Also write `leaf_changed(blocks, i, new)` returning `True` if replacing block `i` by `new` changes the root.
+    starter: |
+      import hashlib
+
+      def merkle_root(blocks):
+          pass
+
+      def leaf_changed(blocks, i, new):
+          pass
+    tests:
+      - name: roots
+        code: |
+          import hashlib
+          h = lambda b: hashlib.sha256(b).digest()
+          assert merkle_root([]) == hashlib.sha256(b"").hexdigest()
+          assert merkle_root([b"a"]) == h(b"a").hex()
+          assert merkle_root([b"a", b"b"]) == h(h(b"a") + h(b"b")).hex()
+          ab, cc = h(h(b"a") + h(b"b")), h(h(b"c") + h(b"c"))
+          assert merkle_root([b"a", b"b", b"c"]) == h(ab + cc).hex()
+      - name: changes
+        code: |
+          blocks = [b"a", b"b", b"c", b"d", b"e"]
+          assert leaf_changed(blocks, 2, b"X") is True
+          assert leaf_changed(blocks, 2, b"c") is False
+          assert merkle_root(blocks) != merkle_root(blocks[:-1])
+    hints:
+      - "Loop with `while len(level) > 1`, padding by `level.append(level[-1])` when the length is odd."
+    solution: |
+      import hashlib
+
+
+      def merkle_root(blocks):
+          if not blocks:
+              return hashlib.sha256(b"").hexdigest()
+          level = [hashlib.sha256(b).digest() for b in blocks]
+          while len(level) > 1:
+              if len(level) % 2:
+                  level.append(level[-1])
+              level = [hashlib.sha256(level[i] + level[i + 1]).digest() for i in range(0, len(level), 2)]
+          return level[0].hex()
+
+
+      def leaf_changed(blocks, i, new):
+          changed = list(blocks)
+          changed[i] = new
+          return merkle_root(changed) != merkle_root(blocks)
+    explanation: "The root is a single fingerprint for all the data; a change anywhere changes it."
+  - id: password-store
+    title: Salted password storage
+    difficulty: 3
+    prompt: |
+      Write `hash_password(password, salt, iterations=1000)` returning the string `"pbkdf2_sha256$<iterations>$<salt hex>$<hash hex>"` where the hash is `hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations).hex()`. Write `verify_password(password, stored)` that parses that string, recomputes with the stored salt and iteration count, and returns `True` or `False` using `hmac.compare_digest`. Return `False` (do not raise) if the stored string is malformed or uses another algorithm.
+    starter: |
+      import hashlib, hmac
+
+      def hash_password(password, salt, iterations=1000):
+          pass
+
+      def verify_password(password, stored):
+          pass
+    tests:
+      - name: round trip
+        code: |
+          s = hash_password("hunter2", b"\x00\x01\x02\x03", 1000)
+          parts = s.split("$")
+          assert parts[0] == "pbkdf2_sha256" and parts[1] == "1000" and parts[2] == "00010203" and len(parts[3]) == 64
+          assert verify_password("hunter2", s) is True
+          assert verify_password("Hunter2", s) is False
+          assert verify_password("", s) is False
+      - name: salts and malformed input
+        code: |
+          a = hash_password("pw", b"salt-a", 500)
+          b = hash_password("pw", b"salt-b", 500)
+          assert a != b
+          assert verify_password("pw", a) and verify_password("pw", b)
+          assert verify_password("pw", "garbage") is False
+          assert verify_password("pw", "md5$1$00$00") is False
+          assert verify_password("pw", "pbkdf2_sha256$x$00$00") is False
+    hints:
+      - "`stored.split(\"$\")` should have exactly four parts and the first must be `pbkdf2_sha256`."
+      - "Wrap the parsing in `try/except (ValueError, TypeError)` and return `False`."
+    solution: |
+      import hashlib, hmac
+
+
+      def hash_password(password, salt, iterations=1000):
+          dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+          return "pbkdf2_sha256$%d$%s$%s" % (iterations, salt.hex(), dk.hex())
+
+
+      def verify_password(password, stored):
+          try:
+              algo, iterations, salt_hex, hash_hex = stored.split("$")
+              if algo != "pbkdf2_sha256":
+                  return False
+              dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations))
+          except (ValueError, TypeError):
+              return False
+          return hmac.compare_digest(dk.hex(), hash_hex)
+    explanation: "Real code would use a library such as argon2-cffi or bcrypt, but the structure is the same: parameters, salt and hash are stored together."
+  - id: audit-passwords
+    title: Audit your own users' passwords
+    difficulty: 3
+    prompt: |
+      A defender checks whether stolen unsalted SHA-256 password hashes would fall to a common-password list. Write `weak_users(hashes, wordlist)` where `hashes` maps username to the SHA-256 hex of the password, and return the sorted list of usernames whose password is in `wordlist`. Also write `duplicate_groups(hashes)` returning a sorted list of sorted lists of users who share the same hash (only groups with at least two users), which shows why salting matters.
+    starter: |
+      import hashlib
+
+      def weak_users(hashes, wordlist):
+          pass
+
+      def duplicate_groups(hashes):
+          pass
+    tests:
+      - name: audit
+        code: |
+          import hashlib
+          H = lambda p: hashlib.sha256(p.encode()).hexdigest()
+          hashes = {"ana": H("sunshine"), "bo": H("sunshine"), "cy": H("x7!Qm2$pLr"), "di": H("letmein"), "ed": H("x7!Qm2$pLr")}
+          words = ["password", "sunshine", "letmein"]
+          assert weak_users(hashes, words) == ["ana", "bo", "di"]
+          assert duplicate_groups(hashes) == [["ana", "bo"], ["cy", "ed"]]
+          assert weak_users({}, words) == [] and duplicate_groups({"a": H("x")}) == []
+    hints:
+      - "Build a set of hashes of the wordlist, then filter users."
+      - "Group users in a dictionary keyed by hash."
+    solution: |
+      import hashlib
+
+
+      def weak_users(hashes, wordlist):
+          weak = {hashlib.sha256(w.encode()).hexdigest() for w in wordlist}
+          return sorted(u for u, h in hashes.items() if h in weak)
+
+
+      def duplicate_groups(hashes):
+          groups = {}
+          for user, h in hashes.items():
+              groups.setdefault(h, []).append(user)
+          return sorted(sorted(g) for g in groups.values() if len(g) > 1)
+    explanation: "Identical hashes reveal that users share a password. Per-user salts remove this signal and make precomputed tables useless."
+
+commonMistakes:
+  - title: "Storing passwords in plain text or encrypted"
+    explanation: "Store a salted slow hash. Encrypted passwords can all be decrypted if the key is stolen."
+  - title: "Using MD5 or SHA-1, or a fast hash for passwords"
+    explanation: "They are broken for collisions or far too fast for guessing. Use Argon2, bcrypt, scrypt or PBKDF2."
+  - title: "One global salt"
+    explanation: "Salts must be unique per password so that attackers cannot attack all users at once."
+  - title: "Using H(key + message) as a MAC"
+    explanation: "It is vulnerable to length extension for SHA-2. Use HMAC."
+  - title: "Comparing secrets with =="
+    explanation: "It stops at the first difference and leaks timing. Use hmac.compare_digest."
+
+summary:
+  - "Cryptographic hashes are one-way, second-preimage and collision resistant; collisions cost about 2^(n/2) because of the birthday effect."
+  - "HMAC makes a keyed tag that avoids the length-extension weakness of H(key + message)."
+  - "A Merkle tree commits to many blocks with one root and proves membership with a logarithmic-size path."
+  - "Passwords need a unique salt and a deliberately slow KDF (Argon2, scrypt, bcrypt, PBKDF2) so offline guessing is expensive."
+  - "Use constant-time comparison, check against breached passwords and add rate limits and multi-factor authentication."
+next: u16-publickey
+
+quiz:
+  - type: mcq
+    question: Roughly how many hashes are needed to find a collision in an n-bit hash?
+    options: ["2^(n/2)", "2^n", "n", "n^2"]
+    answer: 0
+    explanation: "The birthday effect."
+  - type: mcq
+    question: What is a salt for?
+    options: ["Making equal passwords hash differently and defeating precomputed tables", "Encrypting the hash", "Making hashing faster", "Hiding the algorithm"]
+    answer: 0
+    explanation: "It is unique per password and stored with the hash."
+  - type: mcq
+    question: Why should password hashing be slow?
+    options: ["To make each offline guess expensive", "To protect against SQL injection", "To compress data", "To avoid salts"]
+    answer: 0
+    explanation: "It cuts the attacker's guess rate dramatically."
+  - type: mcq
+    question: What attack does HMAC avoid compared with H(key || message)?
+    options: ["Length extension", "SQL injection", "Cross-site scripting", "Phishing"]
+    answer: 0
+    explanation: "Merkle-Damgård hashes expose their internal state in the digest."
+  - type: mcq
+    question: What does a Merkle proof for one of n blocks contain?
+    options: ["About log2(n) sibling hashes", "All n blocks", "The key", "n hashes"]
+    answer: 0
+    explanation: "One sibling per level of the tree."
+  - type: mcq
+    question: Which hash functions are considered broken for collision resistance?
+    options: ["MD5 and SHA-1", "SHA-256 and SHA-3", "BLAKE2 and SHA-512", "HMAC-SHA256"]
+    answer: 0
+    explanation: "Practical collisions have been found."
+  - type: code
+    question: |
+      Write `bits_changed(a, b)` returning how many bits differ between two `bytes` objects of equal length (the count of 1 bits in the XOR).
+    starter: |
+      def bits_changed(a, b):
+          pass
+    tests:
+      - name: bits
+        code: |
+          assert bits_changed(b"\x00", b"\xff") == 8
+          assert bits_changed(b"ab", b"ab") == 0
+          assert bits_changed(b"\x0f\x01", b"\x00\x00") == 5
+    solution: |
+      def bits_changed(a, b):
+          return sum(bin(x ^ y).count("1") for x, y in zip(a, b))

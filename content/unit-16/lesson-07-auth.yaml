@@ -1,0 +1,594 @@
+id: u16-auth
+title: "Authentication and Authorization"
+minutes: 60
+objective: |
+  Learn how systems decide who you are (authentication) and what you may do (authorization). You will build one-time passwords with HMAC (TOTP), rate limiting and lockout, role-based and attribute-based access control, and learn how tokens and OAuth delegate access without sharing passwords.
+outcomes:
+  - Distinguish authentication from authorization and name the factors of authentication
+  - Implement HOTP and TOTP one-time codes with HMAC
+  - Throttle login attempts to slow guessing attacks
+  - Model role-based access control and avoid insecure direct object references
+  - Describe how tokens, JWTs and OAuth delegate access safely
+
+sections:
+  - heading: Who are you, and what may you do?
+    body: |
+      **Authentication (authn)** answers "who is this?" and **authorization (authz)** answers "what may they do?". They are different checks, and many serious breaches are a correct login followed by a missing authorization check. Authentication evidence comes in **factors**: something you **know** (a password), something you **have** (a phone, a hardware key), something you **are** (a fingerprint). **Multi-factor authentication (MFA)** combines factors from different categories, so that stealing a password alone is not enough.
+
+      Good practice for passwords follows Lesson 16.3: hash with a slow salted algorithm, check against lists of breached passwords, allow long passphrases, do not force frequent rotation, and give the same vague error for "no such user" and "wrong password" so attackers cannot **enumerate** accounts. Password **reset** flows are authentication too, and a weak one (a guessable question, a token that never expires) is a back door: reset tokens must be random, single use, short lived and tied to the account.
+
+  - heading: "One-time codes: HOTP and TOTP"
+    body: |
+      A second factor often is a six-digit code. **HOTP** (HMAC-based one-time password, RFC 4226) computes `HMAC-SHA1(secret, counter)`, takes 4 bytes chosen by the low nibble of the last byte (**dynamic truncation**), masks the top bit, and reduces modulo 10^6. **TOTP** (RFC 6238) is HOTP where the counter is `floor(unix_time / 30)`, so the code changes every 30 seconds. The server and the authenticator app share the secret once (the QR code), and afterward both compute the same code independently with no network traffic. Servers accept a small window of neighbouring time steps for clock drift and reject a code that was already used.
+
+      Phishing-resistant factors are better still. **Passkeys / WebAuthn** use public-key cryptography (Lesson 16.4): the device signs a challenge that includes the site's origin, so a fake site cannot relay it. SMS codes are the weakest, because phone numbers can be hijacked.
+
+  - heading: Slowing guessers
+    body: |
+      Even a good system is attacked by volume. **Brute force** tries every password; **credential stuffing** tries username and password pairs leaked from other sites, exploiting reuse; **password spraying** tries a few common passwords against many accounts. Defences are layered: **rate limiting** per account and per source address, **exponential back-off** or temporary lockout (careful: permanent lockout lets attackers lock out real users, a denial of service), CAPTCHA after repeated failure, MFA, and **monitoring** for patterns such as one address failing for many accounts. Compare secrets in **constant time** (Lesson 16.3).
+
+  - heading: Authorization models
+    body: |
+      Once you know who the user is, decide what they can do. **Access control lists (ACLs)** attach permissions to each resource. **Role-based access control (RBAC)** gives users roles (`viewer`, `editor`, `admin`), and roles carry permissions, which scales to large organisations. **Attribute-based access control (ABAC)** decides from attributes of the user, resource and context ("doctors may read records of patients in their own hospital, during a shift"). Apply the **principle of least privilege**: grant the minimum needed, deny by default, and check on **every** request on the server.
+
+      The classic flaw is **broken access control**, including the **insecure direct object reference (IDOR)**: `GET /invoice/1042` returns invoice 1042 to anyone logged in, because the code checked "is logged in" but not "does invoice 1042 belong to you?". Changing the number in the URL then exposes everyone's data. Always check ownership, never rely on hiding ids, and beware **privilege escalation**: a normal user reaching admin functions by calling the endpoint directly or setting `role=admin` in a request body (**mass assignment**).
+
+  - heading: Tokens and delegation
+    body: |
+      Instead of a server-side session, an API may issue a **token** after login. A **JSON Web Token (JWT)** has three base64url parts, `header.payload.signature`; the payload carries **claims** such as `sub` (subject), `exp` (expiry) and `role`. The signature (HMAC or public-key) lets servers verify it without a database lookup, but pitfalls abound: always verify the signature and expiry, pin the allowed algorithm (an attacker once could set `"alg":"none"`), keep tokens short lived, and remember a JWT is only **signed, not encrypted**, so anyone can read it. Revoking a token before it expires needs extra machinery.
+
+      **OAuth 2.0** lets a user grant an app limited access to their account on another service **without giving the app their password**. In the authorization-code flow, the app redirects the user to the provider, the user logs in there and approves **scopes** (such as `read:calendar`), the provider redirects back with a one-time **code**, and the app exchanges it (with its client secret, or a PKCE verifier) for an **access token**. **OpenID Connect** adds an identity layer on top ("Sign in with ..."). The `state` parameter is a CSRF token for the redirect. Never put tokens in URLs that get logged.
+
+examples:
+  - title: A one-time password with HOTP
+    intro: "The RFC 4226 test vectors let us check our implementation against known answers."
+    code: |
+      import hmac, hashlib, struct
+
+      def hotp(secret, counter, digits=6):
+          msg = struct.pack(">Q", counter)
+          h = hmac.new(secret, msg, hashlib.sha1).digest()
+          offset = h[-1] & 0x0F
+          code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+          return str(code % 10 ** digits).zfill(digits)
+
+      secret = b"12345678901234567890"
+      print([hotp(secret, c) for c in range(5)])
+    output: |
+      ['755224', '287082', '359152', '969429', '338314']
+    lines:
+      - line: 4
+        note: "The counter is packed as an 8-byte big-endian integer."
+      - line: 6
+        note: "Dynamic truncation: the last nibble picks which 4 bytes to use."
+      - line: 7
+        note: "Clearing the top bit avoids sign problems. These first five codes match RFC 4226."
+  - title: TOTP from the clock
+    intro: "Same function, but the counter is the current 30-second time step."
+    code: |
+      import hmac, hashlib, struct
+
+      def hotp(secret, counter, digits=6):
+          h = hmac.new(secret, struct.pack(">Q", counter), hashlib.sha1).digest()
+          o = h[-1] & 0x0F
+          return str((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+      def totp(secret, now, step=30, digits=6):
+          return hotp(secret, int(now // step), digits)
+
+      def verify(secret, code, now, window=1):
+          return any(hmac.compare_digest(totp(secret, now + d * 30), code) for d in range(-window, window + 1))
+
+      secret = b"12345678901234567890"
+      print(totp(secret, 59, digits=8))
+      code = totp(secret, 1_000_000)
+      print(code, verify(secret, code, 1_000_000), verify(secret, code, 1_000_031), verify(secret, code, 1_000_100))
+    output: |
+      94287082
+      702344 True True False
+    lines:
+      - line: 9
+        note: "Time 59 gives time step 1. RFC 6238's test vector for 8 digits is 94287082."
+      - line: 12
+        note: "Accept the previous, current and next step to tolerate clock drift."
+      - line: 17
+        note: "A code is valid within the window and rejected once it is several steps old."
+  - title: Rate limiting login attempts
+    intro: "Track recent failures and refuse to check the password once there are too many."
+    code: |
+      class Limiter:
+          def __init__(self, max_fail=3, window=60):
+              self.max_fail, self.window, self.fails = max_fail, window, {}
+
+          def allowed(self, who, now):
+              recent = [t for t in self.fails.get(who, []) if now - t < self.window]
+              self.fails[who] = recent
+              return len(recent) < self.max_fail
+
+          def record_failure(self, who, now):
+              self.fails.setdefault(who, []).append(now)
+
+      lim = Limiter()
+      for t in [0, 5, 10, 15]:
+          if lim.allowed("ana", t):
+              lim.record_failure("ana", t)
+              print(t, "wrong password")
+          else:
+              print(t, "locked out")
+      print(70, lim.allowed("ana", 70))
+    output: |
+      0 wrong password
+      5 wrong password
+      10 wrong password
+      15 locked out
+      70 True
+    lines:
+      - line: 6
+        note: "Only failures inside the sliding window count."
+      - line: 20
+        note: "After the window passes the account is usable again, so attackers cannot lock people out permanently."
+  - title: Role-based access control
+    intro: "Roles map to permissions; a request is allowed only if some role grants it. Deny by default."
+    code: |
+      ROLES = {
+          "viewer": {"read"},
+          "editor": {"read", "write"},
+          "admin": {"read", "write", "delete", "manage_users"},
+      }
+      USERS = {"ana": ["viewer"], "bo": ["editor"], "cy": ["viewer", "editor"], "di": ["admin"]}
+
+      def can(user, action):
+          return any(action in ROLES.get(r, set()) for r in USERS.get(user, []))
+
+      for user in ["ana", "bo", "cy", "di", "zed"]:
+          print(user, [a for a in ["read", "write", "delete", "manage_users"] if can(user, a)])
+    output: |
+      ana ['read']
+      bo ['read', 'write']
+      cy ['read', 'write']
+      di ['read', 'write', 'delete', 'manage_users']
+      zed []
+    lines:
+      - line: 9
+        note: "Unknown users and unknown roles get nothing: deny by default."
+  - title: An IDOR bug and its fix
+    intro: "The vulnerable version checks only that you are logged in; the fix checks ownership."
+    code: |
+      INVOICES = {1: {"owner": "ana", "total": 40}, 2: {"owner": "bo", "total": 99}}
+
+      def get_invoice_bad(user, inv_id):
+          return INVOICES.get(inv_id)
+
+      def get_invoice(user, inv_id):
+          inv = INVOICES.get(inv_id)
+          if inv is None or inv["owner"] != user:
+              return None
+          return inv
+
+      print("bad :", get_invoice_bad("ana", 2))
+      print("good:", get_invoice("ana", 2))
+      print("good:", get_invoice("ana", 1))
+    output: |
+      bad : {'owner': 'bo', 'total': 99}
+      good: None
+      good: {'owner': 'ana', 'total': 40}
+    lines:
+      - line: 4
+        note: "Returns someone else's invoice. Changing a number in the URL is all an attacker needs."
+      - line: 9
+        note: "Missing and forbidden look the same, which also avoids revealing which ids exist."
+  - title: Reading and verifying a token
+    intro: "A JWT is just three base64 parts. The payload is readable by anyone; the signature protects integrity."
+    code: |
+      import hmac, hashlib, base64, json
+
+      def b64(b):
+          return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+      def unb64(s):
+          return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+      def make(claims, key):
+          head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}, sort_keys=True).encode())
+          body = b64(json.dumps(claims, sort_keys=True).encode())
+          sig = b64(hmac.new(key, f"{head}.{body}".encode(), hashlib.sha256).digest())
+          return f"{head}.{body}.{sig}"
+
+      tok = make({"sub": "ana", "role": "viewer", "exp": 2000}, b"k")
+      print(tok.count("."), json.loads(unb64(tok.split(".")[1])))
+    output: |
+      2 {'exp': 2000, 'role': 'viewer', 'sub': 'ana'}
+    lines:
+      - line: 16
+        note: "Anyone can decode the claims. Never put secrets in a JWT."
+
+playground:
+  prompt: |
+    Compute `hotp(b"12345678901234567890", 5)` and compare it with the known RFC value 254676. Then change the secret by one byte and see how the code changes.
+  code: |
+    import hmac, hashlib, struct
+    def hotp(secret, counter):
+        h = hmac.new(secret, struct.pack(">Q", counter), hashlib.sha1).digest()
+        o = h[-1] & 15
+        return str((struct.unpack(">I", h[o:o+4])[0] & 0x7FFFFFFF) % 10**6).zfill(6)
+    print(hotp(b"12345678901234567890", 5))
+
+exercises:
+  - id: totp
+    title: Implement HOTP and TOTP
+    difficulty: 4
+    prompt: |
+      Write `hotp(secret, counter, digits=6)` following RFC 4226 (HMAC-SHA1 of the 8-byte big-endian counter, dynamic truncation, mask the top bit, modulo `10**digits`, zero-padded string). Write `totp(secret, now, step=30, digits=6)` using counter `now // step`.
+    starter: |
+      import hmac, hashlib, struct
+
+      def hotp(secret, counter, digits=6):
+          pass
+
+      def totp(secret, now, step=30, digits=6):
+          pass
+    tests:
+      - name: rfc 4226
+        code: |
+          s = b"12345678901234567890"
+          expected = ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"]
+          assert [hotp(s, i) for i in range(10)] == expected
+      - name: rfc 6238
+        code: |
+          s = b"12345678901234567890"
+          assert totp(s, 59, digits=8) == "94287082"
+          assert totp(s, 1111111109, digits=8) == "07081804"
+          assert totp(s, 1234567890, digits=8) == "89005924"
+          assert totp(s, 29) == totp(s, 0) and totp(s, 29) != totp(s, 30)
+    hints:
+      - "`struct.pack('>Q', counter)` makes the 8-byte message. `offset = digest[-1] & 0x0F`."
+    solution: |
+      import hmac, hashlib, struct
+
+
+      def hotp(secret, counter, digits=6):
+          h = hmac.new(secret, struct.pack(">Q", counter), hashlib.sha1).digest()
+          offset = h[-1] & 0x0F
+          code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+          return str(code % 10 ** digits).zfill(digits)
+
+
+      def totp(secret, now, step=30, digits=6):
+          return hotp(secret, int(now // step), digits)
+    explanation: "Passing the official test vectors is the standard way to check a crypto implementation. In real systems use a vetted library."
+  - id: verify-totp
+    title: Verify with a drift window
+    difficulty: 4
+    prompt: |
+      Use the provided `totp`. Write `verify_totp(secret, code, now, window=1, last_used_step=None)` that returns the **time step** (an int) at which the code matched, searching steps `now//30 - window` to `now//30 + window`, or `None` if no match. A step `<= last_used_step` must be rejected (replay protection). Compare with `hmac.compare_digest`.
+    starter: |
+      import hmac, hashlib, struct
+
+      def hotp(secret, counter, digits=6):
+          h = hmac.new(secret, struct.pack(">Q", counter), hashlib.sha1).digest()
+          o = h[-1] & 0x0F
+          return str((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+      def verify_totp(secret, code, now, window=1, last_used_step=None):
+          pass
+    tests:
+      - name: window
+        code: |
+          s = b"abcdefghijklmnopqrst"
+          now = 1_000_000
+          step = now // 30
+          cur = hotp(s, step)
+          assert verify_totp(s, cur, now) == step
+          assert verify_totp(s, hotp(s, step - 1), now) == step - 1
+          assert verify_totp(s, hotp(s, step + 1), now) == step + 1
+          assert verify_totp(s, hotp(s, step + 2), now) is None
+          assert verify_totp(s, hotp(s, step - 2), now) is None
+          assert verify_totp(s, "000000" if cur != "000000" else "111111", now) is None
+      - name: replay
+        code: |
+          s = b"abcdefghijklmnopqrst"
+          now = 1_000_000
+          step = now // 30
+          assert verify_totp(s, hotp(s, step), now, last_used_step=step - 1) == step
+          assert verify_totp(s, hotp(s, step), now, last_used_step=step) is None
+          assert verify_totp(s, hotp(s, step - 1), now, last_used_step=step) is None
+          assert verify_totp(s, hotp(s, step + 1), now, window=0) is None
+    hints:
+      - "Loop `for s in range(now // 30 - window, now // 30 + window + 1)` and skip steps that are not greater than `last_used_step`."
+    solution: |
+      import hmac, hashlib, struct
+
+
+      def hotp(secret, counter, digits=6):
+          h = hmac.new(secret, struct.pack(">Q", counter), hashlib.sha1).digest()
+          o = h[-1] & 0x0F
+          return str((struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % 10 ** digits).zfill(digits)
+
+
+      def verify_totp(secret, code, now, window=1, last_used_step=None):
+          center = now // 30
+          for step in range(center - window, center + window + 1):
+              if last_used_step is not None and step <= last_used_step:
+                  continue
+              if hmac.compare_digest(hotp(secret, step), code):
+                  return step
+          return None
+    explanation: "A code that has already been used must not work again, or an attacker who sees it over your shoulder can reuse it within the window."
+  - id: lockout
+    title: Back-off lockout
+    difficulty: 3
+    prompt: |
+      Write a class `Throttle(base=1, cap=60)`. `failure(who, now)` records a failure and sets a lock so that after the *n*-th consecutive failure the user is locked for `min(cap, base * 2**(n-1))` seconds starting at `now`. `locked_until(who)` returns the unlock time (0 if never failed). `allowed(who, now)` is True if `now >= locked_until(who)`. `success(who)` clears the failure count.
+    starter: |
+      class Throttle:
+          def __init__(self, base=1, cap=60):
+              pass
+
+          def failure(self, who, now):
+              pass
+
+          def locked_until(self, who):
+              pass
+
+          def allowed(self, who, now):
+              pass
+
+          def success(self, who):
+              pass
+    tests:
+      - name: backoff
+        code: |
+          t = Throttle()
+          assert t.allowed("a", 0) and t.locked_until("a") == 0
+          t.failure("a", 10)
+          assert t.locked_until("a") == 11 and not t.allowed("a", 10) and t.allowed("a", 11)
+          t.failure("a", 11)
+          assert t.locked_until("a") == 13
+          t.failure("a", 13)
+          assert t.locked_until("a") == 17
+          for i in range(10):
+              t.failure("a", 100)
+          assert t.locked_until("a") == 160
+      - name: users separate and reset
+        code: |
+          t = Throttle(base=2, cap=10)
+          t.failure("a", 0)
+          t.failure("a", 5)
+          assert t.locked_until("a") == 9
+          assert t.allowed("b", 0)
+          t.success("a")
+          t.failure("a", 20)
+          assert t.locked_until("a") == 22
+    hints:
+      - "Keep a dict of failure counts and a dict of unlock times."
+    solution: |
+      class Throttle:
+          def __init__(self, base=1, cap=60):
+              self.base, self.cap = base, cap
+              self.counts, self.until = {}, {}
+
+          def failure(self, who, now):
+              n = self.counts.get(who, 0) + 1
+              self.counts[who] = n
+              self.until[who] = now + min(self.cap, self.base * 2 ** (n - 1))
+
+          def locked_until(self, who):
+              return self.until.get(who, 0)
+
+          def allowed(self, who, now):
+              return now >= self.locked_until(who)
+
+          def success(self, who):
+              self.counts.pop(who, None)
+              self.until.pop(who, None)
+    explanation: "Exponential delay makes guessing slow for an attacker but only briefly annoying for a user who mistyped a password, and the cap prevents permanent lockout."
+  - id: rbac
+    title: Roles and permissions
+    difficulty: 3
+    prompt: |
+      Write `class Access` with `grant(role, *perms)`, `assign(user, role)`, `revoke(user, role)`, and `can(user, perm)`. A user can do `perm` if any of their roles grants it. Roles may inherit: `inherit(child, parent)` makes `child` also have all of `parent`'s permissions (including the parent's own inheritance). Unknown users and roles have no permissions. Cycles in inheritance must not loop forever.
+    starter: |
+      class Access:
+          def __init__(self):
+              pass
+
+          def grant(self, role, *perms):
+              pass
+
+          def inherit(self, child, parent):
+              pass
+
+          def assign(self, user, role):
+              pass
+
+          def revoke(self, user, role):
+              pass
+
+          def can(self, user, perm):
+              pass
+    tests:
+      - name: basics
+        code: |
+          a = Access()
+          a.grant("viewer", "read")
+          a.grant("editor", "write")
+          a.inherit("editor", "viewer")
+          a.grant("admin", "delete")
+          a.inherit("admin", "editor")
+          a.assign("ana", "viewer"); a.assign("bo", "editor"); a.assign("di", "admin")
+          assert a.can("ana", "read") and not a.can("ana", "write")
+          assert a.can("bo", "read") and a.can("bo", "write") and not a.can("bo", "delete")
+          assert a.can("di", "read") and a.can("di", "write") and a.can("di", "delete")
+          assert not a.can("zed", "read")
+          a.revoke("di", "admin")
+          assert not a.can("di", "read")
+          a.assign("ghost", "nonexistent")
+          assert not a.can("ghost", "read")
+      - name: cycle safe
+        code: |
+          a = Access()
+          a.grant("x", "p"); a.grant("y", "q")
+          a.inherit("x", "y"); a.inherit("y", "x")
+          a.assign("u", "x")
+          assert a.can("u", "p") and a.can("u", "q") and not a.can("u", "r")
+    hints:
+      - "To expand a role, do a depth-first walk over parents with a `seen` set."
+    solution: |
+      class Access:
+          def __init__(self):
+              self.perms, self.parents, self.roles = {}, {}, {}
+
+          def grant(self, role, *perms):
+              self.perms.setdefault(role, set()).update(perms)
+
+          def inherit(self, child, parent):
+              self.parents.setdefault(child, set()).add(parent)
+
+          def assign(self, user, role):
+              self.roles.setdefault(user, set()).add(role)
+
+          def revoke(self, user, role):
+              self.roles.get(user, set()).discard(role)
+
+          def can(self, user, perm):
+              seen, stack = set(), list(self.roles.get(user, ()))
+              while stack:
+                  r = stack.pop()
+                  if r in seen:
+                      continue
+                  seen.add(r)
+                  if perm in self.perms.get(r, ()):
+                      return True
+                  stack.extend(self.parents.get(r, ()))
+              return False
+    explanation: "Deny by default, and compute effective permissions on each check so revocation takes effect immediately."
+  - id: jwt-verify
+    title: Verify a token safely
+    difficulty: 5
+    prompt: |
+      Write `verify_token(token, key, now)` for HS256 tokens of the form `header.payload.signature` (URL-safe base64 without padding; signature is HMAC-SHA256 of `header + "." + payload`). Return the claims dict only if: it has exactly three parts, the header's `alg` is exactly `"HS256"`, the signature is valid (use `hmac.compare_digest`), and `exp` exists and is greater than `now`. Otherwise return `None`. It must never raise.
+    starter: |
+      import hmac, hashlib, base64, json
+
+      def verify_token(token, key, now):
+          pass
+    tests:
+      - name: valid and invalid
+        code: |
+          import hmac, hashlib, base64, json
+          def b64(b): return base64.urlsafe_b64encode(b).decode().rstrip("=")
+          def make(head, claims, key):
+              h = b64(json.dumps(head).encode()); p = b64(json.dumps(claims).encode())
+              s = b64(hmac.new(key, f"{h}.{p}".encode(), hashlib.sha256).digest())
+              return f"{h}.{p}.{s}"
+          k = b"secret"
+          good = make({"alg": "HS256"}, {"sub": "ana", "exp": 100}, k)
+          assert verify_token(good, k, 50) == {"sub": "ana", "exp": 100}
+          assert verify_token(good, k, 100) is None
+          assert verify_token(good, b"wrong", 50) is None
+          assert verify_token(make({"alg": "none"}, {"sub": "ana", "exp": 100}, k), k, 50) is None
+          assert verify_token(make({"alg": "HS256"}, {"sub": "ana"}, k), k, 50) is None
+          parts = good.split(".")
+          tampered = parts[0] + "." + b64(json.dumps({"sub": "root", "exp": 100}).encode()) + "." + parts[2]
+          assert verify_token(tampered, k, 50) is None
+          for junk in ["", "a.b", "a.b.c.d", "!!.??.##", "abc.def.ghi"]:
+              assert verify_token(junk, k, 50) is None, junk
+    hints:
+      - "Verify the signature before trusting anything in the payload, and wrap parsing in `try/except Exception`."
+    solution: |
+      import hmac, hashlib, base64, json
+
+
+      def _unb64(s):
+          return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+      def verify_token(token, key, now):
+          try:
+              parts = token.split(".")
+              if len(parts) != 3:
+                  return None
+              head = json.loads(_unb64(parts[0]))
+              if not isinstance(head, dict) or head.get("alg") != "HS256":
+                  return None
+              good = base64.urlsafe_b64encode(hmac.new(key, f"{parts[0]}.{parts[1]}".encode(), hashlib.sha256).digest()).decode().rstrip("=")
+              if not hmac.compare_digest(good, parts[2]):
+                  return None
+              claims = json.loads(_unb64(parts[1]))
+              if not isinstance(claims, dict) or not isinstance(claims.get("exp"), (int, float)) or claims["exp"] <= now:
+                  return None
+              return claims
+          except Exception:
+              return None
+    explanation: "Pin the algorithm yourself instead of trusting the header, check the signature first, and always enforce expiry."
+
+commonMistakes:
+  - title: "Checking login but not ownership"
+    explanation: "Every object access needs an authorization check on the server. Otherwise any user can read another's data by changing an id."
+  - title: "Different errors for unknown user and wrong password"
+    explanation: "They let attackers list valid accounts. Use one generic message."
+  - title: "Trusting the alg field or skipping exp in a token"
+    explanation: "Pin the algorithm and verify signature and expiry."
+  - title: "Permanent lockout after failures"
+    explanation: "Attackers can lock out real users. Use time-based back-off."
+  - title: "Putting secrets in a JWT"
+    explanation: "The payload is only encoded, not encrypted."
+
+summary:
+  - "Authentication proves identity (know, have, are); authorization decides permissions, and both are checked on the server."
+  - "TOTP derives a code from a shared secret and the time with HMAC; accept a small window and reject replays."
+  - "Rate limiting, back-off and monitoring blunt brute force, stuffing and spraying."
+  - "Use deny-by-default RBAC/ABAC, least privilege, and ownership checks to avoid IDOR and privilege escalation."
+  - "Tokens are signed not encrypted; OAuth delegates access with scopes and codes instead of sharing passwords."
+next: u16-secure
+
+quiz:
+  - type: mcq
+    question: What is the difference between authentication and authorization?
+    options: ["Authn proves who you are; authz decides what you may do", "They are identical", "Authn is for servers only", "Authz is only for passwords"]
+    answer: 0
+    explanation: "Both are required, and breaches often lack the second."
+  - type: mcq
+    question: Which is a second factor of the 'something you have' kind?
+    options: ["A hardware security key", "A longer password", "A security question", "Your username"]
+    answer: 0
+    explanation: "Possession of a device is a different category from knowledge."
+  - type: mcq
+    question: How does TOTP change over time?
+    options: ["The counter is the current time divided by a 30 second step", "A server sends a new secret each time", "It uses a random number", "It never changes"]
+    answer: 0
+    explanation: "Both sides compute the same value from the shared secret."
+  - type: mcq
+    question: What is an IDOR bug?
+    options: ["Accessing another user's object by changing an id because ownership is not checked", "A slow hash", "A weak cipher", "A TLS error"]
+    answer: 0
+    explanation: "Authorization must be checked per object."
+  - type: mcq
+    question: What is credential stuffing?
+    options: ["Trying leaked username and password pairs from other sites", "Guessing every possible password", "Intercepting Wi-Fi", "Injecting SQL"]
+    answer: 0
+    explanation: "It exploits password reuse."
+  - type: mcq
+    question: What does a JWT signature guarantee?
+    options: ["The token was not altered since it was signed", "The payload is secret", "The user is an admin", "The token never expires"]
+    answer: 0
+    explanation: "It protects integrity, not confidentiality."
+  - type: code
+    question: |
+      Write `can_view(user, doc)` where `doc` is a dict with `"owner"` and `"shared_with"` (a list). Return `True` if `user` is the owner or in `shared_with`, otherwise `False`. A `doc` of `None` returns `False`.
+    starter: |
+      def can_view(user, doc):
+          pass
+    tests:
+      - name: view
+        code: |
+          d = {"owner": "ana", "shared_with": ["bo"]}
+          assert can_view("ana", d) is True
+          assert can_view("bo", d) is True
+          assert can_view("cy", d) is False
+          assert can_view("ana", None) is False
+    solution: |
+      def can_view(user, doc):
+          if doc is None:
+              return False
+          return user == doc["owner"] or user in doc["shared_with"]

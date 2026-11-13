@@ -18,6 +18,35 @@ import linecache
 import sys
 import traceback
 
+# Pyodide's hashlib is built without OpenSSL, so hashlib.pbkdf2_hmac is missing.
+# Provide the standard algorithm (RFC 8018) in pure Python so lessons that use it
+# behave the same here as in normal Python.
+import hashlib as _hashlib
+import hmac as _hmac
+if not hasattr(_hashlib, "pbkdf2_hmac"):
+    def _pbkdf2_hmac(hash_name, password, salt, iterations, dklen=None):
+        if iterations < 1:
+            raise ValueError("iterations must be positive")
+        base = _hmac.new(bytes(password), digestmod=hash_name)
+        size = base.digest_size
+        dklen = size if dklen is None else dklen
+        out = b""
+        block = 1
+        while len(out) < dklen:
+            h = base.copy()
+            h.update(bytes(salt) + block.to_bytes(4, "big"))
+            u = h.digest()
+            acc = int.from_bytes(u, "big")
+            for _ in range(iterations - 1):
+                h = base.copy()
+                h.update(u)
+                u = h.digest()
+                acc ^= int.from_bytes(u, "big")
+            out += acc.to_bytes(size, "big")
+            block += 1
+        return out[:dklen]
+    _hashlib.pbkdf2_hmac = _pbkdf2_hmac
+
 USER_FILE = "<your code>"
 MAX_OUTPUT = 200_000
 

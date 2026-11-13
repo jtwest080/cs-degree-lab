@@ -1,0 +1,496 @@
+id: u16-secure
+title: "Secure Coding and the Supply Chain"
+minutes: 60
+objective: |
+  Learn habits that prevent vulnerabilities before they ship: least privilege, safe handling of secrets, careful error handling, dependency and supply-chain hygiene, fuzzing and security testing. You will build a secret scanner, a version checker for known-vulnerable packages, a hash-pinned dependency verifier and a tiny fuzzer.
+outcomes:
+  - Apply least privilege, fail-safe defaults and defence in depth to a design
+  - Keep secrets out of source code, logs and error messages
+  - Explain supply-chain attacks and use lockfiles, hash pinning and audits
+  - Find bugs with property checks and a simple fuzzer
+  - Describe how security fits into the development lifecycle
+
+sections:
+  - heading: Design principles that prevent bugs
+    body: |
+      Security is easier to design in than to bolt on. Classic principles (Saltzer and Schroeder, 1975) still guide us. **Least privilege**: every user, process and key gets only the access it needs, so a compromise of one part reaches little. **Fail-safe defaults**: deny unless explicitly allowed, and when something errors, fail closed rather than open. **Defence in depth**: several independent layers (validation, encoding, least-privilege database accounts, network rules, monitoring), so one failure is not fatal. **Economy of mechanism**: simple designs have fewer bugs. **Complete mediation**: check every access, every time. **Separation of duties** and **open design**: security must not depend on the design being secret (Kerckhoffs's principle, Lesson 16.2). **Psychological acceptability**: a control that people bypass because it is painful protects nobody.
+
+      Reduce the **attack surface**: every open port, endpoint, feature, dependency and permission is something to defend, so remove what you do not need. Validate at trust boundaries, keep code that handles untrusted input small and isolated, and prefer safe, high-level libraries and memory-safe languages (Lesson 16.5).
+
+  - heading: Secrets and errors
+    body: |
+      A **secret** is any value that grants access: passwords, API keys, tokens, private keys, database URLs. The most common leak is committing them to source control, where they stay in history forever and often end up public. Rules: keep secrets out of code, **load them from the environment or a secrets manager**, give each environment its own, scope them minimally, **rotate** them regularly, and **revoke and rotate immediately** when one leaks (assume it is already compromised: deleting the commit is not enough). Scan repositories automatically for secret patterns before they are pushed.
+
+      Also keep secrets out of **logs, error pages and URLs**. Detailed stack traces help attackers map your system, so show users a generic message plus an incident id, and log the details privately. Never log passwords or full card numbers; **redact** them. Limit what data you collect at all: data you do not hold cannot be stolen (Lesson 16.9 on privacy).
+
+  - heading: The supply chain
+    body: |
+      Modern programs are mostly other people's code: a typical web app pulls in hundreds of packages through **dependencies and transitive dependencies**. A vulnerability in any of them is yours. In 2021 the **Log4Shell** flaw in a ubiquitous Java logging library let attackers run code on servers worldwide, and teams spent weeks just discovering where they used it. Attackers also target the supply chain directly: **typosquatting** (a malicious package named `reqeusts`), **dependency confusion** (publishing a public package with the same name as an internal one so the build fetches it), **compromised maintainer accounts**, and malicious build or CI steps.
+
+      Defences. Use a **lockfile** to pin exact versions so builds are reproducible; pin by **hash** where you can so a swapped file is detected; **audit** dependencies regularly (`npm audit`, `pip-audit`, GitHub Dependabot) and update promptly; prefer fewer, well-maintained dependencies; review what a new package does; keep an **SBOM** (software bill of materials), a list of components, so you can answer "are we affected?" fast; protect CI secrets; and use **signed releases** and **provenance** (verifiable records of how an artifact was built). Version numbers follow **semantic versioning** (`MAJOR.MINOR.PATCH`), which is how advisories express "affected versions below 2.4.1".
+
+  - heading: "Finding bugs: testing, fuzzing and review"
+    body: |
+      Security flaws are bugs, so the Unit 14 tools apply with a hostile mindset: **unit tests for abuse cases** (empty, huge, negative, Unicode, nested input), **code review** with a security checklist, **static analysis (SAST)** that scans source for dangerous patterns (such as string-built SQL), **dependency scanning**, and **dynamic testing (DAST)** that attacks a running app. **Fuzzing** feeds large numbers of random or mutated inputs to a program and watches for crashes, hangs or violated properties; coverage-guided fuzzers (AFL, libFuzzer) steer toward new code paths and have found thousands of real vulnerabilities. A **property** is a statement that must hold for every input ("decode(encode(x)) == x", "the result never contains `<`"), and checking properties on random inputs is **property-based testing**.
+
+      Security belongs in the whole lifecycle ("shift left"): threat-model the design (Lesson 16.1), write secure code, review, test, scan in CI, deploy with least privilege, monitor (Lesson 16.9), and have a **vulnerability disclosure** policy so researchers can report bugs responsibly. Always test only systems you own or have written permission to test.
+
+examples:
+  - title: Secrets come from the environment
+    intro: "Read configuration at run time. Fail loudly if it is missing, and never print the value."
+    code: |
+      import os
+
+      os.environ["DEMO_DB_PASSWORD"] = "s3cret-for-demo"   # normally set outside the program
+
+      def get_secret(name):
+          value = os.environ.get(name)
+          if not value:
+              raise RuntimeError(f"missing required setting {name}")
+          return value
+
+      def redact(value):
+          return value[:2] + "*" * (len(value) - 2)
+
+      pw = get_secret("DEMO_DB_PASSWORD")
+      print("loaded", redact(pw))
+      try:
+          get_secret("DEMO_API_KEY")
+      except RuntimeError as e:
+          print("error:", e)
+    output: |
+      loaded s3*************
+      error: missing required setting DEMO_API_KEY
+    lines:
+      - line: 3
+        note: "Only for the demo. In real life the deployment environment provides it."
+      - line: 14
+        note: "Logs show a redacted form, never the full secret."
+  - title: Scanning for leaked secrets
+    intro: "Regular expressions catch many well-known key formats before they are committed."
+    code: |
+      import re
+
+      PATTERNS = {
+          "aws-access-key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+          "private-key": re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"),
+          "generic-assignment": re.compile(r"(?i)\b(?:password|secret|api[_-]?key|token)\s*=\s*['\"][^'\"]{8,}['\"]"),
+      }
+
+      def scan(text):
+          hits = []
+          for n, line in enumerate(text.splitlines(), 1):
+              for name, rx in PATTERNS.items():
+                  if rx.search(line):
+                      hits.append((n, name))
+          return hits
+
+      code = '''
+      import boto3
+      KEY = "AKIAABCDEFGHIJKLMNOP"
+      password = "hunter2hunter2"
+      timeout = 30
+      '''
+      print(scan(code))
+    output: |
+      [(3, 'aws-access-key'), (4, 'generic-assignment')]
+    lines:
+      - line: 5
+        note: "AWS access key ids always start with AKIA and have 20 characters."
+      - line: 7
+        note: "A looser rule for names such as password or api_key assigned a long literal string."
+  - title: Comparing versions
+    intro: "Advisories say 'affected below 2.4.1'. To apply them we must compare version numbers numerically, not as text."
+    code: |
+      def parse(v):
+          return tuple(int(x) for x in v.split("."))
+
+      print("2.10.0" < "2.9.0", "as strings")
+      print(parse("2.10.0") < parse("2.9.0"), "as numbers")
+      print(parse("1.4.9") < parse("1.5.0"))
+      print(sorted(["1.10.0", "1.2.0", "1.9.3"], key=parse))
+    output: |
+      True as strings
+      False as numbers
+      True
+      ['1.2.0', '1.9.3', '1.10.0']
+    lines:
+      - line: 5
+        note: "Text comparison puts 2.10.0 before 2.9.0, which is wrong."
+      - line: 6
+        note: "Tuples of ints compare element by element, as semantic versioning requires."
+  - title: Hash pinning
+    intro: "A lockfile can record each file's hash. If the downloaded bytes differ, refuse to install."
+    code: |
+      import hashlib
+
+      def sha256(data):
+          return hashlib.sha256(data).hexdigest()
+
+      package = b"print('hello from a trusted package')"
+      LOCK = {"mypkg-1.0.0": sha256(package)}
+
+      def verify(name, data):
+          return LOCK.get(name) == sha256(data)
+
+      print(verify("mypkg-1.0.0", package))
+      tampered = package + b"; steal_keys()"
+      print(verify("mypkg-1.0.0", tampered))
+      print(verify("unknown-2.0", package))
+    output: |
+      True
+      False
+      False
+    lines:
+      - line: 7
+        note: "pip's --require-hashes and npm's package-lock integrity fields work this way."
+      - line: 15
+        note: "An unlisted package is also refused: allowlist, not blocklist."
+  - title: A tiny fuzzer
+    intro: "Throw random inputs at a function and check a property. A fixed seed makes the run repeatable."
+    code: |
+      import random
+
+      def parse_age(s):
+          age = int(s)
+          if age < 0 or age > 150:
+              raise ValueError("out of range")
+          return age
+
+      def fuzz(fn, n=300, seed=1):
+          rng = random.Random(seed)
+          alphabet = "0123456789 -+.e_٠abc"
+          crashes = {}
+          for _ in range(n):
+              s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 6)))
+              try:
+                  fn(s)
+              except ValueError:
+                  pass                      # a clean, expected rejection
+              except Exception as e:
+                  crashes.setdefault(type(e).__name__, s)
+          return crashes
+
+      print(fuzz(parse_age))
+      print(parse_age("١٢"))
+    output: |
+      {}
+      12
+    lines:
+      - line: 18
+        note: "ValueError is the intended way to reject bad input. Any other exception is a bug worth investigating."
+      - line: 24
+        note: "Surprise: int() accepts Arabic-Indic digits, so validation must be deliberate about what it allows."
+
+playground:
+  prompt: |
+    Add a new pattern to the secret scanner for GitHub tokens (they start with `ghp_` followed by 36 letters and digits) and test it on a made-up example.
+  code: |
+    import re
+    rx = re.compile(r"\bghp_[A-Za-z0-9]{36}\b")
+    print(bool(rx.search("token = ghp_" + "a" * 36)))
+
+exercises:
+  - id: scan-secrets
+    title: A secret scanner
+    difficulty: 3
+    prompt: |
+      Write `scan(text)` returning a list of `(line_number, rule_name)` tuples (line numbers start at 1, ordered by line then by the rule order below). Rules: `"aws-key"` for `AKIA` followed by exactly 16 uppercase letters or digits as a whole word; `"private-key"` for a line containing `-----BEGIN` and `PRIVATE KEY-----`; `"hardcoded-password"` for a name `password`, `passwd`, `secret` or `token` (any case) followed by optional spaces, `=` or `:`, optional spaces and a quoted string of at least 8 characters. Lines that contain `# nosec` are ignored.
+    starter: |
+      import re
+
+      def scan(text):
+          pass
+    tests:
+      - name: rules
+        code: |
+          t = '\n'.join([
+              'KEY = "AKIAABCDEFGHIJKLMNOP"',
+              'x = 1',
+              '-----BEGIN RSA PRIVATE KEY-----',
+              'Password = "correcthorse"',
+              "token: 'abcd1234efgh'",
+              'password = "short"',
+              'secret = "longenough"  # nosec',
+              'AKIAABCDEFGHIJKLMNOPQ',
+          ])
+          assert scan(t) == [(1, "aws-key"), (3, "private-key"), (4, "hardcoded-password"), (5, "hardcoded-password")], scan(t)
+      - name: multiple on a line
+        code: |
+          assert scan('a = "AKIAABCDEFGHIJKLMNOP"; password = "abcdefgh1"') == [(1, "aws-key"), (1, "hardcoded-password")]
+          assert scan("") == []
+    hints:
+      - "Loop over `enumerate(text.splitlines(), 1)` and over the rules in order."
+      - "`\\bAKIA[0-9A-Z]{16}\\b` does not match a 17-character run."
+    solution: |
+      import re
+
+      RULES = [
+          ("aws-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+          ("private-key", re.compile(r"-----BEGIN.*PRIVATE KEY-----")),
+          ("hardcoded-password", re.compile(r"(?i)\b(?:password|passwd|secret|token)\s*[=:]\s*(['\"])[^'\"]{8,}\1")),
+      ]
+
+
+      def scan(text):
+          hits = []
+          for n, line in enumerate(text.splitlines(), 1):
+              if "# nosec" in line:
+                  continue
+              for name, rx in RULES:
+                  if rx.search(line):
+                      hits.append((n, name))
+          return hits
+    explanation: "Real scanners (gitleaks, trufflehog) add hundreds of rules and entropy checks, and run as a pre-commit hook and in CI."
+  - id: vuln-versions
+    title: Vulnerable versions
+    difficulty: 3
+    prompt: |
+      Write `parse_version(v)` returning a tuple of ints (`"1.4.10"` becomes `(1, 4, 10)`; missing parts count as zero up to three parts, so `"2"` is `(2, 0, 0)`). Then write `affected(installed, advisories)` where `advisories` is a list of dicts like `{"id": "A1", "introduced": "1.0.0", "fixed": "1.4.2"}`; an advisory affects the installed version when `introduced <= installed < fixed`. Return the sorted list of affected advisory ids.
+    starter: |
+      def parse_version(v):
+          pass
+
+      def affected(installed, advisories):
+          pass
+    tests:
+      - name: parse
+        code: |
+          assert parse_version("1.4.10") == (1, 4, 10)
+          assert parse_version("2") == (2, 0, 0)
+          assert parse_version("2.1") == (2, 1, 0)
+          assert parse_version("2.10.0") > parse_version("2.9.0")
+      - name: affected
+        code: |
+          adv = [{"id": "B", "introduced": "1.0.0", "fixed": "1.4.2"},
+                 {"id": "A", "introduced": "0", "fixed": "2.0.0"},
+                 {"id": "C", "introduced": "1.5.0", "fixed": "1.6.0"}]
+          assert affected("1.4.1", adv) == ["A", "B"]
+          assert affected("1.4.2", adv) == ["A"]
+          assert affected("1.5.0", adv) == ["A", "C"]
+          assert affected("2.0.0", adv) == []
+          assert affected("0.9", adv) == ["A"]
+    hints:
+      - "Pad the tuple with zeros: `parts + [0] * (3 - len(parts))`."
+    solution: |
+      def parse_version(v):
+          parts = [int(x) for x in v.split(".")]
+          parts += [0] * (3 - len(parts))
+          return tuple(parts)
+
+
+      def affected(installed, advisories):
+          inst = parse_version(installed)
+          out = [a["id"] for a in advisories if parse_version(a["introduced"]) <= inst < parse_version(a["fixed"])]
+          return sorted(out)
+    explanation: "Tools such as pip-audit and npm audit do exactly this against a database of advisories."
+  - id: lockfile
+    title: Verify a lockfile
+    difficulty: 4
+    prompt: |
+      Write `check_lock(lock, downloads)` where `lock` maps `"name==version"` to an expected SHA-256 hex digest and `downloads` maps `"name==version"` to the downloaded bytes. Return a sorted list of problem strings: `"name==version: not in lockfile"` for a download missing from the lock, `"name==version: hash mismatch"` when the digest differs, and `"name==version: not downloaded"` for a locked package that was not downloaded. An empty list means everything is fine.
+    starter: |
+      import hashlib
+
+      def check_lock(lock, downloads):
+          pass
+    tests:
+      - name: check
+        code: |
+          import hashlib
+          h = lambda b: hashlib.sha256(b).hexdigest()
+          lock = {"a==1.0": h(b"aaa"), "b==2.0": h(b"bbb"), "c==3.0": h(b"ccc")}
+          assert check_lock(lock, {"a==1.0": b"aaa", "b==2.0": b"bbb", "c==3.0": b"ccc"}) == []
+          assert check_lock(lock, {"a==1.0": b"aaa", "b==2.0": b"BAD", "d==9": b"x"}) == [
+              "b==2.0: hash mismatch", "c==3.0: not downloaded", "d==9: not in lockfile"]
+          assert check_lock({}, {}) == []
+    hints:
+      - "Iterate over the union of both key sets and decide which message applies."
+    solution: |
+      import hashlib
+
+
+      def check_lock(lock, downloads):
+          problems = []
+          for key in set(lock) | set(downloads):
+              if key not in lock:
+                  problems.append(f"{key}: not in lockfile")
+              elif key not in downloads:
+                  problems.append(f"{key}: not downloaded")
+              elif hashlib.sha256(downloads[key]).hexdigest() != lock[key]:
+                  problems.append(f"{key}: hash mismatch")
+          return sorted(problems)
+    explanation: "Pinning hashes means a compromised registry or a man-in-the-middle cannot silently swap the file."
+  - id: least-privilege
+    title: Least privilege audit
+    difficulty: 3
+    prompt: |
+      A service account has a set of `granted` permissions and a set of `used` permissions observed over the last 90 days. Write `audit(accounts)` where `accounts` is a dict mapping an account name to `{"granted": set, "used": set}`. Return a dict mapping only the accounts that have unused grants to the **sorted list** of those unused permissions. Also treat a wildcard grant `"*"` as always unused-excess: if `"*"` is granted, include `"*"` in the list.
+    starter: |
+      def audit(accounts):
+          pass
+    tests:
+      - name: audit
+        code: |
+          acc = {
+              "web": {"granted": {"db:read", "db:write", "s3:read"}, "used": {"db:read", "db:write"}},
+              "job": {"granted": {"db:read"}, "used": {"db:read"}},
+              "ci": {"granted": {"*", "deploy"}, "used": {"deploy"}},
+              "new": {"granted": set(), "used": set()},
+          }
+          assert audit(acc) == {"web": ["s3:read"], "ci": ["*"]}
+          assert audit({}) == {}
+    hints:
+      - "Excess is `granted - used`; a granted `*` is excess even if it appears in `used`."
+    solution: |
+      def audit(accounts):
+          out = {}
+          for name, a in accounts.items():
+              extra = set(a["granted"]) - set(a["used"])
+              if "*" in a["granted"]:
+                  extra.add("*")
+              if extra:
+                  out[name] = sorted(extra)
+          return out
+    explanation: "Cloud tools report this as 'unused permissions'. Removing them shrinks the damage from a stolen credential."
+  - id: fuzz-roundtrip
+    title: Property testing a codec
+    difficulty: 4
+    prompt: |
+      Write `encode(s)` that makes a string safe to put in a URL query by replacing every character except letters, digits, `-`, `_` and `.` with `%XX` (uppercase hex of each **UTF-8 byte**), and `decode(s)` that reverses it. Then write `roundtrip_failures(n, seed)` which generates `n` random strings (length 0-8, drawn from `"ab Z9%&=?/é☃-._"`) using `random.Random(seed)` and returns the list of strings for which `decode(encode(s)) != s` (it must be empty for a correct codec).
+    starter: |
+      import random
+
+      def encode(s):
+          pass
+
+      def decode(s):
+          pass
+
+      def roundtrip_failures(n, seed):
+          pass
+    tests:
+      - name: codec
+        code: |
+          assert encode("ab Z9") == "ab%20Z9"
+          assert encode("é") == "%C3%A9"
+          assert encode("a.b-c_d") == "a.b-c_d"
+          assert encode("100%") == "100%25"
+          assert decode("%E2%98%83") == "☃"
+          assert decode(encode("x=1&y=é☃")) == "x=1&y=é☃"
+      - name: property
+        code: |
+          assert roundtrip_failures(500, 7) == []
+          assert roundtrip_failures(0, 1) == []
+    hints:
+      - "`s.encode('utf-8')` gives bytes; format each with `'%%%02X' % b`. For decoding collect bytes in a `bytearray`, then `.decode('utf-8')`."
+    solution: |
+      import random
+
+      SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+
+
+      def encode(s):
+          out = []
+          for ch in s:
+              if ch in SAFE:
+                  out.append(ch)
+              else:
+                  out.extend("%%%02X" % b for b in ch.encode("utf-8"))
+          return "".join(out)
+
+
+      def decode(s):
+          raw = bytearray()
+          i = 0
+          while i < len(s):
+              if s[i] == "%":
+                  raw.append(int(s[i + 1:i + 3], 16))
+                  i += 3
+              else:
+                  raw.extend(s[i].encode("utf-8"))
+                  i += 1
+          return raw.decode("utf-8")
+
+
+      def roundtrip_failures(n, seed):
+          rng = random.Random(seed)
+          alphabet = "ab Z9%&=?/é☃-._"
+          bad = []
+          for _ in range(n):
+              s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
+              if decode(encode(s)) != s:
+                  bad.append(s)
+          return bad
+    explanation: "Encoding bugs (double decoding, missed characters) are a major source of injection flaws. Round-trip properties catch them with random inputs."
+
+commonMistakes:
+  - title: "Committing secrets, then just deleting the file"
+    explanation: "The history still holds it. Revoke and rotate the secret immediately."
+  - title: "Comparing versions as strings"
+    explanation: "'2.10.0' < '2.9.0' as text. Compare numeric tuples."
+  - title: "Installing dependencies without a lockfile or hashes"
+    explanation: "Builds become unreproducible and open to swapped packages."
+  - title: "Verbose errors shown to users"
+    explanation: "Stack traces reveal internals. Show a generic message and log the details privately."
+  - title: "Granting broad permissions 'just in case'"
+    explanation: "Grant the minimum and review unused access regularly."
+
+summary:
+  - "Design with least privilege, fail-safe defaults, defence in depth and a small attack surface."
+  - "Keep secrets out of code and logs, load them from the environment, rotate and revoke on leak."
+  - "Dependencies are part of your attack surface: lock, hash-pin, audit and keep an SBOM."
+  - "Abuse-case tests, static analysis, code review and fuzzing find flaws before attackers do."
+  - "Security belongs at every stage of the lifecycle, and testing is done only on systems you may test."
+next: u16-defence
+
+quiz:
+  - type: mcq
+    question: What does the principle of least privilege say?
+    options: ["Give each account only the access it needs", "Give admins everything", "Share one account", "Disable logging"]
+    answer: 0
+    explanation: "It limits the damage if something is compromised."
+  - type: mcq
+    question: What should you do first if a secret was committed to a public repository?
+    options: ["Revoke and rotate it", "Delete the file and hope", "Rename the repository", "Wait a week"]
+    answer: 0
+    explanation: "Assume it was copied the moment it was public."
+  - type: mcq
+    question: What is typosquatting?
+    options: ["Publishing a malicious package with a name close to a popular one", "A typing test", "A weak hash", "Fast typing"]
+    answer: 0
+    explanation: "Users who mistype install the attacker's package."
+  - type: mcq
+    question: What is the purpose of pinning dependencies by hash?
+    options: ["To detect a swapped or tampered file", "To make installs faster", "To save disk space", "To hide versions"]
+    answer: 0
+    explanation: "If the bytes differ, the hash differs."
+  - type: mcq
+    question: What does fuzzing do?
+    options: ["Feeds many random or mutated inputs to find crashes and bugs", "Encrypts files", "Formats code", "Measures speed"]
+    answer: 0
+    explanation: "It finds inputs the developers never considered."
+  - type: mcq
+    question: What is an SBOM?
+    options: ["A list of the components in a piece of software", "A type of firewall", "A password manager", "A compiler flag"]
+    answer: 0
+    explanation: "It lets you quickly find whether you use a vulnerable component."
+  - type: code
+    question: |
+      Write `mask(secret, visible=4)` returning the secret with all but the last `visible` characters replaced by `*`. If the secret is no longer than `visible`, return all `*` characters with the same length.
+    starter: |
+      def mask(secret, visible=4):
+          pass
+    tests:
+      - name: mask
+        code: |
+          assert mask("abcdefgh") == "****efgh"
+          assert mask("abcdefgh", 2) == "******gh"
+          assert mask("abc") == "***"
+          assert mask("abcd") == "****"
+          assert mask("") == ""
+    solution: |
+      def mask(secret, visible=4):
+          if len(secret) <= visible:
+              return "*" * len(secret)
+          return "*" * (len(secret) - visible) + secret[-visible:]
