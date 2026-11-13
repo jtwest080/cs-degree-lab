@@ -22,10 +22,10 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 14 | Software Engineering | ✅ Complete (Phase 13) | 9 | 37 | Mini Git (commits, branches, merge base and three-way merge) |
 | 15 | Theory of Computation | ✅ Complete (Phase 14) | 9 | 36 | Computation Lab (regex parser and matcher, Turing machine, SAT solver, vertex cover) |
 | 16 | Security | ✅ Complete (Phase 15) | 9 | 44 | Security Toolkit (safe paths, HTML escaping, password hashing, signed cookies, parameterised queries, rate limiting) |
-| 17 | AI & Machine Learning | Planned | | | |
+| 17 | AI & Machine Learning | ✅ Complete (Phase 16) | 9 | 45 | Mini AI Toolkit (A* search, perfect tic-tac-toe, naive Bayes, linear regression, k-means, a small neural network) |
 | 18 | Capstone Projects | Planned | | | |
 
-Totals so far: 140 lessons, 653 practice exercises, 140 lesson quizzes (840 multiple-choice questions + 140 coding questions), 16 unit projects, 1286 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals so far: 149 lessons, 698 practice exercises, 149 lesson quizzes (894 multiple-choice questions + 149 coding questions), 17 unit projects, 1422 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -423,9 +423,29 @@ Language: Python (Pyodide). Everything is defensive and educational: attacks are
 
 **Unit 17 can assume:** everything through Unit 16 (cryptography basics, hashing, web and application security, privacy). Unit 17 (AI and ML) needs only Python, probability and linear-algebra-style loops from Units 6 and 7; it should build small models from scratch with plain lists, because NumPy is not part of the base Pyodide runtime used here. It can mention adversarial examples, bias and privacy in ML as links back to this unit.
 
+## Unit 17: AI and Machine Learning ✅
+
+Language: Python (Pyodide). Everything is built from scratch with the standard library (no NumPy), using seeded `random.Random` so every result is repeatable.
+
+| Lesson | id | Topics |
+|---|---|---|
+| 17.1 Intelligent Agents and Search | `u17-search` | agents, state spaces, BFS, uniform-cost, greedy, A*, admissible heuristics, 8-puzzle, word ladder, water jugs |
+| 17.2 Game Playing | `u17-games` | game trees, minimax, alpha-beta pruning, memoisation, evaluation functions, Nim and winning positions |
+| 17.3 Reasoning Under Uncertainty | `u17-bayes` | Bayes' rule, base-rate fallacy, naive Bayes with Laplace smoothing, Bayesian updating, Bayesian network inference, Markov chains |
+| 17.4 Machine Learning Basics | `u17-ml` | supervised vs unsupervised, k-NN, train/validation/test, overfitting, precision/recall/F1, scaling, cross-validation, data leakage |
+| 17.5 Regression and Gradient Descent | `u17-regression` | least squares, gradient descent, learning rate, several features, R-squared, ridge regularisation |
+| 17.6 Classification | `u17-classification` | perceptron and XOR, sigmoid and log-loss, logistic regression, decision trees (Gini), bagging and forests |
+| 17.7 Neural Networks and Backpropagation | `u17-neural` | neurons, activations, forward pass, backpropagation on XOR, convolution, softmax and cross-entropy, deep learning |
+| 17.8 Clustering, Anomalies and Reinforcement Learning | `u17-unsupervised` | k-means, elbow method, z-score and MAD anomalies, bandits, MDPs, value iteration, Q-learning |
+| 17.9 Language Models, Attention and Responsible AI | `u17-modern` | bigram models and perplexity, BPE, embeddings and cosine, attention, LLM training, fairness metrics, adversarial examples |
+
+**Project: Mini AI Toolkit.** Learners write A* grid search (`shortest_path`), perfect tic-tac-toe (`best_move`), naive Bayes (`train_bayes`/`predict_bayes`), gradient-descent linear regression (`fit_linear`), `kmeans` and a two-input neural network (`train_network`). 12 checklist items, 12 tests.
+
+**Unit 18 can assume:** everything through Unit 17. The capstone projects (Unit 18) should combine earlier units: for example a command-line or web application with tests and git practice (Units 5, 13, 14), a database-backed service with secure coding (Units 12 and 16), an algorithmic or AI project (Units 8 and 17), and a systems project such as an interpreter or virtual machine (Units 9, 10 and 15). Content must stay within what runs in the browser.
+
 ## Plan for remaining units (to refine before each phase)
 
-- **17 AI & ML**, **18 Capstones**.
+- **18 Capstones**.
 
 ## Technical notes for later phases
 
@@ -449,3 +469,4 @@ Language: Python (Pyodide). Everything is defensive and educational: attacks are
 - **Phase 13 (2026-11-07/08):** complete Unit 14 (9 lessons, 37 exercises, 9 quizzes, Mini Git project, 130 glossary terms). No new framework features; all Python.
 - **Phase 14 (2026-11-08/09):** complete Unit 15 (9 lessons, 36 exercises, 9 quizzes, Computation Lab project, 81 glossary terms). No new framework features; all Python.
 - **Phase 15 (2026-11-13):** complete Unit 16 (9 lessons, 44 exercises, 9 quizzes, Security Toolkit project, 84 glossary terms). The Python test harness now provides `hashlib.pbkdf2_hmac` (missing in Pyodide).
+- **Phase 16 (2026-11-13):** complete Unit 17 (9 lessons, 45 exercises, 9 quizzes, Mini AI Toolkit project, 136 glossary terms). No framework changes; all Python, no external libraries.
