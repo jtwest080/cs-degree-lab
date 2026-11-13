@@ -23,9 +23,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 15 | Theory of Computation | ✅ Complete (Phase 14) | 9 | 36 | Computation Lab (regex parser and matcher, Turing machine, SAT solver, vertex cover) |
 | 16 | Security | ✅ Complete (Phase 15) | 9 | 44 | Security Toolkit (safe paths, HTML escaping, password hashing, signed cookies, parameterised queries, rate limiting) |
 | 17 | AI & Machine Learning | ✅ Complete (Phase 16) | 9 | 45 | Mini AI Toolkit (A* search, perfect tic-tac-toe, naive Bayes, linear regression, k-means, a small neural network) |
-| 18 | Capstone Projects | Planned | | | |
+| 18 | Capstone Projects | ✅ Complete (Phase 17) | 8 | 40 | Notes Service (accounts, signed tokens, a crash-safe log-structured store, validation, rate limiting and security headers in one web API) |
 
-Totals so far: 149 lessons, 698 practice exercises, 149 lesson quizzes (894 multiple-choice questions + 149 coding questions), 17 unit projects, 1422 glossary terms. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 157 lessons, 738 practice exercises, 157 lesson quizzes (942 multiple-choice questions + 157 coding questions), 18 unit projects, 1506 glossary terms. All 18 units are complete. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -443,9 +443,28 @@ Language: Python (Pyodide). Everything is built from scratch with the standard l
 
 **Unit 18 can assume:** everything through Unit 17. The capstone projects (Unit 18) should combine earlier units: for example a command-line or web application with tests and git practice (Units 5, 13, 14), a database-backed service with secure coding (Units 12 and 16), an algorithmic or AI project (Units 8 and 17), and a systems project such as an interpreter or virtual machine (Units 9, 10 and 15). Content must stay within what runs in the browser.
 
+## Unit 18: Capstone Projects ✅
+
+Language: Python (Pyodide). Seven capstones built from scratch with the standard library, each a five-milestone mini-system whose pieces are tested separately, plus a planning lesson. Starters give the earlier pieces as code and ask for the new piece, so every milestone is independently testable.
+
+| Lesson | id | Topics |
+|---|---|---|
+| 18.1 Planning a Capstone | `u18-planning` | scope and milestones, three-point (PERT) estimates, a heap backlog, conventional commits and semantic versions, task order and critical path, README linter |
+| 18.2 Capstone A: A Programming Language | `u18-interpreter` | tokenizer, recursive-descent expression parser, statements, environments, closures and recursion, writing programs in the language |
+| 18.3 Capstone B: A Database Engine | `u18-storage` | checksummed records, write-ahead log replay, key-value store, atomic transactions with commit markers, compaction, secondary index |
+| 18.4 Capstone C: A Web Service Framework | `u18-webservice` | router with typed path parameters, handlers and status codes, middleware chain, HMAC bearer tokens, sliding-window rate limiting, input validation, security headers and CORS |
+| 18.5 Capstone D: A Game Engine | `u18-game` | levels as data, BFS enemy AI, pure step function, validated save files, seeded solvable level generation |
+| 18.6 Capstone E: A Machine Learning Pipeline | `u18-ml-pipeline` | CSV state-machine parser, cleaning and imputation reports, reproducible split, leak-free scaling and one-hot encoding, logistic regression, metrics, per-group fairness audit |
+| 18.7 Capstone F: A Search Engine | `u18-search` | normalisation and stemming, inverted index with positions, boolean/phrase/exclusion queries, TF-IDF ranking, autocomplete with bisect, edit-distance spelling suggestions, safe highlighting |
+| 18.8 Capstone G: Shipping, Showing and Next Steps | `u18-showcase` | API docs from `ast`, a mini doctest, a safe portfolio renderer, dependency and licence audit, release gate, ethics, portfolio and next steps |
+
+**Project: Notes Service.** Learners write `NotesService`, which integrates the log-structured store with transactions (18.3) and the router, middleware, tokens, validation, rate limiting and security headers (18.4) given in the starter: registration and login with salted PBKDF2 hashes, bearer-token authentication, private notes with ownership checks, filters, recovery from the log including torn transactions. 12 checklist items, 12 tests.
+
+Notes for later maintainers: example outputs must not start with spaces (a YAML literal block would need an indentation indicator), exercise functions are never named `run`, and the lessons avoid output that depends on the Python version (for example exact TypeError messages).
+
 ## Plan for remaining units (to refine before each phase)
 
-- **18 Capstones**.
+None: all 18 units are complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -470,3 +489,4 @@ Language: Python (Pyodide). Everything is built from scratch with the standard l
 - **Phase 14 (2026-11-08/09):** complete Unit 15 (9 lessons, 36 exercises, 9 quizzes, Computation Lab project, 81 glossary terms). No new framework features; all Python.
 - **Phase 15 (2026-11-13):** complete Unit 16 (9 lessons, 44 exercises, 9 quizzes, Security Toolkit project, 84 glossary terms). The Python test harness now provides `hashlib.pbkdf2_hmac` (missing in Pyodide).
 - **Phase 16 (2026-11-13):** complete Unit 17 (9 lessons, 45 exercises, 9 quizzes, Mini AI Toolkit project, 136 glossary terms). No framework changes; all Python, no external libraries.
+- **Phase 17 (2026-11-13):** complete Unit 18 (8 lessons, 40 exercises, 8 quizzes, Notes Service project, 84 glossary terms). No framework changes; all Python. This completes the curriculum.

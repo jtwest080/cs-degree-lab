@@ -1,0 +1,1827 @@
+id: u18-storage
+title: 'Capstone B: A Database Engine'
+minutes: 90
+objective: 'Build the heart of a database: a log-structured key-value store that survives crashes. You will design a checksummed record format, replay a write-ahead log to rebuild state, add atomic transactions with commit and rollback, detect and survive damaged logs, and compact the log to reclaim space. This capstone brings together Units 7, 10, 12, 14 and 16.'
+outcomes:
+- Explain durability, write-ahead logging and why appending is a good way to write
+- Design a record format with checksums that detects corruption
+- Rebuild a data store by replaying a log, including after a crash
+- Implement atomic transactions with commit markers and rollback
+- Compact a log and reason about space, speed and recovery trade-offs
+sections:
+- heading: What a storage engine must do
+  body: |-
+    A database is more than a dictionary. A Python `dict` lives in memory and vanishes when the program ends, so a real **storage engine** adds **durability** (data survives restarts and crashes), **integrity** (damage is detected, not silently used), and **atomicity** (a group of changes either happens completely or not at all). Units 10 and 12 met these ideas as the **ACID** properties (atomicity, consistency, isolation, durability) and as journalling in file systems. Here you build them yourself.
+
+    The simplest design that survives crashes is a **write-ahead log (WAL)**: before changing anything, **append** a record describing the change to the end of a file; to rebuild the state after a restart, **replay** the log from the start. Appending is the cheapest write there is (no seeking, no overwriting existing data, so a half-finished write damages only the tail). Many real systems are built this way: databases keep a WAL for recovery, Kafka is a distributed log, and Git's object store and an LSM-tree database (LevelDB, RocksDB, Cassandra) are descendants of the idea. The state in memory is then just a **cache of the log**, a dictionary giving fast reads, and the log is the truth.
+
+    Our `KVStore` keeps the "file" as a list of text lines so that it runs in the browser: `log_text()` is what would be written to disk, and `KVStore(text)` is what you would do when the program starts again. Each line is one **record**: `put` (set a key), `del` (delete a key), and the markers `begin` and `commit` that bracket a transaction.
+- heading: Integrity, recovery and transactions
+  body: |-
+    Disks fail, power is lost halfway through a write, and files get edited by mistake or on purpose (Unit 16), so every record carries a **checksum**: the first 8 hex digits of the SHA-256 hash of its body. When we read a line back we recompute the hash; a mismatch means the line is damaged (or tampered with, though for tamper-proofing against an attacker you would use an HMAC with a secret key, Lesson 16.3). Records are written with `json.dumps(..., sort_keys=True)` so the same record always produces the same bytes, and any JSON-compatible value can be stored.
+
+    **Recovery** replays the log line by line. Plain `put` and `del` records are applied immediately. Our policy for damage is conservative: **stop at the first damaged line and ignore everything after it**, because after a torn write you cannot trust what follows. This is how real WALs behave, since a crash only ever damages the end.
+
+    **Transactions** make several changes atomic. Inside a transaction we do not touch the log or the data: writes go to a **buffer**, reads look in the buffer first (a transaction sees its own writes), and `rollback` simply throws the buffer away. On `commit` we append `begin`, then the records, then `commit`. During replay, records between `begin` and `commit` are held back and applied **only when the commit marker is reached**. If the log ends in the middle of a group, the power failed before the commit was written, so the whole group is **discarded**: this is how a money transfer ("subtract from Alice, add to Bob") can never be half applied. The **commit marker is the atomic moment**. Real systems add **isolation** (concurrent transactions not seeing each other's changes), usually with locks or versions, which is a natural extension.
+- heading: Compaction and trade-offs
+  body: |-
+    An append-only log grows forever: a counter updated a million times leaves a million records for one live value. **Compaction** rewrites the log keeping only what is needed, one `put` per live key (in a real system it writes a new file and then atomically swaps it in, so a crash during compaction leaves the old log intact). The ratio of wasted records to live ones measures how worthwhile compaction is; databases run it in the background when the ratio gets high.
+
+    Every design has trade-offs worth being able to state. **Writes** are fast (append only), but **reads** need the in-memory dictionary, which must fit in RAM, and **recovery time** grows with the log (hence **snapshots** and compaction). A **secondary index**, a second dictionary from a field's value to the keys that have it, makes queries like "all users in Oslo" fast but must be updated on every write and rebuilt on recovery. **Range scans** need sorted keys (we sort on demand; real engines keep sorted structures such as B-trees or sorted string tables). **Concurrency**, **replication** and **encryption at rest** are other layers you could add.
+
+    Security notes for your own version: validate keys and values (we reject empty or non-string keys), never put secrets into logs in plain text, keep the log file's permissions tight, and treat a log from outside as untrusted input: our parser never evaluates it, it only parses JSON.
+examples:
+- title: Records and checksums
+  intro: 'Each record is one line: a checksum, a space and canonical JSON. Changing a single character is detected.'
+  code: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    line = encode_record({"op": "put", "key": "balance", "value": 100})
+    print(line)
+    tampered = line.replace("100", "999")
+    for text in (line, tampered, line[:-4]):
+        try:
+            print("ok     ", decode_record(text)["value"])
+        except CorruptRecord as e:
+            print("REJECTED", e)
+  output: |
+    85d8e001 {"key":"balance","op":"put","value":100}
+    ok      100
+    REJECTED bad checksum
+    REJECTED bad checksum
+  lines:
+  - line: 15
+    note: sort_keys and compact separators make the encoding canonical.
+  - line: 22
+    note: Recomputing the hash catches the damaged line before its contents are used.
+- title: Replaying a log
+  intro: The state is rebuilt by applying records in order. A torn write stops the replay.
+  code: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    E = encode_record
+    log = "".join(E(r) + "\n" for r in [
+        {"op": "put", "key": "alice", "value": 100}, {"op": "put", "key": "bob", "value": 50},
+        {"op": "put", "key": "alice", "value": 80}, {"op": "del", "key": "bob"}, {"op": "put", "key": "carol", "value": 7}])
+    data, kept, discarded = replay(log)
+    print(data, len(kept), "lines kept,", discarded, "discarded")
+
+    damaged = log.split("\n")
+    damaged[3] = damaged[3][:10]                     # simulate a torn write
+    data, kept, discarded = replay("\n".join(damaged))
+    print(data, len(kept), "lines kept,", discarded, "discarded")
+  output: |
+    {'alice': 80, 'carol': 7} 5 lines kept, 0 discarded
+    {'alice': 80, 'bob': 50} 3 lines kept, 2 discarded
+  lines:
+  - line: 40
+    note: The data dictionary is just the result of applying every record.
+- title: Atomic transactions and crashes
+  intro: A transfer between two accounts is written as one begin...commit group. Cut the log at any point and the transfer is either fully there or fully absent.
+  code: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    class KVStore:
+        """A tiny log-structured key-value store: every change is appended to a log, and the log is replayed on start-up."""
+
+        def __init__(self, log_text=""):
+            self.data, self.log, self.discarded = replay(log_text)
+            self.tx = None                       # None, or a list of buffered records inside a transaction
+
+        def _write(self, rec):
+            if self.tx is not None:
+                self.tx.append(rec)
+            else:
+                self.log.append(encode_record(rec))
+                apply_record(self.data, rec)
+
+        def put(self, key, value):
+            if not isinstance(key, str) or not key:
+                raise ValueError("key must be a non-empty string")
+            self._write({"op": "put", "key": key, "value": value})
+
+        def get(self, key, default=None):
+            if self.tx is not None:              # a transaction sees its own writes
+                for rec in reversed(self.tx):
+                    if rec["key"] == key:
+                        return rec["value"] if rec["op"] == "put" else default
+            return self.data.get(key, default)
+
+        def delete(self, key):
+            existed = key in self.keys()
+            self._write({"op": "del", "key": key})
+            return existed
+
+        def keys(self):
+            view = dict(self.data)
+            for rec in (self.tx or []):
+                apply_record(view, rec)
+            return sorted(view)
+
+        def scan(self, prefix=""):
+            return [k for k in self.keys() if k.startswith(prefix)]
+
+        def log_text(self):
+            return "".join(line + "\n" for line in self.log)
+
+        def begin(self):
+            if self.tx is not None:
+                raise RuntimeError("transaction already open")
+            self.tx = []
+
+        def commit(self):
+            if self.tx is None:
+                raise RuntimeError("no open transaction")
+            records, self.tx = self.tx, None
+            if records:
+                self.log.append(encode_record({"op": "begin"}))
+                for rec in records:
+                    self.log.append(encode_record(rec))
+                self.log.append(encode_record({"op": "commit"}))
+                for rec in records:
+                    apply_record(self.data, rec)
+
+        def rollback(self):
+            if self.tx is None:
+                raise RuntimeError("no open transaction")
+            self.tx = None
+
+
+    s = KVStore()
+    s.put("alice", 100); s.put("bob", 50)
+    s.begin()
+    s.put("alice", 70)
+    s.put("bob", 80)
+    s.commit()
+    print("after transfer:", s.data)
+    lines = s.log_text().strip().split("\n")
+    print("log has", len(lines), "lines")
+    for cut in range(2, len(lines) + 1):
+        t = KVStore("\n".join(lines[:cut]) + "\n")
+        print(f"crash after {cut} lines ->", t.data)
+    s.begin()
+    s.put("alice", 0)
+    s.rollback()
+    print("after rollback:", s.data)
+  output: |
+    after transfer: {'alice': 70, 'bob': 80}
+    log has 6 lines
+    crash after 2 lines -> {'alice': 100, 'bob': 50}
+    crash after 3 lines -> {'alice': 100, 'bob': 50}
+    crash after 4 lines -> {'alice': 100, 'bob': 50}
+    crash after 5 lines -> {'alice': 100, 'bob': 50}
+    crash after 6 lines -> {'alice': 70, 'bob': 80}
+    after rollback: {'alice': 70, 'bob': 80}
+  lines:
+  - line: 148
+    note: The commit writes begin, the buffered records and commit as one group.
+  - line: 152
+    note: 'Cut the log after any number of lines: only the complete six-line log contains the commit marker, so only then does the transfer appear.'
+- title: Compaction
+  intro: 300 updates to 3 counters leave only 3 live values.
+  code: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    def compact_log(log_text):
+        """Return a new log text holding one put record per live key (sorted by key)."""
+        data, _, _ = replay(log_text)
+        return "".join(encode_record({"op": "put", "key": k, "value": data[k]}) + "\n" for k in sorted(data))
+
+
+    E = encode_record
+    records = [{"op": "put", "key": f"counter{i % 3}", "value": i} for i in range(300)]
+    log = "".join(E(r) + "\n" for r in records)
+    small = compact_log(log)
+    print("before:", log.count("\n"), "records,", len(log), "bytes")
+    print("after: ", small.count("\n"), "records,", len(small), "bytes")
+    print("same data:", replay(small)[0] == replay(log)[0], replay(small)[0])
+  output: |
+    before: 300 records, 15190 bytes
+    after:  3 records, 153 bytes
+    same data: True {'counter0': 297, 'counter1': 298, 'counter2': 299}
+  lines:
+  - line: 86
+    note: Replay computes the live data, and compaction writes one put per key.
+  - line: 89
+    note: The compacted log rebuilds exactly the same state.
+- title: A secondary index
+  intro: A second dictionary from city to keys, kept up to date on every write and rebuilt from the log on start-up.
+  code: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    class KVStore:
+        """A tiny log-structured key-value store: every change is appended to a log, and the log is replayed on start-up."""
+
+        def __init__(self, log_text=""):
+            self.data, self.log, self.discarded = replay(log_text)
+            self.tx = None                       # None, or a list of buffered records inside a transaction
+
+        def _write(self, rec):
+            if self.tx is not None:
+                self.tx.append(rec)
+            else:
+                self.log.append(encode_record(rec))
+                apply_record(self.data, rec)
+
+        def put(self, key, value):
+            if not isinstance(key, str) or not key:
+                raise ValueError("key must be a non-empty string")
+            self._write({"op": "put", "key": key, "value": value})
+
+        def get(self, key, default=None):
+            if self.tx is not None:              # a transaction sees its own writes
+                for rec in reversed(self.tx):
+                    if rec["key"] == key:
+                        return rec["value"] if rec["op"] == "put" else default
+            return self.data.get(key, default)
+
+        def delete(self, key):
+            existed = key in self.keys()
+            self._write({"op": "del", "key": key})
+            return existed
+
+        def keys(self):
+            view = dict(self.data)
+            for rec in (self.tx or []):
+                apply_record(view, rec)
+            return sorted(view)
+
+        def scan(self, prefix=""):
+            return [k for k in self.keys() if k.startswith(prefix)]
+
+        def log_text(self):
+            return "".join(line + "\n" for line in self.log)
+
+        def begin(self):
+            if self.tx is not None:
+                raise RuntimeError("transaction already open")
+            self.tx = []
+
+        def commit(self):
+            if self.tx is None:
+                raise RuntimeError("no open transaction")
+            records, self.tx = self.tx, None
+            if records:
+                self.log.append(encode_record({"op": "begin"}))
+                for rec in records:
+                    self.log.append(encode_record(rec))
+                self.log.append(encode_record({"op": "commit"}))
+                for rec in records:
+                    apply_record(self.data, rec)
+
+        def rollback(self):
+            if self.tx is None:
+                raise RuntimeError("no open transaction")
+            self.tx = None
+
+
+    class IndexedStore(KVStore):
+        """Keeps a secondary index: field value -> set of keys, updated on every write."""
+
+        def __init__(self, field, log_text=""):
+            super().__init__(log_text)
+            self.field = field
+            self.index = {}
+            for k in self.data:
+                self._index_add(k, self.data[k])
+
+        def _index_add(self, key, value):
+            if isinstance(value, dict) and self.field in value:
+                self.index.setdefault(value[self.field], set()).add(key)
+
+        def _index_remove(self, key):
+            old = self.data.get(key)
+            if isinstance(old, dict) and self.field in old:
+                self.index.get(old[self.field], set()).discard(key)
+
+        def put(self, key, value):
+            self._index_remove(key)
+            super().put(key, value)
+            self._index_add(key, value)
+
+        def delete(self, key):
+            self._index_remove(key)
+            return super().delete(key)
+
+        def find(self, value):
+            return sorted(self.index.get(value, set()))
+
+    s = IndexedStore("city")
+    s.put("u1", {"name": "Ana", "city": "Oslo"})
+    s.put("u2", {"name": "Bo", "city": "Rome"})
+    s.put("u3", {"name": "Cy", "city": "Oslo"})
+    print("Oslo:", s.find("Oslo"), " Rome:", s.find("Rome"))
+    s.put("u1", {"name": "Ana", "city": "Rome"})
+    s.delete("u2")
+    print("Oslo:", s.find("Oslo"), " Rome:", s.find("Rome"))
+    print("rebuilt from the log:", IndexedStore("city", s.log_text()).find("Rome"))
+  output: |
+    Oslo: ['u1', 'u3']  Rome: ['u2']
+    Oslo: ['u3']  Rome: ['u1']
+    rebuilt from the log: ['u1']
+  lines:
+  - line: 157
+    note: Before an overwrite or delete, the old entry must be removed from the index.
+  - line: 172
+    note: A lookup is one dictionary access instead of a scan over every key.
+playground:
+  prompt: Create a store, put a few values, print `log_text()`, then edit one character of one line and start a new store from the edited text. What survives?
+  code: |
+    import json
+    print(json.dumps({"op": "put", "key": "a", "value": 1}, sort_keys=True, separators=(",", ":")))
+exercises:
+- id: record-codec
+  title: 'Milestone 1: Records with checksums'
+  difficulty: 3
+  prompt: Write `checksum(text)` (the first 8 hex digits of the SHA-256 of the UTF-8 text), `encode_record(record)` returning `checksum(body) + " " + body` where `body` is `json.dumps(record, sort_keys=True, separators=(",", ":"))`, and `decode_record(line)` that returns the record dict. `decode_record` must raise `CorruptRecord` if the line has no space, the checksum is not 8 characters or does not match, the body is not valid JSON, or the JSON is not a dict with an `"op"` key.
+  starter: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        pass
+
+
+    def encode_record(record):
+        pass
+
+
+    def decode_record(line):
+        pass
+  tests:
+  - name: encode
+    code: |
+      import hashlib
+      line = encode_record({"op": "put", "key": "a", "value": 1})
+      check, space, body = line.partition(" ")
+      assert space == " " and len(check) == 8
+      assert body == '{"key":"a","op":"put","value":1}'
+      assert check == hashlib.sha256(body.encode()).hexdigest()[:8]
+      assert "\n" not in line
+      assert encode_record({"value": 1, "op": "put", "key": "a"}) == line
+      assert checksum("hello") == hashlib.sha256(b"hello").hexdigest()[:8]
+  - name: round trip
+    code: |
+      for rec in [{"op": "put", "key": "a", "value": 1}, {"op": "del", "key": "b"}, {"op": "begin"},
+                  {"op": "put", "key": "k y", "value": {"n": [1, 2, {"x": None}], "s": "héllo \"q\""}}]:
+          assert decode_record(encode_record(rec)) == rec
+  - name: damage is detected
+    code: |
+      good = encode_record({"op": "put", "key": "a", "value": 100})
+      bad_lines = [good.replace("100", "900"), good[:-3], "", "nospaces", "zzzzzzzz {}", good[1:], " " + good]
+      for bad in bad_lines:
+          try:
+              decode_record(bad)
+          except CorruptRecord:
+              continue
+          raise AssertionError("accepted " + repr(bad))
+      body = '[1,2]'
+      try:
+          decode_record(checksum(body) + " " + body)
+          raise AssertionError("accepted a non-record")
+      except CorruptRecord:
+          pass
+      body = '{"key":"a"}'
+      try:
+          decode_record(checksum(body) + " " + body)
+          raise AssertionError("accepted a record without an op")
+      except CorruptRecord:
+          pass
+  hints:
+  - '`line.partition(" ")` splits at the first space into `(checksum, space, body)`.'
+  - Catch `ValueError` from `json.loads` (its error class `JSONDecodeError` is a subclass).
+  solution: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+  explanation: Checksums turn silent corruption into a loud, handleable error.
+- id: replay-log
+  title: 'Milestone 2: Recovery by replay'
+  difficulty: 4
+  prompt: 'The starter has the record codec. Write `apply_record(data, rec)` (a `put` sets `data[key]`, a `del` removes it if present, anything else is ignored) and `replay(log_text)` returning `(data, kept_lines, discarded_count)`. Read the non-blank lines in order. Plain records are applied immediately; records between a `begin` and a `commit` are applied only when the `commit` is read. Stop at the first damaged line: count it and all later lines as discarded. If the log ends inside a `begin` group with no commit, drop that group''s lines (including the `begin`) from `kept_lines` and count them as discarded too.'
+  starter: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        pass
+
+
+    def replay(log_text):
+        """Return (data, kept_lines, discarded_count)."""
+        pass
+  tests:
+  - name: plain operations
+    code: |
+      log = "".join(encode_record(r) + "\n" for r in [
+          {"op": "put", "key": "a", "value": 1}, {"op": "put", "key": "b", "value": 2},
+          {"op": "put", "key": "a", "value": 10}, {"op": "del", "key": "b"}, {"op": "del", "key": "never"}])
+      data, kept, discarded = replay(log)
+      assert data == {"a": 10} and len(kept) == 5 and discarded == 0
+      assert replay("") == ({}, [], 0)
+      assert replay("\n\n") == ({}, [], 0)
+      rec = {"op": "put", "key": "x", "value": 1}
+      d = {}
+      apply_record(d, rec); apply_record(d, {"op": "del", "key": "x"}); apply_record(d, {"op": "begin"})
+      assert d == {}
+  - name: transactions
+    code: |
+      E = encode_record
+      log = "\n".join([E({"op": "put", "key": "a", "value": 1}), E({"op": "begin"}), E({"op": "put", "key": "b", "value": 2}),
+                        E({"op": "del", "key": "a"}), E({"op": "commit"}), E({"op": "put", "key": "c", "value": 3})]) + "\n"
+      data, kept, discarded = replay(log)
+      assert data == {"b": 2, "c": 3} and len(kept) == 6 and discarded == 0
+      # crash: the log stops inside a transaction
+      cut = "\n".join(log.split("\n")[:4]) + "\n"
+      data, kept, discarded = replay(cut)
+      assert data == {"a": 1} and len(kept) == 1 and discarded == 3, (data, len(kept), discarded)
+      # an empty begin without commit
+      data, kept, discarded = replay(E({"op": "put", "key": "a", "value": 1}) + "\n" + E({"op": "begin"}) + "\n")
+      assert data == {"a": 1} and len(kept) == 1 and discarded == 1
+  - name: corruption stops the replay
+    code: |
+      E = encode_record
+      lines = [E({"op": "put", "key": "a", "value": 1}), E({"op": "put", "key": "b", "value": 2}), "garbage here",
+               E({"op": "put", "key": "c", "value": 3}), E({"op": "put", "key": "d", "value": 4})]
+      data, kept, discarded = replay("\n".join(lines) + "\n")
+      assert data == {"a": 1, "b": 2} and len(kept) == 2 and discarded == 3
+      # damage inside a transaction discards the whole group
+      lines = [E({"op": "put", "key": "a", "value": 1}), E({"op": "begin"}), E({"op": "put", "key": "b", "value": 2}), "xxxx", E({"op": "commit"})]
+      data, kept, discarded = replay("\n".join(lines))
+      assert data == {"a": 1} and len(kept) == 1 and discarded == 4, (data, len(kept), discarded)
+  hints:
+  - Keep `pending` as `None` outside a transaction and a list inside one.
+  - '`for ... else` is handy: the `else` runs only when the loop was not stopped by `break`.'
+  solution: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+  explanation: Replay is the single place where durability, integrity and atomicity meet. Every other feature builds on it.
+- id: kv-store
+  title: 'Milestone 3: The key-value store'
+  difficulty: 4
+  prompt: 'The starter has the codec and `replay`. Implement `KVStore`: `__init__(log_text="")` sets `self.data`, `self.log` (the kept lines) and `self.discarded` from `replay`; `put(key, value)` raises `ValueError` unless the key is a non-empty string, then appends an encoded record to `self.log` and applies it; `get(key, default=None)`; `delete(key)` appends a `del` record and returns `True` if the key existed, else `False`; `keys()` returns sorted keys; `scan(prefix="")` returns sorted keys that start with the prefix; `log_text()` returns the log lines each followed by `"\n"`.'
+  starter: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    class KVStore:
+        def __init__(self, log_text=""):
+            pass
+
+        def put(self, key, value):
+            pass
+
+        def get(self, key, default=None):
+            pass
+
+        def delete(self, key):
+            pass
+
+        def keys(self):
+            pass
+
+        def scan(self, prefix=""):
+            pass
+
+        def log_text(self):
+            pass
+  tests:
+  - name: put, get, delete
+    code: |
+      s = KVStore()
+      assert s.get("a") is None and s.get("a", 5) == 5 and s.keys() == []
+      s.put("a", 1); s.put("b", {"x": [1, 2]}); s.put("a", 2)
+      assert s.get("a") == 2 and s.get("b") == {"x": [1, 2]}
+      assert s.delete("a") is True and s.delete("a") is False and s.get("a") is None
+      assert s.keys() == ["b"]
+      for bad in ["", None, 5]:
+          try:
+              s.put(bad, 1)
+          except ValueError:
+              continue
+          raise AssertionError("accepted key " + repr(bad))
+  - name: keys and scan
+    code: |
+      s = KVStore()
+      for k in ["user:2", "user:1", "post:9", "user:10", "u"]:
+          s.put(k, k.upper())
+      assert s.keys() == ["post:9", "u", "user:1", "user:10", "user:2"]
+      assert s.scan("user:") == ["user:1", "user:10", "user:2"]
+      assert s.scan("zzz") == [] and s.scan() == s.keys()
+  - name: persistence
+    code: |
+      s = KVStore()
+      s.put("a", 1); s.put("b", 2); s.delete("a"); s.put("c", {"deep": True})
+      text = s.log_text()
+      assert text.count("\n") == 4 and text.endswith("\n")
+      t = KVStore(text)
+      assert t.keys() == ["b", "c"] and t.get("c") == {"deep": True} and t.discarded == 0
+      t.put("d", 4)
+      u = KVStore(t.log_text())
+      assert u.keys() == ["b", "c", "d"]
+      assert KVStore().log_text() == ""
+  - name: damaged logs
+    code: |
+      s = KVStore()
+      s.put("a", 1); s.put("b", 2); s.put("c", 3)
+      lines = s.log_text().strip().split("\n")
+      broken = "\n".join([lines[0], lines[1][:-2], lines[2]]) + "\n"
+      t = KVStore(broken)
+      assert t.keys() == ["a"] and t.discarded == 2
+      t.put("z", 26)
+      assert KVStore(t.log_text()).keys() == ["a", "z"]
+  hints:
+  - Reuse `apply_record` so that start-up replay and live writes follow exactly the same rules.
+  solution: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    class KVStore:
+        """A tiny log-structured key-value store: every change is appended to a log, and the log is replayed on start-up."""
+
+        def __init__(self, log_text=""):
+            self.data, self.log, self.discarded = replay(log_text)
+            self.tx = None                       # None, or a list of buffered records inside a transaction
+
+        def _write(self, rec):
+            if self.tx is not None:
+                self.tx.append(rec)
+            else:
+                self.log.append(encode_record(rec))
+                apply_record(self.data, rec)
+
+        def put(self, key, value):
+            if not isinstance(key, str) or not key:
+                raise ValueError("key must be a non-empty string")
+            self._write({"op": "put", "key": key, "value": value})
+
+        def get(self, key, default=None):
+            if self.tx is not None:              # a transaction sees its own writes
+                for rec in reversed(self.tx):
+                    if rec["key"] == key:
+                        return rec["value"] if rec["op"] == "put" else default
+            return self.data.get(key, default)
+
+        def delete(self, key):
+            existed = key in self.keys()
+            self._write({"op": "del", "key": key})
+            return existed
+
+        def keys(self):
+            view = dict(self.data)
+            for rec in (self.tx or []):
+                apply_record(view, rec)
+            return sorted(view)
+
+        def scan(self, prefix=""):
+            return [k for k in self.keys() if k.startswith(prefix)]
+
+        def log_text(self):
+            return "".join(line + "\n" for line in self.log)
+  explanation: Because live writes and recovery share `apply_record`, they cannot disagree.
+- id: transactions
+  title: 'Milestone 4: Atomic transactions'
+  difficulty: 5
+  prompt: The starter has a store that already routes writes through `self.tx` (a buffer, or `None` outside a transaction) and reads its own writes. Implement `begin()` (raise `RuntimeError` if a transaction is already open), `commit()` (raise `RuntimeError` if none is open; if the buffer is non-empty append a `begin` record, the buffered records and a `commit` record to `self.log`, then apply the records to `self.data`; an empty transaction writes nothing) and `rollback()` (raise `RuntimeError` if none is open; discard the buffer).
+  starter: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    class KVStore:
+        """A tiny log-structured key-value store: every change is appended to a log, and the log is replayed on start-up."""
+
+        def __init__(self, log_text=""):
+            self.data, self.log, self.discarded = replay(log_text)
+            self.tx = None                       # None, or a list of buffered records inside a transaction
+
+        def _write(self, rec):
+            if self.tx is not None:
+                self.tx.append(rec)
+            else:
+                self.log.append(encode_record(rec))
+                apply_record(self.data, rec)
+
+        def put(self, key, value):
+            if not isinstance(key, str) or not key:
+                raise ValueError("key must be a non-empty string")
+            self._write({"op": "put", "key": key, "value": value})
+
+        def get(self, key, default=None):
+            if self.tx is not None:              # a transaction sees its own writes
+                for rec in reversed(self.tx):
+                    if rec["key"] == key:
+                        return rec["value"] if rec["op"] == "put" else default
+            return self.data.get(key, default)
+
+        def delete(self, key):
+            existed = key in self.keys()
+            self._write({"op": "del", "key": key})
+            return existed
+
+        def keys(self):
+            view = dict(self.data)
+            for rec in (self.tx or []):
+                apply_record(view, rec)
+            return sorted(view)
+
+        def scan(self, prefix=""):
+            return [k for k in self.keys() if k.startswith(prefix)]
+
+        def log_text(self):
+            return "".join(line + "\n" for line in self.log)
+
+        def begin(self):
+            pass
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+  tests:
+  - name: commit
+    code: |
+      s = KVStore()
+      s.put("a", 1)
+      s.begin()
+      s.put("b", 2); s.put("a", 10); s.delete("a")
+      s.commit()
+      assert s.keys() == ["b"] and s.get("b") == 2 and s.get("a") is None
+      assert s.tx is None
+      lines = s.log_text().strip().split("\n")
+      assert len(lines) == 1 + 1 + 3 + 1
+      assert decode_record(lines[1])["op"] == "begin" and decode_record(lines[-1])["op"] == "commit"
+      t = KVStore(s.log_text())
+      assert t.keys() == ["b"]
+  - name: rollback and reading your own writes
+    code: |
+      s = KVStore()
+      s.put("a", 1)
+      s.begin()
+      s.put("a", 2); s.put("new", 3)
+      assert s.get("a") == 2 and s.get("new") == 3 and s.keys() == ["a", "new"]
+      s.delete("a")
+      assert s.get("a") is None and s.keys() == ["new"]
+      s.rollback()
+      assert s.get("a") == 1 and s.get("new") is None and s.keys() == ["a"]
+      assert len(s.log) == 1
+  - name: misuse and empty transactions
+    code: |
+      s = KVStore()
+      for call in (s.commit, s.rollback):
+          try:
+              call()
+          except RuntimeError:
+              pass
+          else:
+              raise AssertionError("no error")
+      s.begin()
+      try:
+          s.begin()
+          raise AssertionError("nested begin accepted")
+      except RuntimeError:
+          pass
+      s.commit()
+      assert s.log == []
+      s.begin(); s.rollback(); s.put("k", 1)
+      assert len(s.log) == 1
+  - name: crash safety
+    code: |
+      s = KVStore()
+      s.put("a", 1)
+      s.begin(); s.put("b", 2); s.put("c", 3); s.commit()
+      lines = s.log_text().strip().split("\n")
+      assert len(lines) == 5
+      for cut in range(1, 5):
+          t = KVStore("\n".join(lines[:cut]) + "\n")
+          assert t.keys() == ["a"], (cut, t.keys())
+      assert KVStore("\n".join(lines) + "\n").keys() == ["a", "b", "c"]
+      t = KVStore("\n".join(lines[:3]) + "\n")
+      t.put("d", 4)
+      assert KVStore(t.log_text()).keys() == ["a", "d"]
+  hints:
+  - Take the buffer out with `records, self.tx = self.tx, None` before writing so that the log writes are not buffered again.
+  solution: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    class KVStore:
+        """A tiny log-structured key-value store: every change is appended to a log, and the log is replayed on start-up."""
+
+        def __init__(self, log_text=""):
+            self.data, self.log, self.discarded = replay(log_text)
+            self.tx = None                       # None, or a list of buffered records inside a transaction
+
+        def _write(self, rec):
+            if self.tx is not None:
+                self.tx.append(rec)
+            else:
+                self.log.append(encode_record(rec))
+                apply_record(self.data, rec)
+
+        def put(self, key, value):
+            if not isinstance(key, str) or not key:
+                raise ValueError("key must be a non-empty string")
+            self._write({"op": "put", "key": key, "value": value})
+
+        def get(self, key, default=None):
+            if self.tx is not None:              # a transaction sees its own writes
+                for rec in reversed(self.tx):
+                    if rec["key"] == key:
+                        return rec["value"] if rec["op"] == "put" else default
+            return self.data.get(key, default)
+
+        def delete(self, key):
+            existed = key in self.keys()
+            self._write({"op": "del", "key": key})
+            return existed
+
+        def keys(self):
+            view = dict(self.data)
+            for rec in (self.tx or []):
+                apply_record(view, rec)
+            return sorted(view)
+
+        def scan(self, prefix=""):
+            return [k for k in self.keys() if k.startswith(prefix)]
+
+        def log_text(self):
+            return "".join(line + "\n" for line in self.log)
+
+        def begin(self):
+            if self.tx is not None:
+                raise RuntimeError("transaction already open")
+            self.tx = []
+
+        def commit(self):
+            if self.tx is None:
+                raise RuntimeError("no open transaction")
+            records, self.tx = self.tx, None
+            if records:
+                self.log.append(encode_record({"op": "begin"}))
+                for rec in records:
+                    self.log.append(encode_record(rec))
+                self.log.append(encode_record({"op": "commit"}))
+                for rec in records:
+                    apply_record(self.data, rec)
+
+        def rollback(self):
+            if self.tx is None:
+                raise RuntimeError("no open transaction")
+            self.tx = None
+  explanation: 'The commit marker is the point of atomicity: everything before it in the log counts only if the marker made it to disk.'
+- id: compaction
+  title: 'Milestone 5: Compaction'
+  difficulty: 3
+  prompt: Write `compact_log(log_text)` returning a new log text with exactly one `put` record per live key, sorted by key, each line followed by `"\n"` (use `replay`, so transactions and damage are handled; an empty or all-deleted log gives `""`). Write `garbage_ratio(log_text)` returning `1 - live_keys / valid_lines`, where `valid_lines` is the number of kept lines from `replay`, or `0.0` if there are none.
+  starter: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    def compact_log(log_text):
+        pass
+
+
+    def garbage_ratio(log_text):
+        pass
+  tests:
+  - name: compaction
+    code: |
+      E = encode_record
+      recs = [{"op": "put", "key": "a", "value": 1}, {"op": "put", "key": "b", "value": 2}] + \
+             [{"op": "put", "key": "a", "value": i} for i in range(2, 12)] + [{"op": "del", "key": "b"}, {"op": "put", "key": "c", "value": "x"}]
+      log = "".join(E(r) + "\n" for r in recs)
+      small = compact_log(log)
+      assert small.count("\n") == 2 and len(small) < len(log) / 3
+      assert replay(small)[0] == replay(log)[0] == {"a": 11, "c": "x"}
+      assert [decode_record(l)["key"] for l in small.strip().split("\n")] == ["a", "c"]
+      assert compact_log("") == ""
+      assert compact_log(compact_log(log)) == small
+  - name: compaction drops transactions and damage
+    code: |
+      E = encode_record
+      log = "\n".join([E({"op": "put", "key": "a", "value": 1}), E({"op": "begin"}), E({"op": "put", "key": "b", "value": 2}),
+                        E({"op": "commit"}), E({"op": "begin"}), E({"op": "put", "key": "c", "value": 3}), "garbage"]) + "\n"
+      small = compact_log(log)
+      assert replay(small) == ({"a": 1, "b": 2}, small.strip().split("\n"), 0)
+      assert "begin" not in small and "commit" not in small
+  - name: garbage ratio
+    code: |
+      E = encode_record
+      assert garbage_ratio("") == 0.0
+      one = E({"op": "put", "key": "a", "value": 1}) + "\n"
+      assert garbage_ratio(one) == 0.0
+      log = one * 4
+      assert abs(garbage_ratio(log) - 0.75) < 1e-12
+      log2 = one + E({"op": "put", "key": "b", "value": 1}) + "\n" + E({"op": "del", "key": "a"}) + "\n"
+      assert abs(garbage_ratio(log2) - (1 - 1 / 3)) < 1e-12
+  hints:
+  - Replay the log to get the live data, then encode one put per key.
+  solution: |
+    import hashlib
+    import json
+
+
+    class CorruptRecord(Exception):
+        pass
+
+
+    def checksum(text):
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def encode_record(record):
+        """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+        body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+        return checksum(body) + " " + body
+
+
+    def decode_record(line):
+        """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+        check, space, body = line.partition(" ")
+        if not space or len(check) != 8 or checksum(body) != check:
+            raise CorruptRecord("bad checksum")
+        try:
+            record = json.loads(body)
+        except ValueError:
+            raise CorruptRecord("bad json")
+        if not isinstance(record, dict) or "op" not in record:
+            raise CorruptRecord("not a record")
+        return record
+
+
+    def apply_record(data, rec):
+        if rec["op"] == "put":
+            data[rec["key"]] = rec["value"]
+        elif rec["op"] == "del":
+            data.pop(rec["key"], None)
+
+
+    def replay(log_text):
+        """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+        - Plain put/del records are applied as they are read.
+        - A group written between a begin record and a commit record is applied only at the commit.
+        - Reading stops at the first damaged line; everything after it is discarded.
+        - A begin group with no commit at the end of the log (a crash) is discarded.
+        """
+        data, kept, pending = {}, [], None
+        lines = [l for l in log_text.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            try:
+                rec = decode_record(line)
+            except CorruptRecord:
+                discarded = len(lines) - i
+                break
+            else:
+                kept.append(line)
+                if rec["op"] == "begin":
+                    pending = []
+                elif rec["op"] == "commit":
+                    for r in pending or []:
+                        apply_record(data, r)
+                    pending = None
+                elif pending is not None:
+                    pending.append(rec)
+                else:
+                    apply_record(data, rec)
+        else:
+            discarded = 0
+        if pending is not None:
+            drop = len(pending) + 1
+            kept = kept[:len(kept) - drop]
+            discarded += drop
+        return data, kept, discarded
+
+
+    def compact_log(log_text):
+        """Return a new log text holding one put record per live key (sorted by key)."""
+        data, _, _ = replay(log_text)
+        return "".join(encode_record({"op": "put", "key": k, "value": data[k]}) + "\n" for k in sorted(data))
+
+
+    def garbage_ratio(log_text):
+        """Fraction of the valid log lines that are not needed to rebuild the data (0.0 for an empty log)."""
+        data, kept, _ = replay(log_text)
+        return 0.0 if not kept else 1 - len(data) / len(kept)
+  explanation: A background job could call `compact_log` whenever `garbage_ratio` passes a threshold such as 0.5.
+commonMistakes:
+- title: Changing the data before the log record is safe
+  explanation: Write-ahead means the log comes first, so a crash can always be recovered.
+- title: Applying a transaction's records before the commit marker
+  explanation: Recovery would then apply half a transaction.
+- title: Continuing to read after a damaged line
+  explanation: After a torn write you cannot know what the rest means. Stop and discard.
+- title: Ignoring key validation
+  explanation: Reject bad keys at the door; stored data becomes tomorrow's input.
+- title: Never compacting
+  explanation: The log and the recovery time grow without limit.
+summary:
+- A write-ahead log makes changes durable by appending records first; the in-memory dictionary is a cache rebuilt by replay.
+- Checksums detect corruption; recovery stops at the first damaged line.
+- Transactions buffer writes and become atomic through a commit marker in the log.
+- Compaction keeps one put per live key; the garbage ratio says when it is worthwhile.
+- Secondary indexes speed queries at the cost of extra work on every write and on recovery.
+next: u18-webservice
+quiz:
+- type: mcq
+  question: Why is appending to a log a good way to write data?
+  options:
+  - Appends are cheap and a crash damages only the end
+  - It uses no disk space
+  - It encrypts the data
+  - It sorts the data
+  answer: 0
+  explanation: No seeking or overwriting is needed.
+- type: mcq
+  question: What does a checksum let you do?
+  options:
+  - Detect that a record was damaged or altered
+  - Compress the record
+  - Hide the record
+  - Speed up reads
+  answer: 0
+  explanation: A mismatch with the recomputed hash reveals the damage.
+- type: mcq
+  question: How does replay make a transaction atomic?
+  options:
+  - It applies the group only when the commit marker is found
+  - It applies each record twice
+  - It sorts the records
+  - It deletes the log
+  answer: 0
+  explanation: A group without a commit is discarded.
+- type: mcq
+  question: What does compaction remove?
+  options:
+  - Old records of keys that were overwritten or deleted
+  - All keys
+  - The checksums
+  - The newest record
+  answer: 0
+  explanation: Only live values need to be kept.
+- type: mcq
+  question: What is the cost of a secondary index?
+  options:
+  - It must be updated on every write and rebuilt on recovery
+  - It makes the log unreadable
+  - It removes durability
+  - It prevents deletes
+  answer: 0
+  explanation: Faster queries, slower writes.
+- type: mcq
+  question: What does write-ahead mean?
+  options:
+  - Record the change in the log before applying it
+  - Write faster than the disk allows
+  - Write the data twice
+  - Write only ahead of time
+  answer: 0
+  explanation: This lets recovery redo everything that was acknowledged.
+- type: code
+  question: 'Write `live_count(log_text)` that returns how many keys are live after replaying a log made of plain `put` and `del` lines (no checksums): each line is `put KEY VALUE` or `del KEY`, one per line. Ignore blank lines.'
+  starter: |
+    def live_count(log_text):
+        pass
+  tests:
+  - name: live
+    code: |
+      assert live_count("put a 1\nput b 2\ndel a\nput c 3\n") == 2
+      assert live_count("") == 0
+      assert live_count("put a 1\nput a 2\n\ndel b\n") == 1
+  solution: |
+    def live_count(log_text):
+        live = set()
+        for line in log_text.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0] == "put":
+                live.add(parts[1])
+            elif parts[0] == "del":
+                live.discard(parts[1])
+        return len(live)

@@ -1,0 +1,2092 @@
+id: u18-ml-pipeline
+title: 'Capstone E: A Machine Learning Pipeline'
+minutes: 100
+objective: 'Build a complete, honest machine-learning pipeline from raw CSV text to a fairness report: a quote-aware CSV parser, cleaning with imputation, a reproducible train/test split, leak-free scaling and one-hot encoding, logistic regression trained from scratch, evaluation metrics and a per-group audit. This capstone brings together Units 4, 9, 13, 14, 16 and 17.'
+outcomes:
+- Parse real-world CSV, including quoted commas, quotes and line breaks
+- Clean data reproducibly and report exactly what was changed
+- Split data and fit scalers and encoders on training data only, to avoid leakage
+- Train and evaluate a logistic regression classifier and read precision, recall and F1
+- Audit a model for group differences and explain what such numbers can and cannot show
+sections:
+- heading: From raw text to a trustworthy dataset
+  body: |-
+    Most of a data project is not modelling. Real files are messy: numbers are blank or say `NA` or `n/a`, text has stray capitals and spaces, a field contains a comma inside quotes, and a few rows have no answer at all. A **pipeline** is a fixed sequence of steps that turns such raw text into something a model can learn from, written as ordinary functions so that every step can be tested and re-run.
+
+    **CSV** looks trivial and is not: `"Smith, Ann"` is one field, `""` inside quotes means a literal quote, and a quoted field may contain a line break. A correct parser is a small **state machine** (Unit 12) that remembers whether it is inside quotes. Splitting on commas is the classic bug.
+
+    **Cleaning** makes decisions, and every decision should be visible. We drop rows with no valid target (the answer we want to predict), replace missing numbers by the **median** (robust to outliers), mark missing categories as `unknown`, and return a **report** of how many rows were dropped and values imputed. Silent cleaning hides problems; a report lets you notice that 40% of one column was missing.
+- heading: Honest evaluation and logistic regression
+  body: |-
+    A model must be judged on data it has never seen, so we **split** the cleaned rows into a **training set** (to learn from) and a **test set** (to grade on). The split uses `random.Random(seed)`, so it is shuffled but reproducible.
+
+    The most common serious mistake is **data leakage**: letting information from the test set influence training. If you compute the mean and standard deviation for scaling from *all* rows, the test set has already shaped your features. So `fit_scaler` and `fit_encoder` run on the training rows only, and the same fitted scaler and encoder are then *applied* to the test rows. Categories seen only in the test set simply become all zeros.
+
+    **Standardising** (subtracting the mean and dividing by the standard deviation) puts income in dollars and age in years on a common scale so gradient descent behaves. **One-hot encoding** turns a category into one 0/1 column per value. **Logistic regression** (Unit 17) multiplies features by weights, adds a bias and squeezes the result through the **sigmoid** to get a probability; training minimises **log loss** by gradient descent. Our `sigmoid` is written carefully so that a huge negative or positive input cannot overflow.
+
+    Always compare with a **baseline**: a model that always predicts the majority class. If 95% of cases are negative, 95% accuracy means nothing. That is why we also read **precision** (of the ones we flagged, how many were right), **recall** (of the real positives, how many we found) and **F1** (their harmonic mean), all from the **confusion matrix** of true and false positives and negatives.
+- heading: Fairness, limits and responsibility
+  body: |-
+    A model that approves loans, ranks job candidates or flags students affects real people, so accuracy is not enough. A **group report** computes the same statistics separately for each group: the **selection rate** (share of the group that the model says yes to) and the **true positive rate** (share of the group's genuinely qualified people who get a yes). The largest difference between groups is the **demographic parity gap** (for selection rate) or the **equal opportunity gap** (for true positive rate).
+
+    Our synthetic data contains a *historical bias*: at the same income and debt, group `b` was approved less often. A model trained on those labels learns the pattern, and when it can see the group column its selection gap grows. **Removing the sensitive column does not make a model fair**: other columns can act as **proxies**, and here the gap stayed small without it only because this toy data has no strong proxy for the group. These numbers come from invented data and one random split; on a real project you would use far more data, check confidence intervals and ask whether the labels themselves are the problem.
+
+    Different fairness definitions can contradict one another, so choosing one is a **human and legal decision**, not a computation. What engineers can do: measure, report honestly, keep a human in the loop for consequential decisions, document the data and its limits, and be willing to not ship a model (Unit 16's security mindset applies here as well: assume inputs and incentives are not all benign).
+examples:
+- title: Parsing messy CSV
+  intro: Quoted commas, doubled quotes and line breaks inside fields are handled; broken files are refused with a clear error.
+  code: |
+    def parse_csv(text):
+        """Parse CSV text into (header, rows) where rows is a list of dictionaries.
+
+        Fields may be quoted: a quoted field can contain commas, line breaks and "" (an escaped quote).
+        Blank lines are ignored. Raises ValueError for empty input, duplicate header names,
+        an unterminated or misplaced quote, or a row whose field count differs from the header's.
+        """
+        records, record, field = [], [], ""
+        in_quotes = closed = False          # closed: a quoted field has just ended
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if in_quotes:
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        field += '"'
+                        i += 1
+                    else:
+                        in_quotes, closed = False, True
+                else:
+                    field += ch
+            elif ch == '"':
+                if field != "" or closed:
+                    raise ValueError("unexpected quote")
+                in_quotes = True
+            elif closed and ch not in ",\r\n":
+                raise ValueError("text after a closing quote")
+            elif ch == ",":
+                record.append(field)
+                field, closed = "", False
+            elif ch in "\r\n":
+                if ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                if record or field != "":
+                    record.append(field)
+                    records.append(record)
+                record, field, closed = [], "", False
+            else:
+                field += ch
+            i += 1
+        if in_quotes:
+            raise ValueError("unterminated quote")
+        if record or field != "":
+            record.append(field)
+            records.append(record)
+        if not records:
+            raise ValueError("empty CSV")
+        header = records[0]
+        if len(set(header)) != len(header):
+            raise ValueError("duplicate column names")
+        rows = []
+        for number, rec in enumerate(records[1:], start=2):
+            if len(rec) != len(header):
+                raise ValueError(f"line {number} has {len(rec)} fields, expected {len(header)}")
+            rows.append(dict(zip(header, rec)))
+        return header, rows
+
+
+    tricky = 'name,note,score\n"Smith, Ann","said ""hi""",3\n"two\nlines",plain,\nBo,,7\n'
+    header, rows = parse_csv(tricky)
+    print(header)
+    for r in rows:
+        print(r)
+    for bad in ['a,b\n1', 'a\n"open']:
+        try:
+            parse_csv(bad)
+        except ValueError as e:
+            print("refused:", e)
+  output: |
+    ['name', 'note', 'score']
+    {'name': 'Smith, Ann', 'note': 'said "hi"', 'score': '3'}
+    {'name': 'two\nlines', 'note': 'plain', 'score': ''}
+    {'name': 'Bo', 'note': '', 'score': '7'}
+    refused: line 2 has 1 fields, expected 2
+    refused: unterminated quote
+  lines:
+  - line: 60
+    note: The quoted comma, the doubled quotes and the line break all stay inside their fields.
+  - line: 66
+    note: A row with the wrong number of fields or an open quote is refused.
+- title: Cleaning with a report
+  intro: 1,200 synthetic loan applications with blanks, junk and mixed capitalisation become typed rows, and the report says what changed.
+  code: |
+    def parse_csv(text):
+        """Parse CSV text into (header, rows) where rows is a list of dictionaries.
+
+        Fields may be quoted: a quoted field can contain commas, line breaks and "" (an escaped quote).
+        Blank lines are ignored. Raises ValueError for empty input, duplicate header names,
+        an unterminated or misplaced quote, or a row whose field count differs from the header's.
+        """
+        records, record, field = [], [], ""
+        in_quotes = closed = False          # closed: a quoted field has just ended
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if in_quotes:
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        field += '"'
+                        i += 1
+                    else:
+                        in_quotes, closed = False, True
+                else:
+                    field += ch
+            elif ch == '"':
+                if field != "" or closed:
+                    raise ValueError("unexpected quote")
+                in_quotes = True
+            elif closed and ch not in ",\r\n":
+                raise ValueError("text after a closing quote")
+            elif ch == ",":
+                record.append(field)
+                field, closed = "", False
+            elif ch in "\r\n":
+                if ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                if record or field != "":
+                    record.append(field)
+                    records.append(record)
+                record, field, closed = [], "", False
+            else:
+                field += ch
+            i += 1
+        if in_quotes:
+            raise ValueError("unterminated quote")
+        if record or field != "":
+            record.append(field)
+            records.append(record)
+        if not records:
+            raise ValueError("empty CSV")
+        header = records[0]
+        if len(set(header)) != len(header):
+            raise ValueError("duplicate column names")
+        rows = []
+        for number, rec in enumerate(records[1:], start=2):
+            if len(rec) != len(header):
+                raise ValueError(f"line {number} has {len(rec)} fields, expected {len(header)}")
+            rows.append(dict(zip(header, rec)))
+        return header, rows
+
+
+    MISSING = {"", "na", "n/a", "null", "none", "nan", "?"}
+
+
+    def is_missing(text):
+        return text.strip().lower() in MISSING
+
+
+    def to_number(text):
+        """A finite float, or None when the text is missing or not a number."""
+        if is_missing(text):
+            return None
+        try:
+            x = float(text)
+        except ValueError:
+            return None
+        return x if abs(x) != float("inf") else None
+
+
+    def median(values):
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+    def clean(rows, schema):
+        """Turn raw text rows into typed rows. schema maps column -> "num", "cat" or "target" (exactly one target).
+
+        Rows whose target is not "0" or "1" are dropped. A numeric value that is missing or not a number is replaced by the
+        median of the usable values of the kept rows (0.0 if there are none). A categorical value is stripped and
+        lower-cased; a missing one becomes "unknown". Columns that are not in the schema are left out.
+        Returns (clean_rows, report) with report = {"dropped": n, "imputed": {column: count}} (only columns with count > 0).
+        """
+        target = next(col for col, kind in schema.items() if kind == "target")
+        kept = [r for r in rows if r[target].strip() in ("0", "1")]
+        report = {"dropped": len(rows) - len(kept), "imputed": {}}
+        medians = {}
+        for col, kind in schema.items():
+            if kind == "num":
+                usable = [x for x in (to_number(r[col]) for r in kept) if x is not None]
+                medians[col] = median(usable) if usable else 0.0
+        out = []
+        for r in kept:
+            row = {}
+            for col, kind in schema.items():
+                text = r[col]
+                if kind == "num":
+                    x = to_number(text)
+                    if x is None:
+                        x = medians[col]
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    row[col] = x
+                elif kind == "cat":
+                    if is_missing(text):
+                        row[col] = "unknown"
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    else:
+                        row[col] = text.strip().lower()
+                else:
+                    row[col] = int(text.strip())
+            out.append(row)
+        return out, report
+
+
+    import random
+
+
+    def train_test_split(rows, test_fraction, seed):
+        """Shuffle the indices with random.Random(seed), use the first n_test as the test set. Does not change `rows`.
+
+        n_test = round(len(rows) * test_fraction), but at least 1 and at most len(rows) - 1.
+        Raises ValueError unless 0 < test_fraction < 1 and there are at least 2 rows.
+        """
+        if not 0 < test_fraction < 1 or len(rows) < 2:
+            raise ValueError("need 0 < test_fraction < 1 and at least 2 rows")
+        order = list(range(len(rows)))
+        random.Random(seed).shuffle(order)
+        n_test = min(max(1, round(len(rows) * test_fraction)), len(rows) - 1)
+        return [rows[i] for i in order[n_test:]], [rows[i] for i in order[:n_test]]
+
+
+    def fit_scaler(rows, cols):
+        """For each numeric column: (mean, standard deviation), using the population formula. A standard deviation of 0 becomes 1.0."""
+        if not rows:
+            raise ValueError("cannot fit on no rows")
+        scaler = {}
+        for c in cols:
+            values = [r[c] for r in rows]
+            mean = sum(values) / len(values)
+            std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+            scaler[c] = (mean, std or 1.0)
+        return scaler
+
+
+    def fit_encoder(rows, cols):
+        """For each categorical column: the sorted list of categories seen."""
+        return {c: sorted({r[c] for r in rows}) for c in cols}
+
+
+    def vectorize(rows, scaler, encoder):
+        """One feature list per row: z-scores for the scaler's columns, then one-hot flags (1.0 or 0.0) for each category of each
+        encoder column, in order. A category not seen during fitting gives all zeros for that column."""
+        X = []
+        for r in rows:
+            x = [(r[c] - mean) / std for c, (mean, std) in scaler.items()]
+            for c, categories in encoder.items():
+                x.extend(1.0 if r[c] == cat else 0.0 for cat in categories)
+            X.append(x)
+        return X
+
+
+    import math
+
+
+    def sigmoid(z):
+        if z >= 0:
+            return 1 / (1 + math.exp(-z))
+        e = math.exp(z)
+        return e / (1 + e)
+
+
+    def predict_proba(model, x):
+        weights, bias = model
+        return sigmoid(sum(w * v for w, v in zip(weights, x)) + bias)
+
+
+    def train_logistic(X, y, lr=0.1, epochs=200, l2=0.0):
+        """Batch gradient descent for logistic regression. Returns (weights, bias).
+
+        Every epoch: gradient of the average log loss over all rows, plus l2 * weight for each weight (not the bias).
+        Starts from all zeros, so training is deterministic.
+        """
+        n, d = len(X), len(X[0])
+        weights, bias = [0.0] * d, 0.0
+        for _ in range(epochs):
+            grad_w, grad_b = [0.0] * d, 0.0
+            for x, target in zip(X, y):
+                error = predict_proba((weights, bias), x) - target
+                for j in range(d):
+                    grad_w[j] += error * x[j]
+                grad_b += error
+            for j in range(d):
+                weights[j] -= lr * (grad_w[j] / n + l2 * weights[j])
+            bias -= lr * grad_b / n
+        return weights, bias
+
+
+    def log_loss(model, X, y):
+        total = 0.0
+        for x, target in zip(X, y):
+            p = min(max(predict_proba(model, x), 1e-12), 1 - 1e-12)
+            total -= target * math.log(p) + (1 - target) * math.log(1 - p)
+        return total / len(X)
+
+
+    def predict(model, X, threshold=0.5):
+        return [1 if predict_proba(model, x) >= threshold else 0 for x in X]
+
+
+    def confusion(y_true, y_pred):
+        pairs = list(zip(y_true, y_pred))
+        return {"tp": sum(1 for t, p in pairs if t == 1 and p == 1), "fp": sum(1 for t, p in pairs if t == 0 and p == 1),
+                "tn": sum(1 for t, p in pairs if t == 0 and p == 0), "fn": sum(1 for t, p in pairs if t == 1 and p == 0)}
+
+
+    def metrics(y_true, y_pred):
+        """accuracy, precision, recall and f1 (each 0.0 when its denominator is 0) and the confusion counts."""
+        c = confusion(y_true, y_pred)
+        total = len(y_true)
+        accuracy = (c["tp"] + c["tn"]) / total if total else 0.0
+        precision = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
+        recall = c["tp"] / (c["tp"] + c["fn"]) if c["tp"] + c["fn"] else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, "confusion": c}
+
+
+    def group_report(groups, y_true, y_pred):
+        """Per group (keys in sorted order): size, selection_rate (share predicted 1), tpr (recall; None if the group has no
+        actual positives) and accuracy."""
+        report = {}
+        for g in sorted(set(groups)):
+            idx = [i for i, member in enumerate(groups) if member == g]
+            yt, yp = [y_true[i] for i in idx], [y_pred[i] for i in idx]
+            positives = sum(yt)
+            report[g] = {"size": len(idx), "selection_rate": sum(yp) / len(idx),
+                         "tpr": sum(1 for t, p in zip(yt, yp) if t == 1 and p == 1) / positives if positives else None,
+                         "accuracy": sum(1 for t, p in zip(yt, yp) if t == p) / len(idx)}
+        return report
+
+
+    def disparity(report, key):
+        """Largest minus smallest value of `key` across groups, ignoring None; 0.0 if fewer than two groups have a value."""
+        values = [v[key] for v in report.values() if v[key] is not None]
+        return max(values) - min(values) if len(values) >= 2 else 0.0
+
+
+    def make_csv(n, seed):
+        """Synthetic loan data with realistic mess: blanks, junk, a quoted comma, and a historical bias against group b."""
+        rng = random.Random(seed)
+        lines = ["id,age,income,debt,region,group,notes,approved"]
+        for i in range(n):
+            age = rng.randint(21, 65)
+            income = round(rng.gauss(52000, 15000))
+            debt = round(rng.uniform(0, 30000))
+            region = rng.choice(["North", "South", "East", "West"])
+            group = "a" if rng.random() < 0.6 else "b"
+            score = (income - debt) / 12000 + rng.gauss(0, 0.8) - (0.9 if group == "b" else 0.0)
+            approved = 1 if score > 2.6 else 0
+            note = rng.choice(["", "", "first-time", '"moved, recently"', '"said ""urgent"""'])
+            fields = [str(age), str(income), str(debt), region, group]
+            if rng.random() < 0.05:
+                fields[1] = ""
+            if rng.random() < 0.04:
+                fields[0] = "NA"
+            if rng.random() < 0.03:
+                fields[2] = "n/a"
+            if rng.random() < 0.02:
+                fields[3] = "abc"
+            if rng.random() < 0.03:
+                fields[4] = "  " + fields[4].upper() + " "
+            label = "" if rng.random() < 0.02 else str(approved)
+            lines.append(",".join([str(i + 1)] + fields[:-1] + [fields[-1], note, label]))
+        return "\n".join(lines) + "\n"
+
+    SCHEMA = {"age": "num", "income": "num", "debt": "num", "region": "cat", "group": "cat", "approved": "target"}
+
+
+    text = make_csv(1200, seed=7)
+    print(text.splitlines()[0])
+    print(text.splitlines()[2])
+    header, raw = parse_csv(text)
+    rows, report = clean(raw, SCHEMA)
+    print(len(raw), "raw rows ->", len(rows), "clean rows")
+    print("report:", report)
+    print(rows[1])
+  output: |
+    id,age,income,debt,region,group,notes,approved
+    2,24,,6697,North,a,"moved, recently",1
+    1200 raw rows -> 1173 clean rows
+    report: {'dropped': 27, 'imputed': {'income': 57, 'age': 40, 'debt': 38}}
+    {'age': 24.0, 'income': 52314.0, 'debt': 6697.0, 'region': 'north', 'group': 'a', 'approved': 1}
+  lines:
+  - line: 289
+    note: Cleaning returns the typed rows and a report of what it changed.
+  - line: 291
+    note: Counts per column show where the data was weakest.
+- title: Splitting without leaking
+  intro: 'Scaling statistics come from the training rows only. Fitting on everything gives slightly different numbers: the test set would have leaked in.'
+  code: |
+    def parse_csv(text):
+        """Parse CSV text into (header, rows) where rows is a list of dictionaries.
+
+        Fields may be quoted: a quoted field can contain commas, line breaks and "" (an escaped quote).
+        Blank lines are ignored. Raises ValueError for empty input, duplicate header names,
+        an unterminated or misplaced quote, or a row whose field count differs from the header's.
+        """
+        records, record, field = [], [], ""
+        in_quotes = closed = False          # closed: a quoted field has just ended
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if in_quotes:
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        field += '"'
+                        i += 1
+                    else:
+                        in_quotes, closed = False, True
+                else:
+                    field += ch
+            elif ch == '"':
+                if field != "" or closed:
+                    raise ValueError("unexpected quote")
+                in_quotes = True
+            elif closed and ch not in ",\r\n":
+                raise ValueError("text after a closing quote")
+            elif ch == ",":
+                record.append(field)
+                field, closed = "", False
+            elif ch in "\r\n":
+                if ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                if record or field != "":
+                    record.append(field)
+                    records.append(record)
+                record, field, closed = [], "", False
+            else:
+                field += ch
+            i += 1
+        if in_quotes:
+            raise ValueError("unterminated quote")
+        if record or field != "":
+            record.append(field)
+            records.append(record)
+        if not records:
+            raise ValueError("empty CSV")
+        header = records[0]
+        if len(set(header)) != len(header):
+            raise ValueError("duplicate column names")
+        rows = []
+        for number, rec in enumerate(records[1:], start=2):
+            if len(rec) != len(header):
+                raise ValueError(f"line {number} has {len(rec)} fields, expected {len(header)}")
+            rows.append(dict(zip(header, rec)))
+        return header, rows
+
+
+    MISSING = {"", "na", "n/a", "null", "none", "nan", "?"}
+
+
+    def is_missing(text):
+        return text.strip().lower() in MISSING
+
+
+    def to_number(text):
+        """A finite float, or None when the text is missing or not a number."""
+        if is_missing(text):
+            return None
+        try:
+            x = float(text)
+        except ValueError:
+            return None
+        return x if abs(x) != float("inf") else None
+
+
+    def median(values):
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+    def clean(rows, schema):
+        """Turn raw text rows into typed rows. schema maps column -> "num", "cat" or "target" (exactly one target).
+
+        Rows whose target is not "0" or "1" are dropped. A numeric value that is missing or not a number is replaced by the
+        median of the usable values of the kept rows (0.0 if there are none). A categorical value is stripped and
+        lower-cased; a missing one becomes "unknown". Columns that are not in the schema are left out.
+        Returns (clean_rows, report) with report = {"dropped": n, "imputed": {column: count}} (only columns with count > 0).
+        """
+        target = next(col for col, kind in schema.items() if kind == "target")
+        kept = [r for r in rows if r[target].strip() in ("0", "1")]
+        report = {"dropped": len(rows) - len(kept), "imputed": {}}
+        medians = {}
+        for col, kind in schema.items():
+            if kind == "num":
+                usable = [x for x in (to_number(r[col]) for r in kept) if x is not None]
+                medians[col] = median(usable) if usable else 0.0
+        out = []
+        for r in kept:
+            row = {}
+            for col, kind in schema.items():
+                text = r[col]
+                if kind == "num":
+                    x = to_number(text)
+                    if x is None:
+                        x = medians[col]
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    row[col] = x
+                elif kind == "cat":
+                    if is_missing(text):
+                        row[col] = "unknown"
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    else:
+                        row[col] = text.strip().lower()
+                else:
+                    row[col] = int(text.strip())
+            out.append(row)
+        return out, report
+
+
+    import random
+
+
+    def train_test_split(rows, test_fraction, seed):
+        """Shuffle the indices with random.Random(seed), use the first n_test as the test set. Does not change `rows`.
+
+        n_test = round(len(rows) * test_fraction), but at least 1 and at most len(rows) - 1.
+        Raises ValueError unless 0 < test_fraction < 1 and there are at least 2 rows.
+        """
+        if not 0 < test_fraction < 1 or len(rows) < 2:
+            raise ValueError("need 0 < test_fraction < 1 and at least 2 rows")
+        order = list(range(len(rows)))
+        random.Random(seed).shuffle(order)
+        n_test = min(max(1, round(len(rows) * test_fraction)), len(rows) - 1)
+        return [rows[i] for i in order[n_test:]], [rows[i] for i in order[:n_test]]
+
+
+    def fit_scaler(rows, cols):
+        """For each numeric column: (mean, standard deviation), using the population formula. A standard deviation of 0 becomes 1.0."""
+        if not rows:
+            raise ValueError("cannot fit on no rows")
+        scaler = {}
+        for c in cols:
+            values = [r[c] for r in rows]
+            mean = sum(values) / len(values)
+            std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+            scaler[c] = (mean, std or 1.0)
+        return scaler
+
+
+    def fit_encoder(rows, cols):
+        """For each categorical column: the sorted list of categories seen."""
+        return {c: sorted({r[c] for r in rows}) for c in cols}
+
+
+    def vectorize(rows, scaler, encoder):
+        """One feature list per row: z-scores for the scaler's columns, then one-hot flags (1.0 or 0.0) for each category of each
+        encoder column, in order. A category not seen during fitting gives all zeros for that column."""
+        X = []
+        for r in rows:
+            x = [(r[c] - mean) / std for c, (mean, std) in scaler.items()]
+            for c, categories in encoder.items():
+                x.extend(1.0 if r[c] == cat else 0.0 for cat in categories)
+            X.append(x)
+        return X
+
+
+    import math
+
+
+    def sigmoid(z):
+        if z >= 0:
+            return 1 / (1 + math.exp(-z))
+        e = math.exp(z)
+        return e / (1 + e)
+
+
+    def predict_proba(model, x):
+        weights, bias = model
+        return sigmoid(sum(w * v for w, v in zip(weights, x)) + bias)
+
+
+    def train_logistic(X, y, lr=0.1, epochs=200, l2=0.0):
+        """Batch gradient descent for logistic regression. Returns (weights, bias).
+
+        Every epoch: gradient of the average log loss over all rows, plus l2 * weight for each weight (not the bias).
+        Starts from all zeros, so training is deterministic.
+        """
+        n, d = len(X), len(X[0])
+        weights, bias = [0.0] * d, 0.0
+        for _ in range(epochs):
+            grad_w, grad_b = [0.0] * d, 0.0
+            for x, target in zip(X, y):
+                error = predict_proba((weights, bias), x) - target
+                for j in range(d):
+                    grad_w[j] += error * x[j]
+                grad_b += error
+            for j in range(d):
+                weights[j] -= lr * (grad_w[j] / n + l2 * weights[j])
+            bias -= lr * grad_b / n
+        return weights, bias
+
+
+    def log_loss(model, X, y):
+        total = 0.0
+        for x, target in zip(X, y):
+            p = min(max(predict_proba(model, x), 1e-12), 1 - 1e-12)
+            total -= target * math.log(p) + (1 - target) * math.log(1 - p)
+        return total / len(X)
+
+
+    def predict(model, X, threshold=0.5):
+        return [1 if predict_proba(model, x) >= threshold else 0 for x in X]
+
+
+    def confusion(y_true, y_pred):
+        pairs = list(zip(y_true, y_pred))
+        return {"tp": sum(1 for t, p in pairs if t == 1 and p == 1), "fp": sum(1 for t, p in pairs if t == 0 and p == 1),
+                "tn": sum(1 for t, p in pairs if t == 0 and p == 0), "fn": sum(1 for t, p in pairs if t == 1 and p == 0)}
+
+
+    def metrics(y_true, y_pred):
+        """accuracy, precision, recall and f1 (each 0.0 when its denominator is 0) and the confusion counts."""
+        c = confusion(y_true, y_pred)
+        total = len(y_true)
+        accuracy = (c["tp"] + c["tn"]) / total if total else 0.0
+        precision = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
+        recall = c["tp"] / (c["tp"] + c["fn"]) if c["tp"] + c["fn"] else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, "confusion": c}
+
+
+    def group_report(groups, y_true, y_pred):
+        """Per group (keys in sorted order): size, selection_rate (share predicted 1), tpr (recall; None if the group has no
+        actual positives) and accuracy."""
+        report = {}
+        for g in sorted(set(groups)):
+            idx = [i for i, member in enumerate(groups) if member == g]
+            yt, yp = [y_true[i] for i in idx], [y_pred[i] for i in idx]
+            positives = sum(yt)
+            report[g] = {"size": len(idx), "selection_rate": sum(yp) / len(idx),
+                         "tpr": sum(1 for t, p in zip(yt, yp) if t == 1 and p == 1) / positives if positives else None,
+                         "accuracy": sum(1 for t, p in zip(yt, yp) if t == p) / len(idx)}
+        return report
+
+
+    def disparity(report, key):
+        """Largest minus smallest value of `key` across groups, ignoring None; 0.0 if fewer than two groups have a value."""
+        values = [v[key] for v in report.values() if v[key] is not None]
+        return max(values) - min(values) if len(values) >= 2 else 0.0
+
+
+    def make_csv(n, seed):
+        """Synthetic loan data with realistic mess: blanks, junk, a quoted comma, and a historical bias against group b."""
+        rng = random.Random(seed)
+        lines = ["id,age,income,debt,region,group,notes,approved"]
+        for i in range(n):
+            age = rng.randint(21, 65)
+            income = round(rng.gauss(52000, 15000))
+            debt = round(rng.uniform(0, 30000))
+            region = rng.choice(["North", "South", "East", "West"])
+            group = "a" if rng.random() < 0.6 else "b"
+            score = (income - debt) / 12000 + rng.gauss(0, 0.8) - (0.9 if group == "b" else 0.0)
+            approved = 1 if score > 2.6 else 0
+            note = rng.choice(["", "", "first-time", '"moved, recently"', '"said ""urgent"""'])
+            fields = [str(age), str(income), str(debt), region, group]
+            if rng.random() < 0.05:
+                fields[1] = ""
+            if rng.random() < 0.04:
+                fields[0] = "NA"
+            if rng.random() < 0.03:
+                fields[2] = "n/a"
+            if rng.random() < 0.02:
+                fields[3] = "abc"
+            if rng.random() < 0.03:
+                fields[4] = "  " + fields[4].upper() + " "
+            label = "" if rng.random() < 0.02 else str(approved)
+            lines.append(",".join([str(i + 1)] + fields[:-1] + [fields[-1], note, label]))
+        return "\n".join(lines) + "\n"
+
+    SCHEMA = {"age": "num", "income": "num", "debt": "num", "region": "cat", "group": "cat", "approved": "target"}
+
+
+    header, raw = parse_csv(make_csv(1200, seed=7))
+    rows, report = clean(raw, SCHEMA)
+    train, test = train_test_split(rows, 0.25, seed=1)
+    print("train:", len(train), "test:", len(test))
+    honest = fit_scaler(train, ["income"])["income"]
+    leaky = fit_scaler(rows, ["income"])["income"]
+    print("income mean/std from train only:", round(honest[0]), round(honest[1]))
+    print("income mean/std from all rows   :", round(leaky[0]), round(leaky[1]))
+    scaler = fit_scaler(train, ["age", "income", "debt"])
+    encoder = fit_encoder(train, ["region"])
+    X = vectorize(train[:2], scaler, encoder)
+    print("features per row:", len(X[0]))
+    print([round(v, 2) for v in X[0]])
+  output: |
+    train: 880 test: 293
+    income mean/std from train only: 52158 14494
+    income mean/std from all rows   : 52139 14405
+    features per row: 8
+    [-1.76, 0.01, -0.06, 0.0, 0.0, 0.0, 1.0, 0.0]
+  lines:
+  - line: 289
+    note: Only the training rows decide the mean and standard deviation.
+  - line: 295
+    note: Three scaled numbers plus one flag per region make each feature row.
+- title: Training and evaluating
+  intro: Compare the model with a majority-class baseline and look at more than accuracy.
+  code: |
+    def parse_csv(text):
+        """Parse CSV text into (header, rows) where rows is a list of dictionaries.
+
+        Fields may be quoted: a quoted field can contain commas, line breaks and "" (an escaped quote).
+        Blank lines are ignored. Raises ValueError for empty input, duplicate header names,
+        an unterminated or misplaced quote, or a row whose field count differs from the header's.
+        """
+        records, record, field = [], [], ""
+        in_quotes = closed = False          # closed: a quoted field has just ended
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if in_quotes:
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        field += '"'
+                        i += 1
+                    else:
+                        in_quotes, closed = False, True
+                else:
+                    field += ch
+            elif ch == '"':
+                if field != "" or closed:
+                    raise ValueError("unexpected quote")
+                in_quotes = True
+            elif closed and ch not in ",\r\n":
+                raise ValueError("text after a closing quote")
+            elif ch == ",":
+                record.append(field)
+                field, closed = "", False
+            elif ch in "\r\n":
+                if ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                if record or field != "":
+                    record.append(field)
+                    records.append(record)
+                record, field, closed = [], "", False
+            else:
+                field += ch
+            i += 1
+        if in_quotes:
+            raise ValueError("unterminated quote")
+        if record or field != "":
+            record.append(field)
+            records.append(record)
+        if not records:
+            raise ValueError("empty CSV")
+        header = records[0]
+        if len(set(header)) != len(header):
+            raise ValueError("duplicate column names")
+        rows = []
+        for number, rec in enumerate(records[1:], start=2):
+            if len(rec) != len(header):
+                raise ValueError(f"line {number} has {len(rec)} fields, expected {len(header)}")
+            rows.append(dict(zip(header, rec)))
+        return header, rows
+
+
+    MISSING = {"", "na", "n/a", "null", "none", "nan", "?"}
+
+
+    def is_missing(text):
+        return text.strip().lower() in MISSING
+
+
+    def to_number(text):
+        """A finite float, or None when the text is missing or not a number."""
+        if is_missing(text):
+            return None
+        try:
+            x = float(text)
+        except ValueError:
+            return None
+        return x if abs(x) != float("inf") else None
+
+
+    def median(values):
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+    def clean(rows, schema):
+        """Turn raw text rows into typed rows. schema maps column -> "num", "cat" or "target" (exactly one target).
+
+        Rows whose target is not "0" or "1" are dropped. A numeric value that is missing or not a number is replaced by the
+        median of the usable values of the kept rows (0.0 if there are none). A categorical value is stripped and
+        lower-cased; a missing one becomes "unknown". Columns that are not in the schema are left out.
+        Returns (clean_rows, report) with report = {"dropped": n, "imputed": {column: count}} (only columns with count > 0).
+        """
+        target = next(col for col, kind in schema.items() if kind == "target")
+        kept = [r for r in rows if r[target].strip() in ("0", "1")]
+        report = {"dropped": len(rows) - len(kept), "imputed": {}}
+        medians = {}
+        for col, kind in schema.items():
+            if kind == "num":
+                usable = [x for x in (to_number(r[col]) for r in kept) if x is not None]
+                medians[col] = median(usable) if usable else 0.0
+        out = []
+        for r in kept:
+            row = {}
+            for col, kind in schema.items():
+                text = r[col]
+                if kind == "num":
+                    x = to_number(text)
+                    if x is None:
+                        x = medians[col]
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    row[col] = x
+                elif kind == "cat":
+                    if is_missing(text):
+                        row[col] = "unknown"
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    else:
+                        row[col] = text.strip().lower()
+                else:
+                    row[col] = int(text.strip())
+            out.append(row)
+        return out, report
+
+
+    import random
+
+
+    def train_test_split(rows, test_fraction, seed):
+        """Shuffle the indices with random.Random(seed), use the first n_test as the test set. Does not change `rows`.
+
+        n_test = round(len(rows) * test_fraction), but at least 1 and at most len(rows) - 1.
+        Raises ValueError unless 0 < test_fraction < 1 and there are at least 2 rows.
+        """
+        if not 0 < test_fraction < 1 or len(rows) < 2:
+            raise ValueError("need 0 < test_fraction < 1 and at least 2 rows")
+        order = list(range(len(rows)))
+        random.Random(seed).shuffle(order)
+        n_test = min(max(1, round(len(rows) * test_fraction)), len(rows) - 1)
+        return [rows[i] for i in order[n_test:]], [rows[i] for i in order[:n_test]]
+
+
+    def fit_scaler(rows, cols):
+        """For each numeric column: (mean, standard deviation), using the population formula. A standard deviation of 0 becomes 1.0."""
+        if not rows:
+            raise ValueError("cannot fit on no rows")
+        scaler = {}
+        for c in cols:
+            values = [r[c] for r in rows]
+            mean = sum(values) / len(values)
+            std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+            scaler[c] = (mean, std or 1.0)
+        return scaler
+
+
+    def fit_encoder(rows, cols):
+        """For each categorical column: the sorted list of categories seen."""
+        return {c: sorted({r[c] for r in rows}) for c in cols}
+
+
+    def vectorize(rows, scaler, encoder):
+        """One feature list per row: z-scores for the scaler's columns, then one-hot flags (1.0 or 0.0) for each category of each
+        encoder column, in order. A category not seen during fitting gives all zeros for that column."""
+        X = []
+        for r in rows:
+            x = [(r[c] - mean) / std for c, (mean, std) in scaler.items()]
+            for c, categories in encoder.items():
+                x.extend(1.0 if r[c] == cat else 0.0 for cat in categories)
+            X.append(x)
+        return X
+
+
+    import math
+
+
+    def sigmoid(z):
+        if z >= 0:
+            return 1 / (1 + math.exp(-z))
+        e = math.exp(z)
+        return e / (1 + e)
+
+
+    def predict_proba(model, x):
+        weights, bias = model
+        return sigmoid(sum(w * v for w, v in zip(weights, x)) + bias)
+
+
+    def train_logistic(X, y, lr=0.1, epochs=200, l2=0.0):
+        """Batch gradient descent for logistic regression. Returns (weights, bias).
+
+        Every epoch: gradient of the average log loss over all rows, plus l2 * weight for each weight (not the bias).
+        Starts from all zeros, so training is deterministic.
+        """
+        n, d = len(X), len(X[0])
+        weights, bias = [0.0] * d, 0.0
+        for _ in range(epochs):
+            grad_w, grad_b = [0.0] * d, 0.0
+            for x, target in zip(X, y):
+                error = predict_proba((weights, bias), x) - target
+                for j in range(d):
+                    grad_w[j] += error * x[j]
+                grad_b += error
+            for j in range(d):
+                weights[j] -= lr * (grad_w[j] / n + l2 * weights[j])
+            bias -= lr * grad_b / n
+        return weights, bias
+
+
+    def log_loss(model, X, y):
+        total = 0.0
+        for x, target in zip(X, y):
+            p = min(max(predict_proba(model, x), 1e-12), 1 - 1e-12)
+            total -= target * math.log(p) + (1 - target) * math.log(1 - p)
+        return total / len(X)
+
+
+    def predict(model, X, threshold=0.5):
+        return [1 if predict_proba(model, x) >= threshold else 0 for x in X]
+
+
+    def confusion(y_true, y_pred):
+        pairs = list(zip(y_true, y_pred))
+        return {"tp": sum(1 for t, p in pairs if t == 1 and p == 1), "fp": sum(1 for t, p in pairs if t == 0 and p == 1),
+                "tn": sum(1 for t, p in pairs if t == 0 and p == 0), "fn": sum(1 for t, p in pairs if t == 1 and p == 0)}
+
+
+    def metrics(y_true, y_pred):
+        """accuracy, precision, recall and f1 (each 0.0 when its denominator is 0) and the confusion counts."""
+        c = confusion(y_true, y_pred)
+        total = len(y_true)
+        accuracy = (c["tp"] + c["tn"]) / total if total else 0.0
+        precision = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
+        recall = c["tp"] / (c["tp"] + c["fn"]) if c["tp"] + c["fn"] else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, "confusion": c}
+
+
+    def group_report(groups, y_true, y_pred):
+        """Per group (keys in sorted order): size, selection_rate (share predicted 1), tpr (recall; None if the group has no
+        actual positives) and accuracy."""
+        report = {}
+        for g in sorted(set(groups)):
+            idx = [i for i, member in enumerate(groups) if member == g]
+            yt, yp = [y_true[i] for i in idx], [y_pred[i] for i in idx]
+            positives = sum(yt)
+            report[g] = {"size": len(idx), "selection_rate": sum(yp) / len(idx),
+                         "tpr": sum(1 for t, p in zip(yt, yp) if t == 1 and p == 1) / positives if positives else None,
+                         "accuracy": sum(1 for t, p in zip(yt, yp) if t == p) / len(idx)}
+        return report
+
+
+    def disparity(report, key):
+        """Largest minus smallest value of `key` across groups, ignoring None; 0.0 if fewer than two groups have a value."""
+        values = [v[key] for v in report.values() if v[key] is not None]
+        return max(values) - min(values) if len(values) >= 2 else 0.0
+
+
+    def make_csv(n, seed):
+        """Synthetic loan data with realistic mess: blanks, junk, a quoted comma, and a historical bias against group b."""
+        rng = random.Random(seed)
+        lines = ["id,age,income,debt,region,group,notes,approved"]
+        for i in range(n):
+            age = rng.randint(21, 65)
+            income = round(rng.gauss(52000, 15000))
+            debt = round(rng.uniform(0, 30000))
+            region = rng.choice(["North", "South", "East", "West"])
+            group = "a" if rng.random() < 0.6 else "b"
+            score = (income - debt) / 12000 + rng.gauss(0, 0.8) - (0.9 if group == "b" else 0.0)
+            approved = 1 if score > 2.6 else 0
+            note = rng.choice(["", "", "first-time", '"moved, recently"', '"said ""urgent"""'])
+            fields = [str(age), str(income), str(debt), region, group]
+            if rng.random() < 0.05:
+                fields[1] = ""
+            if rng.random() < 0.04:
+                fields[0] = "NA"
+            if rng.random() < 0.03:
+                fields[2] = "n/a"
+            if rng.random() < 0.02:
+                fields[3] = "abc"
+            if rng.random() < 0.03:
+                fields[4] = "  " + fields[4].upper() + " "
+            label = "" if rng.random() < 0.02 else str(approved)
+            lines.append(",".join([str(i + 1)] + fields[:-1] + [fields[-1], note, label]))
+        return "\n".join(lines) + "\n"
+
+    SCHEMA = {"age": "num", "income": "num", "debt": "num", "region": "cat", "group": "cat", "approved": "target"}
+
+
+    header, raw = parse_csv(make_csv(1200, seed=7))
+    rows, report = clean(raw, SCHEMA)
+    train, test = train_test_split(rows, 0.25, seed=1)
+    scaler = fit_scaler(train, ["age", "income", "debt"])
+    encoder = fit_encoder(train, ["region"])
+    X_train, X_test = vectorize(train, scaler, encoder), vectorize(test, scaler, encoder)
+    y_train, y_test = [r["approved"] for r in train], [r["approved"] for r in test]
+
+    majority = round(sum(y_train) / len(y_train))
+    baseline = metrics(y_test, [majority] * len(y_test))
+    print("baseline (always", majority, ") accuracy:", round(baseline["accuracy"], 3))
+    model = train_logistic(X_train, y_train, lr=0.5, epochs=300)
+    print("train loss:", round(log_loss(model, X_train, y_train), 3), " test loss:", round(log_loss(model, X_test, y_test), 3))
+    result = metrics(y_test, predict(model, X_test))
+    for name in ("accuracy", "precision", "recall", "f1"):
+        print(name, round(result[name], 3))
+    print(result["confusion"])
+  output: |
+    baseline (always 1 ) accuracy: 0.57
+    train loss: 0.395  test loss: 0.412
+    accuracy 0.805
+    precision 0.802
+    recall 0.874
+    f1 0.837
+    {'tp': 146, 'fp': 36, 'tn': 90, 'fn': 21}
+  lines:
+  - line: 293
+    note: The baseline always predicts the most common training label.
+  - line: 296
+    note: Learning rate 0.5 and 300 epochs of batch gradient descent.
+  - line: 301
+    note: The confusion counts show which kinds of mistakes the model makes.
+- title: A fairness audit
+  intro: The data itself shows a gap. A model that sees the group column reproduces it; one that does not shows a much smaller gap on this toy data.
+  code: |
+    def parse_csv(text):
+        """Parse CSV text into (header, rows) where rows is a list of dictionaries.
+
+        Fields may be quoted: a quoted field can contain commas, line breaks and "" (an escaped quote).
+        Blank lines are ignored. Raises ValueError for empty input, duplicate header names,
+        an unterminated or misplaced quote, or a row whose field count differs from the header's.
+        """
+        records, record, field = [], [], ""
+        in_quotes = closed = False          # closed: a quoted field has just ended
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if in_quotes:
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        field += '"'
+                        i += 1
+                    else:
+                        in_quotes, closed = False, True
+                else:
+                    field += ch
+            elif ch == '"':
+                if field != "" or closed:
+                    raise ValueError("unexpected quote")
+                in_quotes = True
+            elif closed and ch not in ",\r\n":
+                raise ValueError("text after a closing quote")
+            elif ch == ",":
+                record.append(field)
+                field, closed = "", False
+            elif ch in "\r\n":
+                if ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                if record or field != "":
+                    record.append(field)
+                    records.append(record)
+                record, field, closed = [], "", False
+            else:
+                field += ch
+            i += 1
+        if in_quotes:
+            raise ValueError("unterminated quote")
+        if record or field != "":
+            record.append(field)
+            records.append(record)
+        if not records:
+            raise ValueError("empty CSV")
+        header = records[0]
+        if len(set(header)) != len(header):
+            raise ValueError("duplicate column names")
+        rows = []
+        for number, rec in enumerate(records[1:], start=2):
+            if len(rec) != len(header):
+                raise ValueError(f"line {number} has {len(rec)} fields, expected {len(header)}")
+            rows.append(dict(zip(header, rec)))
+        return header, rows
+
+
+    MISSING = {"", "na", "n/a", "null", "none", "nan", "?"}
+
+
+    def is_missing(text):
+        return text.strip().lower() in MISSING
+
+
+    def to_number(text):
+        """A finite float, or None when the text is missing or not a number."""
+        if is_missing(text):
+            return None
+        try:
+            x = float(text)
+        except ValueError:
+            return None
+        return x if abs(x) != float("inf") else None
+
+
+    def median(values):
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+    def clean(rows, schema):
+        """Turn raw text rows into typed rows. schema maps column -> "num", "cat" or "target" (exactly one target).
+
+        Rows whose target is not "0" or "1" are dropped. A numeric value that is missing or not a number is replaced by the
+        median of the usable values of the kept rows (0.0 if there are none). A categorical value is stripped and
+        lower-cased; a missing one becomes "unknown". Columns that are not in the schema are left out.
+        Returns (clean_rows, report) with report = {"dropped": n, "imputed": {column: count}} (only columns with count > 0).
+        """
+        target = next(col for col, kind in schema.items() if kind == "target")
+        kept = [r for r in rows if r[target].strip() in ("0", "1")]
+        report = {"dropped": len(rows) - len(kept), "imputed": {}}
+        medians = {}
+        for col, kind in schema.items():
+            if kind == "num":
+                usable = [x for x in (to_number(r[col]) for r in kept) if x is not None]
+                medians[col] = median(usable) if usable else 0.0
+        out = []
+        for r in kept:
+            row = {}
+            for col, kind in schema.items():
+                text = r[col]
+                if kind == "num":
+                    x = to_number(text)
+                    if x is None:
+                        x = medians[col]
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    row[col] = x
+                elif kind == "cat":
+                    if is_missing(text):
+                        row[col] = "unknown"
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    else:
+                        row[col] = text.strip().lower()
+                else:
+                    row[col] = int(text.strip())
+            out.append(row)
+        return out, report
+
+
+    import random
+
+
+    def train_test_split(rows, test_fraction, seed):
+        """Shuffle the indices with random.Random(seed), use the first n_test as the test set. Does not change `rows`.
+
+        n_test = round(len(rows) * test_fraction), but at least 1 and at most len(rows) - 1.
+        Raises ValueError unless 0 < test_fraction < 1 and there are at least 2 rows.
+        """
+        if not 0 < test_fraction < 1 or len(rows) < 2:
+            raise ValueError("need 0 < test_fraction < 1 and at least 2 rows")
+        order = list(range(len(rows)))
+        random.Random(seed).shuffle(order)
+        n_test = min(max(1, round(len(rows) * test_fraction)), len(rows) - 1)
+        return [rows[i] for i in order[n_test:]], [rows[i] for i in order[:n_test]]
+
+
+    def fit_scaler(rows, cols):
+        """For each numeric column: (mean, standard deviation), using the population formula. A standard deviation of 0 becomes 1.0."""
+        if not rows:
+            raise ValueError("cannot fit on no rows")
+        scaler = {}
+        for c in cols:
+            values = [r[c] for r in rows]
+            mean = sum(values) / len(values)
+            std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+            scaler[c] = (mean, std or 1.0)
+        return scaler
+
+
+    def fit_encoder(rows, cols):
+        """For each categorical column: the sorted list of categories seen."""
+        return {c: sorted({r[c] for r in rows}) for c in cols}
+
+
+    def vectorize(rows, scaler, encoder):
+        """One feature list per row: z-scores for the scaler's columns, then one-hot flags (1.0 or 0.0) for each category of each
+        encoder column, in order. A category not seen during fitting gives all zeros for that column."""
+        X = []
+        for r in rows:
+            x = [(r[c] - mean) / std for c, (mean, std) in scaler.items()]
+            for c, categories in encoder.items():
+                x.extend(1.0 if r[c] == cat else 0.0 for cat in categories)
+            X.append(x)
+        return X
+
+
+    import math
+
+
+    def sigmoid(z):
+        if z >= 0:
+            return 1 / (1 + math.exp(-z))
+        e = math.exp(z)
+        return e / (1 + e)
+
+
+    def predict_proba(model, x):
+        weights, bias = model
+        return sigmoid(sum(w * v for w, v in zip(weights, x)) + bias)
+
+
+    def train_logistic(X, y, lr=0.1, epochs=200, l2=0.0):
+        """Batch gradient descent for logistic regression. Returns (weights, bias).
+
+        Every epoch: gradient of the average log loss over all rows, plus l2 * weight for each weight (not the bias).
+        Starts from all zeros, so training is deterministic.
+        """
+        n, d = len(X), len(X[0])
+        weights, bias = [0.0] * d, 0.0
+        for _ in range(epochs):
+            grad_w, grad_b = [0.0] * d, 0.0
+            for x, target in zip(X, y):
+                error = predict_proba((weights, bias), x) - target
+                for j in range(d):
+                    grad_w[j] += error * x[j]
+                grad_b += error
+            for j in range(d):
+                weights[j] -= lr * (grad_w[j] / n + l2 * weights[j])
+            bias -= lr * grad_b / n
+        return weights, bias
+
+
+    def log_loss(model, X, y):
+        total = 0.0
+        for x, target in zip(X, y):
+            p = min(max(predict_proba(model, x), 1e-12), 1 - 1e-12)
+            total -= target * math.log(p) + (1 - target) * math.log(1 - p)
+        return total / len(X)
+
+
+    def predict(model, X, threshold=0.5):
+        return [1 if predict_proba(model, x) >= threshold else 0 for x in X]
+
+
+    def confusion(y_true, y_pred):
+        pairs = list(zip(y_true, y_pred))
+        return {"tp": sum(1 for t, p in pairs if t == 1 and p == 1), "fp": sum(1 for t, p in pairs if t == 0 and p == 1),
+                "tn": sum(1 for t, p in pairs if t == 0 and p == 0), "fn": sum(1 for t, p in pairs if t == 1 and p == 0)}
+
+
+    def metrics(y_true, y_pred):
+        """accuracy, precision, recall and f1 (each 0.0 when its denominator is 0) and the confusion counts."""
+        c = confusion(y_true, y_pred)
+        total = len(y_true)
+        accuracy = (c["tp"] + c["tn"]) / total if total else 0.0
+        precision = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
+        recall = c["tp"] / (c["tp"] + c["fn"]) if c["tp"] + c["fn"] else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, "confusion": c}
+
+
+    def group_report(groups, y_true, y_pred):
+        """Per group (keys in sorted order): size, selection_rate (share predicted 1), tpr (recall; None if the group has no
+        actual positives) and accuracy."""
+        report = {}
+        for g in sorted(set(groups)):
+            idx = [i for i, member in enumerate(groups) if member == g]
+            yt, yp = [y_true[i] for i in idx], [y_pred[i] for i in idx]
+            positives = sum(yt)
+            report[g] = {"size": len(idx), "selection_rate": sum(yp) / len(idx),
+                         "tpr": sum(1 for t, p in zip(yt, yp) if t == 1 and p == 1) / positives if positives else None,
+                         "accuracy": sum(1 for t, p in zip(yt, yp) if t == p) / len(idx)}
+        return report
+
+
+    def disparity(report, key):
+        """Largest minus smallest value of `key` across groups, ignoring None; 0.0 if fewer than two groups have a value."""
+        values = [v[key] for v in report.values() if v[key] is not None]
+        return max(values) - min(values) if len(values) >= 2 else 0.0
+
+
+    def make_csv(n, seed):
+        """Synthetic loan data with realistic mess: blanks, junk, a quoted comma, and a historical bias against group b."""
+        rng = random.Random(seed)
+        lines = ["id,age,income,debt,region,group,notes,approved"]
+        for i in range(n):
+            age = rng.randint(21, 65)
+            income = round(rng.gauss(52000, 15000))
+            debt = round(rng.uniform(0, 30000))
+            region = rng.choice(["North", "South", "East", "West"])
+            group = "a" if rng.random() < 0.6 else "b"
+            score = (income - debt) / 12000 + rng.gauss(0, 0.8) - (0.9 if group == "b" else 0.0)
+            approved = 1 if score > 2.6 else 0
+            note = rng.choice(["", "", "first-time", '"moved, recently"', '"said ""urgent"""'])
+            fields = [str(age), str(income), str(debt), region, group]
+            if rng.random() < 0.05:
+                fields[1] = ""
+            if rng.random() < 0.04:
+                fields[0] = "NA"
+            if rng.random() < 0.03:
+                fields[2] = "n/a"
+            if rng.random() < 0.02:
+                fields[3] = "abc"
+            if rng.random() < 0.03:
+                fields[4] = "  " + fields[4].upper() + " "
+            label = "" if rng.random() < 0.02 else str(approved)
+            lines.append(",".join([str(i + 1)] + fields[:-1] + [fields[-1], note, label]))
+        return "\n".join(lines) + "\n"
+
+    SCHEMA = {"age": "num", "income": "num", "debt": "num", "region": "cat", "group": "cat", "approved": "target"}
+
+
+    header, raw = parse_csv(make_csv(1200, seed=7))
+    rows, report = clean(raw, SCHEMA)
+    for g in ("a", "b"):
+        labels = [r["approved"] for r in rows if r["group"] == g]
+        print(f"group {g}: {len(labels)} people, {sum(labels) / len(labels):.0%} approved in the data")
+
+    train, test = train_test_split(rows, 0.25, seed=1)
+    y_train, y_test = [r["approved"] for r in train], [r["approved"] for r in test]
+    for features in (["region"], ["region", "group"]):
+        scaler = fit_scaler(train, ["age", "income", "debt"])
+        encoder = fit_encoder(train, features)
+        model = train_logistic(vectorize(train, scaler, encoder), y_train, lr=0.5, epochs=300)
+        pred = predict(model, vectorize(test, scaler, encoder))
+        rep = group_report([r["group"] for r in test], y_test, pred)
+        print()
+        print("categorical features:", features, "accuracy:", round(metrics(y_test, pred)["accuracy"], 3))
+        for g, stats in rep.items():
+            print(f"  {g}: selected {stats['selection_rate']:.0%}, true positive rate {stats['tpr']:.0%}")
+        print("  selection gap:", round(disparity(rep, "selection_rate"), 3), " opportunity gap:", round(disparity(rep, "tpr"), 3))
+  output: |
+    group a: 725 people, 63% approved in the data
+    group b: 448 people, 46% approved in the data
+
+    categorical features: ['region'] accuracy: 0.805
+      a: selected 60%, true positive rate 84%
+      b: selected 65%, true positive rate 95%
+      selection gap: 0.042  opportunity gap: 0.106
+
+    categorical features: ['region', 'group'] accuracy: 0.84
+      a: selected 68%, true positive rate 93%
+      b: selected 49%, true positive rate 82%
+      selection gap: 0.192  opportunity gap: 0.11
+  lines:
+  - line: 287
+    note: 'First look at the data: the approval rates already differ.'
+  - line: 293
+    note: The second run lets the model see the group column.
+  - line: 303
+    note: The selection gap and the true positive rate gap measure different things.
+playground:
+  prompt: 'Change the `make_csv` bias from 0.9 to 0.0 (no historical bias) or to 2.0 (a lot), rerun the audit and watch both gaps move. Then try `threshold=0.3` in `predict`: how do precision and recall change?'
+  code: |
+    import math
+    print(1 / (1 + math.exp(-2)))
+exercises:
+- id: csv-parser
+  title: 'Milestone 1: A CSV parser'
+  difficulty: 5
+  prompt: 'Write `parse_csv(text)` returning `(header, rows)`: `header` is the list of column names from the first record, `rows` a list of dictionaries (values are always strings, kept exactly, spaces included). Fields are separated by commas and records by `\n` or `\r\n`. A field may be quoted: inside quotes commas and line breaks are ordinary characters and `""` means one quote character. Blank lines are ignored. Raise `ValueError` for empty input, duplicate column names, an unterminated quote, a quote in the middle of an unquoted field, text directly after a closing quote, or a row with the wrong number of fields.'
+  starter: |
+    def parse_csv(text):
+        """Parse CSV text into (header, rows) where rows is a list of dictionaries (see the task for the rules)."""
+        pass
+  tests:
+  - name: simple tables
+    code: |
+      header, rows = parse_csv("a,b,c\n1,2,3\n4,5,6\n")
+      assert header == ["a", "b", "c"]
+      assert rows == [{"a": "1", "b": "2", "c": "3"}, {"a": "4", "b": "5", "c": "6"}]
+      assert parse_csv("x,y\n1,2")[1] == [{"x": "1", "y": "2"}]
+      assert parse_csv("x,y\r\n1,2\r\n3,4\r\n")[1] == [{"x": "1", "y": "2"}, {"x": "3", "y": "4"}]
+      assert parse_csv("x\n\n1\n\n2\n\n")[1] == [{"x": "1"}, {"x": "2"}]
+      assert parse_csv("only,header\n")[1] == []
+  - name: empty fields are kept as empty text
+    code: |
+      header, rows = parse_csv("a,b,c\n,2,\n1,,\n,,\n")
+      assert rows == [{"a": "", "b": "2", "c": ""}, {"a": "1", "b": "", "c": ""}, {"a": "", "b": "", "c": ""}]
+      assert parse_csv("a,b\n x , y \n")[1] == [{"a": " x ", "b": " y "}]
+  - name: quoted fields
+    code: |
+      text = 'name,note\n"Smith, Ann","said ""hi"""\n"two\nlines",plain\n"",x\n'
+      header, rows = parse_csv(text)
+      assert rows[0] == {"name": "Smith, Ann", "note": 'said "hi"'}
+      assert rows[1] == {"name": "two\nlines", "note": "plain"}
+      assert rows[2] == {"name": "", "note": "x"}
+      assert len(rows) == 3
+      header, rows = parse_csv('a\n"x,y"\n')
+      assert rows == [{"a": "x,y"}]
+  - name: malformed input is refused
+    code: |
+      bad = ["", "\n\n", "a,a\n1,2", "a,b\n1", "a,b\n1,2,3", 'a\n"unterminated', 'a,b\nx"y,2', 'a\n"x"y']
+      for text in bad:
+          try:
+              parse_csv(text)
+          except ValueError:
+              continue
+          raise AssertionError("accepted " + repr(text))
+  hints:
+  - Walk through the text one character at a time with a flag `in_quotes`; build the current field and record as you go.
+  - Inside quotes, a `"` followed by another `"` adds one quote and skips ahead; a single `"` ends the quoted part.
+  solution: |
+    def parse_csv(text):
+        """Parse CSV text into (header, rows) where rows is a list of dictionaries.
+
+        Fields may be quoted: a quoted field can contain commas, line breaks and "" (an escaped quote).
+        Blank lines are ignored. Raises ValueError for empty input, duplicate header names,
+        an unterminated or misplaced quote, or a row whose field count differs from the header's.
+        """
+        records, record, field = [], [], ""
+        in_quotes = closed = False          # closed: a quoted field has just ended
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if in_quotes:
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        field += '"'
+                        i += 1
+                    else:
+                        in_quotes, closed = False, True
+                else:
+                    field += ch
+            elif ch == '"':
+                if field != "" or closed:
+                    raise ValueError("unexpected quote")
+                in_quotes = True
+            elif closed and ch not in ",\r\n":
+                raise ValueError("text after a closing quote")
+            elif ch == ",":
+                record.append(field)
+                field, closed = "", False
+            elif ch in "\r\n":
+                if ch == "\r" and i + 1 < n and text[i + 1] == "\n":
+                    i += 1
+                if record or field != "":
+                    record.append(field)
+                    records.append(record)
+                record, field, closed = [], "", False
+            else:
+                field += ch
+            i += 1
+        if in_quotes:
+            raise ValueError("unterminated quote")
+        if record or field != "":
+            record.append(field)
+            records.append(record)
+        if not records:
+            raise ValueError("empty CSV")
+        header = records[0]
+        if len(set(header)) != len(header):
+            raise ValueError("duplicate column names")
+        rows = []
+        for number, rec in enumerate(records[1:], start=2):
+            if len(rec) != len(header):
+                raise ValueError(f"line {number} has {len(rec)} fields, expected {len(header)}")
+            rows.append(dict(zip(header, rec)))
+        return header, rows
+  explanation: 'A state machine reads one character at a time and remembers only what matters: here, whether it is inside quotes and whether a quoted field just ended.'
+- id: clean-and-split
+  title: 'Milestone 2: Cleaning and splitting'
+  difficulty: 5
+  prompt: 'The starter has `is_missing`, `to_number` and `median`. Write `clean(rows, schema)`: `schema` maps column names to `"num"`, `"cat"` or `"target"` (exactly one target). Drop rows whose target (after stripping spaces) is not `"0"` or `"1"`. In the remaining rows, replace a missing or non-numeric `num` value by the median of the usable values of that column (`0.0` if there are none); strip and lower-case `cat` values and turn missing ones into `"unknown"`; convert the target to `int`. Output rows contain only the schema''s columns. Also return `report = {"dropped": n, "imputed": {column: count}}` listing only columns with a positive count. Then write `train_test_split(rows, test_fraction, seed)`: shuffle a list of indices with `random.Random(seed).shuffle`, take the first `n_test` as the test set (`n_test = round(len(rows) * test_fraction)`, at least 1 and at most `len(rows) - 1`), and return `(train, test)`. Do not change the input. Raise `ValueError` unless `0 < test_fraction < 1` and there are at least two rows.'
+  starter: |
+    MISSING = {"", "na", "n/a", "null", "none", "nan", "?"}
+
+
+    def is_missing(text):
+        return text.strip().lower() in MISSING
+
+
+    def to_number(text):
+        """A finite float, or None when the text is missing or not a number."""
+        if is_missing(text):
+            return None
+        try:
+            x = float(text)
+        except ValueError:
+            return None
+        return x if abs(x) != float("inf") else None
+
+
+    def median(values):
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+
+    import random
+
+
+    def clean(rows, schema):
+        pass
+
+
+    def train_test_split(rows, test_fraction, seed):
+        pass
+  tests:
+  - name: rows without a usable target are dropped
+    code: |
+      schema = {"age": "num", "income": "num", "city": "cat", "ok": "target"}
+      def row(age, income, city, ok):
+          return {"id": "x", "age": age, "income": income, "city": city, "ok": ok}
+
+      rows = [row("30", "100", "Oslo", "1"), row("31", "200", "Rome", ""), row("32", "300", "Oslo", "yes"),
+              row("33", "400", "Oslo", " 0 "), row("34", "500", "Oslo", "2")]
+      out, report = clean(rows, schema)
+      assert [r["age"] for r in out] == [30.0, 33.0]
+      assert [r["ok"] for r in out] == [1, 0]
+      assert report["dropped"] == 3 and report["imputed"] == {}
+      assert all(set(r) == {"age", "income", "city", "ok"} for r in out)
+  - name: missing numbers become the median
+    code: |
+      schema = {"age": "num", "income": "num", "city": "cat", "ok": "target"}
+      def row(age, income, city, ok):
+          return {"id": "x", "age": age, "income": income, "city": city, "ok": ok}
+
+      rows = [row("10", "100", "a", "1"), row("", "200", "a", "0"), row("30", "NA", "a", "1"), row("abc", "400", "a", "0"),
+              row("50", "300", "a", "1"), row("n/a", "inf", "a", "0")]
+      out, report = clean(rows, schema)
+      assert [r["age"] for r in out] == [10.0, 30.0, 30.0, 30.0, 50.0, 30.0]
+      assert [r["income"] for r in out] == [100.0, 200.0, 250.0, 400.0, 300.0, 250.0]
+      assert report == {"dropped": 0, "imputed": {"age": 3, "income": 2}}
+      assert all(isinstance(r["age"], float) for r in out)
+      rows = [row("", "1", "a", "1"), row("x", "2", "a", "0")]
+      assert [r["age"] for r in clean(rows, schema)[0]] == [0.0, 0.0]
+  - name: the median ignores dropped rows
+    code: |
+      schema = {"age": "num", "income": "num", "city": "cat", "ok": "target"}
+      def row(age, income, city, ok):
+          return {"id": "x", "age": age, "income": income, "city": city, "ok": ok}
+
+      rows = [row("10", "1", "a", "1"), row("1000", "1", "a", "9"), row("20", "1", "a", "0"), row("", "1", "a", "1")]
+      out, report = clean(rows, schema)
+      assert [r["age"] for r in out] == [10.0, 20.0, 15.0]
+      assert report == {"dropped": 1, "imputed": {"age": 1}}
+  - name: categories are normalised
+    code: |
+      schema = {"age": "num", "income": "num", "city": "cat", "ok": "target"}
+      def row(age, income, city, ok):
+          return {"id": "x", "age": age, "income": income, "city": city, "ok": ok}
+
+      rows = [row("1", "1", "  OSLO ", "1"), row("1", "1", "oslo", "0"), row("1", "1", "", "1"), row("1", "1", "N/A", "0"), row("1", "1", "Rome", "1")]
+      out, report = clean(rows, schema)
+      assert [r["city"] for r in out] == ["oslo", "oslo", "unknown", "unknown", "rome"]
+      assert report["imputed"] == {"city": 2}
+  - name: splitting is reproducible and complete
+    code: |
+      import random
+      data = [{"i": i} for i in range(20)]
+      train, test = train_test_split(data, 0.25, 3)
+      assert len(test) == 5 and len(train) == 15
+      assert sorted(r["i"] for r in train + test) == list(range(20))
+      order = list(range(20)); random.Random(3).shuffle(order)
+      assert [r["i"] for r in test] == order[:5] and [r["i"] for r in train] == order[5:]
+      assert train_test_split(data, 0.25, 3) == (train, test)
+      assert train_test_split(data, 0.25, 4) != (train, test)
+      assert [r["i"] for r in data] == list(range(20))
+  - name: sizes and invalid arguments
+    code: |
+      data = [{"i": i} for i in range(10)]
+      assert len(train_test_split(data, 0.01, 0)[1]) == 1
+      assert len(train_test_split(data, 0.99, 0)[0]) == 1
+      assert len(train_test_split(data, 0.5, 0)[1]) == 5
+      assert len(train_test_split(data[:2], 0.5, 0)[0]) == 1
+      for args in [(data, 0, 0), (data, 1, 0), (data, -0.5, 0), (data[:1], 0.5, 0), ([], 0.5, 0)]:
+          try:
+              train_test_split(*args)
+          except ValueError:
+              continue
+          raise AssertionError("accepted " + repr(args[1:]))
+  hints:
+  - Drop the bad-target rows first, then compute medians from the rows that remain.
+  - '`random.Random(seed).shuffle(order)` shuffles the list in place.'
+  solution: |
+    MISSING = {"", "na", "n/a", "null", "none", "nan", "?"}
+
+
+    def is_missing(text):
+        return text.strip().lower() in MISSING
+
+
+    def to_number(text):
+        """A finite float, or None when the text is missing or not a number."""
+        if is_missing(text):
+            return None
+        try:
+            x = float(text)
+        except ValueError:
+            return None
+        return x if abs(x) != float("inf") else None
+
+
+    def median(values):
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+
+
+    def clean(rows, schema):
+        """Turn raw text rows into typed rows. schema maps column -> "num", "cat" or "target" (exactly one target).
+
+        Rows whose target is not "0" or "1" are dropped. A numeric value that is missing or not a number is replaced by the
+        median of the usable values of the kept rows (0.0 if there are none). A categorical value is stripped and
+        lower-cased; a missing one becomes "unknown". Columns that are not in the schema are left out.
+        Returns (clean_rows, report) with report = {"dropped": n, "imputed": {column: count}} (only columns with count > 0).
+        """
+        target = next(col for col, kind in schema.items() if kind == "target")
+        kept = [r for r in rows if r[target].strip() in ("0", "1")]
+        report = {"dropped": len(rows) - len(kept), "imputed": {}}
+        medians = {}
+        for col, kind in schema.items():
+            if kind == "num":
+                usable = [x for x in (to_number(r[col]) for r in kept) if x is not None]
+                medians[col] = median(usable) if usable else 0.0
+        out = []
+        for r in kept:
+            row = {}
+            for col, kind in schema.items():
+                text = r[col]
+                if kind == "num":
+                    x = to_number(text)
+                    if x is None:
+                        x = medians[col]
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    row[col] = x
+                elif kind == "cat":
+                    if is_missing(text):
+                        row[col] = "unknown"
+                        report["imputed"][col] = report["imputed"].get(col, 0) + 1
+                    else:
+                        row[col] = text.strip().lower()
+                else:
+                    row[col] = int(text.strip())
+            out.append(row)
+        return out, report
+
+
+    import random
+
+
+    def train_test_split(rows, test_fraction, seed):
+        """Shuffle the indices with random.Random(seed), use the first n_test as the test set. Does not change `rows`.
+
+        n_test = round(len(rows) * test_fraction), but at least 1 and at most len(rows) - 1.
+        Raises ValueError unless 0 < test_fraction < 1 and there are at least 2 rows.
+        """
+        if not 0 < test_fraction < 1 or len(rows) < 2:
+            raise ValueError("need 0 < test_fraction < 1 and at least 2 rows")
+        order = list(range(len(rows)))
+        random.Random(seed).shuffle(order)
+        n_test = min(max(1, round(len(rows) * test_fraction)), len(rows) - 1)
+        return [rows[i] for i in order[n_test:]], [rows[i] for i in order[:n_test]]
+  explanation: Every cleaning rule is a decision. Returning a report keeps the decisions visible instead of silent.
+- id: features
+  title: 'Milestone 3: Scaling and one-hot encoding'
+  difficulty: 4
+  prompt: 'Write `fit_scaler(rows, cols)` returning a dictionary `{column: (mean, std)}` (population standard deviation; use `1.0` instead of a standard deviation of 0; raise `ValueError` for no rows), `fit_encoder(rows, cols)` returning `{column: sorted list of categories}` and `vectorize(rows, scaler, encoder)` returning one list per row: first the z-score `(value - mean) / std` for each scaler column, then for each encoder column one `1.0` or `0.0` flag per category, in the order of the dictionaries. A category that was not seen when fitting gives all zeros.'
+  starter: |
+    def fit_scaler(rows, cols):
+        pass
+
+
+    def fit_encoder(rows, cols):
+        pass
+
+
+    def vectorize(rows, scaler, encoder):
+        pass
+  tests:
+  - name: scaling
+    code: |
+      rows = [{"a": 1.0, "b": 10.0}, {"a": 3.0, "b": 10.0}, {"a": 5.0, "b": 10.0}]
+      sc = fit_scaler(rows, ["a", "b"])
+      assert list(sc) == ["a", "b"]
+      mean, std = sc["a"]
+      assert mean == 3.0 and abs(std - (8 / 3) ** 0.5) < 1e-12
+      assert sc["b"] == (10.0, 1.0)
+      X = vectorize(rows, sc, {})
+      assert abs(X[0][0] + 1.224744871391589) < 1e-9 and X[1][0] == 0.0 and X[0][1] == 0.0
+      assert abs(sum(x[0] for x in X)) < 1e-12
+      try:
+          fit_scaler([], ["a"])
+          raise AssertionError("accepted no rows")
+      except ValueError:
+          pass
+  - name: one-hot encoding
+    code: |
+      rows = [{"c": "red"}, {"c": "blue"}, {"c": "red"}, {"c": "green"}]
+      enc = fit_encoder(rows, ["c"])
+      assert enc == {"c": ["blue", "green", "red"]}
+      assert vectorize(rows, {}, enc) == [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]
+      assert vectorize([{"c": "purple"}], {}, enc) == [[0.0, 0.0, 0.0]]
+  - name: columns follow the order given
+    code: |
+      rows = [{"x": 0.0, "y": 4.0, "c": "a", "d": "p"}, {"x": 2.0, "y": 8.0, "c": "b", "d": "q"}]
+      sc = fit_scaler(rows, ["y", "x"])
+      enc = fit_encoder(rows, ["d", "c"])
+      assert list(sc) == ["y", "x"] and list(enc) == ["d", "c"]
+      assert vectorize(rows, sc, enc) == [[-1.0, -1.0, 1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 0.0, 1.0, 0.0, 1.0]]
+  - name: 'no leakage: fit on training rows only'
+    code: |
+      train = [{"x": 0.0}, {"x": 2.0}]
+      test = [{"x": 100.0}]
+      sc = fit_scaler(train, ["x"])
+      assert sc == {"x": (1.0, 1.0)}
+      assert vectorize(test, sc, {}) == [[99.0]]
+  hints:
+  - Dictionaries remember insertion order, so loop over `scaler.items()` and `encoder.items()`.
+  - '`std or 1.0` replaces a zero by 1.0.'
+  solution: |
+    def fit_scaler(rows, cols):
+        """For each numeric column: (mean, standard deviation), using the population formula. A standard deviation of 0 becomes 1.0."""
+        if not rows:
+            raise ValueError("cannot fit on no rows")
+        scaler = {}
+        for c in cols:
+            values = [r[c] for r in rows]
+            mean = sum(values) / len(values)
+            std = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+            scaler[c] = (mean, std or 1.0)
+        return scaler
+
+
+    def fit_encoder(rows, cols):
+        """For each categorical column: the sorted list of categories seen."""
+        return {c: sorted({r[c] for r in rows}) for c in cols}
+
+
+    def vectorize(rows, scaler, encoder):
+        """One feature list per row: z-scores for the scaler's columns, then one-hot flags (1.0 or 0.0) for each category of each
+        encoder column, in order. A category not seen during fitting gives all zeros for that column."""
+        X = []
+        for r in rows:
+            x = [(r[c] - mean) / std for c, (mean, std) in scaler.items()]
+            for c, categories in encoder.items():
+                x.extend(1.0 if r[c] == cat else 0.0 for cat in categories)
+            X.append(x)
+        return X
+  explanation: Fit on training rows and apply to everything else. That one habit prevents the most common leak.
+- id: logistic
+  title: 'Milestone 4: Logistic regression from scratch'
+  difficulty: 5
+  prompt: 'Write `sigmoid(z)` (it must not overflow for `z = 1000` or `-1000`), `predict_proba(model, x)` for `model = (weights, bias)`, `train_logistic(X, y, lr=0.1, epochs=200, l2=0.0)`, `log_loss(model, X, y)` (average negative log likelihood; clip probabilities to `[1e-12, 1 - 1e-12]`) and `predict(model, X, threshold=0.5)` returning 0/1 labels (`>= threshold` is 1). Training starts from all-zero weights and bias and does batch gradient descent: every epoch compute the gradients of the average log loss over all rows (for each weight `mean(error * x_j)`, for the bias `mean(error)`, where `error = probability - target`), add `l2 * weight` to each weight''s gradient (not to the bias) and step by `lr`.'
+  starter: |
+    import math
+
+
+    def sigmoid(z):
+        pass
+
+
+    def predict_proba(model, x):
+        """model is (weights, bias)."""
+        pass
+
+
+    def train_logistic(X, y, lr=0.1, epochs=200, l2=0.0):
+        pass
+
+
+    def log_loss(model, X, y):
+        pass
+
+
+    def predict(model, X, threshold=0.5):
+        pass
+  tests:
+  - name: sigmoid
+    code: |
+      assert sigmoid(0) == 0.5
+      assert abs(sigmoid(2) - 0.8807970779778823) < 1e-12 and abs(sigmoid(-2) - 0.11920292202211755) < 1e-12
+      assert sigmoid(1000) == 1.0 and 0.0 <= sigmoid(-1000) < 1e-300
+      assert abs(sigmoid(5) + sigmoid(-5) - 1) < 1e-12
+      assert abs(predict_proba(([2.0, -1.0], 0.5), [1.0, 3.0]) - sigmoid(-0.5)) < 1e-12
+  - name: one step of gradient descent
+    code: |
+      X, y = [[-2.0], [-1.0], [1.0], [2.0]], [0, 0, 1, 1]
+      w, b = train_logistic(X, y, lr=0.1, epochs=1)
+      assert abs(w[0] - 0.075) < 1e-12 and abs(b) < 1e-12
+      w, b = train_logistic(X, y, epochs=0)
+      assert w == [0.0] and b == 0.0
+      assert predict_proba((w, b), [3.0]) == 0.5
+  - name: learning separable data
+    code: |
+      X, y = [[-2.0], [-1.0], [1.0], [2.0]], [0, 0, 1, 1]
+      model = train_logistic(X, y, lr=0.5, epochs=300)
+      assert model[0][0] > 1.0
+      assert predict(model, X) == y
+      assert predict(model, [[-5.0], [5.0]]) == [0, 1]
+      losses = [log_loss(train_logistic(X, y, lr=0.5, epochs=e), X, y) for e in (1, 10, 100, 300)]
+      assert losses == sorted(losses, reverse=True) and losses[-1] < 0.2
+      assert train_logistic(X, y, lr=0.5, epochs=50) == train_logistic(X, y, lr=0.5, epochs=50)
+  - name: two features and a bias
+    code: |
+      X = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]] * 3
+      y = [0, 1, 1, 1] * 3
+      model = train_logistic(X, y, lr=1.0, epochs=500)
+      assert predict(model, X[:4]) == [0, 1, 1, 1]
+      assert model[1] < 0
+  - name: regularisation, loss and threshold
+    code: |
+      X, y = [[-2.0], [-1.0], [1.0], [2.0]], [0, 0, 1, 1]
+      free = train_logistic(X, y, lr=0.5, epochs=300)
+      shrunk = train_logistic(X, y, lr=0.5, epochs=300, l2=0.5)
+      assert 0 < shrunk[0][0] < free[0][0]
+      assert abs(log_loss((([0.0]), 0.0), [[1.0]], [1]) - 0.6931471805599453) < 1e-12
+      assert log_loss(([100.0], 0.0), [[1.0]], [0]) > 20 and log_loss(([100.0], 0.0), [[1.0]], [0]) < 40
+      assert predict(([1.0], 0.0), [[0.5]], threshold=0.7) == [0]
+      assert predict(([1.0], 0.0), [[0.5]], threshold=0.6) == [1]
+      assert predict(([1.0], 0.0), [[0.0]]) == [1]
+  hints:
+  - For negative `z` use `e = exp(z)` and return `e / (1 + e)`, which never overflows.
+  - Compute all gradients first, then update the weights, so every row sees the same model within an epoch.
+  solution: |
+    import math
+
+
+    def sigmoid(z):
+        if z >= 0:
+            return 1 / (1 + math.exp(-z))
+        e = math.exp(z)
+        return e / (1 + e)
+
+
+    def predict_proba(model, x):
+        weights, bias = model
+        return sigmoid(sum(w * v for w, v in zip(weights, x)) + bias)
+
+
+    def train_logistic(X, y, lr=0.1, epochs=200, l2=0.0):
+        """Batch gradient descent for logistic regression. Returns (weights, bias).
+
+        Every epoch: gradient of the average log loss over all rows, plus l2 * weight for each weight (not the bias).
+        Starts from all zeros, so training is deterministic.
+        """
+        n, d = len(X), len(X[0])
+        weights, bias = [0.0] * d, 0.0
+        for _ in range(epochs):
+            grad_w, grad_b = [0.0] * d, 0.0
+            for x, target in zip(X, y):
+                error = predict_proba((weights, bias), x) - target
+                for j in range(d):
+                    grad_w[j] += error * x[j]
+                grad_b += error
+            for j in range(d):
+                weights[j] -= lr * (grad_w[j] / n + l2 * weights[j])
+            bias -= lr * grad_b / n
+        return weights, bias
+
+
+    def log_loss(model, X, y):
+        total = 0.0
+        for x, target in zip(X, y):
+            p = min(max(predict_proba(model, x), 1e-12), 1 - 1e-12)
+            total -= target * math.log(p) + (1 - target) * math.log(1 - p)
+        return total / len(X)
+
+
+    def predict(model, X, threshold=0.5):
+        return [1 if predict_proba(model, x) >= threshold else 0 for x in X]
+  explanation: Gradient descent is just repeated small corrections; the update uses the same formulas as Unit 17, now on standardised features.
+- id: evaluation
+  title: 'Milestone 5: Metrics and a fairness audit'
+  difficulty: 4
+  prompt: Write `confusion(y_true, y_pred)` returning the counts `{"tp", "fp", "tn", "fn"}`; `metrics(y_true, y_pred)` returning `accuracy`, `precision`, `recall`, `f1` (each `0.0` whenever its denominator is 0) and the `confusion` dictionary; `group_report(groups, y_true, y_pred)` returning, for each group in sorted order, a dictionary with `size`, `selection_rate` (share predicted 1), `tpr` (share of the group's actual positives predicted 1, or `None` if there are none) and `accuracy`; and `disparity(report, key)`, the largest minus the smallest value of `key` across groups, ignoring `None`, or `0.0` if fewer than two groups have a value.
+  starter: |
+    def confusion(y_true, y_pred):
+        pass
+
+
+    def metrics(y_true, y_pred):
+        pass
+
+
+    def group_report(groups, y_true, y_pred):
+        pass
+
+
+    def disparity(report, key):
+        pass
+  tests:
+  - name: confusion and metrics
+    code: |
+      yt = [1, 1, 0, 0, 1, 0]
+      yp = [1, 0, 0, 1, 1, 0]
+      assert confusion(yt, yp) == {"tp": 2, "fp": 1, "tn": 2, "fn": 1}
+      m = metrics(yt, yp)
+      for k in ("accuracy", "precision", "recall", "f1"):
+          assert abs(m[k] - (2 / 3)) < 1e-12, k
+      assert m["confusion"] == {"tp": 2, "fp": 1, "tn": 2, "fn": 1}
+  - name: no division by zero
+    code: |
+      m = metrics([1, 1, 0], [0, 0, 0])
+      assert m["precision"] == 0.0 and m["recall"] == 0.0 and m["f1"] == 0.0 and abs(m["accuracy"] - 1 / 3) < 1e-12
+      m = metrics([0, 0], [0, 0])
+      assert m["accuracy"] == 1.0 and m["recall"] == 0.0 and m["precision"] == 0.0
+      m = metrics([], [])
+      assert m["accuracy"] == 0.0 and m["confusion"] == {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
+      m = metrics([1, 0, 1, 0], [1, 1, 0, 0])
+      assert m["precision"] == 0.5 and m["recall"] == 0.5 and m["f1"] == 0.5
+  - name: accuracy can be misleading
+    code: |
+      yt = [0] * 95 + [1] * 5
+      m = metrics(yt, [0] * 100)
+      assert m["accuracy"] == 0.95 and m["recall"] == 0.0 and m["f1"] == 0.0
+  - name: per-group report
+    code: |
+      groups = ["a", "a", "b", "b", "b", "a"]
+      yt = [1, 0, 1, 1, 0, 1]
+      yp = [1, 0, 0, 0, 0, 1]
+      rep = group_report(groups, yt, yp)
+      assert list(rep) == ["a", "b"]
+      assert rep["a"] == {"size": 3, "selection_rate": 2 / 3, "tpr": 1.0, "accuracy": 1.0}
+      b = rep["b"]
+      assert b["size"] == 3 and b["selection_rate"] == 0.0 and b["tpr"] == 0.0 and abs(b["accuracy"] - 1 / 3) < 1e-12
+      assert abs(disparity(rep, "selection_rate") - 2 / 3) < 1e-12
+      assert disparity(rep, "tpr") == 1.0
+      assert disparity(rep, "accuracy") > 0.6
+  - name: groups without positives and single groups
+    code: |
+      rep = group_report(["x", "x", "y"], [0, 0, 1], [0, 1, 1])
+      assert rep["x"]["tpr"] is None and rep["y"]["tpr"] == 1.0
+      assert disparity(rep, "tpr") == 0.0
+      assert abs(disparity(rep, "selection_rate") - 0.5) < 1e-12
+      one = group_report(["g", "g"], [1, 0], [1, 1])
+      assert disparity(one, "selection_rate") == 0.0
+  hints:
+  - Guard each division with a check on its denominator.
+  - Build index lists per group, then slice `y_true` and `y_pred` with them.
+  solution: |
+    def confusion(y_true, y_pred):
+        pairs = list(zip(y_true, y_pred))
+        return {"tp": sum(1 for t, p in pairs if t == 1 and p == 1), "fp": sum(1 for t, p in pairs if t == 0 and p == 1),
+                "tn": sum(1 for t, p in pairs if t == 0 and p == 0), "fn": sum(1 for t, p in pairs if t == 1 and p == 0)}
+
+
+    def metrics(y_true, y_pred):
+        """accuracy, precision, recall and f1 (each 0.0 when its denominator is 0) and the confusion counts."""
+        c = confusion(y_true, y_pred)
+        total = len(y_true)
+        accuracy = (c["tp"] + c["tn"]) / total if total else 0.0
+        precision = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
+        recall = c["tp"] / (c["tp"] + c["fn"]) if c["tp"] + c["fn"] else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1, "confusion": c}
+
+
+    def group_report(groups, y_true, y_pred):
+        """Per group (keys in sorted order): size, selection_rate (share predicted 1), tpr (recall; None if the group has no
+        actual positives) and accuracy."""
+        report = {}
+        for g in sorted(set(groups)):
+            idx = [i for i, member in enumerate(groups) if member == g]
+            yt, yp = [y_true[i] for i in idx], [y_pred[i] for i in idx]
+            positives = sum(yt)
+            report[g] = {"size": len(idx), "selection_rate": sum(yp) / len(idx),
+                         "tpr": sum(1 for t, p in zip(yt, yp) if t == 1 and p == 1) / positives if positives else None,
+                         "accuracy": sum(1 for t, p in zip(yt, yp) if t == p) / len(idx)}
+        return report
+
+
+    def disparity(report, key):
+        """Largest minus smallest value of `key` across groups, ignoring None; 0.0 if fewer than two groups have a value."""
+        values = [v[key] for v in report.values() if v[key] is not None]
+        return max(values) - min(values) if len(values) >= 2 else 0.0
+  explanation: Metrics describe a model; a group report describes who it works for. Reporting both is part of doing the job properly.
+commonMistakes:
+- title: Splitting CSV text on commas
+  explanation: Quoted fields can contain commas, quotes and line breaks. Use a real parser.
+- title: Fitting the scaler on all the data
+  explanation: That leaks information from the test set. Fit on training rows only, then apply.
+- title: Judging a model by accuracy alone
+  explanation: With imbalanced classes a useless model can score high. Compare with a baseline and read precision and recall.
+- title: Cleaning silently
+  explanation: Return a report of drops and imputations so problems are visible.
+- title: Assuming that removing a sensitive column removes bias
+  explanation: Other columns can act as proxies and the labels themselves may carry the bias.
+- title: Forgetting the seed
+  explanation: Without a seed neither the split nor the results can be reproduced.
+summary:
+- A pipeline is a sequence of small, testable functions from raw text to evaluated predictions.
+- CSV parsing is a state machine; cleaning is a set of explicit decisions that deserve a report.
+- Split first and fit scalers and encoders on training data only to avoid leakage.
+- Logistic regression from scratch is gradient descent on log loss; compare with a baseline and read the confusion matrix.
+- Group reports expose differences, but fairness definitions conflict and the choices are human ones.
+next: u18-search
+quiz:
+- type: mcq
+  question: What is data leakage?
+  options:
+  - Test-set information influencing training or feature fitting
+  - Losing rows while parsing
+  - A memory leak
+  - A slow model
+  answer: 0
+  explanation: Evaluate only on data the pipeline never learned from.
+- type: mcq
+  question: Why impute missing numbers with the median rather than the mean?
+  options:
+  - The median is not distorted by extreme outliers
+  - The median is faster to compute
+  - Medians are always integers
+  - Means cannot be computed
+  answer: 0
+  explanation: A few huge values can drag the mean far from typical values.
+- type: mcq
+  question: A dataset has 95 negatives and 5 positives. A model that always predicts negative has what accuracy and recall?
+  options:
+  - 95% accuracy, 0% recall
+  - 5% accuracy, 100% recall
+  - 100% accuracy, 100% recall
+  - 50% accuracy, 50% recall
+  answer: 0
+  explanation: Accuracy hides the failure to find any positives.
+- type: mcq
+  question: What does precision measure?
+  options:
+  - Of the cases flagged positive, how many really are
+  - Of the real positives, how many were found
+  - The share of correct predictions overall
+  - The model's speed
+  answer: 0
+  explanation: Precision is tp / (tp + fp).
+- type: mcq
+  question: Why is the sigmoid written differently for negative inputs?
+  options:
+  - To avoid overflow in exp for large values
+  - To make it faster
+  - Because the formula is different mathematically
+  - To return integers
+  answer: 0
+  explanation: exp(1000) overflows; exp(-1000) is safely 0.
+- type: mcq
+  question: Which statement about fairness metrics is true?
+  options:
+  - Different definitions can conflict, so choosing one is a human decision
+  - One formula is always correct
+  - A gap of zero proves the model is fair in every sense
+  - Removing a column always removes bias
+  answer: 0
+  explanation: Metrics inform the decision; they do not make it.
+- type: code
+  question: Write `f1(precision, recall)` returning the harmonic mean `2 * p * r / (p + r)`, or `0.0` if both are 0.
+  starter: |
+    def f1(precision, recall):
+        pass
+  tests:
+  - name: f1
+    code: |
+      assert f1(0.5, 0.5) == 0.5
+      assert f1(0.0, 0.0) == 0.0
+      assert abs(f1(1.0, 0.5) - 2 / 3) < 1e-12
+      assert f1(0.0, 1.0) == 0.0
+  solution: |
+    def f1(precision, recall):
+        if precision + recall == 0:
+            return 0.0
+        return 2 * precision * recall / (precision + recall)

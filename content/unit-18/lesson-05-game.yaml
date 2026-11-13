@@ -1,0 +1,2101 @@
+id: u18-game
+title: 'Capstone D: A Game Engine'
+minutes: 90
+objective: 'Build a complete turn-based grid game: levels as data, shortest-path guards, a pure step function for the rules, safe save files and seeded random level generation that is guaranteed solvable. This capstone brings together Units 5, 6, 8, 12, 14 and 16.'
+outcomes:
+- Separate game data, rules and drawing so each can be tested on its own
+- Parse and validate levels from text
+- Use breadth-first search to give enemies a smart, deterministic chase
+- Write a pure step function that returns a new state instead of changing the old one
+- Treat save files as untrusted input and generate levels reproducibly from a seed
+sections:
+- heading: Data, rules and drawing
+  body: |-
+    Games feel like a pile of special cases, but good ones are built from three separate parts. **Data** says what exists: the map, where things are, the score. **Rules** say how the data changes when something happens: one move, one tick. **Presentation** turns data into something a player can see. In this lesson the whole engine is **pure logic with no drawing and no input**; the game shown in your browser or terminal is just `render(state)` printing characters.
+
+    That separation is what makes the engine testable. Our central function is `step(state, action)`. It takes the current state and a player action and **returns a new state**, never changing the old one. Functions like this are called **pure** (Unit 6) and have wonderful properties: you can undo a move by keeping the previous state, replay a whole game from a list of moves, run thousands of random games to find bugs, and save a game by writing the state to a file.
+
+    The state is a plain dictionary: `level` (the unchanging map), `player`, `guards`, the remaining `coins`, `score`, `turns` and `status` (`playing`, `won` or `lost`). The level is parsed once from ASCII art such as `#` for wall, `@` start, `X` exit, `$` coin and `g` guard, and any malformed level is refused with a clear `ValueError` at the door.
+- heading: 'Artificial opponents: breadth-first search'
+  body: |-
+    Guards need to chase the player around walls. The classic tool is **breadth-first search (BFS)** (Unit 8): explore outward from the start one step at a time, remembering for every cell where you came from. The first time you reach the goal you have found a **shortest path**, and following the "came from" links backwards gives the route.
+
+    Our BFS visits neighbours in a fixed order (up, down, left, right). That makes the game **deterministic**: the same moves always produce the same game. Determinism is a feature to protect, because it is what lets a bug report say "start a new game and make these ten moves" and lets tests assert exact positions.
+
+    Each turn, after the player moves, every guard asks BFS for the shortest path to the player's *new* cell and takes the first step. A guard with no path simply waits (a sealed-off guard is harmless). Notice the careful rule order in `step`: moving onto a guard loses immediately, reaching the exit wins before the guards get to move, and only then do the guards move and possibly catch you. Game design is mostly choosing these small rules and writing them down precisely.
+- heading: Saving games and generating levels
+  body: |-
+    A **save file** is data that outlives your program, so it is **untrusted input** (Unit 16). Players edit files, files get damaged, and old versions linger. `load_state` therefore checks everything: it parses JSON inside `try`, demands exactly the expected fields, checks types (remembering that `True` is an `int` in Python), re-parses the map, and verifies that every position is a legal floor cell, that coins are a subset of the level's coins and that the guard count matches. Anything wrong raises `SaveError` instead of producing a corrupt game. Validation catches *impossible* data, not *plausible* cheating: a player can still raise their own score. To detect that you would sign the file with an HMAC and a secret (Unit 16, and the token code in the web-service capstone) or keep scores on a server. A **version** field lets future versions of the game change the format safely.
+
+    **Procedural generation** makes levels from an algorithm. We use `random.Random(seed)`, so the same seed always gives the same level: players can share seeds, tests can replay failures, and nothing needs storing. Random walls alone can seal the exit, so the generator first **carves a guaranteed route** from start to exit and only then scatters coins and guards on the remaining free cells (guards far from the start so that the first turn is fair). "Generate, then guarantee a property by construction" is more reliable than "generate, then test and retry".
+examples:
+- title: Levels as data
+  intro: ASCII art becomes a level dictionary. Bad levels are refused with a message that says what is wrong.
+  code: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    text = """
+    #######
+    #@..$.#
+    #.##..#
+    #..g.X#
+    #######
+    """
+    level = parse_level(text)
+    print("size:", level["w"], "x", level["h"])
+    print("start:", level["start"], "exit:", level["exit"])
+    print("coins:", sorted(level["coins"]), "guards:", level["guards"])
+    print("walls:", len(level["walls"]))
+    for bad in ["#@..#", "#@X?#", "#@X#\n#.#"]:
+        try:
+            parse_level(bad)
+        except ValueError as e:
+            print("refused:", e)
+  output: |
+    size: 7 x 5
+    start: (1, 1) exit: (5, 3)
+    coins: [(4, 1)] guards: ((3, 3),)
+    walls: 22
+    refused: a level needs exactly one X
+    refused: unknown character '?' at (3, 0)
+    refused: row 1 has 3 columns, expected 4
+  lines:
+  - line: 54
+    note: One call turns the whole text into data the rest of the engine can use.
+  - line: 61
+    note: Refusing bad input early keeps the error message close to its cause.
+- title: Breadth-first search
+  intro: BFS finds a shortest route through a maze and returns None when the goal cannot be reached.
+  code: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    maze = parse_level("""
+    @.#.....
+    .##.###.
+    ....#X..
+    .####.#.
+    ......#.
+    """)
+    path = bfs_path(maze, (0, 0), (5, 2))
+    print("steps:", len(path) - 1)
+    rows = [list("." * maze["w"]) for _ in range(maze["h"])]
+    for (x, y) in maze["walls"]:
+        rows[y][x] = "#"
+    for (x, y) in path:
+        rows[y][x] = "*"
+    print("\n".join("".join(r) for r in rows))
+    print(bfs_path(parse_level("@#X"), (0, 0), (2, 0)))
+  output: |
+    steps: 11
+    *.#.....
+    *##.###.
+    *...#*..
+    *####*#.
+    ******#.
+    None
+  lines:
+  - line: 76
+    note: The path includes both ends, so the number of steps is one less than its length.
+  - line: 82
+    note: Marking the path on a copy of the map makes the route visible.
+- title: Playing a game
+  intro: The guard chases the player through the level; each move produces a new state. Reaching the exit ends the game before the guard can move again.
+  code: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def new_game(level):
+        return {"level": level, "player": level["start"], "guards": level["guards"], "coins": level["coins"],
+                "score": 0, "turns": 0, "status": "playing"}
+
+
+    def step(state, action):
+        """Return the next state after the player does `action`. The old state is never changed."""
+        if action not in DIRS:
+            raise ValueError(f"unknown action: {action}")
+        if state["status"] != "playing":
+            return state
+        level = state["level"]
+        old = state["player"]
+        new = (old[0] + DIRS[action][0], old[1] + DIRS[action][1])
+        if not in_bounds(level, new) or new in level["walls"]:
+            new = old
+        coins, score = state["coins"], state["score"]
+        if new in coins:
+            coins = coins - {new}
+            score += 10
+        result = dict(state, player=new, coins=coins, score=score, turns=state["turns"] + 1)
+        if new in state["guards"]:
+            return dict(result, status="lost")
+        if new == level["exit"]:
+            return dict(result, score=score + 100, status="won")
+        guards = []
+        for g in state["guards"]:
+            path = bfs_path(level, g, new)
+            guards.append(path[1] if path and len(path) > 1 else g)
+        result["guards"] = tuple(guards)
+        if new in result["guards"]:
+            result["status"] = "lost"
+        return result
+
+
+    def level_to_text(level):
+        rows = []
+        for y in range(level["h"]):
+            row = []
+            for x in range(level["w"]):
+                c = (x, y)
+                if c in level["walls"]:
+                    row.append("#")
+                elif c == level["start"]:
+                    row.append("@")
+                elif c == level["exit"]:
+                    row.append("X")
+                elif c in level["coins"]:
+                    row.append("$")
+                elif c in level["guards"]:
+                    row.append("g")
+                else:
+                    row.append(".")
+            rows.append("".join(row))
+        return "\n".join(rows)
+
+
+    class SaveError(ValueError):
+        """A save file that is damaged, edited or from the wrong version."""
+
+
+    STATUSES = ("playing", "won", "lost")
+
+
+    def _cell(value, level):
+        if not isinstance(value, list) or len(value) != 2 or not all(type(v) is int for v in value):
+            raise SaveError("a cell must be a list of two integers")
+        cell = (value[0], value[1])
+        if not in_bounds(level, cell) or cell in level["walls"]:
+            raise SaveError(f"cell {cell} is not on the floor")
+        return cell
+
+
+    def save_state(state):
+        return json.dumps({"version": 1, "map": level_to_text(state["level"]), "player": list(state["player"]),
+                           "guards": [list(g) for g in state["guards"]], "coins": sorted(list(c) for c in state["coins"]),
+                           "score": state["score"], "turns": state["turns"], "status": state["status"]}, sort_keys=True)
+
+
+    def load_state(text):
+        """Rebuild a state from save_state's text. Treat the text as untrusted: raise SaveError for anything odd."""
+        try:
+            data = json.loads(text)
+        except ValueError:
+            raise SaveError("not valid JSON")
+        fields = {"version", "map", "player", "guards", "coins", "score", "turns", "status"}
+        if not isinstance(data, dict) or set(data) != fields:
+            raise SaveError("unexpected fields")
+        if type(data["version"]) is not int or data["version"] != 1:
+            raise SaveError("unsupported version")
+        if not isinstance(data["map"], str):
+            raise SaveError("bad map")
+        try:
+            level = parse_level(data["map"])
+        except ValueError as e:
+            raise SaveError(f"bad map: {e}")
+        for key in ("score", "turns"):
+            if type(data[key]) is not int or data[key] < 0:
+                raise SaveError(f"bad {key}")
+        if data["status"] not in STATUSES:
+            raise SaveError("bad status")
+        player = _cell(data["player"], level)
+        if not isinstance(data["guards"], list) or len(data["guards"]) != len(level["guards"]):
+            raise SaveError("wrong number of guards")
+        guards = tuple(_cell(g, level) for g in data["guards"])
+        if not isinstance(data["coins"], list):
+            raise SaveError("bad coins")
+        coins = frozenset(_cell(c, level) for c in data["coins"])
+        if not coins <= level["coins"]:
+            raise SaveError("coins that are not in the level")
+        return {"level": level, "player": player, "guards": guards, "coins": coins,
+                "score": data["score"], "turns": data["turns"], "status": data["status"]}
+
+
+    def generate_level(w, h, seed, density=0.25, coins=3, guards=1):
+        """Make a random but always solvable level as text. The same arguments always give the same level."""
+        if w < 5 or h < 5:
+            raise ValueError("levels must be at least 5 by 5")
+        rng = random.Random(seed)
+        grid = [["#" if x in (0, w - 1) or y in (0, h - 1) or rng.random() < density else "." for x in range(w)]
+                for y in range(h)]
+        x, y = 1, 1
+        grid[y][x] = "."
+        while (x, y) != (w - 2, h - 2):                 # carve a guaranteed route from start to exit
+            options = []
+            if x < w - 2:
+                options.append((1, 0))
+            if y < h - 2:
+                options.append((0, 1))
+            dx, dy = rng.choice(options)
+            x, y = x + dx, y + dy
+            grid[y][x] = "."
+        free = [(cx, cy) for cy in range(h) for cx in range(w)
+                if grid[cy][cx] == "." and (cx, cy) not in ((1, 1), (w - 2, h - 2))]
+        chosen = rng.sample(free, min(coins, len(free)))
+        for cx, cy in chosen:
+            grid[cy][cx] = "$"
+        far = [c for c in free if c not in chosen and abs(c[0] - 1) + abs(c[1] - 1) >= 4]
+        for cx, cy in rng.sample(far, min(guards, len(far))):
+            grid[cy][cx] = "g"
+        grid[1][1] = "@"
+        grid[h - 2][w - 2] = "X"
+        return "\n".join("".join(row) for row in grid)
+
+
+    def render(state):
+        level = state["level"]
+        rows = []
+        for y in range(level["h"]):
+            row = ""
+            for x in range(level["w"]):
+                c = (x, y)
+                if c == state["player"]:
+                    row += "@"
+                elif c in state["guards"]:
+                    row += "g"
+                elif c in level["walls"]:
+                    row += "#"
+                elif c == level["exit"]:
+                    row += "X"
+                elif c in state["coins"]:
+                    row += "$"
+                else:
+                    row += "."
+            rows.append(row)
+        return "\n".join(rows)
+
+
+    state = new_game(parse_level("""
+    #######
+    #@..$.#
+    #.##..#
+    #..g.X#
+    #######
+    """))
+    print(render(state))
+    for move in ["right", "right", "right", "down", "down"]:
+        state = step(state, move)
+        print()
+        print(f"after {move}: score {state['score']}, {state['status']}")
+        print(render(state))
+    state = step(state, "right")
+    print()
+    print("last move:", state["status"], "with score", state["score"], "after", state["turns"], "turns")
+  output: |
+    #######
+    #@..$.#
+    #.##..#
+    #..g.X#
+    #######
+
+    after right: score 0, playing
+    #######
+    #.@.$.#
+    #.##..#
+    #.g..X#
+    #######
+
+    after right: score 0, playing
+    #######
+    #..@$.#
+    #.##..#
+    #g...X#
+    #######
+
+    after right: score 10, playing
+    #######
+    #...@.#
+    #g##..#
+    #....X#
+    #######
+
+    after down: score 10, playing
+    #######
+    #g....#
+    #.##@.#
+    #....X#
+    #######
+
+    after down: score 10, playing
+    #######
+    #.....#
+    #g##..#
+    #...@X#
+    #######
+
+    last move: won with score 110 after 6 turns
+  lines:
+  - line: 237
+    note: Every state is a new dictionary; old ones stay valid.
+  - line: 246
+    note: Each move returns a new state, so keeping a list of states would give undo.
+- title: Safe save files
+  intro: 'A save file is plain JSON. Impossible or damaged data is refused, but a plausible edit such as a higher score passes validation: stopping that needs a signature (Unit 16) or a server.'
+  code: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def new_game(level):
+        return {"level": level, "player": level["start"], "guards": level["guards"], "coins": level["coins"],
+                "score": 0, "turns": 0, "status": "playing"}
+
+
+    def step(state, action):
+        """Return the next state after the player does `action`. The old state is never changed."""
+        if action not in DIRS:
+            raise ValueError(f"unknown action: {action}")
+        if state["status"] != "playing":
+            return state
+        level = state["level"]
+        old = state["player"]
+        new = (old[0] + DIRS[action][0], old[1] + DIRS[action][1])
+        if not in_bounds(level, new) or new in level["walls"]:
+            new = old
+        coins, score = state["coins"], state["score"]
+        if new in coins:
+            coins = coins - {new}
+            score += 10
+        result = dict(state, player=new, coins=coins, score=score, turns=state["turns"] + 1)
+        if new in state["guards"]:
+            return dict(result, status="lost")
+        if new == level["exit"]:
+            return dict(result, score=score + 100, status="won")
+        guards = []
+        for g in state["guards"]:
+            path = bfs_path(level, g, new)
+            guards.append(path[1] if path and len(path) > 1 else g)
+        result["guards"] = tuple(guards)
+        if new in result["guards"]:
+            result["status"] = "lost"
+        return result
+
+
+    def level_to_text(level):
+        rows = []
+        for y in range(level["h"]):
+            row = []
+            for x in range(level["w"]):
+                c = (x, y)
+                if c in level["walls"]:
+                    row.append("#")
+                elif c == level["start"]:
+                    row.append("@")
+                elif c == level["exit"]:
+                    row.append("X")
+                elif c in level["coins"]:
+                    row.append("$")
+                elif c in level["guards"]:
+                    row.append("g")
+                else:
+                    row.append(".")
+            rows.append("".join(row))
+        return "\n".join(rows)
+
+
+    class SaveError(ValueError):
+        """A save file that is damaged, edited or from the wrong version."""
+
+
+    STATUSES = ("playing", "won", "lost")
+
+
+    def _cell(value, level):
+        if not isinstance(value, list) or len(value) != 2 or not all(type(v) is int for v in value):
+            raise SaveError("a cell must be a list of two integers")
+        cell = (value[0], value[1])
+        if not in_bounds(level, cell) or cell in level["walls"]:
+            raise SaveError(f"cell {cell} is not on the floor")
+        return cell
+
+
+    def save_state(state):
+        return json.dumps({"version": 1, "map": level_to_text(state["level"]), "player": list(state["player"]),
+                           "guards": [list(g) for g in state["guards"]], "coins": sorted(list(c) for c in state["coins"]),
+                           "score": state["score"], "turns": state["turns"], "status": state["status"]}, sort_keys=True)
+
+
+    def load_state(text):
+        """Rebuild a state from save_state's text. Treat the text as untrusted: raise SaveError for anything odd."""
+        try:
+            data = json.loads(text)
+        except ValueError:
+            raise SaveError("not valid JSON")
+        fields = {"version", "map", "player", "guards", "coins", "score", "turns", "status"}
+        if not isinstance(data, dict) or set(data) != fields:
+            raise SaveError("unexpected fields")
+        if type(data["version"]) is not int or data["version"] != 1:
+            raise SaveError("unsupported version")
+        if not isinstance(data["map"], str):
+            raise SaveError("bad map")
+        try:
+            level = parse_level(data["map"])
+        except ValueError as e:
+            raise SaveError(f"bad map: {e}")
+        for key in ("score", "turns"):
+            if type(data[key]) is not int or data[key] < 0:
+                raise SaveError(f"bad {key}")
+        if data["status"] not in STATUSES:
+            raise SaveError("bad status")
+        player = _cell(data["player"], level)
+        if not isinstance(data["guards"], list) or len(data["guards"]) != len(level["guards"]):
+            raise SaveError("wrong number of guards")
+        guards = tuple(_cell(g, level) for g in data["guards"])
+        if not isinstance(data["coins"], list):
+            raise SaveError("bad coins")
+        coins = frozenset(_cell(c, level) for c in data["coins"])
+        if not coins <= level["coins"]:
+            raise SaveError("coins that are not in the level")
+        return {"level": level, "player": player, "guards": guards, "coins": coins,
+                "score": data["score"], "turns": data["turns"], "status": data["status"]}
+
+
+    def generate_level(w, h, seed, density=0.25, coins=3, guards=1):
+        """Make a random but always solvable level as text. The same arguments always give the same level."""
+        if w < 5 or h < 5:
+            raise ValueError("levels must be at least 5 by 5")
+        rng = random.Random(seed)
+        grid = [["#" if x in (0, w - 1) or y in (0, h - 1) or rng.random() < density else "." for x in range(w)]
+                for y in range(h)]
+        x, y = 1, 1
+        grid[y][x] = "."
+        while (x, y) != (w - 2, h - 2):                 # carve a guaranteed route from start to exit
+            options = []
+            if x < w - 2:
+                options.append((1, 0))
+            if y < h - 2:
+                options.append((0, 1))
+            dx, dy = rng.choice(options)
+            x, y = x + dx, y + dy
+            grid[y][x] = "."
+        free = [(cx, cy) for cy in range(h) for cx in range(w)
+                if grid[cy][cx] == "." and (cx, cy) not in ((1, 1), (w - 2, h - 2))]
+        chosen = rng.sample(free, min(coins, len(free)))
+        for cx, cy in chosen:
+            grid[cy][cx] = "$"
+        far = [c for c in free if c not in chosen and abs(c[0] - 1) + abs(c[1] - 1) >= 4]
+        for cx, cy in rng.sample(far, min(guards, len(far))):
+            grid[cy][cx] = "g"
+        grid[1][1] = "@"
+        grid[h - 2][w - 2] = "X"
+        return "\n".join("".join(row) for row in grid)
+
+
+    import json
+
+    level = parse_level("######\n#@$.X#\n######")
+    state = step(new_game(level), "right")
+    saved = save_state(state)
+    print(saved)
+    print("round trip equal:", load_state(saved) == state)
+
+    data = json.loads(saved)
+    data["score"] = 99999
+    for label, text in [("plausible edit (score 99999)", json.dumps(data)), ("player in a wall", saved.replace("[2, 1]", "[0, 0]").replace("[2,1]", "[0,0]")), ("garbage", "{oops")]:
+        try:
+            load_state(text)
+            print(label, "-> accepted")
+        except SaveError as e:
+            print(label, "-> refused:", e)
+  output: |
+    {"coins": [], "guards": [], "map": "######\n#@$.X#\n######", "player": [2, 1], "score": 10, "status": "playing", "turns": 1, "version": 1}
+    round trip equal: True
+    plausible edit (score 99999) -> accepted
+    player in a wall -> refused: cell (0, 0) is not on the floor
+    garbage -> refused: not valid JSON
+  lines:
+  - line: 218
+    note: The save is plain, sorted JSON so it is easy to inspect and diff.
+  - line: 148
+    note: Anything that does not pass every check raises SaveError.
+- title: Seeded level generation
+  intro: The same seed gives the same level, and carving a route first makes every level solvable, even with many walls.
+  code: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def generate_level(w, h, seed, density=0.25, coins=3, guards=1):
+        """Make a random but always solvable level as text. The same arguments always give the same level."""
+        if w < 5 or h < 5:
+            raise ValueError("levels must be at least 5 by 5")
+        rng = random.Random(seed)
+        grid = [["#" if x in (0, w - 1) or y in (0, h - 1) or rng.random() < density else "." for x in range(w)]
+                for y in range(h)]
+        x, y = 1, 1
+        grid[y][x] = "."
+        while (x, y) != (w - 2, h - 2):                 # carve a guaranteed route from start to exit
+            options = []
+            if x < w - 2:
+                options.append((1, 0))
+            if y < h - 2:
+                options.append((0, 1))
+            dx, dy = rng.choice(options)
+            x, y = x + dx, y + dy
+            grid[y][x] = "."
+        free = [(cx, cy) for cy in range(h) for cx in range(w)
+                if grid[cy][cx] == "." and (cx, cy) not in ((1, 1), (w - 2, h - 2))]
+        chosen = rng.sample(free, min(coins, len(free)))
+        for cx, cy in chosen:
+            grid[cy][cx] = "$"
+        far = [c for c in free if c not in chosen and abs(c[0] - 1) + abs(c[1] - 1) >= 4]
+        for cx, cy in rng.sample(far, min(guards, len(far))):
+            grid[cy][cx] = "g"
+        grid[1][1] = "@"
+        grid[h - 2][w - 2] = "X"
+        return "\n".join("".join(row) for row in grid)
+
+
+    print(generate_level(11, 7, seed=5))
+    print()
+    print("same seed twice equal:", generate_level(11, 7, 5) == generate_level(11, 7, 5))
+    print("different seeds equal:", generate_level(11, 7, 5) == generate_level(11, 7, 6))
+    solvable = 0
+    for seed in range(200):
+        lv = parse_level(generate_level(11, 7, seed, density=0.45))
+        if bfs_path(lv, lv["start"], lv["exit"]):
+            solvable += 1
+    print("solvable levels out of 200:", solvable)
+  output: |
+    ###########
+    #@...$.#..#
+    #..#.#.$###
+    #...#.#.###
+    #.#g......#
+    ##.....$.X#
+    ###########
+
+    same seed twice equal: True
+    different seeds equal: False
+    solvable levels out of 200: 200
+  lines:
+  - line: 100
+    note: The seed fully decides the level.
+  - line: 106
+    note: Even with many walls, the carved route keeps every level solvable.
+playground:
+  prompt: Copy the finished engine, then add a new tile `~` (water) that the player cannot enter but guards can cross, or give the player three lives. Which functions have to change, and which do not?
+  code: |
+    from collections import deque
+    q = deque([(0, 0)])
+    print(q.popleft())
+exercises:
+- id: parse-level
+  title: 'Milestone 1: Levels from text'
+  difficulty: 3
+  prompt: Write `parse_level(text)` that turns ASCII art into a dictionary with `w`, `h`, `walls` (a frozenset of `(x, y)`), `start`, `exit`, `coins` (a frozenset), and `guards` (a tuple in reading order, top row first and left to right). `#` is a wall, `.` is floor, `@` the start, `X` the exit, `$` a coin and `g` a guard. Ignore blank lines before and after the map. Raise `ValueError` for an empty level, rows of different lengths, an unknown character, or anything other than exactly one `@` and exactly one `X`.
+  starter: |
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary: w, h, walls (frozenset), start, exit, coins (frozenset), guards (tuple)."""
+        pass
+  tests:
+  - name: a valid level
+    code: |
+      LV = """#######
+      #@..$.#
+      #.##..#
+      #..g.X#
+      #######"""
+
+      lv = parse_level(LV)
+      assert (lv["w"], lv["h"]) == (7, 5)
+      assert lv["start"] == (1, 1) and lv["exit"] == (5, 3)
+      assert lv["coins"] == frozenset({(4, 1)})
+      assert lv["guards"] == ((3, 3),)
+      assert (0, 0) in lv["walls"] and (2, 2) in lv["walls"] and (1, 1) not in lv["walls"]
+      assert len(lv["walls"]) == LV.count("#")
+      assert isinstance(lv["walls"], frozenset) and isinstance(lv["guards"], tuple)
+      assert parse_level("\n" + LV + "\n") == lv
+  - name: guards keep reading order
+    code: |
+      lv = parse_level("#####\n#g@g#\n#gXg#\n#####")
+      assert lv["guards"] == ((1, 1), (3, 1), (1, 2), (3, 2))
+      assert lv["coins"] == frozenset()
+  - name: bad levels are refused
+    code: |
+      bad = ["", "\n\n", "#@X\n#.", "@X?", "@..", "X..", "@@X", "@XX", "#@\n#X\n##.", "@ X"]
+      for text in bad:
+          try:
+              parse_level(text)
+          except ValueError:
+              continue
+          raise AssertionError("accepted " + repr(text))
+      assert parse_level("@X")["w"] == 2
+  hints:
+  - '`text.strip("\n").split("\n")` gives the rows.'
+  - '`for y, row in enumerate(rows)` and `for x, ch in enumerate(row)` give coordinates.'
+  solution: |
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+  explanation: Validating at the door means the rest of the engine can assume a well-formed level.
+- id: bfs
+  title: 'Milestone 2: Shortest paths'
+  difficulty: 4
+  prompt: The starter has `parse_level` and `in_bounds`. Write `bfs_path(level, start, goal)` returning a shortest path as a list of cells from `start` to `goal` inclusive (moves are up, down, left or right, never through walls or off the map), or `None` if there is no path. Try neighbours in the order of `ORDER` so that ties are broken the same way every time. `bfs_path(level, a, a)` is `[a]`.
+  starter: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        pass
+  tests:
+  - name: a shortest path
+    code: |
+      LV = """#######
+      #@..$.#
+      #.##..#
+      #..g.X#
+      #######"""
+
+      lv = parse_level(LV)
+      path = bfs_path(lv, (1, 1), (5, 3))
+      assert path == [(1, 1), (1, 2), (1, 3), (2, 3), (3, 3), (4, 3), (5, 3)]
+      assert bfs_path(lv, (1, 1), (4, 1)) == [(1, 1), (2, 1), (3, 1), (4, 1)]
+  - name: trivial and impossible
+    code: |
+      LV = """#######
+      #@..$.#
+      #.##..#
+      #..g.X#
+      #######"""
+
+      lv = parse_level(LV)
+      assert bfs_path(lv, (1, 1), (1, 1)) == [(1, 1)]
+      assert bfs_path(lv, (1, 1), (0, 0)) is None        # the goal is a wall
+      assert bfs_path(lv, (1, 1), (9, 9)) is None        # off the map
+      sealed = parse_level("#####\n#@#X#\n#####")
+      assert bfs_path(sealed, (1, 1), (3, 1)) is None
+  - name: paths are valid and shortest
+    code: |
+      open_room = parse_level("@...X\n.....\n.....")
+      path = bfs_path(open_room, (0, 0), (4, 2))
+      assert len(path) == 7 and path[0] == (0, 0) and path[-1] == (4, 2)
+      for a, b in zip(path, path[1:]):
+          assert abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1
+      maze = parse_level("""@.#.....
+      .##.###.
+      ....#X..
+      .####.#.
+      ......#.""")
+      path = bfs_path(maze, (0, 0), (5, 2))
+      assert path is not None and len(path) - 1 == 11
+      assert all(c not in maze["walls"] for c in path)
+      for a, b in zip(path, path[1:]):
+          assert abs(a[0] - b[0]) + abs(a[1] - b[1]) == 1
+  - name: ties follow the direction order
+    code: |
+      room = parse_level("@..\n...\n..X")
+      assert bfs_path(room, (0, 0), (2, 2)) == [(0, 0), (0, 1), (0, 2), (1, 2), (2, 2)]
+  hints:
+  - Use `collections.deque` as the queue and a dictionary `parent` that also doubles as the visited set.
+  - Rebuild the path by following `parent` from the goal back to the start and reversing the list.
+  solution: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+  explanation: BFS explores in rings, so the first time it meets the goal it has used the fewest steps.
+- id: step
+  title: 'Milestone 3: The rules'
+  difficulty: 5
+  prompt: The starter has everything so far and `new_game`. Write `step(state, action)` returning a new state without changing the old one. Actions are the keys of `DIRS` (otherwise raise `ValueError`). A finished game (`won` or `lost`) is returned unchanged. The player moves unless a wall or the map edge blocks the move; the turn count always goes up by one. Picking up a coin gives 10 points. If the player's new cell holds a guard the game is `lost`. Otherwise, if it is the exit, the player gets 100 points and the game is `won` (the guards do not move). Otherwise every guard moves one step along its BFS path to the player's new cell (a guard with no path stays), and if a guard now stands on the player the game is `lost`.
+  starter: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def new_game(level):
+        return {"level": level, "player": level["start"], "guards": level["guards"], "coins": level["coins"],
+                "score": 0, "turns": 0, "status": "playing"}
+
+
+    def step(state, action):
+        """Return the next state after the player does `action`. The old state is never changed."""
+        pass
+  tests:
+  - name: moving, walls and coins
+    code: |
+      lv = parse_level("#####\n#@.$X\n#####")
+      s = new_game(lv)
+      assert s["player"] == (1, 1) and s["score"] == 0 and s["turns"] == 0 and s["status"] == "playing"
+      a = step(s, "right")
+      assert a["player"] == (2, 1) and a["turns"] == 1 and a["score"] == 0 and a["status"] == "playing"
+      assert s["player"] == (1, 1) and s["turns"] == 0            # the old state is untouched
+      b = step(s, "up")
+      assert b["player"] == (1, 1) and b["turns"] == 1
+      assert step(s, "left")["player"] == (1, 1)
+      w = step(s, "wait")
+      assert w["player"] == (1, 1) and w["turns"] == 1
+      c = step(step(s, "right"), "right")
+      assert c["player"] == (3, 1) and c["score"] == 10 and c["coins"] == frozenset()
+      assert s["coins"] == frozenset({(3, 1)})
+      try:
+          step(s, "jump")
+          raise AssertionError("accepted a bad action")
+      except ValueError:
+          pass
+  - name: winning ends the game
+    code: |
+      lv = parse_level("#####\n#@.$X\n#####")
+      s = new_game(lv)
+      for move in ["right", "right", "right"]:
+          s = step(s, move)
+      assert s["status"] == "won" and s["score"] == 110 and s["player"] == (4, 1) and s["turns"] == 3
+      assert step(s, "left") == s
+      assert set(s) == {"level", "player", "guards", "coins", "score", "turns", "status"}
+  - name: guards chase the player
+    code: |
+      lv = parse_level("#######\n#@...g#\n#....X#\n#######")
+      s = new_game(lv)
+      seen = []
+      for _ in range(3):
+          s = step(s, "wait")
+          seen.append(s["guards"][0])
+          assert s["status"] == "playing"
+      assert seen == [(4, 1), (3, 1), (2, 1)]
+      s = step(s, "wait")
+      assert s["status"] == "lost" and s["guards"] == ((1, 1),)
+      assert step(s, "right") == s
+  - name: walking into a guard, escaping and blocked guards
+    code: |
+      lv = parse_level("#####\n#@g.#\n#..X#\n#####")
+      s = step(new_game(lv), "right")
+      assert s["status"] == "lost" and s["player"] == (2, 1)
+      race = parse_level("#######\n#@...gX\n#######")
+      s = new_game(race)
+      for _ in range(4):
+          s = step(s, "right")
+      assert s["status"] == "lost"
+      lv = parse_level("#####\n#@#g#\n#.X##\n#####")
+      s = new_game(lv)
+      for _ in range(3):
+          s = step(s, "wait")
+      assert s["guards"] == ((3, 1),) and s["status"] == "playing"
+      lv = parse_level("######\n#@..g#\n#.gX.#\n######")
+      s = step(new_game(lv), "wait")
+      assert s["guards"] == ((3, 1), (2, 1)) and s["status"] == "playing"
+      s = step(s, "right")
+      assert s["player"] == (2, 1) and s["status"] == "lost"
+  hints:
+  - '`dict(state, player=new, turns=state["turns"] + 1)` copies the dictionary with some fields replaced.'
+  - '`bfs_path(level, guard, player)[1]` is the first step; check that the path exists and has at least two cells.'
+  solution: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def new_game(level):
+        return {"level": level, "player": level["start"], "guards": level["guards"], "coins": level["coins"],
+                "score": 0, "turns": 0, "status": "playing"}
+
+
+    def step(state, action):
+        """Return the next state after the player does `action`. The old state is never changed."""
+        if action not in DIRS:
+            raise ValueError(f"unknown action: {action}")
+        if state["status"] != "playing":
+            return state
+        level = state["level"]
+        old = state["player"]
+        new = (old[0] + DIRS[action][0], old[1] + DIRS[action][1])
+        if not in_bounds(level, new) or new in level["walls"]:
+            new = old
+        coins, score = state["coins"], state["score"]
+        if new in coins:
+            coins = coins - {new}
+            score += 10
+        result = dict(state, player=new, coins=coins, score=score, turns=state["turns"] + 1)
+        if new in state["guards"]:
+            return dict(result, status="lost")
+        if new == level["exit"]:
+            return dict(result, score=score + 100, status="won")
+        guards = []
+        for g in state["guards"]:
+            path = bfs_path(level, g, new)
+            guards.append(path[1] if path and len(path) > 1 else g)
+        result["guards"] = tuple(guards)
+        if new in result["guards"]:
+            result["status"] = "lost"
+        return result
+  explanation: A rule order that is written down and tested is a game design decision you can defend.
+- id: save-load
+  title: 'Milestone 4: Safe save files'
+  difficulty: 5
+  prompt: 'The starter has the engine, `level_to_text` and `SaveError`. Write `save_state(state)` returning JSON text (with `sort_keys=True`) with exactly these fields: `version` (1), `map` (`level_to_text(state["level"])`), `player` (a two-item list), `guards` (a list of two-item lists), `coins` (a sorted list of two-item lists), `score`, `turns` and `status`. Write `load_state(text)` that rebuilds the state and raises `SaveError` for: invalid JSON or anything that is not an object, missing or extra fields, a version other than the integer 1, an unparsable map, a negative or non-integer score or turns (a `bool` is not an integer), a status other than `playing`, `won` or `lost`, any cell that is not a list of two integers on a floor cell inside the map, a wrong number of guards, or coins that were not in the level.'
+  starter: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def new_game(level):
+        return {"level": level, "player": level["start"], "guards": level["guards"], "coins": level["coins"],
+                "score": 0, "turns": 0, "status": "playing"}
+
+
+    def step(state, action):
+        """Return the next state after the player does `action`. The old state is never changed."""
+        if action not in DIRS:
+            raise ValueError(f"unknown action: {action}")
+        if state["status"] != "playing":
+            return state
+        level = state["level"]
+        old = state["player"]
+        new = (old[0] + DIRS[action][0], old[1] + DIRS[action][1])
+        if not in_bounds(level, new) or new in level["walls"]:
+            new = old
+        coins, score = state["coins"], state["score"]
+        if new in coins:
+            coins = coins - {new}
+            score += 10
+        result = dict(state, player=new, coins=coins, score=score, turns=state["turns"] + 1)
+        if new in state["guards"]:
+            return dict(result, status="lost")
+        if new == level["exit"]:
+            return dict(result, score=score + 100, status="won")
+        guards = []
+        for g in state["guards"]:
+            path = bfs_path(level, g, new)
+            guards.append(path[1] if path and len(path) > 1 else g)
+        result["guards"] = tuple(guards)
+        if new in result["guards"]:
+            result["status"] = "lost"
+        return result
+
+
+    def level_to_text(level):
+        rows = []
+        for y in range(level["h"]):
+            row = []
+            for x in range(level["w"]):
+                c = (x, y)
+                if c in level["walls"]:
+                    row.append("#")
+                elif c == level["start"]:
+                    row.append("@")
+                elif c == level["exit"]:
+                    row.append("X")
+                elif c in level["coins"]:
+                    row.append("$")
+                elif c in level["guards"]:
+                    row.append("g")
+                else:
+                    row.append(".")
+            rows.append("".join(row))
+        return "\n".join(rows)
+
+
+    class SaveError(ValueError):
+        """A save file that is damaged, edited or from the wrong version."""
+
+
+    STATUSES = ("playing", "won", "lost")
+
+
+    def save_state(state):
+        pass
+
+
+    def load_state(text):
+        """Rebuild a state from save_state's text. The text is untrusted: raise SaveError for anything odd."""
+        pass
+  tests:
+  - name: round trip
+    code: |
+      lv = parse_level("#######\n#@..$.#\n#.##..#\n#..g.X#\n#######")
+      s = new_game(lv)
+      text = save_state(s)
+      assert isinstance(text, str)
+      assert load_state(text) == s
+      for moves in (["right", "right"], ["right", "right", "right", "down", "down", "right"], ["wait"] * 5):
+          s = new_game(lv)
+          for m in moves:
+              s = step(s, m)
+          t = save_state(s)
+          assert load_state(t) == s
+          assert save_state(load_state(t)) == t
+  - name: the file is plain JSON with sorted keys
+    code: |
+      import json
+      lv = parse_level("#####\n#@$X#\n#####")
+      text = save_state(step(new_game(lv), "right"))
+      data = json.loads(text)
+      assert data["version"] == 1 and data["score"] == 10 and data["turns"] == 1
+      assert data["player"] == [2, 1] and data["coins"] == [] and data["guards"] == [] and data["status"] == "playing"
+      assert data["map"] == level_to_text(lv)
+      assert text == json.dumps(data, sort_keys=True)
+      assert set(data) == {"version", "map", "player", "guards", "coins", "score", "turns", "status"}
+  - name: tampered saves are rejected
+    code: |
+      import json
+      lv = parse_level("#######\n#@..$.#\n#.##..#\n#..g.X#\n#######")
+      s = step(step(new_game(lv), "right"), "right")
+      good = json.loads(save_state(s))
+      def broken(**changes):
+          d = dict(good)
+          for k, v in changes.items():
+              if v == "__missing__":
+                  del d[k]
+              else:
+                  d[k] = v
+          return json.dumps(d)
+      cases = [
+          broken(status="cheating"), broken(score=-5), broken(score="100"), broken(score=True), broken(score=1.5),
+          broken(turns=-1), broken(player=[0, 0]), broken(player=[99, 99]), broken(player=[1]), broken(player="1,1"),
+          broken(player=[1.0, 1]), broken(player=[True, 1]), broken(god_mode=True), broken(coins="__missing__"),
+          broken(version=2), broken(version=True), broken(coins=[[2, 1]]), broken(coins=[[4, 1], [4, 1], [1, 1]]),
+          broken(guards=[]), broken(guards=[[3, 3], [3, 3]]), broken(guards=[[0, 0]]),
+          broken(map="@@X"), broken(map=5), broken(map="#@\n#X\n##."),
+          "{oops", "[]", "", "null", "5", '"text"',
+      ]
+      for text in cases:
+          try:
+              load_state(text)
+          except SaveError:
+              continue
+          raise AssertionError("accepted " + text[:60])
+  - name: a loaded game can be played on
+    code: |
+      lv = parse_level("#####\n#@$X#\n#####")
+      s = load_state(save_state(new_game(lv)))
+      s = step(step(s, "right"), "right")
+      assert s["status"] == "won" and s["score"] == 110
+  hints:
+  - Write a small helper that validates one `[x, y]` cell and returns the tuple.
+  - '`type(value) is int` rejects `True` and `1.0`.'
+  solution: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def new_game(level):
+        return {"level": level, "player": level["start"], "guards": level["guards"], "coins": level["coins"],
+                "score": 0, "turns": 0, "status": "playing"}
+
+
+    def step(state, action):
+        """Return the next state after the player does `action`. The old state is never changed."""
+        if action not in DIRS:
+            raise ValueError(f"unknown action: {action}")
+        if state["status"] != "playing":
+            return state
+        level = state["level"]
+        old = state["player"]
+        new = (old[0] + DIRS[action][0], old[1] + DIRS[action][1])
+        if not in_bounds(level, new) or new in level["walls"]:
+            new = old
+        coins, score = state["coins"], state["score"]
+        if new in coins:
+            coins = coins - {new}
+            score += 10
+        result = dict(state, player=new, coins=coins, score=score, turns=state["turns"] + 1)
+        if new in state["guards"]:
+            return dict(result, status="lost")
+        if new == level["exit"]:
+            return dict(result, score=score + 100, status="won")
+        guards = []
+        for g in state["guards"]:
+            path = bfs_path(level, g, new)
+            guards.append(path[1] if path and len(path) > 1 else g)
+        result["guards"] = tuple(guards)
+        if new in result["guards"]:
+            result["status"] = "lost"
+        return result
+
+
+    def level_to_text(level):
+        rows = []
+        for y in range(level["h"]):
+            row = []
+            for x in range(level["w"]):
+                c = (x, y)
+                if c in level["walls"]:
+                    row.append("#")
+                elif c == level["start"]:
+                    row.append("@")
+                elif c == level["exit"]:
+                    row.append("X")
+                elif c in level["coins"]:
+                    row.append("$")
+                elif c in level["guards"]:
+                    row.append("g")
+                else:
+                    row.append(".")
+            rows.append("".join(row))
+        return "\n".join(rows)
+
+
+    class SaveError(ValueError):
+        """A save file that is damaged, edited or from the wrong version."""
+
+
+    STATUSES = ("playing", "won", "lost")
+
+
+    def _cell(value, level):
+        if not isinstance(value, list) or len(value) != 2 or not all(type(v) is int for v in value):
+            raise SaveError("a cell must be a list of two integers")
+        cell = (value[0], value[1])
+        if not in_bounds(level, cell) or cell in level["walls"]:
+            raise SaveError(f"cell {cell} is not on the floor")
+        return cell
+
+
+    def save_state(state):
+        return json.dumps({"version": 1, "map": level_to_text(state["level"]), "player": list(state["player"]),
+                           "guards": [list(g) for g in state["guards"]], "coins": sorted(list(c) for c in state["coins"]),
+                           "score": state["score"], "turns": state["turns"], "status": state["status"]}, sort_keys=True)
+
+
+    def load_state(text):
+        """Rebuild a state from save_state's text. Treat the text as untrusted: raise SaveError for anything odd."""
+        try:
+            data = json.loads(text)
+        except ValueError:
+            raise SaveError("not valid JSON")
+        fields = {"version", "map", "player", "guards", "coins", "score", "turns", "status"}
+        if not isinstance(data, dict) or set(data) != fields:
+            raise SaveError("unexpected fields")
+        if type(data["version"]) is not int or data["version"] != 1:
+            raise SaveError("unsupported version")
+        if not isinstance(data["map"], str):
+            raise SaveError("bad map")
+        try:
+            level = parse_level(data["map"])
+        except ValueError as e:
+            raise SaveError(f"bad map: {e}")
+        for key in ("score", "turns"):
+            if type(data[key]) is not int or data[key] < 0:
+                raise SaveError(f"bad {key}")
+        if data["status"] not in STATUSES:
+            raise SaveError("bad status")
+        player = _cell(data["player"], level)
+        if not isinstance(data["guards"], list) or len(data["guards"]) != len(level["guards"]):
+            raise SaveError("wrong number of guards")
+        guards = tuple(_cell(g, level) for g in data["guards"])
+        if not isinstance(data["coins"], list):
+            raise SaveError("bad coins")
+        coins = frozenset(_cell(c, level) for c in data["coins"])
+        if not coins <= level["coins"]:
+            raise SaveError("coins that are not in the level")
+        return {"level": level, "player": player, "guards": guards, "coins": coins,
+                "score": data["score"], "turns": data["turns"], "status": data["status"]}
+  explanation: Every field of an untrusted file needs a check. Raising one specific exception type lets the game say "this save is damaged" instead of crashing.
+- id: generator
+  title: 'Milestone 5: Seeded, solvable levels'
+  difficulty: 5
+  prompt: The starter has `parse_level` and `bfs_path`. Write `generate_level(w, h, seed, density=0.25, coins=3, guards=1)` returning level text that `parse_level` accepts. Raise `ValueError` if `w` or `h` is below 5. Use `random.Random(seed)` so the same arguments always give the same level. The border is wall; each interior cell is a wall with probability `density`. The start `@` is at `(1, 1)` and the exit `X` at `(w - 2, h - 2)`, and a route between them must always exist (carve one, for example a random walk that only moves right or down). Place `coins` coins on distinct free cells and `guards` guards on other free cells at least 4 steps (Manhattan distance) from the start; if there are fewer suitable cells than requested, place as many as fit.
+  starter: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def generate_level(w, h, seed, density=0.25, coins=3, guards=1):
+        pass
+  tests:
+  - name: solvable, well formed and complete
+    code: |
+      for seed in range(25):
+          text = generate_level(9, 7, seed)
+          lv = parse_level(text)
+          assert (lv["w"], lv["h"]) == (9, 7)
+          assert lv["start"] == (1, 1) and lv["exit"] == (7, 5)
+          rows = text.split("\n")
+          assert set(rows[0]) == {"#"} and set(rows[-1]) == {"#"}
+          assert all(r[0] == "#" and r[-1] == "#" for r in rows)
+          assert bfs_path(lv, lv["start"], lv["exit"]) is not None, seed
+          assert len(lv["coins"]) == 3 and len(lv["guards"]) == 1
+          for g in lv["guards"]:
+              assert abs(g[0] - 1) + abs(g[1] - 1) >= 4
+  - name: same seed, same level
+    code: |
+      assert generate_level(10, 8, 42) == generate_level(10, 8, 42)
+      assert generate_level(10, 8, 42, density=0.4, coins=5, guards=2) == generate_level(10, 8, 42, density=0.4, coins=5, guards=2)
+      assert len({generate_level(9, 7, s) for s in range(10)}) >= 5
+      assert generate_level(9, 7, 1) != generate_level(9, 7, 1, density=0.6)
+  - name: parameters are respected
+    code: |
+      lv = parse_level(generate_level(12, 9, 7, coins=6, guards=3))
+      assert len(lv["coins"]) == 6 and len(lv["guards"]) == 3
+      lv = parse_level(generate_level(12, 9, 7, coins=0, guards=0))
+      assert len(lv["coins"]) == 0 and len(lv["guards"]) == 0
+      walls = [len(parse_level(generate_level(15, 15, s, density=d))["walls"]) for s in range(5) for d in (0.0,)]
+      assert all(w == 2 * 15 + 2 * 13 for w in walls)
+  - name: cramped and invalid levels
+    code: |
+      text = generate_level(5, 5, 1, density=1.0, coins=10, guards=5)
+      lv = parse_level(text)
+      assert bfs_path(lv, lv["start"], lv["exit"]) is not None
+      assert len(lv["coins"]) + len(lv["guards"]) <= 3
+      for w, h in [(4, 9), (9, 4), (3, 3)]:
+          try:
+              generate_level(w, h, 0)
+          except ValueError:
+              continue
+          raise AssertionError("accepted a tiny level")
+  hints:
+  - Make the random walls first, then carve the route so it overrides them.
+  - '`rng.sample(list_of_cells, k)` chooses k distinct cells; sort or build the candidate list in a fixed order so the result depends only on the seed.'
+  solution: |
+    import json
+    import random
+    from collections import deque
+
+    DIRS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0), "wait": (0, 0)}
+    ORDER = [(0, -1), (0, 1), (-1, 0), (1, 0)]          # up, down, left, right
+
+
+    def in_bounds(level, cell):
+        return 0 <= cell[0] < level["w"] and 0 <= cell[1] < level["h"]
+
+
+    VALID = set("#.@X$g")
+
+
+    def parse_level(text):
+        """Turn ASCII art into a level dictionary. Raises ValueError for a badly formed level."""
+        rows = [r.rstrip("\r") for r in text.strip("\n").split("\n")]
+        if not rows[0]:
+            raise ValueError("empty level")
+        width = len(rows[0])
+        walls, coins, guards, starts, exits = set(), set(), [], [], []
+        for y, row in enumerate(rows):
+            if len(row) != width:
+                raise ValueError(f"row {y} has {len(row)} columns, expected {width}")
+            for x, ch in enumerate(row):
+                if ch not in VALID:
+                    raise ValueError(f"unknown character {ch!r} at ({x}, {y})")
+                if ch == "#":
+                    walls.add((x, y))
+                elif ch == "$":
+                    coins.add((x, y))
+                elif ch == "g":
+                    guards.append((x, y))
+                elif ch == "@":
+                    starts.append((x, y))
+                elif ch == "X":
+                    exits.append((x, y))
+        if len(starts) != 1:
+            raise ValueError("a level needs exactly one @")
+        if len(exits) != 1:
+            raise ValueError("a level needs exactly one X")
+        return {"w": width, "h": len(rows), "walls": frozenset(walls), "start": starts[0], "exit": exits[0],
+                "coins": frozenset(coins), "guards": tuple(guards)}
+
+
+    def bfs_path(level, start, goal):
+        """Shortest path from start to goal (both included) as a list of cells, or None if there is none."""
+        if start == goal:
+            return [start]
+        parent = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for dx, dy in ORDER:
+                nxt = (cell[0] + dx, cell[1] + dy)
+                if nxt in parent or not in_bounds(level, nxt) or nxt in level["walls"]:
+                    continue
+                parent[nxt] = cell
+                if nxt == goal:
+                    path = [nxt]
+                    while parent[path[-1]] is not None:
+                        path.append(parent[path[-1]])
+                    return path[::-1]
+                queue.append(nxt)
+        return None
+
+
+    def generate_level(w, h, seed, density=0.25, coins=3, guards=1):
+        """Make a random but always solvable level as text. The same arguments always give the same level."""
+        if w < 5 or h < 5:
+            raise ValueError("levels must be at least 5 by 5")
+        rng = random.Random(seed)
+        grid = [["#" if x in (0, w - 1) or y in (0, h - 1) or rng.random() < density else "." for x in range(w)]
+                for y in range(h)]
+        x, y = 1, 1
+        grid[y][x] = "."
+        while (x, y) != (w - 2, h - 2):                 # carve a guaranteed route from start to exit
+            options = []
+            if x < w - 2:
+                options.append((1, 0))
+            if y < h - 2:
+                options.append((0, 1))
+            dx, dy = rng.choice(options)
+            x, y = x + dx, y + dy
+            grid[y][x] = "."
+        free = [(cx, cy) for cy in range(h) for cx in range(w)
+                if grid[cy][cx] == "." and (cx, cy) not in ((1, 1), (w - 2, h - 2))]
+        chosen = rng.sample(free, min(coins, len(free)))
+        for cx, cy in chosen:
+            grid[cy][cx] = "$"
+        far = [c for c in free if c not in chosen and abs(c[0] - 1) + abs(c[1] - 1) >= 4]
+        for cx, cy in rng.sample(far, min(guards, len(far))):
+            grid[cy][cx] = "g"
+        grid[1][1] = "@"
+        grid[h - 2][w - 2] = "X"
+        return "\n".join("".join(row) for row in grid)
+  explanation: Guaranteeing a property by construction beats generating randomly and hoping. The seed turns a random game into a reproducible one.
+commonMistakes:
+- title: Changing the old state inside step
+  explanation: Return a new state; otherwise undo, replay and tests all break.
+- title: Letting dictionary or set order decide the game
+  explanation: Iterate in a fixed order so the same moves always give the same game.
+- title: Checking the rules in the wrong order
+  explanation: Win, loss and guard movement interact; write the order down and test every combination.
+- title: Trusting a save file
+  explanation: Validate types, ranges and relationships; True is also an int in Python.
+- title: Using the global random generator
+  explanation: Create random.Random(seed) so generation is reproducible and does not disturb other code.
+- title: Hoping a random level is solvable
+  explanation: Carve the guaranteed route first and add the randomness around it.
+summary:
+- Keep data, rules and drawing apart; the engine is pure logic that tests can drive.
+- A pure step function returns a new state, which gives undo, replay and easy saving for free.
+- Breadth-first search with a fixed neighbour order gives deterministic shortest-path guards.
+- 'Save files are untrusted input: validate every field and raise one clear error type.'
+- Seeded generators are reproducible; construct the guarantees you need instead of hoping.
+next: u18-ml-pipeline
+quiz:
+- type: mcq
+  question: What does it mean that step is a pure function?
+  options:
+  - It returns a new state and does not change its input
+  - It never uses loops
+  - It prints the board
+  - It draws the game on screen
+  answer: 0
+  explanation: Pure functions have no side effects, which makes undo and replay trivial.
+- type: mcq
+  question: Why does BFS find a shortest path on a grid?
+  options:
+  - It explores all cells one step away, then two, and so on
+  - It always goes straight toward the goal
+  - It tries random moves
+  - It sorts the cells
+  answer: 0
+  explanation: The first time it reaches the goal it has used the fewest steps.
+- type: mcq
+  question: Why try neighbours in a fixed order?
+  options:
+  - So ties are broken the same way and the game is deterministic
+  - It is faster
+  - Python requires it
+  - Walls move otherwise
+  answer: 0
+  explanation: Determinism makes bugs reproducible and tests exact.
+- type: mcq
+  question: Why should load_state reject a score of True?
+  options:
+  - bool is a subclass of int, so a loose type check would accept it
+  - True is negative
+  - JSON has no booleans
+  - It would be too small
+  answer: 0
+  explanation: isinstance(True, int) is True; use type(value) is int.
+- type: mcq
+  question: What does using random.Random(seed) give you?
+  options:
+  - The same random sequence every time for that seed
+  - True randomness
+  - A faster generator
+  - A secure generator for passwords
+  answer: 0
+  explanation: Seeded generators are reproducible but not cryptographically secure.
+- type: mcq
+  question: How does the generator guarantee a solvable level?
+  options:
+  - It carves a route from start to exit before placing items
+  - It checks after generation and prays
+  - It removes all walls
+  - It places the exit next to the start
+  answer: 0
+  explanation: Guarantee the property by construction.
+- type: code
+  question: Write `neighbours(cell, w, h)` returning the cells directly above, below, left and right of `cell` (in that order) that lie inside a `w` by `h` grid. Cells are `(x, y)` tuples.
+  starter: |
+    def neighbours(cell, w, h):
+        pass
+  tests:
+  - name: neighbours
+    code: |
+      assert neighbours((1, 1), 3, 3) == [(1, 0), (1, 2), (0, 1), (2, 1)]
+      assert neighbours((0, 0), 3, 3) == [(0, 1), (1, 0)]
+      assert neighbours((2, 2), 3, 3) == [(2, 1), (1, 2)]
+      assert neighbours((0, 0), 1, 1) == []
+  solution: |
+    def neighbours(cell, w, h):
+        x, y = cell
+        result = []
+        for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < w and 0 <= ny < h:
+                result.append((nx, ny))
+        return result

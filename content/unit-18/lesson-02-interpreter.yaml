@@ -1,0 +1,2944 @@
+id: u18-interpreter
+title: 'Capstone A: Build a Programming Language'
+minutes: 90
+objective: Build an interpreter for MiniScript, a small programming language with variables, arithmetic, comparisons, if/else, while loops and functions with recursion and closures. You will write a tokenizer, a recursive-descent parser, an expression evaluator, a statement interpreter with scopes, and finally write programs in your own language. This capstone ties together Units 4, 7, 9, 10, 15 and 16.
+outcomes:
+- Describe the pipeline from source text to tokens, syntax tree and evaluation
+- Write a tokenizer and a recursive-descent parser that respects operator precedence
+- Evaluate expression trees and execute statements with environments (scopes)
+- Implement functions, recursion and closures
+- Protect an interpreter with step and recursion limits and clear error messages
+sections:
+- heading: How a language is built
+  body: |-
+    Every programming language you have used was built by programs, and the first big idea of this capstone is that **an interpreter is just a program that reads a program**. The classic pipeline has four stages (Units 9 and 15 met each of them): **source text** is split into **tokens** by a **tokenizer** (or **lexer**): numbers, names, keywords and symbols; the tokens are arranged into a **syntax tree** (an **abstract syntax tree**, **AST**) by a **parser**, which also rejects ill-formed programs; and an **evaluator** walks the tree and carries out what it says. A **compiler** would instead translate the tree to another language or to bytecode (Unit 10's virtual machine); an **interpreter** just does the work directly.
+
+    MiniScript is deliberately small. Programs are sequences of statements ending in `;`: `let x = 3 + 4;` creates a variable, `x = x * 2;` changes it, `print x;` shows it. Blocks are in braces: `if x > 5 { ... } else { ... }`, `while i < 10 { ... }`. Functions are `fn name(a, b) { return a + b; }`, and values are numbers (integers and decimals). Comparisons return 1 (true) or 0 (false), and any non-zero value counts as true in a condition. Comments start with `#`.
+
+    Our plan has five **milestones**, one per exercise: (1) the tokenizer, (2) an expression parser and evaluator, (3) a statement parser, (4) an interpreter with scopes and functions, and (5) writing real programs in the language you have built.
+- heading: Grammar and precedence
+  body: |-
+    A **grammar** (Unit 15) describes which token sequences are valid. For expressions, we write one rule per level of **precedence**, from the loosest-binding operator to the tightest:
+
+    ```
+    expression = sum  (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
+    sum        = term (("+" | "-") term)*
+    term       = unary (("*" | "/" | "%") unary)*
+    unary      = "-" unary | primary
+    primary    = number | name | name "(" [expression ("," expression)*] ")" | "(" expression ")"
+    ```
+
+    In a **recursive-descent parser** each rule becomes a function that calls the function for the next-tighter rule. Because `term` is called from inside `sum`, multiplication binds tighter than addition, so `1 + 2 * 3` parses as `1 + (2 * 3)`. The loop `(... term)*` makes operators **left-associative**: `10 - 4 - 3` becomes `(10 - 4) - 3`. A parenthesised expression restarts at the top rule, which is how parentheses override precedence. Each parse function takes the token list and a **position** and returns the tree it built along with the position after it, so the caller can carry on. When the tokens do not fit the grammar, the parser raises a clear error rather than guessing.
+
+    The result is a tree such as `("bin", "+", ("num", 1), ("bin", "*", ("num", 2), ("num", 3)))`. The evaluator is then a short recursive function with one case per node type, the same idea as the expression trees of Unit 7. Statements get their own grammar: `let name = expression ;`, `name = expression ;`, `print expression ;`, `if expression block [else block]`, `while expression block`, `fn name ( params ) block`, `return expression ;`, and an expression followed by `;`.
+- heading: Scopes, functions and closures
+  body: |-
+    Variables need a home. An **environment** maps names to values. Blocks and function calls create a **new scope** whose **parent** is the scope around it, so a lookup that fails locally continues outward; this is the **scope chain** (Unit 4). `let` always creates a variable in the *current* scope, while assignment `x = ...` changes the nearest existing `x` and is an error if there is none.
+
+    A **function** is a stored parameter list and body, plus the scope where it was **defined**. Calling it creates a fresh scope whose parent is that defining scope, binds the parameters to the argument values, and runs the body. Remembering the defining scope makes the function a **closure**: `fn make(n) { fn add(x) { return x + n; } return add; }` returns a function that still sees `n` after `make` has finished. We implement `return` with an **exception** that unwinds the Python stack back to the call (Unit 5), and functions are stored in the environment as ordinary callable values, which also lets us add built-in functions written in Python. Recursion works automatically because each call has its own scope.
+
+    Finally, **safety** (Unit 16). An interpreter runs code you did not write, so it must defend itself. An accidental or malicious `while 1 { }` would loop forever, so we count executed statements and stop at a **step limit**; unbounded recursion would exhaust the Python stack, so we count the **call depth**; and every failure becomes a clean `LangError` with a message instead of a crash. These same limits are how online code runners (and this course's own browser runner) protect themselves.
+examples:
+- title: Tokenizing
+  intro: The tokenizer splits text into (kind, value) pairs and throws away whitespace and comments.
+  code: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    print(tokenize("let total = (price + 2.5) * 3;  # cost"))
+    print(tokenize("while x <= 10 { x = x + 1; }"))
+    try:
+        tokenize("let y = 4 @ 2;")
+    except LangError as e:
+        print("error:", e)
+  output: |
+    [('kw', 'let'), ('name', 'total'), ('sym', '='), ('sym', '('), ('name', 'price'), ('sym', '+'), ('num', 2.5), ('sym', ')'), ('sym', '*'), ('num', 3), ('sym', ';')]
+    [('kw', 'while'), ('name', 'x'), ('sym', '<='), ('num', 10), ('sym', '{'), ('name', 'x'), ('sym', '='), ('name', 'x'), ('sym', '+'), ('num', 1), ('sym', ';'), ('sym', '}')]
+    error: unexpected character '@'
+  lines:
+  - line: 16
+    note: Whitespace is skipped. A comment runs to the end of the line.
+  - line: 26
+    note: Numbers with a dot become floats, others ints. Words become keywords or names.
+- title: Parsing precedence
+  intro: A tiny recursive-descent parser shows how rule order gives precedence and left-associativity.
+  code: |
+    def tokenize(src):
+        import re
+        return re.findall(r"\d+|[-+*/()]", src)
+
+    def parse_sum(t, pos):
+        left, pos = parse_term(t, pos)
+        while pos < len(t) and t[pos] in "+-":
+            op = t[pos]
+            right, pos = parse_term(t, pos + 1)
+            left = (op, left, right)
+        return left, pos
+
+    def parse_term(t, pos):
+        left, pos = parse_atom(t, pos)
+        while pos < len(t) and t[pos] in "*/":
+            op = t[pos]
+            right, pos = parse_atom(t, pos + 1)
+            left = (op, left, right)
+        return left, pos
+
+    def parse_atom(t, pos):
+        if t[pos] == "(":
+            inner, pos = parse_sum(t, pos + 1)
+            return inner, pos + 1
+        return int(t[pos]), pos + 1
+
+    for src in ["1 + 2 * 3", "(1 + 2) * 3", "10 - 4 - 3", "2 * 3 + 4 * 5"]:
+        print(f"{src:14}", parse_sum(tokenize(src), 0)[0])
+  output: |
+    1 + 2 * 3      ('+', 1, ('*', 2, 3))
+    (1 + 2) * 3    ('*', ('+', 1, 2), 3)
+    10 - 4 - 3     ('-', ('-', 10, 4), 3)
+    2 * 3 + 4 * 5  ('+', ('*', 2, 3), ('*', 4, 5))
+  lines:
+  - line: 5
+    note: parse_sum handles the loosest operators and calls parse_term for the tighter ones.
+  - line: 10
+    note: 'Each new operator wraps the tree built so far on its left: that is left-associativity.'
+  - line: 27
+    note: 'The tree shape shows precedence: multiplication sits deeper, so it happens first.'
+- title: Evaluating a tree
+  intro: One function with a case per node type. The environment is a plain dictionary here.
+  code: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def evaluate(node, env):
+        kind = node[0]
+        if kind == "num":
+            return node[1]
+        if kind == "var":
+            if node[1] not in env:
+                raise LangError("undefined variable " + node[1])
+            return env[node[1]]
+        if kind == "neg":
+            return -evaluate(node[1], env)
+        if kind == "call":
+            if node[1] not in env or not callable(env[node[1]]):
+                raise LangError("undefined function " + node[1])
+            return env[node[1]](*[evaluate(a, env) for a in node[2]])
+        op, left, right = node[1], evaluate(node[2], env), evaluate(node[3], env)
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op in ("/", "%"):
+            if right == 0:
+                raise LangError("division by zero")
+            if op == "%":
+                return left % right
+            if isinstance(left, int) and isinstance(right, int) and left % right == 0:
+                return left // right
+            return left / right
+        return int({"==": left == right, "!=": left != right, "<": left < right,
+                    "<=": left <= right, ">": left > right, ">=": left >= right}[op])
+
+
+    env = {"x": 6, "y": 7, "square": lambda n: n * n}
+    for src in ["x * y", "square(x + 1) - 1", "10 / 4", "-x % 4", "x < y", "7 / 0"]:
+        try:
+            print(f"{src:18}", evaluate(parse(tokenize(src)), env))
+        except LangError as e:
+            print(f"{src:18} error: {e}")
+  output: |
+    x * y              42
+    square(x + 1) - 1  48
+    10 / 4             2.5
+    -x % 4             2
+    x < y              1
+    7 / 0              error: division by zero
+  lines:
+  - line: 128
+    note: Calls look up a callable in the environment, so built-ins and user functions work the same way.
+  - line: 152
+    note: Errors in the program become LangError messages, never Python crashes.
+- title: A scope chain
+  intro: Each block gets an Env whose parent is the enclosing scope. Lookups walk outward; let defines locally; assignment changes the nearest existing variable.
+  code: |
+    class LangError(Exception):
+        pass
+
+    class Env:
+        """A scope: a dictionary of variables plus a link to the enclosing scope."""
+
+        def __init__(self, parent=None):
+            self.vars, self.parent = {}, parent
+
+        def __contains__(self, name):
+            return name in self.vars or (self.parent is not None and name in self.parent)
+
+        def __getitem__(self, name):
+            if name in self.vars:
+                return self.vars[name]
+            if self.parent is not None:
+                return self.parent[name]
+            raise KeyError(name)
+
+        def define(self, name, value):
+            self.vars[name] = value
+
+        def assign(self, name, value):
+            scope = self
+            while scope is not None:
+                if name in scope.vars:
+                    scope.vars[name] = value
+                    return
+                scope = scope.parent
+            raise LangError("assignment to undefined variable " + name)
+
+
+
+    g = Env()
+    g.define("x", 1)
+    inner = Env(g)
+    inner.define("y", 2)
+    print("inner sees x and y:", inner["x"], inner["y"])
+    inner.define("x", 100)                 # shadows the outer x
+    print("inner x:", inner["x"], " outer x:", g["x"])
+    g.define("z", 5)
+    inner.assign("z", 6)                   # changes the existing outer z
+    print("outer z:", g["z"])
+    try:
+        inner.assign("nope", 1)
+    except LangError as e:
+        print("error:", e)
+    print("outer cannot see y:", "y" in g)
+  output: |
+    inner sees x and y: 1 2
+    inner x: 100  outer x: 1
+    outer z: 6
+    error: assignment to undefined variable nope
+    outer cannot see y: False
+  lines:
+  - line: 39
+    note: 'let creates a new variable in this scope: it shadows, it does not change, the outer one.'
+  - line: 42
+    note: Assignment walks up the chain to the scope that already owns the name.
+- title: A whole program
+  intro: 'Putting the pipeline together: run MiniScript source and see recursion, a closure and an error.'
+  code: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def evaluate(node, env):
+        kind = node[0]
+        if kind == "num":
+            return node[1]
+        if kind == "var":
+            if node[1] not in env:
+                raise LangError("undefined variable " + node[1])
+            return env[node[1]]
+        if kind == "neg":
+            return -evaluate(node[1], env)
+        if kind == "call":
+            if node[1] not in env or not callable(env[node[1]]):
+                raise LangError("undefined function " + node[1])
+            return env[node[1]](*[evaluate(a, env) for a in node[2]])
+        op, left, right = node[1], evaluate(node[2], env), evaluate(node[3], env)
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op in ("/", "%"):
+            if right == 0:
+                raise LangError("division by zero")
+            if op == "%":
+                return left % right
+            if isinstance(left, int) and isinstance(right, int) and left % right == 0:
+                return left // right
+            return left / right
+        return int({"==": left == right, "!=": left != right, "<": left < right,
+                    "<=": left <= right, ">": left > right, ">=": left >= right}[op])
+
+
+    def _expect(tokens, pos, kind, value):
+        if pos >= len(tokens) or tokens[pos] != (kind, value):
+            raise LangError("expected " + repr(value))
+        return pos + 1
+
+
+    def parse_block(tokens, pos):
+        pos = _expect(tokens, pos, "sym", "{")
+        stmts = []
+        while not _is_sym(tokens, pos, ("}",)):
+            if pos >= len(tokens):
+                raise LangError("expected }")
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts, pos + 1
+
+
+    def parse_statement(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "kw" and value == "let":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a name after let")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "=")
+            expr, pos = parse_expr(tokens, pos)
+            return ("let", name, expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "print":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("print", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "return":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("return", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "if":
+            cond, pos = parse_expr(tokens, pos + 1)
+            then, pos = parse_block(tokens, pos)
+            other = None
+            if pos < len(tokens) and tokens[pos] == ("kw", "else"):
+                other, pos = parse_block(tokens, pos + 1)
+            return ("if", cond, then, other), pos
+        if kind == "kw" and value == "while":
+            cond, pos = parse_expr(tokens, pos + 1)
+            body, pos = parse_block(tokens, pos)
+            return ("while", cond, body), pos
+        if kind == "kw" and value == "fn":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a function name")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "(")
+            params = []
+            while not _is_sym(tokens, pos, (")",)):
+                if pos >= len(tokens) or tokens[pos][0] != "name":
+                    raise LangError("expected a parameter name")
+                params.append(tokens[pos][1])
+                pos += 1
+                if _is_sym(tokens, pos, (",",)):
+                    pos += 1
+            body, pos = parse_block(tokens, pos + 1)
+            return ("fn", name, params, body), pos
+        if kind == "name" and _is_sym(tokens, pos + 1, ("=",)):
+            expr, pos = parse_expr(tokens, pos + 2)
+            return ("assign", value, expr), _expect(tokens, pos, "sym", ";")
+        expr, pos = parse_expr(tokens, pos)
+        return ("expr", expr), _expect(tokens, pos, "sym", ";")
+
+
+    def parse_program(tokens):
+        stmts, pos = [], 0
+        while pos < len(tokens):
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts
+
+
+    class Env:
+        """A scope: a dictionary of variables plus a link to the enclosing scope."""
+
+        def __init__(self, parent=None):
+            self.vars, self.parent = {}, parent
+
+        def __contains__(self, name):
+            return name in self.vars or (self.parent is not None and name in self.parent)
+
+        def __getitem__(self, name):
+            if name in self.vars:
+                return self.vars[name]
+            if self.parent is not None:
+                return self.parent[name]
+            raise KeyError(name)
+
+        def define(self, name, value):
+            self.vars[name] = value
+
+        def assign(self, name, value):
+            scope = self
+            while scope is not None:
+                if name in scope.vars:
+                    scope.vars[name] = value
+                    return
+                scope = scope.parent
+            raise LangError("assignment to undefined variable " + name)
+
+
+    class _Return(Exception):
+        def __init__(self, value):
+            self.value = value
+
+
+    class Interpreter:
+        MAX_STEPS = 20000
+        MAX_DEPTH = 40
+
+        def __init__(self):
+            self.output, self.steps, self.depth = [], 0, 0
+            self.globals = Env()
+
+        def run(self, stmts):
+            self.exec_block(stmts, self.globals)
+            return self.output
+
+        def exec_block(self, stmts, env):
+            for stmt in stmts:
+                self.exec_stmt(stmt, env)
+
+        def exec_stmt(self, stmt, env):
+            self.steps += 1
+            if self.steps > self.MAX_STEPS:
+                raise LangError("step limit exceeded")
+            kind = stmt[0]
+            if kind == "let":
+                env.define(stmt[1], evaluate(stmt[2], env))
+            elif kind == "assign":
+                env.assign(stmt[1], evaluate(stmt[2], env))
+            elif kind == "print":
+                value = evaluate(stmt[1], env)
+                self.output.append(str(value))
+            elif kind == "expr":
+                evaluate(stmt[1], env)
+            elif kind == "if":
+                if evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                elif stmt[3] is not None:
+                    self.exec_block(stmt[3], Env(env))
+            elif kind == "while":
+                while evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                    self.steps += 1
+                    if self.steps > self.MAX_STEPS:
+                        raise LangError("step limit exceeded")
+            elif kind == "fn":
+                env.define(stmt[1], self.make_function(stmt[1], stmt[2], stmt[3], env))
+            elif kind == "return":
+                raise _Return(evaluate(stmt[1], env))
+            else:
+                raise LangError("unknown statement " + repr(kind))
+
+        def make_function(self, name, params, body, closure_env):
+            def call(*args):
+                if len(args) != len(params):
+                    raise LangError(f"{name} expects {len(params)} arguments, got {len(args)}")
+                if self.depth >= self.MAX_DEPTH:
+                    raise LangError("recursion too deep")
+                local = Env(closure_env)
+                for p, a in zip(params, args):
+                    local.define(p, a)
+                self.depth += 1
+                try:
+                    self.exec_block(body, local)
+                except _Return as r:
+                    return r.value
+                finally:
+                    self.depth -= 1
+                return 0
+            return call
+
+
+    def run_source(src):
+        """Run a MiniScript program. Returns (output_lines, error_message_or_None)."""
+        interp = Interpreter()
+        try:
+            interp.run(parse_program(tokenize(src)))
+        except LangError as e:
+            return interp.output, str(e)
+        return interp.output, None
+
+
+    program = """
+    fn fib(n) {
+        if n < 2 { return n; }
+        return fib(n - 1) + fib(n - 2);
+    }
+    let i = 0;
+    while i < 8 {
+        print fib(i);
+        i = i + 1;
+    }
+    fn counter(start) {
+        fn next(step) { return start + step; }
+        return next;
+    }
+    let from100 = counter(100);
+    print from100(5);
+    """
+    print(run_source(program))
+    print(run_source("print undefined_name;"))
+    print(run_source("while 1 { }"))
+  output: |
+    (['0', '1', '1', '2', '3', '5', '8', '13', '105'], None)
+    ([], 'undefined variable undefined_name')
+    ([], 'step limit exceeded')
+  lines:
+  - line: 336
+    note: Each fib call gets its own scope, so the recursion needs no special handling.
+  - line: 354
+    note: The step limit turns an infinite loop into an error message.
+playground:
+  prompt: 'Write your own MiniScript program in the string below: for example, print the squares of 1 to 10 with a while loop. Then try making it fail on purpose (divide by zero, use an undefined variable) and read the error.'
+  code: |
+    src = "let n = 1; while n <= 3 { print n * n; n = n + 1; }"
+    print(src)
+exercises:
+- id: tokenizer
+  title: 'Milestone 1: The tokenizer'
+  difficulty: 3
+  prompt: 'Write `tokenize(src)` returning a list of `(kind, value)` pairs. Kinds: `"num"` (an `int` for digits only, a `float` if there is a decimal point), `"name"` (a letter or underscore followed by letters, digits or underscores), `"kw"` (a name that is in `KEYWORDS`), and `"sym"` (one of `== != <= >= + - * / % < > = ( ) { } , ;`). Skip whitespace and `#` comments (to the end of the line). For any other character raise `LangError("unexpected character " + repr(ch))`.'
+  starter: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        pass
+  tests:
+  - name: numbers, names and symbols
+    code: |
+      assert tokenize("") == []
+      assert tokenize("42") == [("num", 42)]
+      assert tokenize("3.5") == [("num", 3.5)]
+      assert tokenize("x1 _y") == [("name", "x1"), ("name", "_y")]
+      assert tokenize("let x = 1;") == [("kw", "let"), ("name", "x"), ("sym", "="), ("num", 1), ("sym", ";")]
+      assert tokenize("a<=b==c!=d>=e") == [("name", "a"), ("sym", "<="), ("name", "b"), ("sym", "=="), ("name", "c"), ("sym", "!="), ("name", "d"), ("sym", ">="), ("name", "e")]
+      assert tokenize("(1+2)*3%4") == [("sym", "("), ("num", 1), ("sym", "+"), ("num", 2), ("sym", ")"), ("sym", "*"), ("num", 3), ("sym", "%"), ("num", 4)]
+      assert isinstance(tokenize("2")[0][1], int) and isinstance(tokenize("2.0")[0][1], float)
+  - name: whitespace, comments and keywords
+    code: |
+      assert tokenize("  1 +\n\t2  ") == [("num", 1), ("sym", "+"), ("num", 2)]
+      assert tokenize("1 # a comment\n+ 2") == [("num", 1), ("sym", "+"), ("num", 2)]
+      assert tokenize("# only a comment") == []
+      kws = tokenize("let print if else while fn return letter")
+      assert [k for k, v in kws] == ["kw"] * 7 + ["name"]
+      assert tokenize("fn f(a, b) { return a; }")[0] == ("kw", "fn")
+  - name: bad characters raise LangError
+    code: |
+      for bad in ["1 @ 2", "x = 'a'", "$"]:
+          try:
+              tokenize(bad)
+          except LangError as e:
+              assert "unexpected character" in str(e)
+          else:
+              raise AssertionError("accepted " + bad)
+  hints:
+  - 'Write a loop with a position `pos`. Try the two-character symbols before the one-character ones: a regular expression alternative `==|!=|<=|>=|[-+*/%<>=(){},;]` does this.'
+  solution: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+  explanation: A tokenizer is a loop that chops the input into pieces. Everything after it works with tokens instead of raw characters.
+- id: expressions
+  title: 'Milestone 2: Parse and evaluate expressions'
+  difficulty: 5
+  prompt: 'Write `parse(tokens)` building the expression tree described in the lesson (`("num", v)`, `("var", name)`, `("neg", e)`, `("bin", op, left, right)`, `("call", name, [args])`) with the precedence `comparison < + - < * / % < unary minus < primary`, left-associative, and raising `LangError` if the tokens are not exactly one valid expression. Then write `evaluate(node, env)`: variables and callables come from `env` (an undefined variable raises `LangError("undefined variable NAME")`, an undefined or non-callable function `"undefined function NAME"`, division or modulo by zero `"division by zero"`); `/` gives an `int` when both sides are ints and divide exactly, otherwise a float; comparisons give `1` or `0`.'
+  starter: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    def parse(tokens):
+        """Turn a list of tokens into an expression tree. Raise LangError if malformed."""
+        pass
+
+
+    def evaluate(node, env):
+        """Evaluate an expression tree. env is a dict (or any mapping) of variables and functions."""
+        pass
+  tests:
+  - name: parse builds the right tree
+    code: |
+      P = lambda s: parse(tokenize(s))
+      assert P("42") == ("num", 42)
+      assert P("x") == ("var", "x")
+      assert P("1 + 2") == ("bin", "+", ("num", 1), ("num", 2))
+      assert P("1 + 2 * 3") == ("bin", "+", ("num", 1), ("bin", "*", ("num", 2), ("num", 3)))
+      assert P("(1 + 2) * 3") == ("bin", "*", ("bin", "+", ("num", 1), ("num", 2)), ("num", 3))
+      assert P("10 - 4 - 3") == ("bin", "-", ("bin", "-", ("num", 10), ("num", 4)), ("num", 3))
+      assert P("-x") == ("neg", ("var", "x"))
+      assert P("2 * -3") == ("bin", "*", ("num", 2), ("neg", ("num", 3)))
+      assert P("a < b + 1") == ("bin", "<", ("var", "a"), ("bin", "+", ("var", "b"), ("num", 1)))
+      assert P("f(1, x + 2)") == ("call", "f", [("num", 1), ("bin", "+", ("var", "x"), ("num", 2))])
+      assert P("f()") == ("call", "f", [])
+  - name: parse rejects malformed input
+    code: |
+      for bad in ["", "1 +", "(1 + 2", "1 2", "* 3", ")", "f(1,", "1 + + 2 )"]:
+          try:
+              parse(tokenize(bad))
+          except LangError:
+              continue
+          raise AssertionError("accepted " + repr(bad))
+  - name: evaluate arithmetic
+    code: |
+      E = lambda s, env=None: evaluate(parse(tokenize(s)), env or {})
+      assert E("1 + 2 * 3") == 7
+      assert E("(1 + 2) * 3") == 9
+      assert E("7 % 3") == 1 and E("-5 + 2") == -3
+      assert E("8 / 2") == 4 and isinstance(E("8 / 2"), int)
+      assert E("7 / 2") == 3.5
+      assert E("2 * -3") == -6
+      assert E("1.5 + 1.5") == 3.0
+  - name: evaluate variables, comparisons and calls
+    code: |
+      E = lambda s, env=None: evaluate(parse(tokenize(s)), env or {})
+      assert E("x * y", {"x": 6, "y": 7}) == 42
+      assert E("3 < 4") == 1 and E("3 > 4") == 0 and E("3 == 3") == 1 and E("3 != 3") == 0 and E("4 <= 4") == 1 and E("5 >= 6") == 0
+      assert E("max(1, 9, 4)", {"max": max}) == 9
+      assert E("double(x + 1)", {"x": 4, "double": lambda n: 2 * n}) == 10
+      assert E("f()", {"f": lambda: 7}) == 7
+  - name: evaluate reports errors
+    code: |
+      E = lambda s, env=None: evaluate(parse(tokenize(s)), env or {})
+      for src, text in [("1 / 0", "division by zero"), ("5 % 0", "division by zero"), ("y + 1", "undefined variable y"), ("g(1)", "undefined function g")]:
+          try:
+              E(src)
+          except LangError as e:
+              assert text in str(e), (src, str(e))
+          else:
+              raise AssertionError("no error for " + src)
+      try:
+          E("x(1)", {"x": 5})
+          raise AssertionError("called a number")
+      except LangError:
+          pass
+  hints:
+  - One function per precedence level, each calling the next tighter one, each returning `(tree, next_position)`.
+  - After parsing the top-level expression, if there are tokens left over, raise `LangError`.
+  solution: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def evaluate(node, env):
+        kind = node[0]
+        if kind == "num":
+            return node[1]
+        if kind == "var":
+            if node[1] not in env:
+                raise LangError("undefined variable " + node[1])
+            return env[node[1]]
+        if kind == "neg":
+            return -evaluate(node[1], env)
+        if kind == "call":
+            if node[1] not in env or not callable(env[node[1]]):
+                raise LangError("undefined function " + node[1])
+            return env[node[1]](*[evaluate(a, env) for a in node[2]])
+        op, left, right = node[1], evaluate(node[2], env), evaluate(node[3], env)
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op in ("/", "%"):
+            if right == 0:
+                raise LangError("division by zero")
+            if op == "%":
+                return left % right
+            if isinstance(left, int) and isinstance(right, int) and left % right == 0:
+                return left // right
+            return left / right
+        return int({"==": left == right, "!=": left != right, "<": left < right,
+                    "<=": left <= right, ">": left > right, ">=": left >= right}[op])
+  explanation: The grammar rules map one-to-one onto functions. Left-associativity comes from the loop; precedence comes from the call order.
+- id: statements
+  title: 'Milestone 3: Parse statements'
+  difficulty: 5
+  prompt: 'The starter already contains `tokenize` and the expression parser `parse_expr(tokens, pos)`, which returns `(tree, next_pos)`. Write `parse_program(tokens)` returning a list of statement trees: `("let", name, expr)`, `("assign", name, expr)`, `("print", expr)`, `("expr", expr)`, `("return", expr)`, `("if", cond, then_stmts, else_stmts_or_None)`, `("while", cond, body_stmts)` and `("fn", name, [params], body_stmts)`. Statements ending in an expression need a `;`. Blocks are `{` statements `}`. Anything malformed raises `LangError`.'
+  starter: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def parse_program(tokens):
+        """Turn tokens into a list of statement trees. Raise LangError for bad syntax.
+
+        Statement shapes:
+          ("let", name, expr)        ("assign", name, expr)       ("print", expr)
+          ("expr", expr)             ("return", expr)
+          ("if", cond, then_stmts, else_stmts_or_None)
+          ("while", cond, body_stmts)
+          ("fn", name, [params], body_stmts)
+        """
+        pass
+  tests:
+  - name: simple statements
+    code: |
+      P = lambda s: parse_program(tokenize(s))
+      assert P("") == []
+      assert P("let x = 1 + 2;") == [("let", "x", ("bin", "+", ("num", 1), ("num", 2)))]
+      assert P("x = x * 2;") == [("assign", "x", ("bin", "*", ("var", "x"), ("num", 2)))]
+      assert P("print x;") == [("print", ("var", "x"))]
+      assert P("f(1);") == [("expr", ("call", "f", [("num", 1)]))]
+      assert P("return 0;") == [("return", ("num", 0))]
+      assert P("let a = 1; print a;") == [("let", "a", ("num", 1)), ("print", ("var", "a"))]
+  - name: if and while
+    code: |
+      P = lambda s: parse_program(tokenize(s))
+      assert P("if x < 1 { print 1; }") == [("if", ("bin", "<", ("var", "x"), ("num", 1)), [("print", ("num", 1))], None)]
+      assert P("if x { print 1; } else { print 2; }") == [("if", ("var", "x"), [("print", ("num", 1))], [("print", ("num", 2))])]
+      assert P("while i < 3 { i = i + 1; }") == [("while", ("bin", "<", ("var", "i"), ("num", 3)), [("assign", "i", ("bin", "+", ("var", "i"), ("num", 1)))])]
+      nested = P("while a { if b { print 1; } }")
+      assert nested == [("while", ("var", "a"), [("if", ("var", "b"), [("print", ("num", 1))], None)])]
+      assert P("if x { }") == [("if", ("var", "x"), [], None)]
+  - name: functions
+    code: |
+      P = lambda s: parse_program(tokenize(s))
+      assert P("fn f() { }") == [("fn", "f", [], [])]
+      assert P("fn add(a, b) { return a + b; }") == [("fn", "add", ["a", "b"], [("return", ("bin", "+", ("var", "a"), ("var", "b")))])]
+      assert P("fn g(n) { if n < 2 { return n; } return g(n - 1); }")[0][2] == ["n"]
+  - name: syntax errors
+    code: |
+      for bad in ["let x = 1", "let = 1;", "print;", "if x print 1;", "while { }", "fn () { }", "fn f(1) { }", "if x { print 1;", "x = ;", "else { }", "let x 1;", "print 1 2;"]:
+          try:
+              parse_program(tokenize(bad))
+          except LangError:
+              continue
+          raise AssertionError("accepted " + repr(bad))
+  hints:
+  - Write `parse_statement(tokens, pos)` returning `(stmt, next_pos)`, and `parse_block(tokens, pos)` that loops until it meets `}`.
+  - A name followed by `=` (the single token `=`, not `==`) starts an assignment.
+  solution: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def _expect(tokens, pos, kind, value):
+        if pos >= len(tokens) or tokens[pos] != (kind, value):
+            raise LangError("expected " + repr(value))
+        return pos + 1
+
+
+    def parse_block(tokens, pos):
+        pos = _expect(tokens, pos, "sym", "{")
+        stmts = []
+        while not _is_sym(tokens, pos, ("}",)):
+            if pos >= len(tokens):
+                raise LangError("expected }")
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts, pos + 1
+
+
+    def parse_statement(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "kw" and value == "let":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a name after let")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "=")
+            expr, pos = parse_expr(tokens, pos)
+            return ("let", name, expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "print":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("print", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "return":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("return", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "if":
+            cond, pos = parse_expr(tokens, pos + 1)
+            then, pos = parse_block(tokens, pos)
+            other = None
+            if pos < len(tokens) and tokens[pos] == ("kw", "else"):
+                other, pos = parse_block(tokens, pos + 1)
+            return ("if", cond, then, other), pos
+        if kind == "kw" and value == "while":
+            cond, pos = parse_expr(tokens, pos + 1)
+            body, pos = parse_block(tokens, pos)
+            return ("while", cond, body), pos
+        if kind == "kw" and value == "fn":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a function name")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "(")
+            params = []
+            while not _is_sym(tokens, pos, (")",)):
+                if pos >= len(tokens) or tokens[pos][0] != "name":
+                    raise LangError("expected a parameter name")
+                params.append(tokens[pos][1])
+                pos += 1
+                if _is_sym(tokens, pos, (",",)):
+                    pos += 1
+            body, pos = parse_block(tokens, pos + 1)
+            return ("fn", name, params, body), pos
+        if kind == "name" and _is_sym(tokens, pos + 1, ("=",)):
+            expr, pos = parse_expr(tokens, pos + 2)
+            return ("assign", value, expr), _expect(tokens, pos, "sym", ";")
+        expr, pos = parse_expr(tokens, pos)
+        return ("expr", expr), _expect(tokens, pos, "sym", ";")
+
+
+    def parse_program(tokens):
+        stmts, pos = [], 0
+        while pos < len(tokens):
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts
+  explanation: 'Statement parsing reuses the expression parser: each statement form is a short sequence of expected tokens and sub-parses.'
+- id: interpreter
+  title: 'Milestone 4: The interpreter'
+  difficulty: 5
+  prompt: 'The starter has the complete front end (`tokenize`, expression parsing and evaluation, `parse_program`) and the `Env` class. Implement `Interpreter.run(stmts)`, adding whatever helper methods you like. Rules: `let` defines in the current scope, assignment changes the nearest existing variable (`LangError("assignment to undefined variable NAME")` if none), `print` appends `str(value)` to `self.output`, `if` and `while` run their blocks in a **new child scope**, a condition is true when its value is non-zero, `fn` stores a callable in the environment that remembers the defining scope (a closure), and `return` ends the function (a function that ends without `return` gives `0`). Count each executed statement (and each loop iteration) in `self.steps` and raise `LangError("step limit exceeded")` above `MAX_STEPS`. Function calls check the argument count (`"NAME expects N arguments, got M"`) and raise `LangError("recursion too deep")` when `self.depth` reaches `MAX_DEPTH`. Return the output list.'
+  starter: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def evaluate(node, env):
+        kind = node[0]
+        if kind == "num":
+            return node[1]
+        if kind == "var":
+            if node[1] not in env:
+                raise LangError("undefined variable " + node[1])
+            return env[node[1]]
+        if kind == "neg":
+            return -evaluate(node[1], env)
+        if kind == "call":
+            if node[1] not in env or not callable(env[node[1]]):
+                raise LangError("undefined function " + node[1])
+            return env[node[1]](*[evaluate(a, env) for a in node[2]])
+        op, left, right = node[1], evaluate(node[2], env), evaluate(node[3], env)
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op in ("/", "%"):
+            if right == 0:
+                raise LangError("division by zero")
+            if op == "%":
+                return left % right
+            if isinstance(left, int) and isinstance(right, int) and left % right == 0:
+                return left // right
+            return left / right
+        return int({"==": left == right, "!=": left != right, "<": left < right,
+                    "<=": left <= right, ">": left > right, ">=": left >= right}[op])
+
+
+    def _expect(tokens, pos, kind, value):
+        if pos >= len(tokens) or tokens[pos] != (kind, value):
+            raise LangError("expected " + repr(value))
+        return pos + 1
+
+
+    def parse_block(tokens, pos):
+        pos = _expect(tokens, pos, "sym", "{")
+        stmts = []
+        while not _is_sym(tokens, pos, ("}",)):
+            if pos >= len(tokens):
+                raise LangError("expected }")
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts, pos + 1
+
+
+    def parse_statement(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "kw" and value == "let":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a name after let")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "=")
+            expr, pos = parse_expr(tokens, pos)
+            return ("let", name, expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "print":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("print", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "return":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("return", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "if":
+            cond, pos = parse_expr(tokens, pos + 1)
+            then, pos = parse_block(tokens, pos)
+            other = None
+            if pos < len(tokens) and tokens[pos] == ("kw", "else"):
+                other, pos = parse_block(tokens, pos + 1)
+            return ("if", cond, then, other), pos
+        if kind == "kw" and value == "while":
+            cond, pos = parse_expr(tokens, pos + 1)
+            body, pos = parse_block(tokens, pos)
+            return ("while", cond, body), pos
+        if kind == "kw" and value == "fn":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a function name")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "(")
+            params = []
+            while not _is_sym(tokens, pos, (")",)):
+                if pos >= len(tokens) or tokens[pos][0] != "name":
+                    raise LangError("expected a parameter name")
+                params.append(tokens[pos][1])
+                pos += 1
+                if _is_sym(tokens, pos, (",",)):
+                    pos += 1
+            body, pos = parse_block(tokens, pos + 1)
+            return ("fn", name, params, body), pos
+        if kind == "name" and _is_sym(tokens, pos + 1, ("=",)):
+            expr, pos = parse_expr(tokens, pos + 2)
+            return ("assign", value, expr), _expect(tokens, pos, "sym", ";")
+        expr, pos = parse_expr(tokens, pos)
+        return ("expr", expr), _expect(tokens, pos, "sym", ";")
+
+
+    def parse_program(tokens):
+        stmts, pos = [], 0
+        while pos < len(tokens):
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts
+
+
+    class Env:
+        """A scope: a dictionary of variables plus a link to the enclosing scope."""
+
+        def __init__(self, parent=None):
+            self.vars, self.parent = {}, parent
+
+        def __contains__(self, name):
+            return name in self.vars or (self.parent is not None and name in self.parent)
+
+        def __getitem__(self, name):
+            if name in self.vars:
+                return self.vars[name]
+            if self.parent is not None:
+                return self.parent[name]
+            raise KeyError(name)
+
+        def define(self, name, value):
+            self.vars[name] = value
+
+        def assign(self, name, value):
+            scope = self
+            while scope is not None:
+                if name in scope.vars:
+                    scope.vars[name] = value
+                    return
+                scope = scope.parent
+            raise LangError("assignment to undefined variable " + name)
+
+
+
+    class _Return(Exception):
+        def __init__(self, value):
+            self.value = value
+
+
+    class Interpreter:
+        MAX_STEPS = 20000
+        MAX_DEPTH = 40
+
+        def __init__(self):
+            self.output, self.steps, self.depth = [], 0, 0
+            self.globals = Env()
+
+        def run(self, stmts):
+            """Execute a list of statements. Return the list of printed lines (strings)."""
+            pass
+  tests:
+  - name: variables, printing and arithmetic
+    code: |
+      def go(src):
+          return Interpreter().run(parse_program(tokenize(src)))
+      assert go("let x = 3; let y = x * 2 + 1; print y;") == ["7"]
+      assert go("print 7 / 2; print 8 / 2; print -3 + 10 % 4;") == ["3.5", "4", "-1"]
+      assert go("let a = 1; a = a + 41; print a;") == ["42"]
+      assert go("") == []
+  - name: if, else and while
+    code: |
+      def go(src):
+          return Interpreter().run(parse_program(tokenize(src)))
+      assert go("let a = 1; if a == 1 { print 10; } else { print 20; } if a != 1 { print 30; } else { print 40; }") == ["10", "40"]
+      assert go("let i = 0; let s = 0; while i < 5 { s = s + i; i = i + 1; } print s;") == ["10"]
+      assert go("let x = 0; if x { print 1; }") == []
+      assert go("let n = 1; if n { let n = 5; print n; } print n;") == ["5", "1"]
+      assert go("let t = 0; let i = 0; while i < 3 { let j = 0; while j < 3 { t = t + 1; j = j + 1; } i = i + 1; } print t;") == ["9"]
+  - name: functions, recursion and closures
+    code: |
+      def go(src):
+          return Interpreter().run(parse_program(tokenize(src)))
+      assert go("fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); } print fib(10);") == ["55"]
+      assert go("fn fact(n) { if n <= 1 { return 1; } return n * fact(n - 1); } print fact(20);") == ["2432902008176640000"]
+      assert go("fn nothing() { } print nothing();") == ["0"]
+      assert go("fn make(n) { fn add(x) { return x + n; } return add; } let a = make(5); print a(10); let b = make(100); print b(1);") == ["15", "101"]
+      assert go("let total = 0; fn bump() { total = total + 1; } bump(); bump(); print total;") == ["2"]
+      assert go("fn f(x) { while 1 { if x > 3 { return x; } x = x + 1; } } print f(0);") == ["4"]
+  - name: runtime errors and limits
+    code: |
+      def err(src):
+          try:
+              Interpreter().run(parse_program(tokenize(src)))
+          except LangError as e:
+              return str(e)
+          return None
+      assert err("print 1 / 0;") == "division by zero"
+      assert err("print x;") == "undefined variable x"
+      assert err("y = 1;") == "assignment to undefined variable y"
+      assert err("while 1 { }") == "step limit exceeded"
+      assert err("fn f(n) { return f(n + 1); } print f(0);") == "recursion too deep"
+      assert err("fn g(a, b) { return a + b; } print g(1);") == "g expects 2 arguments, got 1"
+      assert err("let x = 5; x();") == "undefined function x"
+  hints:
+  - 'Functions are Python closures: define `call(*args)` inside a method and return it. Use a private exception class to implement `return`.'
+  - Remember `try/finally` to decrement `self.depth` even when a `return` or an error unwinds the call.
+  solution: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def evaluate(node, env):
+        kind = node[0]
+        if kind == "num":
+            return node[1]
+        if kind == "var":
+            if node[1] not in env:
+                raise LangError("undefined variable " + node[1])
+            return env[node[1]]
+        if kind == "neg":
+            return -evaluate(node[1], env)
+        if kind == "call":
+            if node[1] not in env or not callable(env[node[1]]):
+                raise LangError("undefined function " + node[1])
+            return env[node[1]](*[evaluate(a, env) for a in node[2]])
+        op, left, right = node[1], evaluate(node[2], env), evaluate(node[3], env)
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op in ("/", "%"):
+            if right == 0:
+                raise LangError("division by zero")
+            if op == "%":
+                return left % right
+            if isinstance(left, int) and isinstance(right, int) and left % right == 0:
+                return left // right
+            return left / right
+        return int({"==": left == right, "!=": left != right, "<": left < right,
+                    "<=": left <= right, ">": left > right, ">=": left >= right}[op])
+
+
+    def _expect(tokens, pos, kind, value):
+        if pos >= len(tokens) or tokens[pos] != (kind, value):
+            raise LangError("expected " + repr(value))
+        return pos + 1
+
+
+    def parse_block(tokens, pos):
+        pos = _expect(tokens, pos, "sym", "{")
+        stmts = []
+        while not _is_sym(tokens, pos, ("}",)):
+            if pos >= len(tokens):
+                raise LangError("expected }")
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts, pos + 1
+
+
+    def parse_statement(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "kw" and value == "let":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a name after let")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "=")
+            expr, pos = parse_expr(tokens, pos)
+            return ("let", name, expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "print":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("print", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "return":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("return", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "if":
+            cond, pos = parse_expr(tokens, pos + 1)
+            then, pos = parse_block(tokens, pos)
+            other = None
+            if pos < len(tokens) and tokens[pos] == ("kw", "else"):
+                other, pos = parse_block(tokens, pos + 1)
+            return ("if", cond, then, other), pos
+        if kind == "kw" and value == "while":
+            cond, pos = parse_expr(tokens, pos + 1)
+            body, pos = parse_block(tokens, pos)
+            return ("while", cond, body), pos
+        if kind == "kw" and value == "fn":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a function name")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "(")
+            params = []
+            while not _is_sym(tokens, pos, (")",)):
+                if pos >= len(tokens) or tokens[pos][0] != "name":
+                    raise LangError("expected a parameter name")
+                params.append(tokens[pos][1])
+                pos += 1
+                if _is_sym(tokens, pos, (",",)):
+                    pos += 1
+            body, pos = parse_block(tokens, pos + 1)
+            return ("fn", name, params, body), pos
+        if kind == "name" and _is_sym(tokens, pos + 1, ("=",)):
+            expr, pos = parse_expr(tokens, pos + 2)
+            return ("assign", value, expr), _expect(tokens, pos, "sym", ";")
+        expr, pos = parse_expr(tokens, pos)
+        return ("expr", expr), _expect(tokens, pos, "sym", ";")
+
+
+    def parse_program(tokens):
+        stmts, pos = [], 0
+        while pos < len(tokens):
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts
+
+
+    class Env:
+        """A scope: a dictionary of variables plus a link to the enclosing scope."""
+
+        def __init__(self, parent=None):
+            self.vars, self.parent = {}, parent
+
+        def __contains__(self, name):
+            return name in self.vars or (self.parent is not None and name in self.parent)
+
+        def __getitem__(self, name):
+            if name in self.vars:
+                return self.vars[name]
+            if self.parent is not None:
+                return self.parent[name]
+            raise KeyError(name)
+
+        def define(self, name, value):
+            self.vars[name] = value
+
+        def assign(self, name, value):
+            scope = self
+            while scope is not None:
+                if name in scope.vars:
+                    scope.vars[name] = value
+                    return
+                scope = scope.parent
+            raise LangError("assignment to undefined variable " + name)
+
+
+    class _Return(Exception):
+        def __init__(self, value):
+            self.value = value
+
+
+    class Interpreter:
+        MAX_STEPS = 20000
+        MAX_DEPTH = 40
+
+        def __init__(self):
+            self.output, self.steps, self.depth = [], 0, 0
+            self.globals = Env()
+
+        def run(self, stmts):
+            self.exec_block(stmts, self.globals)
+            return self.output
+
+        def exec_block(self, stmts, env):
+            for stmt in stmts:
+                self.exec_stmt(stmt, env)
+
+        def exec_stmt(self, stmt, env):
+            self.steps += 1
+            if self.steps > self.MAX_STEPS:
+                raise LangError("step limit exceeded")
+            kind = stmt[0]
+            if kind == "let":
+                env.define(stmt[1], evaluate(stmt[2], env))
+            elif kind == "assign":
+                env.assign(stmt[1], evaluate(stmt[2], env))
+            elif kind == "print":
+                value = evaluate(stmt[1], env)
+                self.output.append(str(value))
+            elif kind == "expr":
+                evaluate(stmt[1], env)
+            elif kind == "if":
+                if evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                elif stmt[3] is not None:
+                    self.exec_block(stmt[3], Env(env))
+            elif kind == "while":
+                while evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                    self.steps += 1
+                    if self.steps > self.MAX_STEPS:
+                        raise LangError("step limit exceeded")
+            elif kind == "fn":
+                env.define(stmt[1], self.make_function(stmt[1], stmt[2], stmt[3], env))
+            elif kind == "return":
+                raise _Return(evaluate(stmt[1], env))
+            else:
+                raise LangError("unknown statement " + repr(kind))
+
+        def make_function(self, name, params, body, closure_env):
+            def call(*args):
+                if len(args) != len(params):
+                    raise LangError(f"{name} expects {len(params)} arguments, got {len(args)}")
+                if self.depth >= self.MAX_DEPTH:
+                    raise LangError("recursion too deep")
+                local = Env(closure_env)
+                for p, a in zip(params, args):
+                    local.define(p, a)
+                self.depth += 1
+                try:
+                    self.exec_block(body, local)
+                except _Return as r:
+                    return r.value
+                finally:
+                    self.depth -= 1
+                return 0
+            return call
+  explanation: 'Your interpreter now contains the same ideas as every real one: environments, closures, a call stack, and resource limits for safety.'
+- id: write-programs
+  title: 'Milestone 5: Program in your own language'
+  difficulty: 3
+  prompt: 'The starter contains the finished interpreter and `run_source(src)`, which returns `(output_lines, error_or_None)`. Fill in the four variables with **MiniScript source code** (triple-quoted strings) so that: `FIB_SRC` prints the first 10 Fibonacci numbers (0 1 1 2 3 5 8 13 21 34), one per line, using a loop; `GCD_SRC` defines `fn gcd(a, b)` (Euclid''s algorithm) and prints `gcd(48, 18)` then `gcd(17, 5)`; `SUM_SRC` uses a `while` loop to print the sum of all multiples of 3 or 5 below 100; `PRIMES_SRC` defines `fn is_prime(n)` and prints every prime below 30, one per line. Remember: only the features MiniScript has!'
+  starter: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def evaluate(node, env):
+        kind = node[0]
+        if kind == "num":
+            return node[1]
+        if kind == "var":
+            if node[1] not in env:
+                raise LangError("undefined variable " + node[1])
+            return env[node[1]]
+        if kind == "neg":
+            return -evaluate(node[1], env)
+        if kind == "call":
+            if node[1] not in env or not callable(env[node[1]]):
+                raise LangError("undefined function " + node[1])
+            return env[node[1]](*[evaluate(a, env) for a in node[2]])
+        op, left, right = node[1], evaluate(node[2], env), evaluate(node[3], env)
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op in ("/", "%"):
+            if right == 0:
+                raise LangError("division by zero")
+            if op == "%":
+                return left % right
+            if isinstance(left, int) and isinstance(right, int) and left % right == 0:
+                return left // right
+            return left / right
+        return int({"==": left == right, "!=": left != right, "<": left < right,
+                    "<=": left <= right, ">": left > right, ">=": left >= right}[op])
+
+
+    def _expect(tokens, pos, kind, value):
+        if pos >= len(tokens) or tokens[pos] != (kind, value):
+            raise LangError("expected " + repr(value))
+        return pos + 1
+
+
+    def parse_block(tokens, pos):
+        pos = _expect(tokens, pos, "sym", "{")
+        stmts = []
+        while not _is_sym(tokens, pos, ("}",)):
+            if pos >= len(tokens):
+                raise LangError("expected }")
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts, pos + 1
+
+
+    def parse_statement(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "kw" and value == "let":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a name after let")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "=")
+            expr, pos = parse_expr(tokens, pos)
+            return ("let", name, expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "print":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("print", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "return":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("return", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "if":
+            cond, pos = parse_expr(tokens, pos + 1)
+            then, pos = parse_block(tokens, pos)
+            other = None
+            if pos < len(tokens) and tokens[pos] == ("kw", "else"):
+                other, pos = parse_block(tokens, pos + 1)
+            return ("if", cond, then, other), pos
+        if kind == "kw" and value == "while":
+            cond, pos = parse_expr(tokens, pos + 1)
+            body, pos = parse_block(tokens, pos)
+            return ("while", cond, body), pos
+        if kind == "kw" and value == "fn":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a function name")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "(")
+            params = []
+            while not _is_sym(tokens, pos, (")",)):
+                if pos >= len(tokens) or tokens[pos][0] != "name":
+                    raise LangError("expected a parameter name")
+                params.append(tokens[pos][1])
+                pos += 1
+                if _is_sym(tokens, pos, (",",)):
+                    pos += 1
+            body, pos = parse_block(tokens, pos + 1)
+            return ("fn", name, params, body), pos
+        if kind == "name" and _is_sym(tokens, pos + 1, ("=",)):
+            expr, pos = parse_expr(tokens, pos + 2)
+            return ("assign", value, expr), _expect(tokens, pos, "sym", ";")
+        expr, pos = parse_expr(tokens, pos)
+        return ("expr", expr), _expect(tokens, pos, "sym", ";")
+
+
+    def parse_program(tokens):
+        stmts, pos = [], 0
+        while pos < len(tokens):
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts
+
+
+    class Env:
+        """A scope: a dictionary of variables plus a link to the enclosing scope."""
+
+        def __init__(self, parent=None):
+            self.vars, self.parent = {}, parent
+
+        def __contains__(self, name):
+            return name in self.vars or (self.parent is not None and name in self.parent)
+
+        def __getitem__(self, name):
+            if name in self.vars:
+                return self.vars[name]
+            if self.parent is not None:
+                return self.parent[name]
+            raise KeyError(name)
+
+        def define(self, name, value):
+            self.vars[name] = value
+
+        def assign(self, name, value):
+            scope = self
+            while scope is not None:
+                if name in scope.vars:
+                    scope.vars[name] = value
+                    return
+                scope = scope.parent
+            raise LangError("assignment to undefined variable " + name)
+
+
+    class _Return(Exception):
+        def __init__(self, value):
+            self.value = value
+
+
+    class Interpreter:
+        MAX_STEPS = 20000
+        MAX_DEPTH = 40
+
+        def __init__(self):
+            self.output, self.steps, self.depth = [], 0, 0
+            self.globals = Env()
+
+        def run(self, stmts):
+            self.exec_block(stmts, self.globals)
+            return self.output
+
+        def exec_block(self, stmts, env):
+            for stmt in stmts:
+                self.exec_stmt(stmt, env)
+
+        def exec_stmt(self, stmt, env):
+            self.steps += 1
+            if self.steps > self.MAX_STEPS:
+                raise LangError("step limit exceeded")
+            kind = stmt[0]
+            if kind == "let":
+                env.define(stmt[1], evaluate(stmt[2], env))
+            elif kind == "assign":
+                env.assign(stmt[1], evaluate(stmt[2], env))
+            elif kind == "print":
+                value = evaluate(stmt[1], env)
+                self.output.append(str(value))
+            elif kind == "expr":
+                evaluate(stmt[1], env)
+            elif kind == "if":
+                if evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                elif stmt[3] is not None:
+                    self.exec_block(stmt[3], Env(env))
+            elif kind == "while":
+                while evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                    self.steps += 1
+                    if self.steps > self.MAX_STEPS:
+                        raise LangError("step limit exceeded")
+            elif kind == "fn":
+                env.define(stmt[1], self.make_function(stmt[1], stmt[2], stmt[3], env))
+            elif kind == "return":
+                raise _Return(evaluate(stmt[1], env))
+            else:
+                raise LangError("unknown statement " + repr(kind))
+
+        def make_function(self, name, params, body, closure_env):
+            def call(*args):
+                if len(args) != len(params):
+                    raise LangError(f"{name} expects {len(params)} arguments, got {len(args)}")
+                if self.depth >= self.MAX_DEPTH:
+                    raise LangError("recursion too deep")
+                local = Env(closure_env)
+                for p, a in zip(params, args):
+                    local.define(p, a)
+                self.depth += 1
+                try:
+                    self.exec_block(body, local)
+                except _Return as r:
+                    return r.value
+                finally:
+                    self.depth -= 1
+                return 0
+            return call
+
+
+    def run_source(src):
+        """Run a MiniScript program. Returns (output_lines, error_message_or_None)."""
+        interp = Interpreter()
+        try:
+            interp.run(parse_program(tokenize(src)))
+        except LangError as e:
+            return interp.output, str(e)
+        return interp.output, None
+
+
+    # Write MiniScript source code (as strings) for each task. Use only what the language supports:
+    # let, assignment, print, if/else, while, fn/return, + - * / %, comparisons.
+
+    FIB_SRC = ""      # print the first 10 Fibonacci numbers (0 1 1 2 3 5 8 13 21 34), one per line
+
+    GCD_SRC = ""      # define fn gcd(a, b) with Euclid's algorithm and print gcd(48, 18) then gcd(17, 5)
+
+    SUM_SRC = ""      # print the sum of all multiples of 3 or 5 below 100
+
+    PRIMES_SRC = ""   # define fn is_prime(n) and print every prime below 30, one per line
+  tests:
+  - name: fibonacci
+    code: |
+      out, err = run_source(FIB_SRC)
+      assert err is None, err
+      assert out == ["0", "1", "1", "2", "3", "5", "8", "13", "21", "34"]
+  - name: gcd
+    code: |
+      out, err = run_source(GCD_SRC)
+      assert err is None, err
+      assert out == ["6", "1"]
+      assert "fn gcd" in GCD_SRC
+  - name: multiples of 3 or 5
+    code: |
+      out, err = run_source(SUM_SRC)
+      assert err is None, err
+      assert out == ["2318"]
+      assert "while" in SUM_SRC
+  - name: primes
+    code: |
+      out, err = run_source(PRIMES_SRC)
+      assert err is None, err
+      assert out == ["2", "3", "5", "7", "11", "13", "17", "19", "23", "29"]
+      assert "fn is_prime" in PRIMES_SRC
+  hints:
+  - 'There is no `for` loop and no `and`/`or`: use `while` and nested `if`.'
+  - 'Euclid: while b is not 0, replace (a, b) with (b, a % b).'
+  solution: |
+    import re
+
+    KEYWORDS = {"let", "print", "if", "else", "while", "fn", "return"}
+    _TOKEN = re.compile(r"(\d+\.\d+|\d+)|([A-Za-z_]\w*)|(==|!=|<=|>=|[-+*/%<>=(){},;])")
+
+
+    class LangError(Exception):
+        pass
+
+
+    def tokenize(src):
+        tokens = []
+        pos = 0
+        while pos < len(src):
+            ch = src[pos]
+            if ch.isspace():
+                pos += 1
+                continue
+            if ch == "#":
+                while pos < len(src) and src[pos] != "\n":
+                    pos += 1
+                continue
+            m = _TOKEN.match(src, pos)
+            if not m:
+                raise LangError("unexpected character " + repr(ch))
+            number, name, symbol = m.groups()
+            if number is not None:
+                tokens.append(("num", float(number) if "." in number else int(number)))
+            elif name is not None:
+                tokens.append(("kw" if name in KEYWORDS else "name", name))
+            else:
+                tokens.append(("sym", symbol))
+            pos = m.end()
+        return tokens
+
+
+    COMPARE = ("==", "!=", "<", "<=", ">", ">=")
+
+
+    def _is_sym(tokens, pos, options):
+        return pos < len(tokens) and tokens[pos][0] == "sym" and tokens[pos][1] in options
+
+
+    def parse_expr(tokens, pos=0):
+        """Parse an expression starting at tokens[pos]. Returns (ast, next_pos)."""
+        left, pos = parse_sum(tokens, pos)
+        while _is_sym(tokens, pos, COMPARE):
+            op = tokens[pos][1]
+            right, pos = parse_sum(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_sum(tokens, pos):
+        left, pos = parse_term(tokens, pos)
+        while _is_sym(tokens, pos, ("+", "-")):
+            op = tokens[pos][1]
+            right, pos = parse_term(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_term(tokens, pos):
+        left, pos = parse_unary(tokens, pos)
+        while _is_sym(tokens, pos, ("*", "/", "%")):
+            op = tokens[pos][1]
+            right, pos = parse_unary(tokens, pos + 1)
+            left = ("bin", op, left, right)
+        return left, pos
+
+
+    def parse_unary(tokens, pos):
+        if _is_sym(tokens, pos, ("-",)):
+            operand, pos = parse_unary(tokens, pos + 1)
+            return ("neg", operand), pos
+        return parse_primary(tokens, pos)
+
+
+    def parse_primary(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "num":
+            return ("num", value), pos + 1
+        if kind == "name":
+            if _is_sym(tokens, pos + 1, ("(",)):
+                args, pos = [], pos + 2
+                if not _is_sym(tokens, pos, (")",)):
+                    while True:
+                        arg, pos = parse_expr(tokens, pos)
+                        args.append(arg)
+                        if _is_sym(tokens, pos, (",",)):
+                            pos += 1
+                        else:
+                            break
+                if not _is_sym(tokens, pos, (")",)):
+                    raise LangError("expected )")
+                return ("call", value, args), pos + 1
+            return ("var", value), pos + 1
+        if kind == "sym" and value == "(":
+            inner, pos = parse_expr(tokens, pos + 1)
+            if not _is_sym(tokens, pos, (")",)):
+                raise LangError("expected )")
+            return inner, pos + 1
+        raise LangError("unexpected token " + repr(value))
+
+
+    def parse(tokens):
+        ast, pos = parse_expr(tokens, 0)
+        if pos != len(tokens):
+            raise LangError("unexpected token " + repr(tokens[pos][1]))
+        return ast
+
+
+    def evaluate(node, env):
+        kind = node[0]
+        if kind == "num":
+            return node[1]
+        if kind == "var":
+            if node[1] not in env:
+                raise LangError("undefined variable " + node[1])
+            return env[node[1]]
+        if kind == "neg":
+            return -evaluate(node[1], env)
+        if kind == "call":
+            if node[1] not in env or not callable(env[node[1]]):
+                raise LangError("undefined function " + node[1])
+            return env[node[1]](*[evaluate(a, env) for a in node[2]])
+        op, left, right = node[1], evaluate(node[2], env), evaluate(node[3], env)
+        if op == "+":
+            return left + right
+        if op == "-":
+            return left - right
+        if op == "*":
+            return left * right
+        if op in ("/", "%"):
+            if right == 0:
+                raise LangError("division by zero")
+            if op == "%":
+                return left % right
+            if isinstance(left, int) and isinstance(right, int) and left % right == 0:
+                return left // right
+            return left / right
+        return int({"==": left == right, "!=": left != right, "<": left < right,
+                    "<=": left <= right, ">": left > right, ">=": left >= right}[op])
+
+
+    def _expect(tokens, pos, kind, value):
+        if pos >= len(tokens) or tokens[pos] != (kind, value):
+            raise LangError("expected " + repr(value))
+        return pos + 1
+
+
+    def parse_block(tokens, pos):
+        pos = _expect(tokens, pos, "sym", "{")
+        stmts = []
+        while not _is_sym(tokens, pos, ("}",)):
+            if pos >= len(tokens):
+                raise LangError("expected }")
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts, pos + 1
+
+
+    def parse_statement(tokens, pos):
+        if pos >= len(tokens):
+            raise LangError("unexpected end of input")
+        kind, value = tokens[pos]
+        if kind == "kw" and value == "let":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a name after let")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "=")
+            expr, pos = parse_expr(tokens, pos)
+            return ("let", name, expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "print":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("print", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "return":
+            expr, pos = parse_expr(tokens, pos + 1)
+            return ("return", expr), _expect(tokens, pos, "sym", ";")
+        if kind == "kw" and value == "if":
+            cond, pos = parse_expr(tokens, pos + 1)
+            then, pos = parse_block(tokens, pos)
+            other = None
+            if pos < len(tokens) and tokens[pos] == ("kw", "else"):
+                other, pos = parse_block(tokens, pos + 1)
+            return ("if", cond, then, other), pos
+        if kind == "kw" and value == "while":
+            cond, pos = parse_expr(tokens, pos + 1)
+            body, pos = parse_block(tokens, pos)
+            return ("while", cond, body), pos
+        if kind == "kw" and value == "fn":
+            if pos + 1 >= len(tokens) or tokens[pos + 1][0] != "name":
+                raise LangError("expected a function name")
+            name = tokens[pos + 1][1]
+            pos = _expect(tokens, pos + 2, "sym", "(")
+            params = []
+            while not _is_sym(tokens, pos, (")",)):
+                if pos >= len(tokens) or tokens[pos][0] != "name":
+                    raise LangError("expected a parameter name")
+                params.append(tokens[pos][1])
+                pos += 1
+                if _is_sym(tokens, pos, (",",)):
+                    pos += 1
+            body, pos = parse_block(tokens, pos + 1)
+            return ("fn", name, params, body), pos
+        if kind == "name" and _is_sym(tokens, pos + 1, ("=",)):
+            expr, pos = parse_expr(tokens, pos + 2)
+            return ("assign", value, expr), _expect(tokens, pos, "sym", ";")
+        expr, pos = parse_expr(tokens, pos)
+        return ("expr", expr), _expect(tokens, pos, "sym", ";")
+
+
+    def parse_program(tokens):
+        stmts, pos = [], 0
+        while pos < len(tokens):
+            stmt, pos = parse_statement(tokens, pos)
+            stmts.append(stmt)
+        return stmts
+
+
+    class Env:
+        """A scope: a dictionary of variables plus a link to the enclosing scope."""
+
+        def __init__(self, parent=None):
+            self.vars, self.parent = {}, parent
+
+        def __contains__(self, name):
+            return name in self.vars or (self.parent is not None and name in self.parent)
+
+        def __getitem__(self, name):
+            if name in self.vars:
+                return self.vars[name]
+            if self.parent is not None:
+                return self.parent[name]
+            raise KeyError(name)
+
+        def define(self, name, value):
+            self.vars[name] = value
+
+        def assign(self, name, value):
+            scope = self
+            while scope is not None:
+                if name in scope.vars:
+                    scope.vars[name] = value
+                    return
+                scope = scope.parent
+            raise LangError("assignment to undefined variable " + name)
+
+
+    class _Return(Exception):
+        def __init__(self, value):
+            self.value = value
+
+
+    class Interpreter:
+        MAX_STEPS = 20000
+        MAX_DEPTH = 40
+
+        def __init__(self):
+            self.output, self.steps, self.depth = [], 0, 0
+            self.globals = Env()
+
+        def run(self, stmts):
+            self.exec_block(stmts, self.globals)
+            return self.output
+
+        def exec_block(self, stmts, env):
+            for stmt in stmts:
+                self.exec_stmt(stmt, env)
+
+        def exec_stmt(self, stmt, env):
+            self.steps += 1
+            if self.steps > self.MAX_STEPS:
+                raise LangError("step limit exceeded")
+            kind = stmt[0]
+            if kind == "let":
+                env.define(stmt[1], evaluate(stmt[2], env))
+            elif kind == "assign":
+                env.assign(stmt[1], evaluate(stmt[2], env))
+            elif kind == "print":
+                value = evaluate(stmt[1], env)
+                self.output.append(str(value))
+            elif kind == "expr":
+                evaluate(stmt[1], env)
+            elif kind == "if":
+                if evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                elif stmt[3] is not None:
+                    self.exec_block(stmt[3], Env(env))
+            elif kind == "while":
+                while evaluate(stmt[1], env):
+                    self.exec_block(stmt[2], Env(env))
+                    self.steps += 1
+                    if self.steps > self.MAX_STEPS:
+                        raise LangError("step limit exceeded")
+            elif kind == "fn":
+                env.define(stmt[1], self.make_function(stmt[1], stmt[2], stmt[3], env))
+            elif kind == "return":
+                raise _Return(evaluate(stmt[1], env))
+            else:
+                raise LangError("unknown statement " + repr(kind))
+
+        def make_function(self, name, params, body, closure_env):
+            def call(*args):
+                if len(args) != len(params):
+                    raise LangError(f"{name} expects {len(params)} arguments, got {len(args)}")
+                if self.depth >= self.MAX_DEPTH:
+                    raise LangError("recursion too deep")
+                local = Env(closure_env)
+                for p, a in zip(params, args):
+                    local.define(p, a)
+                self.depth += 1
+                try:
+                    self.exec_block(body, local)
+                except _Return as r:
+                    return r.value
+                finally:
+                    self.depth -= 1
+                return 0
+            return call
+
+
+    def run_source(src):
+        """Run a MiniScript program. Returns (output_lines, error_message_or_None)."""
+        interp = Interpreter()
+        try:
+            interp.run(parse_program(tokenize(src)))
+        except LangError as e:
+            return interp.output, str(e)
+        return interp.output, None
+
+
+    FIB_SRC = '''let a = 0;
+    let b = 1;
+    let i = 0;
+    while i < 10 {
+        print a;
+        let t = a + b;
+        a = b;
+        b = t;
+        i = i + 1;
+    }
+    '''
+
+    GCD_SRC = '''fn gcd(a, b) {
+        while b != 0 {
+            let t = b;
+            b = a % b;
+            a = t;
+        }
+        return a;
+    }
+    print gcd(48, 18);
+    print gcd(17, 5);
+    '''
+
+    SUM_SRC = '''let total = 0;
+    let n = 1;
+    while n < 100 {
+        if n % 3 == 0 {
+            total = total + n;
+        } else {
+            if n % 5 == 0 {
+                total = total + n;
+            }
+        }
+        n = n + 1;
+    }
+    print total;
+    '''
+
+    PRIMES_SRC = '''fn is_prime(n) {
+        if n < 2 { return 0; }
+        let d = 2;
+        while d * d <= n {
+            if n % d == 0 { return 0; }
+            d = d + 1;
+        }
+        return 1;
+    }
+    let k = 2;
+    while k < 30 {
+        if is_prime(k) { print k; }
+        k = k + 1;
+    }
+    '''
+  explanation: 'Writing programs in a language you made yourself is the best test of the design. Notice what was awkward: no `and`, no `for`, no lists. Adding those is a natural extension.'
+commonMistakes:
+- title: Parsing operators in the wrong order
+  explanation: Precedence comes from which function calls which. The loosest operators belong in the outermost function.
+- title: Making subtraction right-associative
+  explanation: Use a loop that wraps the tree so far on the left, so 10 - 4 - 3 is (10 - 4) - 3.
+- title: Forgetting to check that all tokens were consumed
+  explanation: Otherwise `1 2` or `1 + 2 )` would be silently accepted.
+- title: Sharing one scope for everything
+  explanation: Blocks and calls need their own child scope, with the parent link for lookups.
+- title: No limits on loops and recursion
+  explanation: 'An interpreter must protect itself from runaway programs: count steps and depth.'
+summary:
+- 'An interpreter pipeline: tokenizer, parser (syntax tree), evaluator.'
+- Recursive descent turns each grammar rule into a function; call order gives precedence and loops give left-associativity.
+- Environments are chains of scopes; functions that remember their defining scope are closures.
+- Return can be implemented with an exception; resource limits and clear errors make the interpreter safe.
+- Writing programs in the language you built tests its design and shows what to add next.
+next: u18-storage
+quiz:
+- type: mcq
+  question: What does a tokenizer produce?
+  options:
+  - A list of tokens such as numbers, names and symbols
+  - A syntax tree
+  - Machine code
+  - Program output
+  answer: 0
+  explanation: 'It is the first stage: characters to tokens.'
+- type: mcq
+  question: How does a recursive-descent parser give multiplication higher precedence than addition?
+  options:
+  - The addition function calls the multiplication function for its operands
+  - It sorts the operators
+  - It evaluates right to left
+  - It uses a lookup table of numbers
+  answer: 0
+  explanation: Operands of + are whole products, so * is grouped first.
+- type: mcq
+  question: What is a closure?
+  options:
+  - A function together with the scope in which it was defined
+  - A function with no arguments
+  - A loop that stops
+  - A syntax error
+  answer: 0
+  explanation: It keeps access to the variables around its definition.
+- type: mcq
+  question: Why does the interpreter count steps?
+  options:
+  - To stop infinite loops from hanging the program
+  - To measure the file size
+  - To compute the result faster
+  - To print line numbers
+  answer: 0
+  explanation: Untrusted or buggy programs must not run forever.
+- type: mcq
+  question: What does a scope chain do when a variable is not found locally?
+  options:
+  - It looks in the parent scope, and so on outward
+  - It creates the variable
+  - It crashes immediately
+  - It picks a random value
+  answer: 0
+  explanation: Lookup walks outward through enclosing scopes.
+- type: mcq
+  question: How can the return statement be implemented in a tree-walking interpreter?
+  options:
+  - By raising an exception caught at the function call
+  - By deleting the function
+  - By restarting the program
+  - By reading a file
+  answer: 0
+  explanation: The exception unwinds nested blocks and loops back to the call.
+- type: code
+  question: Write `eval_postfix(tokens)` that evaluates a list of tokens like `["3", "4", "+", "2", "*"]` in reverse Polish notation using a stack, supporting `+ - * /` (with `/` as true division), and returns the number.
+  starter: |
+    def eval_postfix(tokens):
+        pass
+  tests:
+  - name: rpn
+    code: |
+      assert eval_postfix(["3", "4", "+", "2", "*"]) == 14
+      assert eval_postfix(["5", "1", "2", "+", "4", "*", "+", "3", "-"]) == 14
+      assert eval_postfix(["7"]) == 7
+      assert eval_postfix(["1", "4", "/"]) == 0.25
+  solution: |
+    def eval_postfix(tokens):
+        stack = []
+        for t in tokens:
+            if t in ("+", "-", "*", "/"):
+                b, a = stack.pop(), stack.pop()
+                if t == "+":
+                    stack.append(a + b)
+                elif t == "-":
+                    stack.append(a - b)
+                elif t == "*":
+                    stack.append(a * b)
+                else:
+                    stack.append(a / b)
+            else:
+                stack.append(int(t))
+        return stack[0]

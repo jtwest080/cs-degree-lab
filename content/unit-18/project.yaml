@@ -1,0 +1,1464 @@
+title: Notes Service
+language: python
+brief: |
+  You will build a **Notes Service**: a small, secure web API for private notes that combines the framework, the database and the security habits of this unit. It runs entirely in memory and in the browser, so you drive it by calling `service.handle(raw_request)`.
+
+  The starter contains the building blocks from the earlier capstones, ready to use: the checksummed log and `KVStore` with transactions (Capstone B), and `Router`, `App`, `HTTPError`, `json_response`, the middleware functions `require_auth` and `rate_limit`, `sign_token` and `verify_token`, `validate` and `secure` (Capstone C). You write the class `NotesService`.
+
+  **Accounts**
+  - `POST /register` with `{"username", "password"}`: usernames are 3 to 20 characters from `a-z`, `0-9` and `_`; passwords at least 8 characters. Answer `201 {"username"}`, `409` if the name is taken and `422` for invalid input (use `validate` and `USER_SCHEMA` first). Store `"user:<name>"` as `{"salt", "hash"}` using a random salt (`secrets.token_bytes(16).hex()`) and `hash_password`. Never store or log the password.
+  - `POST /login` with the same fields: answer `200 {"token", "expires"}` where the token is `sign_token(secret, username, clock() + 3600)`. An unknown user and a wrong password must give the **same** `401 {"error": "invalid username or password"}`; compare hashes with `hmac.compare_digest`.
+
+  **Notes** (all need `Authorization: Bearer <token>`; `/register` and `/login` are public)
+  - `POST /notes` with `{"title", "body"?, "tag"?}` (see `NOTE_SCHEMA`; `422` with the validation messages joined by `"; "`). Answer `201` with the note `{"id", "owner", "title", "body", "tag", "created", "updated"}`; body and tag default to `""`, `created` and `updated` are `clock()`. Ids count up from 1 using `"meta:next_id"`, and creating a note must be **one transaction** (the note and the counter together).
+  - `GET /notes` lists the caller's notes ordered by numeric id, with optional `?tag=` (exact match) and `?q=` (case-insensitive text in the title or body) filters. `GET /notes/<id>`, `PUT /notes/<id>` (a full replacement of title, body and tag; it changes `updated` only) and `DELETE /notes/<id>` (`204`).
+  - Other people's notes behave exactly like missing ones: `404 {"error": "no such note"}`.
+
+  **Operations**
+  - Every response, including errors, carries the security headers from `secure`, with CORS for `allowed_origins`; every request counts toward a limit of 30 per minute per client (`rate_limit(30, 60, clock)`).
+  - `log_text()` returns the store's log; `NotesService(secret, clock, log_text)` must rebuild users and notes from it, and a log that ends in a torn transaction must not produce half a note.
+steps:
+- title: Wire the pieces together first
+  body: |-
+    In `__init__` create `self.store = KVStore(log_text)` and `self.app = App()`, then register the middleware and routes. Add the middleware in this order: security headers (outermost, so even 429 and 401 responses get them), `rate_limit(30, 60, clock)`, then an authentication guard. The guard should call `require_auth(secret, clock)` for every path except `/register` and `/login`. Register the handlers with `self.app.route(method, pattern)(handler)`.
+- title: Accounts
+  body: |-
+    Write a helper that validates the JSON body with `validate` and raises `HTTPError(422, "; ".join(errors))`. For login, always compute a hash (use a dummy salt when the user does not exist) so both failures behave alike, and compare with `hmac.compare_digest`.
+- title: Notes and ownership
+  body: |-
+    Write one helper that loads `"note:<id>"` and raises `HTTPError(404, "no such note")` when it is missing **or** belongs to someone else. Use it in get, update and delete so ownership is checked in exactly one place.
+- title: One transaction per new note
+  body: |-
+    `store.begin()`, read `meta:next_id` (default 1), put the note and the incremented counter, then `store.commit()`. Wrap this in `try`/`except` and call `store.rollback()` if anything goes wrong. Remember that `scan("note:")` returns keys as text, so sort the notes by their numeric `id`, not by key.
+- title: Listing and filters
+  body: |-
+    `request["query"]` is a dictionary of the query-string values. Apply `tag` as an exact match and `q` as a lower-cased substring test on title and body. An empty `q` means no search.
+- title: Recovery and hostile input
+  body: |-
+    Because everything lives in the store, `NotesService(secret, clock, log_text)` recovers by simply creating `KVStore(log_text)`. Before coding the last two checks, think it through: what does the log look like after creating one note, and what remains if its final line is missing?
+checklist:
+- text: Registration validates input and rejects duplicates
+  test: register validates and creates users
+- text: Passwords are salted and hashed, never stored in plain text
+  test: passwords are never stored in plain text
+- text: Login issues a signed token and gives identical errors for unknown users and wrong passwords
+  test: login issues a verifiable token and hides which part was wrong
+- text: Protected routes reject missing, forged and expired tokens
+  test: protected routes need a valid, unexpired token
+- text: Notes can be created, read and listed in numeric id order
+  test: notes can be created, read and listed in id order
+- text: Note input is validated with clear messages
+  test: note input is validated
+- text: Users cannot see, change or delete each other's notes
+  test: users only see their own notes
+- text: Notes can be updated and deleted, with correct status codes
+  test: notes can be updated and deleted
+- text: Listing supports tag and text filters
+  test: listing can filter by tag and search text
+- text: A new service recovers users, notes and ids from the log
+  test: the service recovers everything from its log
+- text: A torn transaction leaves no half-made note
+  test: a torn transaction leaves no half-made note
+- text: Rate limiting and security headers apply to every response
+  test: rate limiting and security headers apply to every response
+starter: |
+  import hashlib
+  import json
+
+
+  class CorruptRecord(Exception):
+      pass
+
+
+  def checksum(text):
+      return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+  def encode_record(record):
+      """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+      body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+      return checksum(body) + " " + body
+
+
+  def decode_record(line):
+      """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+      check, space, body = line.partition(" ")
+      if not space or len(check) != 8 or checksum(body) != check:
+          raise CorruptRecord("bad checksum")
+      try:
+          record = json.loads(body)
+      except ValueError:
+          raise CorruptRecord("bad json")
+      if not isinstance(record, dict) or "op" not in record:
+          raise CorruptRecord("not a record")
+      return record
+
+
+  def apply_record(data, rec):
+      if rec["op"] == "put":
+          data[rec["key"]] = rec["value"]
+      elif rec["op"] == "del":
+          data.pop(rec["key"], None)
+
+
+  def replay(log_text):
+      """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+      - Plain put/del records are applied as they are read.
+      - A group written between a begin record and a commit record is applied only at the commit.
+      - Reading stops at the first damaged line; everything after it is discarded.
+      - A begin group with no commit at the end of the log (a crash) is discarded.
+      """
+      data, kept, pending = {}, [], None
+      lines = [l for l in log_text.split("\n") if l.strip()]
+      for i, line in enumerate(lines):
+          try:
+              rec = decode_record(line)
+          except CorruptRecord:
+              discarded = len(lines) - i
+              break
+          else:
+              kept.append(line)
+              if rec["op"] == "begin":
+                  pending = []
+              elif rec["op"] == "commit":
+                  for r in pending or []:
+                      apply_record(data, r)
+                  pending = None
+              elif pending is not None:
+                  pending.append(rec)
+              else:
+                  apply_record(data, rec)
+      else:
+          discarded = 0
+      if pending is not None:
+          drop = len(pending) + 1
+          kept = kept[:len(kept) - drop]
+          discarded += drop
+      return data, kept, discarded
+
+
+  class KVStore:
+      """A tiny log-structured key-value store: every change is appended to a log, and the log is replayed on start-up."""
+
+      def __init__(self, log_text=""):
+          self.data, self.log, self.discarded = replay(log_text)
+          self.tx = None                       # None, or a list of buffered records inside a transaction
+
+      def _write(self, rec):
+          if self.tx is not None:
+              self.tx.append(rec)
+          else:
+              self.log.append(encode_record(rec))
+              apply_record(self.data, rec)
+
+      def put(self, key, value):
+          if not isinstance(key, str) or not key:
+              raise ValueError("key must be a non-empty string")
+          self._write({"op": "put", "key": key, "value": value})
+
+      def get(self, key, default=None):
+          if self.tx is not None:              # a transaction sees its own writes
+              for rec in reversed(self.tx):
+                  if rec["key"] == key:
+                      return rec["value"] if rec["op"] == "put" else default
+          return self.data.get(key, default)
+
+      def delete(self, key):
+          existed = key in self.keys()
+          self._write({"op": "del", "key": key})
+          return existed
+
+      def keys(self):
+          view = dict(self.data)
+          for rec in (self.tx or []):
+              apply_record(view, rec)
+          return sorted(view)
+
+      def scan(self, prefix=""):
+          return [k for k in self.keys() if k.startswith(prefix)]
+
+      def log_text(self):
+          return "".join(line + "\n" for line in self.log)
+
+      def begin(self):
+          if self.tx is not None:
+              raise RuntimeError("transaction already open")
+          self.tx = []
+
+      def commit(self):
+          if self.tx is None:
+              raise RuntimeError("no open transaction")
+          records, self.tx = self.tx, None
+          if records:
+              self.log.append(encode_record({"op": "begin"}))
+              for rec in records:
+                  self.log.append(encode_record(rec))
+              self.log.append(encode_record({"op": "commit"}))
+              for rec in records:
+                  apply_record(self.data, rec)
+
+      def rollback(self):
+          if self.tx is None:
+              raise RuntimeError("no open transaction")
+          self.tx = None
+
+
+  class Router:
+      """Matches (method, path) to a handler. Patterns look like /notes/<id:int>."""
+
+      def __init__(self):
+          self.routes = []                       # (method, pattern_segments, handler)
+
+      def add(self, method, pattern, handler):
+          self.routes.append((method.upper(), pattern.strip("/").split("/") if pattern.strip("/") else [], handler))
+
+      @staticmethod
+      def _match_segments(pattern, parts):
+          if len(pattern) != len(parts):
+              return None
+          params = {}
+          for pat, part in zip(pattern, parts):
+              if pat.startswith("<") and pat.endswith(">"):
+                  name, _, kind = pat[1:-1].partition(":")
+                  if kind == "int":
+                      if not part.isdigit():
+                          return None
+                      params[name] = int(part)
+                  elif part:
+                      params[name] = part
+                  else:
+                      return None
+              elif pat != part:
+                  return None
+          return params
+
+      def match(self, method, path):
+          """Return (200, handler, params), (404, None, None) or (405, None, allowed_methods)."""
+          parts = path.strip("/").split("/") if path.strip("/") else []
+          allowed = set()
+          for m, pattern, handler in self.routes:
+              params = self._match_segments(pattern, parts)
+              if params is None:
+                  continue
+              if m == method.upper():
+                  return 200, handler, params
+              allowed.add(m)
+          if allowed:
+              return 405, None, sorted(allowed)
+          return 404, None, None
+
+
+  import json
+  from urllib.parse import parse_qs, urlsplit
+
+
+  class HTTPError(Exception):
+      def __init__(self, status, message):
+          super().__init__(message)
+          self.status, self.message = status, message
+
+
+  def json_response(status, data=None, headers=None):
+      h = {"Content-Type": "application/json"}
+      h.update(headers or {})
+      return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+  class App:
+      def __init__(self):
+          self.router = Router()
+          self.middlewares = []
+
+      def route(self, method, pattern):
+          def decorator(fn):
+              self.router.add(method, pattern, fn)
+              return fn
+          return decorator
+
+      def use(self, middleware):
+          self.middlewares.append(middleware)
+
+      def _dispatch(self, request):
+          status, handler, extra = self.router.match(request["method"], request["path"])
+          if status == 404:
+              return json_response(404, {"error": "not found"})
+          if status == 405:
+              return json_response(405, {"error": "method not allowed"}, {"Allow": ", ".join(extra)})
+          try:
+              result = handler(request, **extra)
+          except HTTPError as e:
+              return json_response(e.status, {"error": e.message})
+          except Exception:
+              return json_response(500, {"error": "internal server error"})
+          if result is None:
+              return json_response(204)
+          if isinstance(result, tuple):
+              return json_response(result[0], result[1])
+          return json_response(200, result)
+
+      def handle(self, raw):
+          """raw: {"method", "path" (may include ?query), "headers", "body"}. Returns a response dict."""
+          parts = urlsplit(raw.get("path", "/"))
+          request = {"method": raw.get("method", "GET").upper(), "path": parts.path,
+                     "query": {k: v[0] for k, v in parse_qs(parts.query).items()},
+                     "headers": {k.lower(): v for k, v in (raw.get("headers") or {}).items()},
+                     "client": raw.get("client", "unknown"), "json": None, "user": None}
+          body = raw.get("body")
+          if request["method"] in ("POST", "PUT", "PATCH") and body:
+              try:
+                  request["json"] = json.loads(body)
+              except ValueError:
+                  return json_response(400, {"error": "invalid JSON"})
+          return build_chain(self._dispatch, self.middlewares)(request)
+
+
+  import base64
+  import hashlib
+  import hmac
+  import json
+
+
+  def build_chain(handler, middlewares):
+      """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+      for mw in reversed(middlewares):
+          handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+      return handler
+
+
+  def _b64(data):
+      return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+  def sign_token(secret, user, expires):
+      payload = _b64(json.dumps({"sub": user, "exp": expires}, sort_keys=True).encode())
+      mac = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+      return payload + "." + mac
+
+
+  def verify_token(secret, token, now):
+      """Return the user name if the token is genuine and unexpired, otherwise None."""
+      payload, dot, mac = token.partition(".")
+      if not dot:
+          return None
+      good = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+      if not hmac.compare_digest(mac.encode(), good.encode()):
+          return None
+      try:
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          if claims["exp"] <= now:
+              return None
+          return claims["sub"] if isinstance(claims["sub"], str) else None
+      except (ValueError, KeyError, TypeError):
+          return None
+
+
+  def require_auth(secret, clock):
+      """Middleware: demand 'Authorization: Bearer <token>'; put the user name in request['user']."""
+      def middleware(request, nxt):
+          header = request["headers"].get("authorization", "")
+          scheme, _, token = header.partition(" ")
+          user = verify_token(secret, token.strip(), clock()) if scheme == "Bearer" else None
+          if user is None:
+              return json_response(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+          request["user"] = user
+          return nxt(request)
+      return middleware
+
+
+  def rate_limit(max_requests, window, clock):
+      """Middleware: at most max_requests per client in any sliding window of `window` seconds."""
+      seen = {}
+      def middleware(request, nxt):
+          now = clock()
+          recent = [t for t in seen.get(request["client"], []) if now - t < window]
+          if len(recent) >= max_requests:
+              seen[request["client"]] = recent
+              retry = max(1, int(window - (now - recent[0]) + 0.999))
+              return json_response(429, {"error": "too many requests"}, {"Retry-After": str(retry)})
+          recent.append(now)
+          seen[request["client"]] = recent
+          return nxt(request)
+      return middleware
+
+
+  def validate(data, schema):
+      """Check a JSON object against a schema. Returns a sorted list of error strings (empty if valid).
+
+      schema maps field name -> {"type": "string"|"integer"|"boolean", "required": bool,
+                                 "min": number, "max": number, "max_length": int, "choices": list}
+      Unknown fields are errors. "min"/"max" apply to integers, "max_length" to strings.
+      """
+      if not isinstance(data, dict):
+          return ["body must be an object"]
+      errors = []
+      for name in data:
+          if name not in schema:
+              errors.append(f"{name}: unknown field")
+      for name, rule in schema.items():
+          if name not in data:
+              if rule.get("required"):
+                  errors.append(f"{name}: required")
+              continue
+          value, kind = data[name], rule["type"]
+          if kind == "string":
+              ok = isinstance(value, str)
+          elif kind == "integer":
+              ok = isinstance(value, int) and not isinstance(value, bool)
+          else:
+              ok = isinstance(value, bool)
+          if not ok:
+              errors.append(f"{name}: must be a {kind}")
+              continue
+          if kind == "string" and "max_length" in rule and len(value) > rule["max_length"]:
+              errors.append(f"{name}: too long (max {rule['max_length']})")
+          if kind == "integer":
+              if "min" in rule and value < rule["min"]:
+                  errors.append(f"{name}: must be at least {rule['min']}")
+              if "max" in rule and value > rule["max"]:
+                  errors.append(f"{name}: must be at most {rule['max']}")
+          if "choices" in rule and value not in rule["choices"]:
+              errors.append(f"{name}: must be one of {sorted(rule['choices'])}")
+      return sorted(errors)
+
+
+  SECURITY_HEADERS = {
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+      "Cache-Control": "no-store",
+  }
+
+
+  def secure(response, request_origin, allowed_origins):
+      """Return a copy of the response with security headers and, for an allowed origin, CORS headers."""
+      headers = dict(response["headers"])
+      for name, value in SECURITY_HEADERS.items():
+          headers.setdefault(name, value)
+      if request_origin is not None and request_origin in allowed_origins:
+          headers["Access-Control-Allow-Origin"] = request_origin
+          headers["Vary"] = "Origin"
+      return {"status": response["status"], "headers": headers, "body": response["body"]}
+
+
+  def preflight(request_origin, requested_method, allowed_origins, allowed_methods):
+      """Answer a CORS preflight (OPTIONS) request."""
+      if request_origin not in allowed_origins or requested_method not in allowed_methods:
+          return {"status": 403, "headers": {}, "body": ""}
+      return {"status": 204, "headers": {"Access-Control-Allow-Origin": request_origin,
+                                         "Access-Control-Allow-Methods": ", ".join(sorted(allowed_methods)),
+                                         "Access-Control-Max-Age": "600", "Vary": "Origin"}, "body": ""}
+
+
+  import hashlib
+  import hmac
+  import re
+  import secrets
+
+  USER_SCHEMA = {"username": {"type": "string", "required": True, "max_length": 20},
+                 "password": {"type": "string", "required": True, "max_length": 100}}
+  NOTE_SCHEMA = {"title": {"type": "string", "required": True, "max_length": 50},
+                 "body": {"type": "string", "max_length": 1000},
+                 "tag": {"type": "string", "max_length": 20}}
+  USERNAME = re.compile(r"[a-z0-9_]{3,20}")
+  TOKEN_LIFETIME = 3600
+  PBKDF2_ROUNDS = 1000
+
+
+  def hash_password(password, salt_hex):
+      """PBKDF2-HMAC-SHA256 of the password with the salt (given as hex text), as hex text."""
+      return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), PBKDF2_ROUNDS).hex()
+
+
+  class NotesService:
+      """A small notes API built from the pieces of this unit.
+
+      self.store is a KVStore holding "user:<name>" -> {"salt", "hash"}, "note:<id>" -> note and "meta:next_id" -> int.
+      """
+
+      def __init__(self, secret, clock, log_text="", allowed_origins=()):
+          pass
+
+      def handle(self, raw):
+          """Take a raw request dictionary (see App.handle) and return a response dictionary."""
+          pass
+
+      def log_text(self):
+          """The store's log, so that NotesService(secret, clock, log_text) can recover everything."""
+          pass
+tests:
+- name: register validates and creates users
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    assert call(svc, "POST", "/register", {"username": "ana", "password": "correct horse"})[:2] == (201, {"username": "ana"})
+    assert call(svc, "POST", "/register", {"username": "ana", "password": "another pass"})[0] == 409
+    bad = [{"username": "ab", "password": "longenough"}, {"username": "A!", "password": "longenough"},
+           {"username": "x" * 21, "password": "longenough"}, {"username": "bob", "password": "short"}, {"username": "bob"},
+           {"username": "bob", "password": "longenough", "admin": True}, {"username": 5, "password": "longenough"}, [1, 2]]
+    for i, body in enumerate(bad):
+        assert call(svc, "POST", "/register", body, client="c%d" % i)[0] == 422, body
+    assert call(svc, "POST", "/register", "{not json", client="z")[0] == 400
+    assert call(svc, "GET", "/register", client="z")[0] == 405
+    assert call(svc, "POST", "/login", {"username": "bob", "password": "longenough"}, client="z")[0] == 401
+- name: passwords are never stored in plain text
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    signup(svc, "ana", "correct horse")
+    signup(svc, "ben", "correct horse")
+    assert "correct horse" not in svc.log_text() and "horse" not in svc.log_text()
+    a, b = svc.store.get("user:ana"), svc.store.get("user:ben")
+    assert set(a) == {"salt", "hash"} and set(b) == {"salt", "hash"}
+    assert a["salt"] != b["salt"] and a["hash"] != b["hash"]
+    assert len(a["hash"]) == 64
+- name: login issues a verifiable token and hides which part was wrong
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    call(svc, "POST", "/register", {"username": "ana", "password": "correct horse"})
+    status, body, _ = call(svc, "POST", "/login", {"username": "ana", "password": "correct horse"})
+    assert status == 200 and body["expires"] == t[0] + 3600
+    assert verify_token(b"s3cret-key", body["token"], t[0]) == "ana"
+    assert verify_token(b"s3cret-key", body["token"], t[0] + 3600) is None
+    wrong = call(svc, "POST", "/login", {"username": "ana", "password": "wrong password"})
+    unknown = call(svc, "POST", "/login", {"username": "nobody", "password": "correct horse"})
+    assert wrong[0] == 401 and (wrong[0], wrong[1]) == (unknown[0], unknown[1])
+    assert call(svc, "POST", "/login", {"username": "ana"})[0] == 422
+- name: protected routes need a valid, unexpired token
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    token = signup(svc)
+    status, body, headers = call(svc, "GET", "/notes")
+    assert status == 401 and headers["WWW-Authenticate"] == "Bearer"
+    assert call(svc, "GET", "/notes", token="garbage")[0] == 401
+    assert call(svc, "GET", "/notes", token=token + "x")[0] == 401
+    assert call(svc, "GET", "/notes", token=sign_token(b"other-secret", "ana", t[0] + 100))[0] == 401
+    assert call(svc, "GET", "/notes", token=token)[0] == 200
+    assert call(svc, "POST", "/notes", {"title": "x"})[0] == 401
+    t[0] += 3600
+    assert call(svc, "GET", "/notes", token=token)[0] == 401
+    assert call(svc, "POST", "/login", {"username": "ana", "password": "correct horse"})[0] == 200
+- name: notes can be created, read and listed in id order
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    token = signup(svc)
+    status, note, _ = call(svc, "POST", "/notes", {"title": "Milk", "body": "2 litres", "tag": "home"}, token)
+    assert status == 201
+    assert note == {"id": 1, "owner": "ana", "title": "Milk", "body": "2 litres", "tag": "home", "created": 1000, "updated": 1000}
+    assert call(svc, "GET", "/notes/1", token=token)[:2] == (200, note)
+    t[0] += 5
+    second = call(svc, "POST", "/notes", {"title": "Plain"}, token)[1]
+    assert second["id"] == 2 and second["body"] == "" and second["tag"] == "" and second["created"] == 1005
+    for i in range(9):
+        call(svc, "POST", "/notes", {"title": "n%d" % i}, token)
+    listing = call(svc, "GET", "/notes", token=token)[1]["notes"]
+    assert [n["id"] for n in listing] == list(range(1, 12))
+    assert call(svc, "GET", "/notes/12", token=token)[0] == 404
+- name: note input is validated
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    token = signup(svc)
+    status, body, _ = call(svc, "POST", "/notes", {"body": "no title"}, token)
+    assert status == 422 and "title: required" in body["error"]
+    for bad in [{"title": "x" * 51}, {"title": "ok", "body": "b" * 1001}, {"title": 5}, {"title": "ok", "colour": "red"},
+                {"title": "ok", "tag": "t" * 21}, {}, [1]]:
+        assert call(svc, "POST", "/notes", bad, token)[0] == 422, bad
+    assert call(svc, "POST", "/notes", "{oops", token)[0] == 400
+    assert call(svc, "POST", "/notes", {"title": "x" * 50, "body": "b" * 1000, "tag": "t" * 20}, token)[1]["id"] == 1
+- name: users only see their own notes
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    ana, ben = signup(svc, "ana"), signup(svc, "ben")
+    call(svc, "POST", "/notes", {"title": "Ana's secret"}, ana)
+    assert call(svc, "GET", "/notes", token=ben)[1] == {"notes": []}
+    missing = call(svc, "GET", "/notes/99", token=ben)[:2]
+    assert missing[0] == 404
+    assert call(svc, "GET", "/notes/1", token=ben)[:2] == missing
+    assert call(svc, "PUT", "/notes/1", {"title": "mine now"}, ben)[:2] == missing
+    assert call(svc, "DELETE", "/notes/1", token=ben)[:2] == missing
+    second = call(svc, "POST", "/notes", {"title": "Ben's"}, ben)[1]
+    assert second["id"] == 2 and second["owner"] == "ben"
+    assert [n["id"] for n in call(svc, "GET", "/notes", token=ana)[1]["notes"]] == [1]
+    assert call(svc, "GET", "/notes/2", token=ana)[0] == 404
+    assert call(svc, "GET", "/notes/1", token=ana)[1]["title"] == "Ana's secret"
+- name: notes can be updated and deleted
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    token = signup(svc)
+    call(svc, "POST", "/notes", {"title": "Old", "body": "b", "tag": "x"}, token)
+    t[0] += 60
+    status, note, _ = call(svc, "PUT", "/notes/1", {"title": "New", "body": "b2", "tag": "y"}, token)
+    assert status == 200 and note == {"id": 1, "owner": "ana", "title": "New", "body": "b2", "tag": "y", "created": 1000, "updated": 1060}
+    assert call(svc, "PUT", "/notes/1", {"body": "no title"}, token)[0] == 422
+    assert call(svc, "GET", "/notes/1", token=token)[1] == note
+    status, body, _ = call(svc, "DELETE", "/notes/1", token=token)
+    assert status == 204 and body is None
+    assert call(svc, "GET", "/notes/1", token=token)[0] == 404
+    assert call(svc, "DELETE", "/notes/1", token=token)[0] == 404
+    status, body, headers = call(svc, "PATCH", "/notes/1", {"title": "x"}, token)
+    assert status == 405 and headers["Allow"] == "DELETE, GET, PUT"
+- name: listing can filter by tag and search text
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    token = signup(svc)
+    call(svc, "POST", "/notes", {"title": "Milk", "tag": "home"}, token)
+    call(svc, "POST", "/notes", {"title": "Report", "body": "Send the MILK run numbers", "tag": "work"}, token)
+    call(svc, "POST", "/notes", {"title": "Taxes", "tag": "work"}, token)
+    def ids(path):
+        return [n["id"] for n in call(svc, "GET", path, token=token)[1]["notes"]]
+    assert ids("/notes?tag=work") == [2, 3]
+    assert ids("/notes?q=milk") == [1, 2]
+    assert ids("/notes?q=MILK&tag=work") == [2]
+    assert ids("/notes?tag=none") == [] and ids("/notes?q=zzz") == []
+    assert ids("/notes?q=") == [1, 2, 3] and ids("/notes") == [1, 2, 3]
+- name: the service recovers everything from its log
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    token = signup(svc)
+    call(svc, "POST", "/notes", {"title": "One"}, token)
+    call(svc, "POST", "/notes", {"title": "Two"}, token)
+    call(svc, "DELETE", "/notes/2", token=token)
+    call(svc, "PUT", "/notes/1", {"title": "One v2"}, token)
+    again = NotesService(b"s3cret-key", lambda: t[0], svc.log_text())
+    listing = call(again, "GET", "/notes", token=token)[1]["notes"]
+    assert [(n["id"], n["title"]) for n in listing] == [(1, "One v2")]
+    assert call(again, "POST", "/login", {"username": "ana", "password": "correct horse"}, client="c9")[0] == 200
+    assert call(again, "POST", "/register", {"username": "ana", "password": "something else"}, client="c9")[0] == 409
+    assert call(again, "POST", "/notes", {"title": "Three"}, token)[1]["id"] == 3
+    assert again.log_text().startswith(svc.log_text())
+- name: a torn transaction leaves no half-made note
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make()
+    token = signup(svc)
+    call(svc, "POST", "/notes", {"title": "Safe"}, token)
+    before = svc.log_text()
+    call(svc, "POST", "/notes", {"title": "Torn"}, token)
+    lines = svc.log_text().split("\n")
+    assert lines[-1] == "" and len(lines) == len(before.split("\n")) + 4
+    no_commit = "\n".join(lines[:-2]) + "\n"
+    half_line = svc.log_text()[:-10]
+    for damaged in (no_commit, half_line):
+        again = NotesService(b"s3cret-key", lambda: t[0], damaged)
+        assert [n["title"] for n in call(again, "GET", "/notes", token=token)[1]["notes"]] == ["Safe"]
+        assert call(again, "POST", "/notes", {"title": "Retry"}, token)[1]["id"] == 2
+        third = NotesService(b"s3cret-key", lambda: t[0], again.log_text())
+        assert [n["title"] for n in call(third, "GET", "/notes", token=token)[1]["notes"]] == ["Safe", "Retry"]
+- name: rate limiting and security headers apply to every response
+  code: |
+    import json
+
+    def make(log_text="", start=1000, origins=()):
+        t = [start]
+        return NotesService(b"s3cret-key", lambda: t[0], log_text, origins), t
+
+    def call(svc, method, path, body=None, token=None, client="c1", headers=None):
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
+        raw = {"method": method, "path": path, "headers": h, "client": client}
+        if body is not None:
+            raw["body"] = body if isinstance(body, str) else json.dumps(body)
+        r = svc.handle(raw)
+        return r["status"], (json.loads(r["body"]) if r["body"] else None), r["headers"]
+
+    def signup(svc, name="ana", password="correct horse"):
+        assert call(svc, "POST", "/register", {"username": name, "password": password}, client=name)[0] == 201
+        status, body, _ = call(svc, "POST", "/login", {"username": name, "password": password}, client=name)
+        assert status == 200, status
+        return body["token"]
+
+    svc, t = make(origins=("https://app.example",))
+    statuses = [call(svc, "GET", "/notes", client="hot")[0] for _ in range(30)]
+    assert set(statuses) == {401}
+    status, body, headers = call(svc, "GET", "/notes", client="hot")
+    assert status == 429 and body == {"error": "too many requests"} and int(headers["Retry-After"]) >= 1
+    assert headers["X-Content-Type-Options"] == "nosniff" and headers["X-Frame-Options"] == "DENY"
+    assert call(svc, "GET", "/notes", client="calm")[0] == 401
+    t[0] += 60
+    assert call(svc, "GET", "/notes", client="hot")[0] == 401
+    for path, method in [("/nowhere", "GET"), ("/register", "GET"), ("/notes", "GET")]:
+        h = call(svc, method, path, client="h" + path)[2]
+        assert h["X-Content-Type-Options"] == "nosniff" and h["Cache-Control"] == "no-store", path
+    ok = call(svc, "GET", "/notes", client="c5", headers={"Origin": "https://app.example"})[2]
+    assert ok["Access-Control-Allow-Origin"] == "https://app.example" and ok["Vary"] == "Origin"
+    evil = call(svc, "GET", "/notes", client="c6", headers={"Origin": "https://evil.example"})[2]
+    assert "Access-Control-Allow-Origin" not in evil
+    assert "Access-Control-Allow-Origin" not in call(svc, "GET", "/notes", client="c7")[2]
+solution: |
+  import hashlib
+  import json
+
+
+  class CorruptRecord(Exception):
+      pass
+
+
+  def checksum(text):
+      return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+  def encode_record(record):
+      """record is a dict such as {"op": "put", "key": "a", "value": 1}. Returns one line (no newline)."""
+      body = json.dumps(record, sort_keys=True, separators=(",", ":"))
+      return checksum(body) + " " + body
+
+
+  def decode_record(line):
+      """Parse a line made by encode_record. Raise CorruptRecord if it is damaged."""
+      check, space, body = line.partition(" ")
+      if not space or len(check) != 8 or checksum(body) != check:
+          raise CorruptRecord("bad checksum")
+      try:
+          record = json.loads(body)
+      except ValueError:
+          raise CorruptRecord("bad json")
+      if not isinstance(record, dict) or "op" not in record:
+          raise CorruptRecord("not a record")
+      return record
+
+
+  def apply_record(data, rec):
+      if rec["op"] == "put":
+          data[rec["key"]] = rec["value"]
+      elif rec["op"] == "del":
+          data.pop(rec["key"], None)
+
+
+  def replay(log_text):
+      """Rebuild the data from a log. Returns (data, kept_lines, discarded_count).
+
+      - Plain put/del records are applied as they are read.
+      - A group written between a begin record and a commit record is applied only at the commit.
+      - Reading stops at the first damaged line; everything after it is discarded.
+      - A begin group with no commit at the end of the log (a crash) is discarded.
+      """
+      data, kept, pending = {}, [], None
+      lines = [l for l in log_text.split("\n") if l.strip()]
+      for i, line in enumerate(lines):
+          try:
+              rec = decode_record(line)
+          except CorruptRecord:
+              discarded = len(lines) - i
+              break
+          else:
+              kept.append(line)
+              if rec["op"] == "begin":
+                  pending = []
+              elif rec["op"] == "commit":
+                  for r in pending or []:
+                      apply_record(data, r)
+                  pending = None
+              elif pending is not None:
+                  pending.append(rec)
+              else:
+                  apply_record(data, rec)
+      else:
+          discarded = 0
+      if pending is not None:
+          drop = len(pending) + 1
+          kept = kept[:len(kept) - drop]
+          discarded += drop
+      return data, kept, discarded
+
+
+  class KVStore:
+      """A tiny log-structured key-value store: every change is appended to a log, and the log is replayed on start-up."""
+
+      def __init__(self, log_text=""):
+          self.data, self.log, self.discarded = replay(log_text)
+          self.tx = None                       # None, or a list of buffered records inside a transaction
+
+      def _write(self, rec):
+          if self.tx is not None:
+              self.tx.append(rec)
+          else:
+              self.log.append(encode_record(rec))
+              apply_record(self.data, rec)
+
+      def put(self, key, value):
+          if not isinstance(key, str) or not key:
+              raise ValueError("key must be a non-empty string")
+          self._write({"op": "put", "key": key, "value": value})
+
+      def get(self, key, default=None):
+          if self.tx is not None:              # a transaction sees its own writes
+              for rec in reversed(self.tx):
+                  if rec["key"] == key:
+                      return rec["value"] if rec["op"] == "put" else default
+          return self.data.get(key, default)
+
+      def delete(self, key):
+          existed = key in self.keys()
+          self._write({"op": "del", "key": key})
+          return existed
+
+      def keys(self):
+          view = dict(self.data)
+          for rec in (self.tx or []):
+              apply_record(view, rec)
+          return sorted(view)
+
+      def scan(self, prefix=""):
+          return [k for k in self.keys() if k.startswith(prefix)]
+
+      def log_text(self):
+          return "".join(line + "\n" for line in self.log)
+
+      def begin(self):
+          if self.tx is not None:
+              raise RuntimeError("transaction already open")
+          self.tx = []
+
+      def commit(self):
+          if self.tx is None:
+              raise RuntimeError("no open transaction")
+          records, self.tx = self.tx, None
+          if records:
+              self.log.append(encode_record({"op": "begin"}))
+              for rec in records:
+                  self.log.append(encode_record(rec))
+              self.log.append(encode_record({"op": "commit"}))
+              for rec in records:
+                  apply_record(self.data, rec)
+
+      def rollback(self):
+          if self.tx is None:
+              raise RuntimeError("no open transaction")
+          self.tx = None
+
+
+  class Router:
+      """Matches (method, path) to a handler. Patterns look like /notes/<id:int>."""
+
+      def __init__(self):
+          self.routes = []                       # (method, pattern_segments, handler)
+
+      def add(self, method, pattern, handler):
+          self.routes.append((method.upper(), pattern.strip("/").split("/") if pattern.strip("/") else [], handler))
+
+      @staticmethod
+      def _match_segments(pattern, parts):
+          if len(pattern) != len(parts):
+              return None
+          params = {}
+          for pat, part in zip(pattern, parts):
+              if pat.startswith("<") and pat.endswith(">"):
+                  name, _, kind = pat[1:-1].partition(":")
+                  if kind == "int":
+                      if not part.isdigit():
+                          return None
+                      params[name] = int(part)
+                  elif part:
+                      params[name] = part
+                  else:
+                      return None
+              elif pat != part:
+                  return None
+          return params
+
+      def match(self, method, path):
+          """Return (200, handler, params), (404, None, None) or (405, None, allowed_methods)."""
+          parts = path.strip("/").split("/") if path.strip("/") else []
+          allowed = set()
+          for m, pattern, handler in self.routes:
+              params = self._match_segments(pattern, parts)
+              if params is None:
+                  continue
+              if m == method.upper():
+                  return 200, handler, params
+              allowed.add(m)
+          if allowed:
+              return 405, None, sorted(allowed)
+          return 404, None, None
+
+
+  import json
+  from urllib.parse import parse_qs, urlsplit
+
+
+  class HTTPError(Exception):
+      def __init__(self, status, message):
+          super().__init__(message)
+          self.status, self.message = status, message
+
+
+  def json_response(status, data=None, headers=None):
+      h = {"Content-Type": "application/json"}
+      h.update(headers or {})
+      return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+  class App:
+      def __init__(self):
+          self.router = Router()
+          self.middlewares = []
+
+      def route(self, method, pattern):
+          def decorator(fn):
+              self.router.add(method, pattern, fn)
+              return fn
+          return decorator
+
+      def use(self, middleware):
+          self.middlewares.append(middleware)
+
+      def _dispatch(self, request):
+          status, handler, extra = self.router.match(request["method"], request["path"])
+          if status == 404:
+              return json_response(404, {"error": "not found"})
+          if status == 405:
+              return json_response(405, {"error": "method not allowed"}, {"Allow": ", ".join(extra)})
+          try:
+              result = handler(request, **extra)
+          except HTTPError as e:
+              return json_response(e.status, {"error": e.message})
+          except Exception:
+              return json_response(500, {"error": "internal server error"})
+          if result is None:
+              return json_response(204)
+          if isinstance(result, tuple):
+              return json_response(result[0], result[1])
+          return json_response(200, result)
+
+      def handle(self, raw):
+          """raw: {"method", "path" (may include ?query), "headers", "body"}. Returns a response dict."""
+          parts = urlsplit(raw.get("path", "/"))
+          request = {"method": raw.get("method", "GET").upper(), "path": parts.path,
+                     "query": {k: v[0] for k, v in parse_qs(parts.query).items()},
+                     "headers": {k.lower(): v for k, v in (raw.get("headers") or {}).items()},
+                     "client": raw.get("client", "unknown"), "json": None, "user": None}
+          body = raw.get("body")
+          if request["method"] in ("POST", "PUT", "PATCH") and body:
+              try:
+                  request["json"] = json.loads(body)
+              except ValueError:
+                  return json_response(400, {"error": "invalid JSON"})
+          return build_chain(self._dispatch, self.middlewares)(request)
+
+
+  import base64
+  import hashlib
+  import hmac
+  import json
+
+
+  def build_chain(handler, middlewares):
+      """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+      for mw in reversed(middlewares):
+          handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+      return handler
+
+
+  def _b64(data):
+      return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+  def sign_token(secret, user, expires):
+      payload = _b64(json.dumps({"sub": user, "exp": expires}, sort_keys=True).encode())
+      mac = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+      return payload + "." + mac
+
+
+  def verify_token(secret, token, now):
+      """Return the user name if the token is genuine and unexpired, otherwise None."""
+      payload, dot, mac = token.partition(".")
+      if not dot:
+          return None
+      good = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+      if not hmac.compare_digest(mac.encode(), good.encode()):
+          return None
+      try:
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          if claims["exp"] <= now:
+              return None
+          return claims["sub"] if isinstance(claims["sub"], str) else None
+      except (ValueError, KeyError, TypeError):
+          return None
+
+
+  def require_auth(secret, clock):
+      """Middleware: demand 'Authorization: Bearer <token>'; put the user name in request['user']."""
+      def middleware(request, nxt):
+          header = request["headers"].get("authorization", "")
+          scheme, _, token = header.partition(" ")
+          user = verify_token(secret, token.strip(), clock()) if scheme == "Bearer" else None
+          if user is None:
+              return json_response(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+          request["user"] = user
+          return nxt(request)
+      return middleware
+
+
+  def rate_limit(max_requests, window, clock):
+      """Middleware: at most max_requests per client in any sliding window of `window` seconds."""
+      seen = {}
+      def middleware(request, nxt):
+          now = clock()
+          recent = [t for t in seen.get(request["client"], []) if now - t < window]
+          if len(recent) >= max_requests:
+              seen[request["client"]] = recent
+              retry = max(1, int(window - (now - recent[0]) + 0.999))
+              return json_response(429, {"error": "too many requests"}, {"Retry-After": str(retry)})
+          recent.append(now)
+          seen[request["client"]] = recent
+          return nxt(request)
+      return middleware
+
+
+  def validate(data, schema):
+      """Check a JSON object against a schema. Returns a sorted list of error strings (empty if valid).
+
+      schema maps field name -> {"type": "string"|"integer"|"boolean", "required": bool,
+                                 "min": number, "max": number, "max_length": int, "choices": list}
+      Unknown fields are errors. "min"/"max" apply to integers, "max_length" to strings.
+      """
+      if not isinstance(data, dict):
+          return ["body must be an object"]
+      errors = []
+      for name in data:
+          if name not in schema:
+              errors.append(f"{name}: unknown field")
+      for name, rule in schema.items():
+          if name not in data:
+              if rule.get("required"):
+                  errors.append(f"{name}: required")
+              continue
+          value, kind = data[name], rule["type"]
+          if kind == "string":
+              ok = isinstance(value, str)
+          elif kind == "integer":
+              ok = isinstance(value, int) and not isinstance(value, bool)
+          else:
+              ok = isinstance(value, bool)
+          if not ok:
+              errors.append(f"{name}: must be a {kind}")
+              continue
+          if kind == "string" and "max_length" in rule and len(value) > rule["max_length"]:
+              errors.append(f"{name}: too long (max {rule['max_length']})")
+          if kind == "integer":
+              if "min" in rule and value < rule["min"]:
+                  errors.append(f"{name}: must be at least {rule['min']}")
+              if "max" in rule and value > rule["max"]:
+                  errors.append(f"{name}: must be at most {rule['max']}")
+          if "choices" in rule and value not in rule["choices"]:
+              errors.append(f"{name}: must be one of {sorted(rule['choices'])}")
+      return sorted(errors)
+
+
+  SECURITY_HEADERS = {
+      "X-Content-Type-Options": "nosniff",
+      "X-Frame-Options": "DENY",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+      "Cache-Control": "no-store",
+  }
+
+
+  def secure(response, request_origin, allowed_origins):
+      """Return a copy of the response with security headers and, for an allowed origin, CORS headers."""
+      headers = dict(response["headers"])
+      for name, value in SECURITY_HEADERS.items():
+          headers.setdefault(name, value)
+      if request_origin is not None and request_origin in allowed_origins:
+          headers["Access-Control-Allow-Origin"] = request_origin
+          headers["Vary"] = "Origin"
+      return {"status": response["status"], "headers": headers, "body": response["body"]}
+
+
+  def preflight(request_origin, requested_method, allowed_origins, allowed_methods):
+      """Answer a CORS preflight (OPTIONS) request."""
+      if request_origin not in allowed_origins or requested_method not in allowed_methods:
+          return {"status": 403, "headers": {}, "body": ""}
+      return {"status": 204, "headers": {"Access-Control-Allow-Origin": request_origin,
+                                         "Access-Control-Allow-Methods": ", ".join(sorted(allowed_methods)),
+                                         "Access-Control-Max-Age": "600", "Vary": "Origin"}, "body": ""}
+
+
+  import hashlib
+  import hmac
+  import re
+  import secrets
+
+  USER_SCHEMA = {"username": {"type": "string", "required": True, "max_length": 20},
+                 "password": {"type": "string", "required": True, "max_length": 100}}
+  NOTE_SCHEMA = {"title": {"type": "string", "required": True, "max_length": 50},
+                 "body": {"type": "string", "max_length": 1000},
+                 "tag": {"type": "string", "max_length": 20}}
+  USERNAME = re.compile(r"[a-z0-9_]{3,20}")
+  TOKEN_LIFETIME = 3600
+  PBKDF2_ROUNDS = 1000
+
+
+  def hash_password(password, salt_hex):
+      """PBKDF2-HMAC-SHA256 of the password with the salt (given as hex text), as hex text."""
+      return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), PBKDF2_ROUNDS).hex()
+
+
+  class NotesService:
+      """A small notes API on top of the log-structured store. Users and notes live in the store:
+      "user:<name>" -> {"salt", "hash"}, "note:<id>" -> note, "meta:next_id" -> next free note id."""
+
+      def __init__(self, secret, clock, log_text="", allowed_origins=()):
+          self.secret, self.clock = secret, clock
+          self.store = KVStore(log_text)
+          self.app = App()
+          auth = require_auth(secret, clock)
+
+          def headers_mw(request, nxt):
+              return secure(nxt(request), request["headers"].get("origin"), set(allowed_origins))
+
+          def guard(request, nxt):
+              if request["path"] in ("/register", "/login"):
+                  return nxt(request)
+              return auth(request, nxt)
+
+          self.app.use(headers_mw)
+          self.app.use(rate_limit(30, 60, clock))
+          self.app.use(guard)
+          self.app.route("POST", "/register")(self._register)
+          self.app.route("POST", "/login")(self._login)
+          self.app.route("GET", "/notes")(self._list)
+          self.app.route("POST", "/notes")(self._create)
+          self.app.route("GET", "/notes/<id:int>")(self._get)
+          self.app.route("PUT", "/notes/<id:int>")(self._update)
+          self.app.route("DELETE", "/notes/<id:int>")(self._delete)
+
+      def handle(self, raw):
+          return self.app.handle(raw)
+
+      def log_text(self):
+          return self.store.log_text()
+
+      # --- accounts ---
+      def _credentials(self, request):
+          errors = validate(request["json"], USER_SCHEMA)
+          if errors:
+              raise HTTPError(422, "; ".join(errors))
+          return request["json"]["username"], request["json"]["password"]
+
+      def _register(self, request):
+          username, password = self._credentials(request)
+          if not USERNAME.fullmatch(username):
+              raise HTTPError(422, "username must be 3 to 20 characters: a-z, 0-9 or _")
+          if len(password) < 8:
+              raise HTTPError(422, "password must be at least 8 characters")
+          if self.store.get("user:" + username) is not None:
+              raise HTTPError(409, "username taken")
+          salt = secrets.token_bytes(16).hex()
+          self.store.put("user:" + username, {"salt": salt, "hash": hash_password(password, salt)})
+          return 201, {"username": username}
+
+      def _login(self, request):
+          username, password = self._credentials(request)
+          user = self.store.get("user:" + username) or {"salt": "00" * 16, "hash": ""}
+          ok = hmac.compare_digest(hash_password(password, user["salt"]), user["hash"])
+          if not ok:
+              raise HTTPError(401, "invalid username or password")
+          expires = self.clock() + TOKEN_LIFETIME
+          return {"token": sign_token(self.secret, username, expires), "expires": expires}
+
+      # --- notes ---
+      def _notes_of(self, user):
+          notes = [self.store.get(k) for k in self.store.scan("note:")]
+          return sorted((n for n in notes if n["owner"] == user), key=lambda n: n["id"])
+
+      def _owned(self, request, id):
+          note = self.store.get(f"note:{id}")
+          if note is None or note["owner"] != request["user"]:
+              raise HTTPError(404, "no such note")
+          return note
+
+      def _fields(self, request):
+          errors = validate(request["json"], NOTE_SCHEMA)
+          if errors:
+              raise HTTPError(422, "; ".join(errors))
+          data = request["json"]
+          return data["title"], data.get("body", ""), data.get("tag", "")
+
+      def _list(self, request):
+          notes = self._notes_of(request["user"])
+          tag, q = request["query"].get("tag"), request["query"].get("q")
+          if tag is not None:
+              notes = [n for n in notes if n["tag"] == tag]
+          if q:
+              needle = q.lower()
+              notes = [n for n in notes if needle in n["title"].lower() or needle in n["body"].lower()]
+          return {"notes": notes}
+
+      def _create(self, request):
+          title, body, tag = self._fields(request)
+          now = self.clock()
+          self.store.begin()
+          try:
+              nid = self.store.get("meta:next_id", 1)
+              note = {"id": nid, "owner": request["user"], "title": title, "body": body, "tag": tag,
+                      "created": now, "updated": now}
+              self.store.put(f"note:{nid}", note)
+              self.store.put("meta:next_id", nid + 1)
+              self.store.commit()
+          except Exception:
+              self.store.rollback()
+              raise
+          return 201, note
+
+      def _get(self, request, id):
+          return self._owned(request, id)
+
+      def _update(self, request, id):
+          note = self._owned(request, id)
+          title, body, tag = self._fields(request)
+          note = dict(note, title=title, body=body, tag=tag, updated=self.clock())
+          self.store.put(f"note:{id}", note)
+          return note
+
+      def _delete(self, request, id):
+          self._owned(request, id)
+          self.store.delete(f"note:{id}")
+          return None
+stretch:
+- Add a `GET /notes?limit=&offset=` pagination scheme and test it with 100 notes (Capstone C).
+- Add `POST /compact` (admin only) that rewrites the log with `compact_log` and show that the data survives (Capstone B).
+- Index note text with the search engine of Capstone F and add `GET /search?q=` with ranked results.
+- 'Add a lockout: after five failed logins for one username, refuse that user for ten minutes, and think about how an attacker could abuse this against real users (Unit 16).'
+- Write a README, generate API docs with `api_docs` and run the release gate of Capstone G on the project (Capstone G).

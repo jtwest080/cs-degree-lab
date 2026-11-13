@@ -1,0 +1,1569 @@
+id: u18-webservice
+title: 'Capstone C: A Web Service Framework'
+minutes: 90
+objective: 'Build the core of a web framework from scratch: a router with path parameters, JSON handlers with correct status codes, a middleware chain, signed-token authentication, rate limiting, input validation and security headers. You will see exactly what frameworks such as Flask and Express do for you. This capstone brings together Units 9, 11, 14 and 16.'
+outcomes:
+- Explain the request/response cycle and choose correct HTTP status codes
+- Route requests to handlers using patterns with typed path parameters
+- Compose middleware so that cross-cutting concerns wrap every handler
+- Authenticate requests with signed, expiring tokens and limit request rates
+- Validate untrusted input and add security headers and CORS rules
+sections:
+- heading: What a web framework really does
+  body: |-
+    A web server receives a **request** (a method such as `GET` or `POST`, a path, headers and sometimes a body) and must send back a **response** (a status code, headers and a body). A **web framework** is the code that turns that raw exchange into something pleasant to program against. Inside, it is smaller than you might expect: a **router** decides which function handles a request, **handlers** are plain functions that return data, and **middleware** wraps every request with shared behaviour such as logging or authentication.
+
+    Our framework is deliberately pure Python and runs entirely in the browser: `App.handle(raw)` takes a dictionary describing a request and returns a dictionary describing the response. Real servers do the same job after reading bytes from a network socket (Unit 11), so everything you build here carries over to Flask, FastAPI, Express or Spring.
+
+    Good status codes are part of a good API: `200 OK`, `201 Created`, `204 No Content` (success with no body), `400 Bad Request` (the client sent something unreadable), `401 Unauthorized` (who are you?), `403 Forbidden` (I know who you are, and the answer is no), `404 Not Found`, `405 Method Not Allowed`, `422 Unprocessable Entity` (readable but invalid), `429 Too Many Requests` and `500 Internal Server Error`.
+- heading: Routing, handlers and the middleware chain
+  body: |-
+    The **router** stores `(method, pattern, handler)` triples. A pattern such as `/notes/<id:int>` has **path parameters** in angle brackets; `<id:int>` only matches digits and hands the handler an `int`. Matching has three outcomes that map directly to status codes: a match (`200`), a path that exists but not for this method (`405`, with an `Allow` header listing what *is* allowed), and no path at all (`404`).
+
+    **Handlers** stay simple: they receive the request and return data. A dictionary means `200`; a `(status, data)` tuple chooses the status; `None` means `204`. To fail on purpose a handler raises `HTTPError(status, message)`. The framework turns that into a JSON error, and it turns any *other* exception into a generic `500` that does **not** reveal the exception text, since error details help attackers (Unit 16).
+
+    **Middleware** is a function `(request, next_handler) -> response`. It can act before calling `next_handler`, after it returns, or instead of it. `build_chain` nests them like the layers of an onion: the first middleware added is the outermost, so it sees the request first and the response last. Authentication, rate limiting, logging and security headers all fit this one shape, and because they wrap the *router itself*, they also apply to 404 responses.
+- heading: Authentication, limits and defensive input handling
+  body: |-
+    **Tokens.** After login, the server gives the client a **bearer token** and the client sends it back in `Authorization: Bearer <token>`. Ours is `payload.mac`: the payload is base64url-encoded JSON `{"sub": user, "exp": expiry}`, and the MAC is an HMAC-SHA256 of the payload with a secret that only the server knows. Anyone can *read* the payload, but nobody can *change* it without the secret, so the server can trust what it verifies (this is the idea behind JWTs, which you saw in Unit 16). Always compare MACs with `hmac.compare_digest`, which takes the same time however many characters match, and always check the expiry.
+
+    **Rate limiting** protects against brute-forcing and overload. Ours keeps the recent request times for each client and answers `429` with a `Retry-After` header when a client exceeds its budget in a sliding window. Rejected requests are not recorded, so waiting is always enough.
+
+    **Validation.** Everything in a request body is untrusted. A **schema** states the allowed fields, their types, ranges, lengths and choices; `validate` returns a list of precise messages, and the handler turns a non-empty list into a `422`. Reject **unknown fields** (they hide mass-assignment bugs) and remember that in Python `True` is an `int`, so it needs an explicit check.
+
+    **Headers.** Security headers tell browsers to be careful: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a strict `Content-Security-Policy`. **CORS** controls which other websites may call your API from a browser: echo back only origins on an allow-list, never `*` for an authenticated API, and add `Vary: Origin` so caches do not mix responses up.
+examples:
+- title: Routing
+  intro: The router distinguishes a match, a wrong method (405) and an unknown path (404). Typed parameters only match what they should.
+  code: |
+    class Router:
+        """Matches (method, path) to a handler. Patterns look like /notes/<id:int>."""
+
+        def __init__(self):
+            self.routes = []                       # (method, pattern_segments, handler)
+
+        def add(self, method, pattern, handler):
+            self.routes.append((method.upper(), pattern.strip("/").split("/") if pattern.strip("/") else [], handler))
+
+        @staticmethod
+        def _match_segments(pattern, parts):
+            if len(pattern) != len(parts):
+                return None
+            params = {}
+            for pat, part in zip(pattern, parts):
+                if pat.startswith("<") and pat.endswith(">"):
+                    name, _, kind = pat[1:-1].partition(":")
+                    if kind == "int":
+                        if not part.isdigit():
+                            return None
+                        params[name] = int(part)
+                    elif part:
+                        params[name] = part
+                    else:
+                        return None
+                elif pat != part:
+                    return None
+            return params
+
+        def match(self, method, path):
+            """Return (200, handler, params), (404, None, None) or (405, None, allowed_methods)."""
+            parts = path.strip("/").split("/") if path.strip("/") else []
+            allowed = set()
+            for m, pattern, handler in self.routes:
+                params = self._match_segments(pattern, parts)
+                if params is None:
+                    continue
+                if m == method.upper():
+                    return 200, handler, params
+                allowed.add(m)
+            if allowed:
+                return 405, None, sorted(allowed)
+            return 404, None, None
+
+
+    r = Router()
+    r.add("GET", "/notes", "list notes")
+    r.add("POST", "/notes", "create note")
+    r.add("GET", "/notes/<id:int>", "show note")
+    for method, path in [("GET", "/notes"), ("GET", "/notes/12"), ("GET", "/notes/abc"), ("DELETE", "/notes"), ("GET", "/other")]:
+        print(method, path, "->", r.match(method, path))
+  output: |
+    GET /notes -> (200, 'list notes', {})
+    GET /notes/12 -> (200, 'show note', {'id': 12})
+    GET /notes/abc -> (404, None, None)
+    DELETE /notes -> (405, None, ['GET', 'POST'])
+    GET /other -> (404, None, None)
+  lines:
+  - line: 30
+    note: match tries every route; the first that fits both path and method wins.
+  - line: 51
+    note: Each result is (status, handler, params). A 405 lists the allowed methods.
+- title: A notes API
+  intro: Handlers return plain data. Status codes come from what they return or raise.
+  code: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    class Router:
+        """Matches (method, path) to a handler. Patterns look like /notes/<id:int>."""
+
+        def __init__(self):
+            self.routes = []                       # (method, pattern_segments, handler)
+
+        def add(self, method, pattern, handler):
+            self.routes.append((method.upper(), pattern.strip("/").split("/") if pattern.strip("/") else [], handler))
+
+        @staticmethod
+        def _match_segments(pattern, parts):
+            if len(pattern) != len(parts):
+                return None
+            params = {}
+            for pat, part in zip(pattern, parts):
+                if pat.startswith("<") and pat.endswith(">"):
+                    name, _, kind = pat[1:-1].partition(":")
+                    if kind == "int":
+                        if not part.isdigit():
+                            return None
+                        params[name] = int(part)
+                    elif part:
+                        params[name] = part
+                    else:
+                        return None
+                elif pat != part:
+                    return None
+            return params
+
+        def match(self, method, path):
+            """Return (200, handler, params), (404, None, None) or (405, None, allowed_methods)."""
+            parts = path.strip("/").split("/") if path.strip("/") else []
+            allowed = set()
+            for m, pattern, handler in self.routes:
+                params = self._match_segments(pattern, parts)
+                if params is None:
+                    continue
+                if m == method.upper():
+                    return 200, handler, params
+                allowed.add(m)
+            if allowed:
+                return 405, None, sorted(allowed)
+            return 404, None, None
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    class App:
+        def __init__(self):
+            self.router = Router()
+            self.middlewares = []
+
+        def route(self, method, pattern):
+            def decorator(fn):
+                self.router.add(method, pattern, fn)
+                return fn
+            return decorator
+
+        def use(self, middleware):
+            self.middlewares.append(middleware)
+
+        def _dispatch(self, request):
+            status, handler, extra = self.router.match(request["method"], request["path"])
+            if status == 404:
+                return json_response(404, {"error": "not found"})
+            if status == 405:
+                return json_response(405, {"error": "method not allowed"}, {"Allow": ", ".join(extra)})
+            try:
+                result = handler(request, **extra)
+            except HTTPError as e:
+                return json_response(e.status, {"error": e.message})
+            except Exception:
+                return json_response(500, {"error": "internal server error"})
+            if result is None:
+                return json_response(204)
+            if isinstance(result, tuple):
+                return json_response(result[0], result[1])
+            return json_response(200, result)
+
+        def handle(self, raw):
+            """raw: {"method", "path" (may include ?query), "headers", "body"}. Returns a response dict."""
+            parts = urlsplit(raw.get("path", "/"))
+            request = {"method": raw.get("method", "GET").upper(), "path": parts.path,
+                       "query": {k: v[0] for k, v in parse_qs(parts.query).items()},
+                       "headers": {k.lower(): v for k, v in (raw.get("headers") or {}).items()},
+                       "client": raw.get("client", "unknown"), "json": None, "user": None}
+            body = raw.get("body")
+            if request["method"] in ("POST", "PUT", "PATCH") and body:
+                try:
+                    request["json"] = json.loads(body)
+                except ValueError:
+                    return json_response(400, {"error": "invalid JSON"})
+            return build_chain(self._dispatch, self.middlewares)(request)
+
+
+    app = App()
+    notes = {1: "buy milk"}
+
+    @app.route("GET", "/notes/<id:int>")
+    def show(request, id):
+        if id not in notes:
+            raise HTTPError(404, "no such note")
+        return {"id": id, "text": notes[id]}
+
+    @app.route("POST", "/notes")
+    def create(request):
+        new_id = max(notes, default=0) + 1
+        notes[new_id] = request["json"]["text"]
+        return 201, {"id": new_id}
+
+    def call(method, path, body=None):
+        r = app.handle({"method": method, "path": path, "body": body})
+        print(method, path, "->", r["status"], r["body"])
+
+    call("GET", "/notes/1")
+    call("GET", "/notes/9")
+    call("POST", "/notes", '{"text": "write code"}')
+    call("GET", "/notes/2")
+    call("POST", "/notes", "{oops")
+    call("PUT", "/notes/1")
+  output: |
+    GET /notes/1 -> 200 {"id": 1, "text": "buy milk"}
+    GET /notes/9 -> 404 {"error": "no such note"}
+    POST /notes -> 201 {"id": 2}
+    GET /notes/2 -> 200 {"id": 2, "text": "write code"}
+    POST /notes -> 400 {"error": "invalid JSON"}
+    PUT /notes/1 -> 405 {"error": "method not allowed"}
+  lines:
+  - line: 133
+    note: Raising HTTPError is the clean way to stop and report an error.
+  - line: 140
+    note: A (status, data) tuple picks the status code.
+  - line: 143
+    note: Everything is plain dictionaries, so the framework is easy to test.
+- title: The middleware onion
+  intro: 'The first middleware is the outermost: it enters first and leaves last.'
+  code: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    def request_log(log):
+        """Middleware: after the response comes back, append 'METHOD /path -> status' to the list `log`."""
+        def middleware(request, nxt):
+            response = nxt(request)
+            log.append(f"{request['method']} {request['path']} -> {response['status']}")
+            return response
+        return middleware
+
+
+    def timer(name):
+        def middleware(request, nxt):
+            print("enter", name)
+            response = nxt(request)
+            print("leave", name, "with", response["status"])
+            return response
+        return middleware
+
+    def handler(request):
+        print("handler runs")
+        return json_response(200, {"ok": True})
+
+    log = []
+    chain = build_chain(handler, [timer("outer"), request_log(log), timer("inner")])
+    chain({"method": "GET", "path": "/ping"})
+    print(log)
+  output: |
+    enter outer
+    enter inner
+    handler runs
+    leave inner with 200
+    leave outer with 200
+    ['GET /ping -> 200']
+  lines:
+  - line: 56
+    note: The first middleware in the list is the outermost layer.
+  - line: 58
+    note: The logger saw the response after the inner layer returned it.
+- title: Signed tokens
+  intro: A token that is expired, forged or signed with another key is rejected. Missing or malformed credentials give 401.
+  code: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    def _b64(data):
+        return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+    def sign_token(secret, user, expires):
+        payload = _b64(json.dumps({"sub": user, "exp": expires}, sort_keys=True).encode())
+        mac = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+        return payload + "." + mac
+
+
+    def verify_token(secret, token, now):
+        """Return the user name if the token is genuine and unexpired, otherwise None."""
+        payload, dot, mac = token.partition(".")
+        if not dot:
+            return None
+        good = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(mac.encode(), good.encode()):
+            return None
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            if claims["exp"] <= now:
+                return None
+            return claims["sub"] if isinstance(claims["sub"], str) else None
+        except (ValueError, KeyError, TypeError):
+            return None
+
+
+    def require_auth(secret, clock):
+        """Middleware: demand 'Authorization: Bearer <token>'; put the user name in request['user']."""
+        def middleware(request, nxt):
+            header = request["headers"].get("authorization", "")
+            scheme, _, token = header.partition(" ")
+            user = verify_token(secret, token.strip(), clock()) if scheme == "Bearer" else None
+            if user is None:
+                return json_response(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+            request["user"] = user
+            return nxt(request)
+        return middleware
+
+
+
+
+    secret = b"change-me-and-keep-me-out-of-git"
+    token = sign_token(secret, "ana", 1000)
+    print("token:", token[:30] + "...")
+    print("valid     :", verify_token(secret, token, 500))
+    print("expired   :", verify_token(secret, token, 1000))
+    print("wrong key :", verify_token(b"other", token, 500))
+    payload, mac = token.split(".")
+    print("tampered  :", verify_token(secret, payload[:-2] + "AA." + mac, 500))
+
+    chain = build_chain(lambda req: json_response(200, {"hello": req["user"]}), [require_auth(secret, lambda: 500)])
+    for header in ["Bearer " + token, "Bearer nonsense", None]:
+        headers = {} if header is None else {"authorization": header}
+        r = chain({"headers": headers})
+        print(r["status"], r["body"])
+  output: |
+    token: eyJleHAiOiAxMDAwLCAic3ViIjogIm...
+    valid     : ana
+    expired   : None
+    wrong key : None
+    tampered  : None
+    200 {"hello": "ana"}
+    401 {"error": "unauthorized"}
+    401 {"error": "unauthorized"}
+  lines:
+  - line: 38
+    note: The secret never leaves the server; keep it in an environment variable, not in code.
+  - line: 83
+    note: Changing even two characters of the payload breaks the signature.
+- title: Validation and CORS
+  intro: Every problem is reported at once, and only allow-listed origins receive CORS headers.
+  code: |
+    def validate(data, schema):
+        """Check a JSON object against a schema. Returns a sorted list of error strings (empty if valid).
+
+        schema maps field name -> {"type": "string"|"integer"|"boolean", "required": bool,
+                                   "min": number, "max": number, "max_length": int, "choices": list}
+        Unknown fields are errors. "min"/"max" apply to integers, "max_length" to strings.
+        """
+        if not isinstance(data, dict):
+            return ["body must be an object"]
+        errors = []
+        for name in data:
+            if name not in schema:
+                errors.append(f"{name}: unknown field")
+        for name, rule in schema.items():
+            if name not in data:
+                if rule.get("required"):
+                    errors.append(f"{name}: required")
+                continue
+            value, kind = data[name], rule["type"]
+            if kind == "string":
+                ok = isinstance(value, str)
+            elif kind == "integer":
+                ok = isinstance(value, int) and not isinstance(value, bool)
+            else:
+                ok = isinstance(value, bool)
+            if not ok:
+                errors.append(f"{name}: must be a {kind}")
+                continue
+            if kind == "string" and "max_length" in rule and len(value) > rule["max_length"]:
+                errors.append(f"{name}: too long (max {rule['max_length']})")
+            if kind == "integer":
+                if "min" in rule and value < rule["min"]:
+                    errors.append(f"{name}: must be at least {rule['min']}")
+                if "max" in rule and value > rule["max"]:
+                    errors.append(f"{name}: must be at most {rule['max']}")
+            if "choices" in rule and value not in rule["choices"]:
+                errors.append(f"{name}: must be one of {sorted(rule['choices'])}")
+        return sorted(errors)
+
+
+    SECURITY_HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+        "Cache-Control": "no-store",
+    }
+
+
+    def secure(response, request_origin, allowed_origins):
+        """Return a copy of the response with security headers and, for an allowed origin, CORS headers."""
+        headers = dict(response["headers"])
+        for name, value in SECURITY_HEADERS.items():
+            headers.setdefault(name, value)
+        if request_origin is not None and request_origin in allowed_origins:
+            headers["Access-Control-Allow-Origin"] = request_origin
+            headers["Vary"] = "Origin"
+        return {"status": response["status"], "headers": headers, "body": response["body"]}
+
+
+    def preflight(request_origin, requested_method, allowed_origins, allowed_methods):
+        """Answer a CORS preflight (OPTIONS) request."""
+        if request_origin not in allowed_origins or requested_method not in allowed_methods:
+            return {"status": 403, "headers": {}, "body": ""}
+        return {"status": 204, "headers": {"Access-Control-Allow-Origin": request_origin,
+                                           "Access-Control-Allow-Methods": ", ".join(sorted(allowed_methods)),
+                                           "Access-Control-Max-Age": "600", "Vary": "Origin"}, "body": ""}
+
+
+    schema = {"title": {"type": "string", "required": True, "max_length": 20},
+              "priority": {"type": "integer", "min": 1, "max": 3}}
+    for body in [{"title": "Ship it", "priority": 2}, {"priority": 9, "colour": "red"}, ["not", "an", "object"]]:
+        print(validate(body, schema))
+
+    resp = {"status": 200, "headers": {"Content-Type": "application/json"}, "body": "{}"}
+    allowed = {"https://notes.example"}
+    for origin in ["https://notes.example", "https://evil.example", None]:
+        print(origin, "->", secure(resp, origin, allowed)["headers"].get("Access-Control-Allow-Origin"))
+    print(preflight("https://notes.example", "POST", allowed, {"GET", "POST"})["status"],
+          preflight("https://evil.example", "POST", allowed, {"GET", "POST"})["status"])
+  output: |
+    []
+    ['colour: unknown field', 'priority: must be at most 3', 'title: required']
+    ['body must be an object']
+    https://notes.example -> https://notes.example
+    https://evil.example -> None
+    None -> None
+    204 403
+  lines:
+  - line: 70
+    note: A schema is data, so it can be shared with documentation and tests.
+  - line: 79
+    note: Browsers send an OPTIONS preflight before cross-origin POSTs; only listed origins pass.
+playground:
+  prompt: Add a third route to the notes API, `DELETE /notes/<id:int>`, that returns `None` (204) and removes the note. Then call it twice. What status should the second call return, and how would you make it so?
+  code: |
+    print({"method": "GET", "path": "/notes/1"})
+exercises:
+- id: router
+  title: 'Milestone 1: The router'
+  difficulty: 4
+  prompt: Implement `Router`. `add(method, pattern, handler)` stores the route (methods are case-insensitive; store them upper-case). Patterns are split on `/` after stripping leading and trailing slashes; `/` is the empty pattern. A segment like `<name>` matches any non-empty text and `<id:int>` matches only digits (give the handler an `int`). `match(method, path)` returns `(200, handler, params)` for the first route that fits the path and method, `(405, None, allowed)` where `allowed` is the sorted list of methods registered for paths that fit, or `(404, None, None)`. Path segment counts must be equal.
+  starter: |
+    class Router:
+        """Matches (method, path) to a handler. Patterns look like /notes/<id:int> or /users/<name>."""
+
+        def __init__(self):
+            self.routes = []
+
+        def add(self, method, pattern, handler):
+            pass
+
+        def match(self, method, path):
+            """Return (200, handler, params), (404, None, None) or (405, None, sorted_allowed_methods)."""
+            pass
+  tests:
+  - name: static routes and methods
+    code: |
+      r = Router()
+      h1, h2, h3, h5 = (lambda: 1), (lambda: 2), (lambda: 3), (lambda: 5)
+      r.add("GET", "/notes", h1); r.add("POST", "/notes", h3); r.add("GET", "/", h5)
+      assert r.match("GET", "/notes") == (200, h1, {})
+      assert r.match("GET", "/notes/") == (200, h1, {})
+      assert r.match("get", "/notes") == (200, h1, {})
+      assert r.match("POST", "/notes") == (200, h3, {})
+      assert r.match("GET", "/") == (200, h5, {})
+      assert r.match("GET", "/nope") == (404, None, None)
+      assert r.match("GET", "/notes/extra") == (404, None, None)
+  - name: path parameters
+    code: |
+      r = Router()
+      h2, h4 = (lambda: 2), (lambda: 4)
+      r.add("GET", "/notes/<id:int>", h2)
+      r.add("GET", "/users/<name>/posts/<pid:int>", h4)
+      assert r.match("GET", "/notes/42") == (200, h2, {"id": 42})
+      assert r.match("GET", "/notes/07") == (200, h2, {"id": 7})
+      assert r.match("GET", "/users/ana/posts/7") == (200, h4, {"name": "ana", "pid": 7})
+      for bad in ["/notes/abc", "/notes/-1", "/notes/1.5", "/notes/", "/users/ana/posts/x", "/users//posts/1"]:
+          assert r.match("GET", bad)[0] == 404, bad
+  - name: 405 lists the allowed methods
+    code: |
+      r = Router()
+      r.add("GET", "/notes", 1); r.add("POST", "/notes", 2); r.add("DELETE", "/notes/<id:int>", 3)
+      assert r.match("PUT", "/notes") == (405, None, ["GET", "POST"])
+      assert r.match("GET", "/notes/5") == (405, None, ["DELETE"])
+      assert r.match("PUT", "/missing") == (404, None, None)
+  hints:
+  - Write a helper that compares one pattern with the path's parts and returns a params dictionary or `None`.
+  - Collect the methods of every route whose path fits into a `set` and return it sorted for the 405 case.
+  solution: |
+    class Router:
+        """Matches (method, path) to a handler. Patterns look like /notes/<id:int>."""
+
+        def __init__(self):
+            self.routes = []                       # (method, pattern_segments, handler)
+
+        def add(self, method, pattern, handler):
+            self.routes.append((method.upper(), pattern.strip("/").split("/") if pattern.strip("/") else [], handler))
+
+        @staticmethod
+        def _match_segments(pattern, parts):
+            if len(pattern) != len(parts):
+                return None
+            params = {}
+            for pat, part in zip(pattern, parts):
+                if pat.startswith("<") and pat.endswith(">"):
+                    name, _, kind = pat[1:-1].partition(":")
+                    if kind == "int":
+                        if not part.isdigit():
+                            return None
+                        params[name] = int(part)
+                    elif part:
+                        params[name] = part
+                    else:
+                        return None
+                elif pat != part:
+                    return None
+            return params
+
+        def match(self, method, path):
+            """Return (200, handler, params), (404, None, None) or (405, None, allowed_methods)."""
+            parts = path.strip("/").split("/") if path.strip("/") else []
+            allowed = set()
+            for m, pattern, handler in self.routes:
+                params = self._match_segments(pattern, parts)
+                if params is None:
+                    continue
+                if m == method.upper():
+                    return 200, handler, params
+                allowed.add(m)
+            if allowed:
+                return 405, None, sorted(allowed)
+            return 404, None, None
+  explanation: Routing is pattern matching with two failure modes. Returning the allowed methods turns a mysterious error into helpful guidance.
+- id: app
+  title: 'Milestone 2: Handlers, requests and responses'
+  difficulty: 5
+  prompt: 'The starter has the router, `HTTPError`, `json_response` and `build_chain`. Implement `App._dispatch(request)` (routing: 404 and 405 with an `Allow` header as JSON errors; call the handler with `**params`; `HTTPError` becomes its status and message; any other exception becomes a generic 500 with the message `"internal server error"`; a dictionary or list means 200, a `(status, data)` tuple chooses the status, `None` means 204) and `App.handle(raw)`. `handle` builds the request dictionary with `method` (upper-case), `path` (without the query), `query` (first value of each key, from `parse_qs`), `headers` (names lower-cased), `client` (default `"unknown"`), `json` and `user` (both `None` at first), parses the JSON body for POST, PUT and PATCH (an unreadable body gives a 400 `"invalid JSON"`), and runs `_dispatch` inside `build_chain(...)` of the registered middleware.'
+  starter: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    class Router:
+        """Matches (method, path) to a handler. Patterns look like /notes/<id:int>."""
+
+        def __init__(self):
+            self.routes = []                       # (method, pattern_segments, handler)
+
+        def add(self, method, pattern, handler):
+            self.routes.append((method.upper(), pattern.strip("/").split("/") if pattern.strip("/") else [], handler))
+
+        @staticmethod
+        def _match_segments(pattern, parts):
+            if len(pattern) != len(parts):
+                return None
+            params = {}
+            for pat, part in zip(pattern, parts):
+                if pat.startswith("<") and pat.endswith(">"):
+                    name, _, kind = pat[1:-1].partition(":")
+                    if kind == "int":
+                        if not part.isdigit():
+                            return None
+                        params[name] = int(part)
+                    elif part:
+                        params[name] = part
+                    else:
+                        return None
+                elif pat != part:
+                    return None
+            return params
+
+        def match(self, method, path):
+            """Return (200, handler, params), (404, None, None) or (405, None, allowed_methods)."""
+            parts = path.strip("/").split("/") if path.strip("/") else []
+            allowed = set()
+            for m, pattern, handler in self.routes:
+                params = self._match_segments(pattern, parts)
+                if params is None:
+                    continue
+                if m == method.upper():
+                    return 200, handler, params
+                allowed.add(m)
+            if allowed:
+                return 405, None, sorted(allowed)
+            return 404, None, None
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    class App:
+        def __init__(self):
+            self.router = Router()
+            self.middlewares = []
+
+        def route(self, method, pattern):
+            def decorator(fn):
+                self.router.add(method, pattern, fn)
+                return fn
+            return decorator
+
+        def use(self, middleware):
+            self.middlewares.append(middleware)
+
+        def _dispatch(self, request):
+            pass
+
+        def handle(self, raw):
+            pass
+  tests:
+  - name: handlers and status codes
+    code: |
+      app = App()
+      notes = {}
+      @app.route("GET", "/hello/<name>")
+      def hello(req, name):
+          return {"hello": name}
+      @app.route("POST", "/echo")
+      def echo(req):
+          return 201, req["json"]
+      @app.route("DELETE", "/x/<id:int>")
+      def rm(req, id):
+          return None
+      @app.route("GET", "/teapot")
+      def teapot(req):
+          raise HTTPError(418, "teapot")
+      @app.route("GET", "/crash")
+      def crash(req):
+          return {"x": 1 / 0}
+      @app.route("GET", "/q")
+      def q(req):
+          return {"query": req["query"], "headers": req["headers"], "client": req["client"], "path": req["path"]}
+
+      r = app.handle({"method": "GET", "path": "/hello/ana"})
+      assert r["status"] == 200 and r["headers"]["Content-Type"] == "application/json"
+      assert json.loads(r["body"]) == {"hello": "ana"}
+      r = app.handle({"method": "post", "path": "/echo", "body": '{"a": [1, 2]}'})
+      assert r["status"] == 201 and json.loads(r["body"]) == {"a": [1, 2]}
+      r = app.handle({"method": "DELETE", "path": "/x/3"})
+      assert r["status"] == 204 and r["body"] == ""
+      r = app.handle({"method": "GET", "path": "/teapot"})
+      assert r["status"] == 418 and json.loads(r["body"]) == {"error": "teapot"}
+  - name: errors never leak details
+    code: |
+      app = App()
+      notes = {}
+      @app.route("GET", "/hello/<name>")
+      def hello(req, name):
+          return {"hello": name}
+      @app.route("POST", "/echo")
+      def echo(req):
+          return 201, req["json"]
+      @app.route("DELETE", "/x/<id:int>")
+      def rm(req, id):
+          return None
+      @app.route("GET", "/teapot")
+      def teapot(req):
+          raise HTTPError(418, "teapot")
+      @app.route("GET", "/crash")
+      def crash(req):
+          return {"x": 1 / 0}
+      @app.route("GET", "/q")
+      def q(req):
+          return {"query": req["query"], "headers": req["headers"], "client": req["client"], "path": req["path"]}
+
+      r = app.handle({"method": "GET", "path": "/crash"})
+      assert r["status"] == 500 and json.loads(r["body"]) == {"error": "internal server error"}
+      assert "division" not in r["body"] and "ZeroDivision" not in r["body"]
+      r = app.handle({"method": "GET", "path": "/nowhere"})
+      assert r["status"] == 404 and json.loads(r["body"]) == {"error": "not found"}
+      r = app.handle({"method": "PUT", "path": "/echo"})
+      assert r["status"] == 405 and r["headers"]["Allow"] == "POST"
+      assert json.loads(r["body"]) == {"error": "method not allowed"}
+      r = app.handle({"method": "POST", "path": "/echo", "body": "{bad"})
+      assert r["status"] == 400 and json.loads(r["body"]) == {"error": "invalid JSON"}
+  - name: the request object
+    code: |
+      app = App()
+      notes = {}
+      @app.route("GET", "/hello/<name>")
+      def hello(req, name):
+          return {"hello": name}
+      @app.route("POST", "/echo")
+      def echo(req):
+          return 201, req["json"]
+      @app.route("DELETE", "/x/<id:int>")
+      def rm(req, id):
+          return None
+      @app.route("GET", "/teapot")
+      def teapot(req):
+          raise HTTPError(418, "teapot")
+      @app.route("GET", "/crash")
+      def crash(req):
+          return {"x": 1 / 0}
+      @app.route("GET", "/q")
+      def q(req):
+          return {"query": req["query"], "headers": req["headers"], "client": req["client"], "path": req["path"]}
+
+      r = app.handle({"method": "GET", "path": "/q?a=1&b=two&a=3", "headers": {"X-Token": "abc", "Accept": "*/*"}, "client": "10.0.0.1", "body": "ignored"})
+      data = json.loads(r["body"])
+      assert data["query"] == {"a": "1", "b": "two"}
+      assert data["headers"] == {"x-token": "abc", "accept": "*/*"}
+      assert data["client"] == "10.0.0.1" and data["path"] == "/q"
+      r = app.handle({"method": "GET", "path": "/q"})
+      assert json.loads(r["body"])["client"] == "unknown"
+  - name: middleware wraps the router
+    code: |
+      app = App()
+      notes = {}
+      @app.route("GET", "/hello/<name>")
+      def hello(req, name):
+          return {"hello": name}
+      @app.route("POST", "/echo")
+      def echo(req):
+          return 201, req["json"]
+      @app.route("DELETE", "/x/<id:int>")
+      def rm(req, id):
+          return None
+      @app.route("GET", "/teapot")
+      def teapot(req):
+          raise HTTPError(418, "teapot")
+      @app.route("GET", "/crash")
+      def crash(req):
+          return {"x": 1 / 0}
+      @app.route("GET", "/q")
+      def q(req):
+          return {"query": req["query"], "headers": req["headers"], "client": req["client"], "path": req["path"]}
+
+      seen = []
+      def spy(request, nxt):
+          seen.append(request["path"])
+          return nxt(request)
+      def blocker(request, nxt):
+          if request["path"].startswith("/blocked"):
+              return json_response(403, {"error": "forbidden"})
+          return nxt(request)
+      app.use(spy)
+      app.use(blocker)
+      assert app.handle({"method": "GET", "path": "/hello/x"})["status"] == 200
+      assert app.handle({"method": "GET", "path": "/blocked/anything"})["status"] == 403
+      assert app.handle({"method": "GET", "path": "/missing"})["status"] == 404
+      assert seen == ["/hello/x", "/blocked/anything", "/missing"]
+  hints:
+  - '`urlsplit(raw.get("path", "/"))` gives `.path` and `.query`; `parse_qs` returns lists, so take the first item.'
+  - Call the handler inside `try`, catching `HTTPError` first and then `Exception`.
+  solution: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    class Router:
+        """Matches (method, path) to a handler. Patterns look like /notes/<id:int>."""
+
+        def __init__(self):
+            self.routes = []                       # (method, pattern_segments, handler)
+
+        def add(self, method, pattern, handler):
+            self.routes.append((method.upper(), pattern.strip("/").split("/") if pattern.strip("/") else [], handler))
+
+        @staticmethod
+        def _match_segments(pattern, parts):
+            if len(pattern) != len(parts):
+                return None
+            params = {}
+            for pat, part in zip(pattern, parts):
+                if pat.startswith("<") and pat.endswith(">"):
+                    name, _, kind = pat[1:-1].partition(":")
+                    if kind == "int":
+                        if not part.isdigit():
+                            return None
+                        params[name] = int(part)
+                    elif part:
+                        params[name] = part
+                    else:
+                        return None
+                elif pat != part:
+                    return None
+            return params
+
+        def match(self, method, path):
+            """Return (200, handler, params), (404, None, None) or (405, None, allowed_methods)."""
+            parts = path.strip("/").split("/") if path.strip("/") else []
+            allowed = set()
+            for m, pattern, handler in self.routes:
+                params = self._match_segments(pattern, parts)
+                if params is None:
+                    continue
+                if m == method.upper():
+                    return 200, handler, params
+                allowed.add(m)
+            if allowed:
+                return 405, None, sorted(allowed)
+            return 404, None, None
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    class App:
+        def __init__(self):
+            self.router = Router()
+            self.middlewares = []
+
+        def route(self, method, pattern):
+            def decorator(fn):
+                self.router.add(method, pattern, fn)
+                return fn
+            return decorator
+
+        def use(self, middleware):
+            self.middlewares.append(middleware)
+
+        def _dispatch(self, request):
+            status, handler, extra = self.router.match(request["method"], request["path"])
+            if status == 404:
+                return json_response(404, {"error": "not found"})
+            if status == 405:
+                return json_response(405, {"error": "method not allowed"}, {"Allow": ", ".join(extra)})
+            try:
+                result = handler(request, **extra)
+            except HTTPError as e:
+                return json_response(e.status, {"error": e.message})
+            except Exception:
+                return json_response(500, {"error": "internal server error"})
+            if result is None:
+                return json_response(204)
+            if isinstance(result, tuple):
+                return json_response(result[0], result[1])
+            return json_response(200, result)
+
+        def handle(self, raw):
+            """raw: {"method", "path" (may include ?query), "headers", "body"}. Returns a response dict."""
+            parts = urlsplit(raw.get("path", "/"))
+            request = {"method": raw.get("method", "GET").upper(), "path": parts.path,
+                       "query": {k: v[0] for k, v in parse_qs(parts.query).items()},
+                       "headers": {k.lower(): v for k, v in (raw.get("headers") or {}).items()},
+                       "client": raw.get("client", "unknown"), "json": None, "user": None}
+            body = raw.get("body")
+            if request["method"] in ("POST", "PUT", "PATCH") and body:
+                try:
+                    request["json"] = json.loads(body)
+                except ValueError:
+                    return json_response(400, {"error": "invalid JSON"})
+            return build_chain(self._dispatch, self.middlewares)(request)
+  explanation: 'A framework''s whole job is translation: raw request in, request object for handlers, and handler results back into proper responses.'
+- id: middleware
+  title: 'Milestone 3: Middleware, logging and rate limiting'
+  difficulty: 5
+  prompt: 'Implement `build_chain(handler, middlewares)` (the first middleware is outermost; an empty list returns the handler unchanged), `rate_limit(max_requests, window, clock)` (a middleware that allows at most `max_requests` per `request["client"]` in any sliding window of `window` seconds; a request at time `now` counts earlier ones with `now - t < window`; if the budget is used up answer `json_response(429, {"error": "too many requests"}, {"Retry-After": str(seconds)})`, where `seconds` is how long until the oldest counted request leaves the window, rounded up and at least 1; rejected requests are not recorded) and `request_log(log)` (after the response returns, append `"METHOD /path -> status"` to the list `log`).'
+  starter: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    def build_chain(handler, middlewares):
+        """Wrap handler in the middlewares; the first one in the list is the outermost."""
+        pass
+
+
+    def rate_limit(max_requests, window, clock):
+        pass
+
+
+    def request_log(log):
+        pass
+  tests:
+  - name: onion order
+    code: |
+      log = []
+      def mk(name):
+          def mw(request, nxt):
+              log.append("in " + name)
+              response = nxt(request)
+              log.append("out " + name)
+              return response
+          return mw
+      chain = build_chain(lambda req: json_response(200, {"ok": True}), [mk("a"), mk("b")])
+      assert chain({})["status"] == 200
+      assert log == ["in a", "in b", "out b", "out a"]
+      handler = lambda req: "plain"
+      assert build_chain(handler, [])({}) == "plain"
+  - name: a middleware can stop the chain
+    code: |
+      calls = []
+      def deny(request, nxt):
+          return json_response(403, {"error": "no"})
+      chain = build_chain(lambda req: calls.append(1) or json_response(200), [deny])
+      assert chain({})["status"] == 403 and calls == []
+  - name: rate limiting
+    code: |
+      t = [0]
+      chain = build_chain(lambda req: json_response(200, {"ok": 1}), [rate_limit(3, 10, lambda: t[0])])
+      a = {"client": "a"}
+      for now in (0, 1, 2):
+          t[0] = now
+          assert chain(a)["status"] == 200
+      t[0] = 3
+      r = chain(a)
+      assert r["status"] == 429 and r["headers"]["Retry-After"] == "7"
+      assert json.loads(r["body"]) == {"error": "too many requests"}
+      t[0] = 4
+      assert chain(a)["status"] == 429
+      t[0] = 4
+      assert chain({"client": "b"})["status"] == 200
+      t[0] = 10
+      assert chain(a)["status"] == 200
+      t[0] = 11
+      assert chain(a)["status"] == 200
+      t[0] = 12
+      assert chain(a)["status"] == 200
+      r = chain(a)
+      assert r["status"] == 429 and r["headers"]["Retry-After"] == "8"
+  - name: request log
+    code: |
+      log = []
+      chain = build_chain(lambda req: json_response(404, {"error": "x"}), [request_log(log)])
+      chain({"method": "GET", "path": "/a"})
+      chain({"method": "POST", "path": "/b"})
+      assert log == ["GET /a -> 404", "POST /b -> 404"]
+  hints:
+  - 'Build the chain from the inside out: loop over `reversed(middlewares)` and wrap `handler` each time. Use a helper function to avoid the late-binding closure trap.'
+  - Keep a dictionary from client to a list of recent times and filter it with `now - t < window`.
+  solution: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    def rate_limit(max_requests, window, clock):
+        """Middleware: at most max_requests per client in any sliding window of `window` seconds."""
+        seen = {}
+        def middleware(request, nxt):
+            now = clock()
+            recent = [t for t in seen.get(request["client"], []) if now - t < window]
+            if len(recent) >= max_requests:
+                seen[request["client"]] = recent
+                retry = max(1, int(window - (now - recent[0]) + 0.999))
+                return json_response(429, {"error": "too many requests"}, {"Retry-After": str(retry)})
+            recent.append(now)
+            seen[request["client"]] = recent
+            return nxt(request)
+        return middleware
+
+
+    def request_log(log):
+        """Middleware: after the response comes back, append 'METHOD /path -> status' to the list `log`."""
+        def middleware(request, nxt):
+            response = nxt(request)
+            log.append(f"{request['method']} {request['path']} -> {response['status']}")
+            return response
+        return middleware
+  explanation: The onion shape makes cross-cutting behaviour composable. The late-binding trap of closures in loops (Unit 3) is the one subtle part.
+- id: auth
+  title: 'Milestone 4: Signed tokens and authentication'
+  difficulty: 5
+  prompt: 'The starter has `HTTPError`, `json_response` and `build_chain`. Implement `sign_token(secret, user, expires)` returning `payload + "." + mac` where `payload` is the base64url (no `=` padding) of `json.dumps({"sub": user, "exp": expires}, sort_keys=True)` and `mac` is the base64url (no padding) of the HMAC-SHA256 of the payload text with `secret`. Implement `verify_token(secret, token, now)` returning the user name, or `None` if anything is wrong: no dot, wrong MAC (compare the encoded bytes with `hmac.compare_digest`), unreadable payload, `exp <= now`, or a `sub` that is not a string. Implement the middleware `require_auth(secret, clock)`: it needs a header `authorization` of the exact form `Bearer <token>`; on success set `request["user"]` and call the next handler, otherwise answer 401 with `{"error": "unauthorized"}` and the header `WWW-Authenticate: Bearer`.'
+  starter: |
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    def sign_token(secret, user, expires):
+        pass
+
+
+    def verify_token(secret, token, now):
+        pass
+
+
+    def require_auth(secret, clock):
+        pass
+  tests:
+  - name: sign and verify
+    code: |
+      tok = sign_token(b"key", "ana", 100)
+      assert isinstance(tok, str) and tok.count(".") == 1
+      assert "=" not in tok and "+" not in tok and "/" not in tok
+      assert verify_token(b"key", tok, 50) == "ana"
+      assert verify_token(b"key", tok, 99) == "ana"
+      assert verify_token(b"key", tok, 100) is None
+      assert verify_token(b"key", tok, 5000) is None
+      assert verify_token(b"other", tok, 50) is None
+      assert sign_token(b"key", "ana", 100) == tok
+      assert sign_token(b"key", "bo", 100) != tok
+  - name: forgeries and garbage are rejected
+    code: |
+      import base64, hashlib, hmac, json
+      tok = sign_token(b"key", "ana", 100)
+      payload, mac = tok.split(".")
+      evil = base64.urlsafe_b64encode(json.dumps({"sub": "admin", "exp": 100}, sort_keys=True).encode()).decode().rstrip("=")
+      for bad in [evil + "." + mac, payload + "." + mac[:-2] + "AA", payload, "", ".", "abc.def", payload + ".", "." + mac, payload + "." + "\u00e9" * 4]:
+          assert verify_token(b"key", bad, 50) is None, bad
+      def forged(claims):
+          p = base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True).encode()).decode().rstrip("=")
+          m = base64.urlsafe_b64encode(hmac.new(b"key", p.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+          return p + "." + m
+      assert verify_token(b"key", forged({"sub": "ok", "exp": 100}), 50) == "ok"
+      assert verify_token(b"key", forged({"sub": 5, "exp": 100}), 50) is None
+      assert verify_token(b"key", forged({"sub": "ok"}), 50) is None
+      assert verify_token(b"key", forged([1, 2]), 50) is None
+  - name: require_auth middleware
+    code: |
+      t = [50]
+      seen = []
+      def handler(req):
+          seen.append(req["user"])
+          return json_response(200, {"user": req["user"]})
+      chain = build_chain(handler, [require_auth(b"key", lambda: t[0])])
+      tok = sign_token(b"key", "ana", 100)
+      r = chain({"headers": {"authorization": "Bearer " + tok}})
+      assert r["status"] == 200 and seen == ["ana"]
+      for headers in [{}, {"authorization": ""}, {"authorization": "Bearer"}, {"authorization": "Basic " + tok},
+                      {"authorization": "bearer " + tok}, {"authorization": "Bearer x" + tok}, {"authorization": tok}]:
+          r = chain({"headers": headers})
+          assert r["status"] == 401, headers
+          assert r["headers"]["WWW-Authenticate"] == "Bearer"
+          assert json.loads(r["body"]) == {"error": "unauthorized"}
+      t[0] = 100
+      assert chain({"headers": {"authorization": "Bearer " + tok}})["status"] == 401
+      assert seen == ["ana"]
+  hints:
+  - '`base64.urlsafe_b64encode(...).decode().rstrip("=")` encodes; add the padding back with `"=" * (-len(text) % 4)` before decoding.'
+  - '`header.partition(" ")` splits `Bearer abc` into the scheme and the token.'
+  solution: |+
+    import json
+    from urllib.parse import parse_qs, urlsplit
+
+
+    class HTTPError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status, self.message = status, message
+
+
+    def json_response(status, data=None, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        return {"status": status, "headers": h, "body": "" if data is None else json.dumps(data, sort_keys=True)}
+
+
+
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+
+    def build_chain(handler, middlewares):
+        """A middleware is a function (request, next_handler) -> response. The first one added runs first (outermost)."""
+        for mw in reversed(middlewares):
+            handler = (lambda mw, nxt: lambda request: mw(request, nxt))(mw, handler)
+        return handler
+
+
+
+
+    def _b64(data):
+        return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+    def sign_token(secret, user, expires):
+        payload = _b64(json.dumps({"sub": user, "exp": expires}, sort_keys=True).encode())
+        mac = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+        return payload + "." + mac
+
+
+    def verify_token(secret, token, now):
+        """Return the user name if the token is genuine and unexpired, otherwise None."""
+        payload, dot, mac = token.partition(".")
+        if not dot:
+            return None
+        good = _b64(hmac.new(secret, payload.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(mac.encode(), good.encode()):
+            return None
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            if claims["exp"] <= now:
+                return None
+            return claims["sub"] if isinstance(claims["sub"], str) else None
+        except (ValueError, KeyError, TypeError):
+            return None
+
+
+    def require_auth(secret, clock):
+        """Middleware: demand 'Authorization: Bearer <token>'; put the user name in request['user']."""
+        def middleware(request, nxt):
+            header = request["headers"].get("authorization", "")
+            scheme, _, token = header.partition(" ")
+            user = verify_token(secret, token.strip(), clock()) if scheme == "Bearer" else None
+            if user is None:
+                return json_response(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+            request["user"] = user
+            return nxt(request)
+        return middleware
+
+
+  explanation: Verifying a signature before trusting any claim is the whole security of the scheme. Constant-time comparison and an expiry check close the two classic holes.
+- id: validation
+  title: 'Milestone 5: Validation and security headers'
+  difficulty: 4
+  prompt: 'Implement `validate(data, schema)` returning a sorted list of error strings. `schema` maps field names to rules with `type` (`"string"`, `"integer"` or `"boolean"`) and optional `required`, `min`, `max`, `max_length` and `choices`. Messages: `"x: required"`, `"x: unknown field"`, `"x: must be a string"` (or `integer` or `boolean`), `"x: too long (max N)"`, `"x: must be at least N"`, `"x: must be at most N"`, `"x: must be one of [...]"` (the sorted choices) and, if `data` is not a dictionary, `["body must be an object"]`. A `bool` is not an integer. Implement `secure(response, request_origin, allowed_origins)`: return a new response whose headers are a copy of the original plus every `SECURITY_HEADERS` entry the response does not already set, and, if `request_origin` is in `allowed_origins`, `Access-Control-Allow-Origin` set to that origin and `Vary: Origin`. Do not change the original response.'
+  starter: |
+    def validate(data, schema):
+        pass
+
+
+    SECURITY_HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+        "Cache-Control": "no-store",
+    }
+
+
+    def secure(response, request_origin, allowed_origins):
+        pass
+  tests:
+  - name: valid data and required fields
+    code: |
+      schema = {"title": {"type": "string", "required": True, "max_length": 5},
+                "pages": {"type": "integer", "min": 1, "max": 10},
+                "done": {"type": "boolean"}}
+      assert validate({"title": "Hi", "pages": 3, "done": False}, schema) == []
+      assert validate({"title": "Hi"}, schema) == []
+      assert validate({}, schema) == ["title: required"]
+      assert validate({"pages": 3}, schema) == ["title: required"]
+  - name: types
+    code: |
+      schema = {"a": {"type": "string"}, "n": {"type": "integer"}, "b": {"type": "boolean"}}
+      assert validate({"a": 1, "n": "2", "b": 0}, schema) == ["a: must be a string", "b: must be a boolean", "n: must be a integer"]
+      assert validate({"n": True}, schema) == ["n: must be a integer"]
+      assert validate({"b": 1}, schema) == ["b: must be a boolean"]
+      assert validate({"n": 1.5}, schema) == ["n: must be a integer"]
+      assert validate({"a": None}, schema) == ["a: must be a string"]
+  - name: ranges, lengths and choices
+    code: |
+      schema = {"t": {"type": "string", "max_length": 3}, "n": {"type": "integer", "min": 1, "max": 5},
+                "s": {"type": "string", "choices": ["open", "done"]}}
+      assert validate({"t": "abcd"}, schema) == ["t: too long (max 3)"]
+      assert validate({"t": "abc"}, schema) == []
+      assert validate({"n": 0}, schema) == ["n: must be at least 1"]
+      assert validate({"n": 6}, schema) == ["n: must be at most 5"]
+      assert validate({"n": 5}, schema) == [] and validate({"n": 1}, schema) == []
+      assert validate({"s": "weird"}, schema) == ["s: must be one of ['done', 'open']"]
+      assert validate({"s": "done"}, schema) == []
+  - name: unknown fields and non-objects
+    code: |
+      schema = {"a": {"type": "string", "required": True}}
+      assert validate({"a": "x", "zzz": 1, "b": 2}, schema) == ["b: unknown field", "zzz: unknown field"]
+      assert validate({"b": 1}, schema) == ["a: required", "b: unknown field"]
+      for bad in [[], "text", 5, None]:
+          assert validate(bad, schema) == ["body must be an object"]
+  - name: security headers and CORS
+    code: |
+      resp = {"status": 200, "headers": {"Content-Type": "application/json", "Cache-Control": "max-age=60"}, "body": "{}"}
+      out = secure(resp, None, {"https://app.example"})
+      assert out["status"] == 200 and out["body"] == "{}"
+      assert out["headers"]["X-Content-Type-Options"] == "nosniff"
+      assert out["headers"]["X-Frame-Options"] == "DENY"
+      assert out["headers"]["Content-Type"] == "application/json"
+      assert out["headers"]["Cache-Control"] == "max-age=60"
+      assert "Access-Control-Allow-Origin" not in out["headers"]
+      assert resp["headers"] == {"Content-Type": "application/json", "Cache-Control": "max-age=60"}
+      ok = secure(resp, "https://app.example", {"https://app.example"})
+      assert ok["headers"]["Access-Control-Allow-Origin"] == "https://app.example" and ok["headers"]["Vary"] == "Origin"
+      bad = secure(resp, "https://evil.example", {"https://app.example"})
+      assert "Access-Control-Allow-Origin" not in bad["headers"] and "Vary" not in bad["headers"]
+      assert bad["headers"]["Referrer-Policy"] == "no-referrer"
+      assert "*" not in "".join(ok["headers"].values())
+  hints:
+  - Check `isinstance(value, bool)` before or alongside `isinstance(value, int)`.
+  - '`dict.setdefault(name, value)` adds a header only if it is missing.'
+  solution: |+
+    def validate(data, schema):
+        """Check a JSON object against a schema. Returns a sorted list of error strings (empty if valid).
+
+        schema maps field name -> {"type": "string"|"integer"|"boolean", "required": bool,
+                                   "min": number, "max": number, "max_length": int, "choices": list}
+        Unknown fields are errors. "min"/"max" apply to integers, "max_length" to strings.
+        """
+        if not isinstance(data, dict):
+            return ["body must be an object"]
+        errors = []
+        for name in data:
+            if name not in schema:
+                errors.append(f"{name}: unknown field")
+        for name, rule in schema.items():
+            if name not in data:
+                if rule.get("required"):
+                    errors.append(f"{name}: required")
+                continue
+            value, kind = data[name], rule["type"]
+            if kind == "string":
+                ok = isinstance(value, str)
+            elif kind == "integer":
+                ok = isinstance(value, int) and not isinstance(value, bool)
+            else:
+                ok = isinstance(value, bool)
+            if not ok:
+                errors.append(f"{name}: must be a {kind}")
+                continue
+            if kind == "string" and "max_length" in rule and len(value) > rule["max_length"]:
+                errors.append(f"{name}: too long (max {rule['max_length']})")
+            if kind == "integer":
+                if "min" in rule and value < rule["min"]:
+                    errors.append(f"{name}: must be at least {rule['min']}")
+                if "max" in rule and value > rule["max"]:
+                    errors.append(f"{name}: must be at most {rule['max']}")
+            if "choices" in rule and value not in rule["choices"]:
+                errors.append(f"{name}: must be one of {sorted(rule['choices'])}")
+        return sorted(errors)
+
+
+    SECURITY_HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+        "Cache-Control": "no-store",
+    }
+
+
+    def secure(response, request_origin, allowed_origins):
+        """Return a copy of the response with security headers and, for an allowed origin, CORS headers."""
+        headers = dict(response["headers"])
+        for name, value in SECURITY_HEADERS.items():
+            headers.setdefault(name, value)
+        if request_origin is not None and request_origin in allowed_origins:
+            headers["Access-Control-Allow-Origin"] = request_origin
+            headers["Vary"] = "Origin"
+        return {"status": response["status"], "headers": headers, "body": response["body"]}
+
+
+  explanation: 'Validation is an allow-list: describe what is acceptable and refuse everything else. Never reflect untrusted origins back blindly.'
+commonMistakes:
+- title: Leaking exception text in a 500 response
+  explanation: Stack traces and messages help attackers. Log them privately and return a generic message.
+- title: Mixing up 401 and 403
+  explanation: 401 means the client has not proved who it is; 403 means it is known and not allowed.
+- title: Comparing MACs with ==
+  explanation: Use hmac.compare_digest, which does not leak how many characters matched.
+- title: Trusting a token's payload before verifying its MAC
+  explanation: The payload is readable by anyone; only a valid signature makes it trustworthy.
+- title: Allowing * as a CORS origin on an authenticated API
+  explanation: Echo only origins from an allow-list.
+- title: Forgetting that True is an int
+  explanation: 'Validate booleans explicitly or {"priority": true} passes an integer check.'
+summary:
+- A web framework is a router, handlers and middleware around a request and response.
+- Routes map (method, pattern) to a handler; mismatches give 404 or 405 with an Allow header.
+- Handlers return data or raise HTTPError; unexpected errors become a generic 500.
+- 'Middleware wraps handlers like an onion: authentication, rate limits, logging and headers.'
+- Signed expiring tokens, validated input and strict headers are the web's basic defences.
+next: u18-game
+quiz:
+- type: mcq
+  question: A request arrives with a valid login token for Ana, but Ana may not delete other people's notes. Which status fits?
+  options:
+  - 403 Forbidden
+  - 401 Unauthorized
+  - 404 Not Found only
+  - 200 OK
+  answer: 0
+  explanation: The server knows who Ana is and refuses the action.
+- type: mcq
+  question: A client sends PUT /notes but only GET and POST exist for that path. What should the server answer?
+  options:
+  - 405 with an Allow header
+  - '404'
+  - '200'
+  - '500'
+  answer: 0
+  explanation: The path exists, the method does not.
+- type: mcq
+  question: In a middleware chain [a, b, c], which sees the response last?
+  options:
+  - a
+  - b
+  - c
+  - The handler
+  answer: 0
+  explanation: 'The first middleware is outermost: first in, last out.'
+- type: mcq
+  question: Why is the token payload not encrypted in our design?
+  options:
+  - Signing proves it is unaltered; secrets do not belong in it
+  - Encryption is impossible
+  - Payloads are always empty
+  - Browsers refuse encrypted tokens
+  answer: 0
+  explanation: A signature gives integrity, not secrecy, so keep sensitive data out of tokens.
+- type: mcq
+  question: Why should validation reject unknown fields?
+  options:
+  - Extra fields can silently set things the client must not control
+  - They make JSON invalid
+  - They slow the server
+  - Python forbids them
+  answer: 0
+  explanation: This is the defence against mass-assignment bugs.
+- type: mcq
+  question: What does Retry-After tell a client?
+  options:
+  - How long to wait before trying again
+  - Which server to use
+  - The token's expiry
+  - The size of the body
+  answer: 0
+  explanation: It accompanies 429 and 503 responses.
+- type: code
+  question: Write `bearer_token(header)` that returns the token from an `Authorization` header of the exact form `Bearer <token>` (one space, a non-empty token with no spaces), or `None` for anything else, including `None`.
+  starter: |
+    def bearer_token(header):
+        pass
+  tests:
+  - name: bearer
+    code: |
+      assert bearer_token("Bearer abc.def") == "abc.def"
+      assert bearer_token("Bearer") is None
+      assert bearer_token("Bearer ") is None
+      assert bearer_token("Basic abc") is None
+      assert bearer_token("bearer abc") is None
+      assert bearer_token("Bearer a b") is None
+      assert bearer_token(None) is None
+      assert bearer_token("") is None
+  solution: |
+    def bearer_token(header):
+        if not isinstance(header, str):
+            return None
+        scheme, space, token = header.partition(" ")
+        if scheme != "Bearer" or not space or not token or " " in token:
+            return None
+        return token

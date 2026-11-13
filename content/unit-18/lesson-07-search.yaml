@@ -1,0 +1,2663 @@
+id: u18-search
+title: 'Capstone F: A Search Engine'
+minutes: 90
+objective: 'Build a miniature search engine: text normalisation and stemming, an inverted index you can update, boolean, phrase and exclusion queries, TF-IDF ranking, autocomplete and spelling suggestions, plus safe highlighting of results. This capstone brings together Units 5, 8, 9, 12, 14 and 16.'
+outcomes:
+- Normalise text into terms with case folding, accent removal, stop words and stemming
+- Build and maintain an inverted index with positions
+- Answer word, phrase and exclusion queries using set operations
+- Rank results with TF-IDF and explain why rare words matter
+- Offer autocomplete and spelling suggestions with binary search and edit distance
+sections:
+- heading: Why search needs an index
+  body: |-
+    The simplest search reads every document and checks whether it contains the word. That is **linear** in the size of the collection: fine for ten notes, hopeless for ten million web pages. Search engines do the work in advance: they build an **inverted index**, a dictionary from each **term** to a **postings list** of the documents (and positions) that contain it, just like the index at the back of a book. Answering a query becomes a few dictionary lookups and **set operations** (Unit 5) instead of a scan.
+
+    Before indexing, text must be **normalised** so that `Searching`, `searches` and `SEARCH` meet at the same term. We lower-case, remove accents, split into words, drop **stop words** (very common words such as `the` and `of` that carry little meaning) and **stem** each word by stripping common endings. Our stemmer is tiny and approximate: its stems (`engin`, `whal`) need not be real words, as long as related words reduce to the same stem. Real systems use better stemmers (Porter, Snowball) or **lemmatisers** and language-specific rules.
+
+    Each posting stores the **positions** of the term in the document. Positions cost memory, but they make **phrase queries** possible: `"search engine"` matches only where `engine` comes directly after `search`. (Because stop words are removed *before* positions are counted, `state of the art` and `state art` look alike. A real engine would keep stop-word positions.)
+- heading: Queries and ranking
+  body: |-
+    Our tiny **query language** has three kinds of parts: plain words (all must appear: set **intersection**), `"quoted phrases"` (positions must be adjacent) and a leading minus such as `-linked` (exclude: set **difference**). `search_any` uses set **union** for "at least one of these words".
+
+    Finding matches is not enough, because a search for `search` may match thousands of documents. **Ranking** puts the best first. **TF-IDF** combines two ideas. **Term frequency (TF)** says a document that uses a word more often is probably more about it, but with diminishing returns: we use `1 + ln(tf)`, so ten occurrences count about 3.3 times, not 10. **Inverse document frequency (IDF)** says a word that appears in few documents is more informative than one that appears everywhere: `ln((N + 1) / (df + 1)) + 1`. A document's score is the sum of `TF x IDF` over the query's words, divided by the square root of its length so that long documents do not win simply by having more words. This is a simplified cousin of the BM25 formula used by many production engines.
+
+    Scores are only comparable *within one query*, and the ordering of ties must be deterministic (here: by document id), otherwise results flicker between runs.
+- heading: Helping the searcher
+  body: |-
+    **Autocomplete** finds the index terms that start with what the user has typed. Keep the terms in a **sorted** list and use **binary search** (`bisect_left`, Unit 8) to jump to the first match, then walk forward while the prefix still fits. Offer the most common terms first.
+
+    **Spelling suggestions** use **edit distance** (Levenshtein distance): the fewest single-character insertions, deletions and substitutions that turn one word into another. It is computed with **dynamic programming** (Unit 8), keeping only the previous row of the table. For `serch` the nearest term is `search` at distance 1. Comparing a typo with every term is slow for big vocabularies, so real engines first narrow the candidates (by length, by shared character n-grams, or with a trie), which is why our code skips terms whose length differs too much.
+
+    Finally, **showing results safely**: highlighting a match means putting HTML around part of a document, and document text is untrusted. In `highlight` every piece of text goes through `html.escape` *before* the `<mark>` tags are added, so a document containing `<script>` shows up as harmless text instead of running (Unit 16: cross-site scripting).
+examples:
+- title: Normalising text
+  intro: Case, accents, punctuation, stop words and word endings are all handled before indexing. A sentence made only of stop words disappears.
+  code: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    for text in ["The Quick brown foxes kept jumping!", "Café, naïve résumé: 3 SEARCHES", "Searching searched searches search"]:
+        print(tokenize(text))
+    print(tokenize("to be or not to be"))
+    print(term_frequencies(tokenize("hash the hash, then hash again")))
+  output: |
+    ['quick', 'brown', 'fox', 'kept', 'jump']
+    ['caf', 'naiv', 'resum', 'search']
+    ['search', 'search', 'search', 'search']
+    ['not']
+    {'hash': 3, 'then': 1, 'again': 1}
+  lines:
+  - line: 56
+    note: Every sentence goes through the same steps.
+  - line: 58
+    note: Only stop words are left to remove, so nothing remains.
+- title: An inverted index
+  intro: Each term maps to the documents and positions where it occurs. Removing a document updates every term it used.
+  code: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def search_all(index, query):
+        """Sorted ids of the documents that contain every term of the query ([] if the query has no terms)."""
+        terms = tokenize(query)
+        if not terms:
+            return []
+        return sorted(set.intersection(*(set(index["postings"].get(t, {})) for t in terms)))
+
+
+    def search_any(index, query):
+        """Sorted ids of the documents that contain at least one term of the query."""
+        found = set()
+        for t in tokenize(query):
+            found |= set(index["postings"].get(t, {}))
+        return sorted(found)
+
+
+    def search_phrase(index, phrase):
+        """Sorted ids of the documents in which the phrase's terms appear next to each other, in order."""
+        terms = tokenize(phrase)
+        if not terms:
+            return []
+        found = []
+        for doc_id in search_all(index, phrase):
+            positions = [set(index["postings"][t][doc_id]) for t in terms]
+            if any(all(start + i in positions[i] for i in range(1, len(terms))) for start in positions[0]):
+                found.append(doc_id)
+        return found
+
+
+    def search(index, query):
+        """A tiny query language. Words must all appear; "quoted phrases" must appear as phrases; a leading minus
+        (-word or -"a phrase") excludes documents. Parts that contain no terms are ignored.
+        A query with no positive part finds nothing. Returns sorted document ids."""
+        must, must_not = [], []
+        for token in re.findall(r'-?"[^"]*"|-?\S+', query):
+            negative = token.startswith("-")
+            body = token[1:] if negative else token
+            if body.startswith('"'):
+                body = body.strip('"')
+                if not tokenize(body):
+                    continue
+                found = set(search_phrase(index, body))
+            else:
+                if not tokenize(body):
+                    continue
+                found = set(search_all(index, body))
+            (must_not if negative else must).append(found)
+        if not must:
+            return []
+        result = set.intersection(*must)
+        for excluded in must_not:
+            result -= excluded
+        return sorted(result)
+
+
+    def idf(index, term):
+        """Inverse document frequency: ln((N + 1) / (df + 1)) + 1, where N is the number of documents."""
+        return math.log((len(index["lengths"]) + 1) / (doc_frequency(index, term) + 1)) + 1
+
+
+    def score(index, doc_id, terms):
+        """Sum over the distinct query terms that occur in the document of (1 + ln(tf)) * idf, divided by sqrt(document length).
+        A document of length 0 scores 0.0."""
+        length = index["lengths"].get(doc_id, 0)
+        if length == 0:
+            return 0.0
+        total = 0.0
+        for term in set(terms):
+            tf = len(index["postings"].get(term, {}).get(doc_id, ()))
+            if tf:
+                total += (1 + math.log(tf)) * idf(index, term)
+        return total / math.sqrt(length)
+
+
+    def rank(index, query, k=10):
+        """The k best documents containing at least one query term, as (doc_id, score), best first (ties by doc_id)."""
+        terms = tokenize(query)
+        candidates = set()
+        for t in terms:
+            candidates |= set(index["postings"].get(t, {}))
+        scored = [(d, score(index, d, terms)) for d in candidates]
+        scored.sort(key=lambda pair: (-pair[1], pair[0]))
+        return scored[:max(k, 0)]
+
+
+    def edit_distance(a, b):
+        """Levenshtein distance: the fewest single-character insertions, deletions and substitutions turning a into b."""
+        previous = list(range(len(b) + 1))
+        for i, ca in enumerate(a, start=1):
+            current = [i]
+            for j, cb in enumerate(b, start=1):
+                current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+            previous = current
+        return previous[-1]
+
+
+    def complete(index, prefix, limit=5):
+        """Index terms that start with the (lower-cased) prefix, most common first (by document frequency, then alphabetically)."""
+        prefix = prefix.lower()
+        terms = sorted(index["postings"])
+        matches = []
+        for i in range(bisect_left(terms, prefix), len(terms)):
+            if not terms[i].startswith(prefix):
+                break
+            matches.append(terms[i])
+        matches.sort(key=lambda t: (-doc_frequency(index, t), t))
+        return matches[:max(limit, 0)]
+
+
+    def did_you_mean(index, word, max_distance=2):
+        """Suggest the index term nearest to a misspelt word, or None.
+
+        The word is normalised with tokenize(); it must give exactly one term. If that term is already in the index,
+        or no term is within max_distance edits, return None. Otherwise return the term with the smallest distance,
+        then the highest document frequency, then the alphabetically first.
+        """
+        found = tokenize(word)
+        if len(found) != 1 or found[0] in index["postings"]:
+            return None
+        target = found[0]
+        best = None
+        for term in index["postings"]:
+            if abs(len(term) - len(target)) > max_distance:
+                continue
+            d = edit_distance(target, term)
+            if d <= max_distance:
+                key = (d, -doc_frequency(index, term), term)
+                if best is None or key < best:
+                    best = key
+        return best[2] if best else None
+
+
+    docs = {
+        "arrays": "Arrays store items in contiguous memory, so reading item number i is fast.",
+        "linked": "A linked list stores items in nodes; reading item number i means following links.",
+        "hash": "Hash tables map keys to values and find items in constant time on average.",
+        "sorting": "Sorting algorithms such as merge sort and quicksort put items in order.",
+        "search": "Binary search finds an item in a sorted array by repeatedly halving the search range.",
+        "graphs": "Graphs connect nodes with edges; breadth-first search finds shortest paths.",
+        "index": "A search engine builds an inverted index that maps each word to the documents containing it.",
+        "security": "Never trust input: escape output, hash passwords and validate every request.",
+    }
+
+    index = build_index(docs)
+    print(len(index["docs"]), "documents,", len(index["postings"]), "distinct terms")
+    for term in ["search", "item", "hash", "link"]:
+        print(term, "->", index["postings"][term])
+    print("document frequency of item:", doc_frequency(index, "item"))
+    remove_document(index, "linked")
+    print("after removing linked:", index["postings"]["item"])
+  output: |
+    8 documents, 59 distinct terms
+    search -> {'search': [1, 8], 'graphs': [6], 'index': [0]}
+    item -> {'arrays': [2, 7], 'linked': [3, 6], 'hash': [6], 'sorting': [7], 'search': [3]}
+    hash -> {'hash': [0], 'security': [5]}
+    link -> {'linked': [0, 10]}
+    document frequency of item: 5
+    after removing linked: {'arrays': [2, 7], 'hash': [6], 'sorting': [7], 'search': [3]}
+  lines:
+  - line: 243
+    note: One pass over the documents builds every postings list.
+  - line: 248
+    note: Removing a document touches only the terms it contains.
+- title: Queries
+  intro: All words, any word, phrases, exclusions and a query nobody can answer.
+  code: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def search_all(index, query):
+        """Sorted ids of the documents that contain every term of the query ([] if the query has no terms)."""
+        terms = tokenize(query)
+        if not terms:
+            return []
+        return sorted(set.intersection(*(set(index["postings"].get(t, {})) for t in terms)))
+
+
+    def search_any(index, query):
+        """Sorted ids of the documents that contain at least one term of the query."""
+        found = set()
+        for t in tokenize(query):
+            found |= set(index["postings"].get(t, {}))
+        return sorted(found)
+
+
+    def search_phrase(index, phrase):
+        """Sorted ids of the documents in which the phrase's terms appear next to each other, in order."""
+        terms = tokenize(phrase)
+        if not terms:
+            return []
+        found = []
+        for doc_id in search_all(index, phrase):
+            positions = [set(index["postings"][t][doc_id]) for t in terms]
+            if any(all(start + i in positions[i] for i in range(1, len(terms))) for start in positions[0]):
+                found.append(doc_id)
+        return found
+
+
+    def search(index, query):
+        """A tiny query language. Words must all appear; "quoted phrases" must appear as phrases; a leading minus
+        (-word or -"a phrase") excludes documents. Parts that contain no terms are ignored.
+        A query with no positive part finds nothing. Returns sorted document ids."""
+        must, must_not = [], []
+        for token in re.findall(r'-?"[^"]*"|-?\S+', query):
+            negative = token.startswith("-")
+            body = token[1:] if negative else token
+            if body.startswith('"'):
+                body = body.strip('"')
+                if not tokenize(body):
+                    continue
+                found = set(search_phrase(index, body))
+            else:
+                if not tokenize(body):
+                    continue
+                found = set(search_all(index, body))
+            (must_not if negative else must).append(found)
+        if not must:
+            return []
+        result = set.intersection(*must)
+        for excluded in must_not:
+            result -= excluded
+        return sorted(result)
+
+
+    def idf(index, term):
+        """Inverse document frequency: ln((N + 1) / (df + 1)) + 1, where N is the number of documents."""
+        return math.log((len(index["lengths"]) + 1) / (doc_frequency(index, term) + 1)) + 1
+
+
+    def score(index, doc_id, terms):
+        """Sum over the distinct query terms that occur in the document of (1 + ln(tf)) * idf, divided by sqrt(document length).
+        A document of length 0 scores 0.0."""
+        length = index["lengths"].get(doc_id, 0)
+        if length == 0:
+            return 0.0
+        total = 0.0
+        for term in set(terms):
+            tf = len(index["postings"].get(term, {}).get(doc_id, ()))
+            if tf:
+                total += (1 + math.log(tf)) * idf(index, term)
+        return total / math.sqrt(length)
+
+
+    def rank(index, query, k=10):
+        """The k best documents containing at least one query term, as (doc_id, score), best first (ties by doc_id)."""
+        terms = tokenize(query)
+        candidates = set()
+        for t in terms:
+            candidates |= set(index["postings"].get(t, {}))
+        scored = [(d, score(index, d, terms)) for d in candidates]
+        scored.sort(key=lambda pair: (-pair[1], pair[0]))
+        return scored[:max(k, 0)]
+
+
+    def edit_distance(a, b):
+        """Levenshtein distance: the fewest single-character insertions, deletions and substitutions turning a into b."""
+        previous = list(range(len(b) + 1))
+        for i, ca in enumerate(a, start=1):
+            current = [i]
+            for j, cb in enumerate(b, start=1):
+                current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+            previous = current
+        return previous[-1]
+
+
+    def complete(index, prefix, limit=5):
+        """Index terms that start with the (lower-cased) prefix, most common first (by document frequency, then alphabetically)."""
+        prefix = prefix.lower()
+        terms = sorted(index["postings"])
+        matches = []
+        for i in range(bisect_left(terms, prefix), len(terms)):
+            if not terms[i].startswith(prefix):
+                break
+            matches.append(terms[i])
+        matches.sort(key=lambda t: (-doc_frequency(index, t), t))
+        return matches[:max(limit, 0)]
+
+
+    def did_you_mean(index, word, max_distance=2):
+        """Suggest the index term nearest to a misspelt word, or None.
+
+        The word is normalised with tokenize(); it must give exactly one term. If that term is already in the index,
+        or no term is within max_distance edits, return None. Otherwise return the term with the smallest distance,
+        then the highest document frequency, then the alphabetically first.
+        """
+        found = tokenize(word)
+        if len(found) != 1 or found[0] in index["postings"]:
+            return None
+        target = found[0]
+        best = None
+        for term in index["postings"]:
+            if abs(len(term) - len(target)) > max_distance:
+                continue
+            d = edit_distance(target, term)
+            if d <= max_distance:
+                key = (d, -doc_frequency(index, term), term)
+                if best is None or key < best:
+                    best = key
+        return best[2] if best else None
+
+
+    docs = {
+        "arrays": "Arrays store items in contiguous memory, so reading item number i is fast.",
+        "linked": "A linked list stores items in nodes; reading item number i means following links.",
+        "hash": "Hash tables map keys to values and find items in constant time on average.",
+        "sorting": "Sorting algorithms such as merge sort and quicksort put items in order.",
+        "search": "Binary search finds an item in a sorted array by repeatedly halving the search range.",
+        "graphs": "Graphs connect nodes with edges; breadth-first search finds shortest paths.",
+        "index": "A search engine builds an inverted index that maps each word to the documents containing it.",
+        "security": "Never trust input: escape output, hash passwords and validate every request.",
+    }
+
+    index = build_index(docs)
+    print("all  :", search_all(index, "search item"))
+    print("any  :", search_any(index, "search item"))
+    print("phrase:", search_phrase(index, "search engine"), search_phrase(index, "engine search"))
+    print("query:", search(index, "search -sorted"))
+    print("query:", search(index, '"reading item" -linked'))
+    print("query:", search(index, "nothing"))
+  output: |
+    all  : ['search']
+    any  : ['arrays', 'graphs', 'hash', 'index', 'linked', 'search', 'sorting']
+    phrase: ['index'] []
+    query: ['graphs', 'index']
+    query: ['arrays']
+    query: []
+  lines:
+  - line: 246
+    note: Phrases need the terms to be neighbours, so the reverse order finds nothing.
+  - line: 247
+    note: Words are intersected and minus-parts are subtracted.
+- title: Ranking with TF-IDF
+  intro: Rarer words have a higher IDF, so matching `engine` is worth more than matching `search`.
+  code: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def search_all(index, query):
+        """Sorted ids of the documents that contain every term of the query ([] if the query has no terms)."""
+        terms = tokenize(query)
+        if not terms:
+            return []
+        return sorted(set.intersection(*(set(index["postings"].get(t, {})) for t in terms)))
+
+
+    def search_any(index, query):
+        """Sorted ids of the documents that contain at least one term of the query."""
+        found = set()
+        for t in tokenize(query):
+            found |= set(index["postings"].get(t, {}))
+        return sorted(found)
+
+
+    def search_phrase(index, phrase):
+        """Sorted ids of the documents in which the phrase's terms appear next to each other, in order."""
+        terms = tokenize(phrase)
+        if not terms:
+            return []
+        found = []
+        for doc_id in search_all(index, phrase):
+            positions = [set(index["postings"][t][doc_id]) for t in terms]
+            if any(all(start + i in positions[i] for i in range(1, len(terms))) for start in positions[0]):
+                found.append(doc_id)
+        return found
+
+
+    def search(index, query):
+        """A tiny query language. Words must all appear; "quoted phrases" must appear as phrases; a leading minus
+        (-word or -"a phrase") excludes documents. Parts that contain no terms are ignored.
+        A query with no positive part finds nothing. Returns sorted document ids."""
+        must, must_not = [], []
+        for token in re.findall(r'-?"[^"]*"|-?\S+', query):
+            negative = token.startswith("-")
+            body = token[1:] if negative else token
+            if body.startswith('"'):
+                body = body.strip('"')
+                if not tokenize(body):
+                    continue
+                found = set(search_phrase(index, body))
+            else:
+                if not tokenize(body):
+                    continue
+                found = set(search_all(index, body))
+            (must_not if negative else must).append(found)
+        if not must:
+            return []
+        result = set.intersection(*must)
+        for excluded in must_not:
+            result -= excluded
+        return sorted(result)
+
+
+    def idf(index, term):
+        """Inverse document frequency: ln((N + 1) / (df + 1)) + 1, where N is the number of documents."""
+        return math.log((len(index["lengths"]) + 1) / (doc_frequency(index, term) + 1)) + 1
+
+
+    def score(index, doc_id, terms):
+        """Sum over the distinct query terms that occur in the document of (1 + ln(tf)) * idf, divided by sqrt(document length).
+        A document of length 0 scores 0.0."""
+        length = index["lengths"].get(doc_id, 0)
+        if length == 0:
+            return 0.0
+        total = 0.0
+        for term in set(terms):
+            tf = len(index["postings"].get(term, {}).get(doc_id, ()))
+            if tf:
+                total += (1 + math.log(tf)) * idf(index, term)
+        return total / math.sqrt(length)
+
+
+    def rank(index, query, k=10):
+        """The k best documents containing at least one query term, as (doc_id, score), best first (ties by doc_id)."""
+        terms = tokenize(query)
+        candidates = set()
+        for t in terms:
+            candidates |= set(index["postings"].get(t, {}))
+        scored = [(d, score(index, d, terms)) for d in candidates]
+        scored.sort(key=lambda pair: (-pair[1], pair[0]))
+        return scored[:max(k, 0)]
+
+
+    def edit_distance(a, b):
+        """Levenshtein distance: the fewest single-character insertions, deletions and substitutions turning a into b."""
+        previous = list(range(len(b) + 1))
+        for i, ca in enumerate(a, start=1):
+            current = [i]
+            for j, cb in enumerate(b, start=1):
+                current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+            previous = current
+        return previous[-1]
+
+
+    def complete(index, prefix, limit=5):
+        """Index terms that start with the (lower-cased) prefix, most common first (by document frequency, then alphabetically)."""
+        prefix = prefix.lower()
+        terms = sorted(index["postings"])
+        matches = []
+        for i in range(bisect_left(terms, prefix), len(terms)):
+            if not terms[i].startswith(prefix):
+                break
+            matches.append(terms[i])
+        matches.sort(key=lambda t: (-doc_frequency(index, t), t))
+        return matches[:max(limit, 0)]
+
+
+    def did_you_mean(index, word, max_distance=2):
+        """Suggest the index term nearest to a misspelt word, or None.
+
+        The word is normalised with tokenize(); it must give exactly one term. If that term is already in the index,
+        or no term is within max_distance edits, return None. Otherwise return the term with the smallest distance,
+        then the highest document frequency, then the alphabetically first.
+        """
+        found = tokenize(word)
+        if len(found) != 1 or found[0] in index["postings"]:
+            return None
+        target = found[0]
+        best = None
+        for term in index["postings"]:
+            if abs(len(term) - len(target)) > max_distance:
+                continue
+            d = edit_distance(target, term)
+            if d <= max_distance:
+                key = (d, -doc_frequency(index, term), term)
+                if best is None or key < best:
+                    best = key
+        return best[2] if best else None
+
+
+    docs = {
+        "arrays": "Arrays store items in contiguous memory, so reading item number i is fast.",
+        "linked": "A linked list stores items in nodes; reading item number i means following links.",
+        "hash": "Hash tables map keys to values and find items in constant time on average.",
+        "sorting": "Sorting algorithms such as merge sort and quicksort put items in order.",
+        "search": "Binary search finds an item in a sorted array by repeatedly halving the search range.",
+        "graphs": "Graphs connect nodes with edges; breadth-first search finds shortest paths.",
+        "index": "A search engine builds an inverted index that maps each word to the documents containing it.",
+        "security": "Never trust input: escape output, hash passwords and validate every request.",
+    }
+
+    index = build_index(docs)
+    for word in ["item", "search", "engine"]:
+        term = tokenize(word)[0]
+        print(f"idf({word}) = {idf(index, term):.3f}  (term '{term}' appears in {doc_frequency(index, term)} of {len(index['lengths'])} documents)")
+    print()
+    for query in ["search engine", "items in order"]:
+        print("query:", query)
+        for doc_id, s in rank(index, query, k=3):
+            print(f"  {s:.3f}  {doc_id}")
+  output: |
+    idf(item) = 1.405  (term 'item' appears in 5 of 8 documents)
+    idf(search) = 1.811  (term 'search' appears in 3 of 8 documents)
+    idf(engine) = 2.504  (term 'engin' appears in 1 of 8 documents)
+
+    query: search engine
+      1.365  index
+      0.970  search
+      0.573  graphs
+    query: items in order
+      1.303  sorting
+      0.753  arrays
+      0.717  linked
+  lines:
+  - line: 245
+    note: Queries and documents must use the same normalised terms, so the word is tokenized first. Rarer terms have a higher idf.
+  - line: 250
+    note: Each result is a (document id, score) pair, best first.
+- title: Autocomplete, spelling and safe highlighting
+  intro: Prefix lookups, nearest-term suggestions and highlighting that cannot be used to inject HTML.
+  code: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def search_all(index, query):
+        """Sorted ids of the documents that contain every term of the query ([] if the query has no terms)."""
+        terms = tokenize(query)
+        if not terms:
+            return []
+        return sorted(set.intersection(*(set(index["postings"].get(t, {})) for t in terms)))
+
+
+    def search_any(index, query):
+        """Sorted ids of the documents that contain at least one term of the query."""
+        found = set()
+        for t in tokenize(query):
+            found |= set(index["postings"].get(t, {}))
+        return sorted(found)
+
+
+    def search_phrase(index, phrase):
+        """Sorted ids of the documents in which the phrase's terms appear next to each other, in order."""
+        terms = tokenize(phrase)
+        if not terms:
+            return []
+        found = []
+        for doc_id in search_all(index, phrase):
+            positions = [set(index["postings"][t][doc_id]) for t in terms]
+            if any(all(start + i in positions[i] for i in range(1, len(terms))) for start in positions[0]):
+                found.append(doc_id)
+        return found
+
+
+    def search(index, query):
+        """A tiny query language. Words must all appear; "quoted phrases" must appear as phrases; a leading minus
+        (-word or -"a phrase") excludes documents. Parts that contain no terms are ignored.
+        A query with no positive part finds nothing. Returns sorted document ids."""
+        must, must_not = [], []
+        for token in re.findall(r'-?"[^"]*"|-?\S+', query):
+            negative = token.startswith("-")
+            body = token[1:] if negative else token
+            if body.startswith('"'):
+                body = body.strip('"')
+                if not tokenize(body):
+                    continue
+                found = set(search_phrase(index, body))
+            else:
+                if not tokenize(body):
+                    continue
+                found = set(search_all(index, body))
+            (must_not if negative else must).append(found)
+        if not must:
+            return []
+        result = set.intersection(*must)
+        for excluded in must_not:
+            result -= excluded
+        return sorted(result)
+
+
+    def idf(index, term):
+        """Inverse document frequency: ln((N + 1) / (df + 1)) + 1, where N is the number of documents."""
+        return math.log((len(index["lengths"]) + 1) / (doc_frequency(index, term) + 1)) + 1
+
+
+    def score(index, doc_id, terms):
+        """Sum over the distinct query terms that occur in the document of (1 + ln(tf)) * idf, divided by sqrt(document length).
+        A document of length 0 scores 0.0."""
+        length = index["lengths"].get(doc_id, 0)
+        if length == 0:
+            return 0.0
+        total = 0.0
+        for term in set(terms):
+            tf = len(index["postings"].get(term, {}).get(doc_id, ()))
+            if tf:
+                total += (1 + math.log(tf)) * idf(index, term)
+        return total / math.sqrt(length)
+
+
+    def rank(index, query, k=10):
+        """The k best documents containing at least one query term, as (doc_id, score), best first (ties by doc_id)."""
+        terms = tokenize(query)
+        candidates = set()
+        for t in terms:
+            candidates |= set(index["postings"].get(t, {}))
+        scored = [(d, score(index, d, terms)) for d in candidates]
+        scored.sort(key=lambda pair: (-pair[1], pair[0]))
+        return scored[:max(k, 0)]
+
+
+    def edit_distance(a, b):
+        """Levenshtein distance: the fewest single-character insertions, deletions and substitutions turning a into b."""
+        previous = list(range(len(b) + 1))
+        for i, ca in enumerate(a, start=1):
+            current = [i]
+            for j, cb in enumerate(b, start=1):
+                current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+            previous = current
+        return previous[-1]
+
+
+    def complete(index, prefix, limit=5):
+        """Index terms that start with the (lower-cased) prefix, most common first (by document frequency, then alphabetically)."""
+        prefix = prefix.lower()
+        terms = sorted(index["postings"])
+        matches = []
+        for i in range(bisect_left(terms, prefix), len(terms)):
+            if not terms[i].startswith(prefix):
+                break
+            matches.append(terms[i])
+        matches.sort(key=lambda t: (-doc_frequency(index, t), t))
+        return matches[:max(limit, 0)]
+
+
+    def did_you_mean(index, word, max_distance=2):
+        """Suggest the index term nearest to a misspelt word, or None.
+
+        The word is normalised with tokenize(); it must give exactly one term. If that term is already in the index,
+        or no term is within max_distance edits, return None. Otherwise return the term with the smallest distance,
+        then the highest document frequency, then the alphabetically first.
+        """
+        found = tokenize(word)
+        if len(found) != 1 or found[0] in index["postings"]:
+            return None
+        target = found[0]
+        best = None
+        for term in index["postings"]:
+            if abs(len(term) - len(target)) > max_distance:
+                continue
+            d = edit_distance(target, term)
+            if d <= max_distance:
+                key = (d, -doc_frequency(index, term), term)
+                if best is None or key < best:
+                    best = key
+        return best[2] if best else None
+
+
+    docs = {
+        "arrays": "Arrays store items in contiguous memory, so reading item number i is fast.",
+        "linked": "A linked list stores items in nodes; reading item number i means following links.",
+        "hash": "Hash tables map keys to values and find items in constant time on average.",
+        "sorting": "Sorting algorithms such as merge sort and quicksort put items in order.",
+        "search": "Binary search finds an item in a sorted array by repeatedly halving the search range.",
+        "graphs": "Graphs connect nodes with edges; breadth-first search finds shortest paths.",
+        "index": "A search engine builds an inverted index that maps each word to the documents containing it.",
+        "security": "Never trust input: escape output, hash passwords and validate every request.",
+    }
+
+    import html
+
+    def highlight(text, query):
+        terms = set(tokenize(query))
+        pieces = re.split(r"(\W+)", text)
+        return "".join(f"<mark>{html.escape(p)}</mark>" if p and set(tokenize(p)) & terms else html.escape(p) for p in pieces)
+
+    index = build_index(docs)
+    print(complete(index, "sea"), complete(index, "s", limit=3))
+    for word in ["serch", "grahps", "hsah", "zebra", "search"]:
+        print(word, "->", did_you_mean(index, word))
+    print(highlight("Binary search finds <b>items</b> & more", "search item"))
+  output: |
+    ['search'] ['search', 'sort', 'stor']
+    serch -> search
+    grahps -> graph
+    hsah -> hash
+    zebra -> None
+    search -> None
+    Binary <mark>search</mark> finds &lt;b&gt;<mark>items</mark>&lt;/b&gt; &amp; more
+  lines:
+  - line: 245
+    note: Every piece is escaped before any markup is added.
+  - line: 253
+    note: Misspellings map to the nearest term; unknown words and correct words give None.
+playground:
+  prompt: Index your own five notes (any text) and try `search`, `rank` and `did_you_mean` on them. Which of your queries gives a surprising ranking, and which stop word or stem would you change?
+  code: |
+    import re
+    print(re.findall(r"[a-z0-9]+", "Hello, World 42!".lower()))
+exercises:
+- id: tokenizer
+  title: 'Milestone 1: Text to terms'
+  difficulty: 3
+  prompt: 'The starter has the `stem` function and the stop-word list. Write `tokenize(text, stop_words=STOP_WORDS)`: (1) remove accents by normalising with `unicodedata.normalize("NFKD", text)` and dropping characters for which `unicodedata.combining(ch)` is true, then lower-case; (2) take the runs of the characters `a-z` and `0-9` as words (`re.findall`); (3) drop words of one character and words in `stop_words` (checked before stemming); (4) apply `stem` to each remaining word. Write `term_frequencies(tokens)` that returns a dictionary from term to the number of times it occurs.'
+  starter: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        pass
+
+
+    def term_frequencies(tokens):
+        pass
+  tests:
+  - name: normalising text
+    code: |
+      assert tokenize("Hello, World!") == ["hello", "world"]
+      assert tokenize("Café au lait!") == ["caf", "au", "lait"]      # stems need not be real words
+      assert tokenize("NAÏVE Zoë") == ["naiv", "zoe"]
+      assert tokenize("R2-D2 costs 10 dollars") == ["r2", "d2", "cost", "10", "dollar"]
+      assert tokenize("") == [] and tokenize("  ...  ") == []
+  - name: stop words and one-letter words
+    code: |
+      assert tokenize("The cat is on the mat") == ["cat", "mat"]
+      assert tokenize("a b c word") == ["word"]
+      assert tokenize("THE and OF") == []
+      assert tokenize("the cat", stop_words=set()) == ["the", "cat"]
+      assert tokenize("the cat", stop_words={"cat"}) == ["the"]
+  - name: stemming joins word forms
+    code: |
+      assert tokenize("search searching searches searched") == ["search"] * 4
+      assert tokenize("Running stopped parties") == ["run", "stop", "party"]
+      assert tokenize("dogs foxes") == ["dog", "fox"]
+      assert tokenize("don't") == ["don"]
+  - name: term frequencies
+    code: |
+      assert term_frequencies(["a", "b", "a", "a"]) == {"a": 3, "b": 1}
+      assert term_frequencies([]) == {}
+      assert term_frequencies(tokenize("Dogs and dog, dogs!")) == {"dog": 3}
+  hints:
+  - '`re.findall(r"[a-z0-9]+", plain)` returns every run of letters and digits.'
+  - 'Filter first, then stem: `[stem(w) for w in words if ...]`.'
+  solution: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+  explanation: Normalisation decides what counts as the same word, which decides what the engine can ever find.
+- id: index
+  title: 'Milestone 2: The inverted index'
+  difficulty: 4
+  prompt: 'The starter has `tokenize`. Implement `new_index()` returning `{"postings": {}, "lengths": {}, "docs": {}, "terms": {}}`; `add_document(index, doc_id, text)`, which tokenizes the text and records `postings[term][doc_id]` as the list of positions in the token list, `lengths[doc_id]` (number of tokens), `docs[doc_id]` (the original text) and `terms[doc_id]` (the set of its terms), first removing any older version of the same document; `remove_document(index, doc_id)`, which forgets the document, deletes terms that no document uses any more and returns `True` (or `False` for an unknown id without changing anything); `build_index(docs)` for a dictionary of id to text; and `doc_frequency(index, term)`, the number of documents containing the term.'
+  starter: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        pass
+
+
+    def add_document(index, doc_id, text):
+        pass
+
+
+    def remove_document(index, doc_id):
+        pass
+
+
+    def build_index(docs):
+        pass
+
+
+    def doc_frequency(index, term):
+        pass
+  tests:
+  - name: the structure of the index
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert set(index) == {"postings", "lengths", "docs", "terms"}
+      assert index["lengths"] == {"d1": 7, "d2": 6, "d3": 7, "d4": 5, "d5": 4}
+      assert index["docs"]["d4"] == docs["d4"]
+      assert index["postings"]["quick"] == {"d1": [0], "d2": [0, 4], "d3": [4]}
+      assert index["postings"]["search"] == {"d4": [0, 1], "d5": [3]}
+      assert index["terms"]["d5"] == {"index", "document", "fast", "search"}
+      assert doc_frequency(index, "quick") == 3 and doc_frequency(index, "search") == 2 and doc_frequency(index, "nothing") == 0
+      assert "the" not in index["postings"]
+  - name: adding a document again replaces it
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      add_document(index, "d1", "A completely new story about whales")
+      assert index["lengths"]["d1"] == 5
+      assert "d1" not in index["postings"]["quick"] and index["postings"]["whal"] == {"d1": [4]}
+      assert "lazy" not in index["postings"] and "jump" not in index["postings"]
+      assert index["docs"]["d1"] == "A completely new story about whales"
+      assert index["terms"]["d1"] == {"completely", "new", "story", "about", "whal"}
+      assert len(index["lengths"]) == 5
+  - name: removing documents
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert remove_document(index, "d4") is True
+      assert "d4" not in index["lengths"] and "d4" not in index["docs"] and "d4" not in index["terms"]
+      assert index["postings"]["search"] == {"d5": [3]}
+      assert "engin" not in index["postings"]
+      assert remove_document(index, "d4") is False and remove_document(index, "zzz") is False
+      for d in ["d1", "d2", "d3", "d5"]:
+          remove_document(index, d)
+      assert index == {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+  - name: build and rebuild agree
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      other = new_index()
+      for d in reversed(list(docs)):
+          add_document(other, d, docs[d])
+      assert other == index
+      assert new_index() == {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+      empty = build_index({"x": "the of and"})
+      assert empty["lengths"] == {"x": 0} and empty["postings"] == {} and empty["terms"] == {"x": set()}
+  hints:
+  - '`index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)` builds the nested structure.'
+  - The `terms` set tells you which postings lists to touch when removing a document.
+  solution: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+  explanation: 'Keeping the set of a document''s terms makes removal cheap: you touch only the postings that mention it.'
+- id: queries
+  title: 'Milestone 3: Word, phrase and exclusion queries'
+  difficulty: 5
+  prompt: The starter has the index functions. Write `search_all(index, query)` (sorted ids of documents containing every term of the query; `[]` if the query has no terms), `search_any(index, query)` (documents containing at least one term), `search_phrase(index, phrase)` (documents where the phrase's terms appear at consecutive positions, in order) and `search(index, query)`. In `search`, split the query into parts with `re.findall(r'-?"[^"]*"|-?\S+', query)`. A plain part is a word (or words, if tokenizing gives several) that must all appear; a part in double quotes is a phrase that must appear; a leading `-` makes the part an exclusion. Parts that tokenize to nothing are ignored. A query with no positive part finds nothing. Return sorted ids.
+  starter: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def search_all(index, query):
+        pass
+
+
+    def search_any(index, query):
+        pass
+
+
+    def search_phrase(index, phrase):
+        pass
+
+
+    def search(index, query):
+        pass
+  tests:
+  - name: all words and any word
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert search_all(index, "quick fox") == ["d1", "d2", "d3"]
+      assert search_all(index, "quick lazy") == ["d1"]
+      assert search_all(index, "quick zebra") == []
+      assert search_all(index, "the of") == [] and search_all(index, "") == []
+      assert search_all(index, "SEARCHES") == ["d4", "d5"]
+      assert search_any(index, "lazy loyal") == ["d1", "d3"]
+      assert search_any(index, "zebra fast") == ["d5"]
+      assert search_any(index, "the") == []
+  - name: phrases
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert search_phrase(index, "quick brown") == ["d1", "d2"]
+      assert search_phrase(index, "brown quick") == []
+      assert search_phrase(index, "quick fox") == ["d2", "d3"]
+      assert search_phrase(index, "search engines") == ["d4"]
+      assert search_phrase(index, "quick") == ["d1", "d2", "d3"]
+      assert search_phrase(index, "fox quick") == []
+      assert search_phrase(index, "document for fast") == ["d5"]      # stop words vanish, so these terms are adjacent
+      assert search_phrase(index, "the") == [] and search_phrase(index, "zebra stripes") == []
+  - name: the query language
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert search(index, "quick -lazy") == ["d2", "d3"]
+      assert search(index, '"quick fox"') == ["d2", "d3"]
+      assert search(index, '"quick fox" -dog') == []
+      assert search(index, "dog fox") == ["d1", "d2", "d3"]
+      assert search(index, "search -\"search engines\"") == ["d5"]
+      assert search(index, "documents -engines -fox") == ["d5"]
+      assert search(index, "quick fox -brown -loyal") == []
+      assert search(index, "QUICK   Fox") == ["d1", "d2", "d3"]
+  - name: odd queries
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert search(index, "-quick") == []
+      assert search(index, "") == [] and search(index, "   ") == []
+      assert search(index, "the quick") == ["d1", "d2", "d3"]
+      assert search(index, '"the" quick') == ["d1", "d2", "d3"]
+      assert search(index, '"" quick') == ["d1", "d2", "d3"]
+      assert search(index, "quick -the") == ["d1", "d2", "d3"]
+      assert search(index, "zebra") == []
+      assert search(index, "quick -") == ["d1", "d2", "d3"]
+  hints:
+  - 'Use sets: `set.intersection(*list_of_sets)` for AND and `-=` for exclusion.'
+  - For a phrase, a document matches if some position `s` of the first term has the term number `i` at position `s + i`.
+  solution: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def search_all(index, query):
+        """Sorted ids of the documents that contain every term of the query ([] if the query has no terms)."""
+        terms = tokenize(query)
+        if not terms:
+            return []
+        return sorted(set.intersection(*(set(index["postings"].get(t, {})) for t in terms)))
+
+
+    def search_any(index, query):
+        """Sorted ids of the documents that contain at least one term of the query."""
+        found = set()
+        for t in tokenize(query):
+            found |= set(index["postings"].get(t, {}))
+        return sorted(found)
+
+
+    def search_phrase(index, phrase):
+        """Sorted ids of the documents in which the phrase's terms appear next to each other, in order."""
+        terms = tokenize(phrase)
+        if not terms:
+            return []
+        found = []
+        for doc_id in search_all(index, phrase):
+            positions = [set(index["postings"][t][doc_id]) for t in terms]
+            if any(all(start + i in positions[i] for i in range(1, len(terms))) for start in positions[0]):
+                found.append(doc_id)
+        return found
+
+
+    def search(index, query):
+        """A tiny query language. Words must all appear; "quoted phrases" must appear as phrases; a leading minus
+        (-word or -"a phrase") excludes documents. Parts that contain no terms are ignored.
+        A query with no positive part finds nothing. Returns sorted document ids."""
+        must, must_not = [], []
+        for token in re.findall(r'-?"[^"]*"|-?\S+', query):
+            negative = token.startswith("-")
+            body = token[1:] if negative else token
+            if body.startswith('"'):
+                body = body.strip('"')
+                if not tokenize(body):
+                    continue
+                found = set(search_phrase(index, body))
+            else:
+                if not tokenize(body):
+                    continue
+                found = set(search_all(index, body))
+            (must_not if negative else must).append(found)
+        if not must:
+            return []
+        result = set.intersection(*must)
+        for excluded in must_not:
+            result -= excluded
+        return sorted(result)
+  explanation: 'Boolean search is set algebra. Positions add the one thing sets cannot express: order.'
+- id: ranking
+  title: 'Milestone 4: TF-IDF ranking'
+  difficulty: 4
+  prompt: The starter has the index. Write `idf(index, term)` as `ln((N + 1) / (df + 1)) + 1` with `N` the number of documents, `score(index, doc_id, terms)` (for each distinct term of `terms` that occurs in the document add `(1 + ln(tf)) * idf`, then divide the sum by the square root of the document's length; `0.0` for an unknown or empty document) and `rank(index, query, k=10)` returning the `k` best `(doc_id, score)` pairs among the documents containing at least one query term, best first, ties broken by document id. `k=0` gives an empty list.
+  starter: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def idf(index, term):
+        pass
+
+
+    def score(index, doc_id, terms):
+        pass
+
+
+    def rank(index, query, k=10):
+        pass
+  tests:
+  - name: idf
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      import math
+      assert abs(idf(index, "search") - (math.log(6 / 3) + 1)) < 1e-12
+      assert abs(idf(index, "lazy") - (math.log(6 / 2) + 1)) < 1e-12
+      assert abs(idf(index, "zebra") - (math.log(6 / 1) + 1)) < 1e-12
+      assert idf(index, "quick") < idf(index, "lazy") < idf(index, "zebra")
+      assert idf(index, "lazy") > 1.0
+  - name: scoring a document
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      import math
+      s = score(index, "d4", ["search"])
+      assert abs(s - (1 + math.log(2)) * (math.log(6 / 3) + 1) / math.sqrt(5)) < 1e-12
+      s = score(index, "d5", ["search", "fast", "zebra"])
+      assert abs(s - ((math.log(6 / 3) + 1) + (math.log(6 / 2) + 1)) / math.sqrt(4)) < 1e-12
+      assert score(index, "d1", ["search"]) == 0.0
+      assert score(index, "d4", ["search", "search"]) == score(index, "d4", ["search"])
+      assert score(index, "nope", ["search"]) == 0.0
+      index2 = build_index({"e": "the of", "f": "dog"})
+      assert score(index2, "e", ["dog"]) == 0.0
+  - name: ranking
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      r = rank(index, "search")
+      assert [d for d, s in r] == ["d4", "d5"] and r[0][1] > r[1][1]
+      assert [d for d, s in rank(index, "quick fox dog")] == ["d2", "d3", "d1"]
+      assert [d for d, s in rank(index, "quick fox dog", k=2)] == ["d2", "d3"]
+      assert rank(index, "zebra") == [] and rank(index, "the of") == [] and rank(index, "search", k=0) == []
+      assert [d for d, s in rank(index, "documents")] == ["d5", "d4"]
+      assert [d for d, s in rank(index, "brown")] == ["d2", "d1"]
+  - name: rarer words count more, and ties are ordered by id
+    code: |
+      index = build_index({"a": "common rare", "b": "common common", "c": "common filler words here", "d": "common"})
+      r = rank(index, "rare common")
+      assert r[0][0] == "a"
+      same = build_index({"y": "cat", "x": "cat", "z": "cat"})
+      assert [d for d, s in rank(same, "cat")] == ["x", "y", "z"]
+      assert len({round(s, 12) for d, s in rank(same, "cat")}) == 1
+  hints:
+  - '`math.log` is the natural logarithm and `math.sqrt` the square root.'
+  - '`scored.sort(key=lambda pair: (-pair[1], pair[0]))` sorts by score descending and then id ascending.'
+  solution: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def idf(index, term):
+        """Inverse document frequency: ln((N + 1) / (df + 1)) + 1, where N is the number of documents."""
+        return math.log((len(index["lengths"]) + 1) / (doc_frequency(index, term) + 1)) + 1
+
+
+    def score(index, doc_id, terms):
+        """Sum over the distinct query terms that occur in the document of (1 + ln(tf)) * idf, divided by sqrt(document length).
+        A document of length 0 scores 0.0."""
+        length = index["lengths"].get(doc_id, 0)
+        if length == 0:
+            return 0.0
+        total = 0.0
+        for term in set(terms):
+            tf = len(index["postings"].get(term, {}).get(doc_id, ()))
+            if tf:
+                total += (1 + math.log(tf)) * idf(index, term)
+        return total / math.sqrt(length)
+
+
+    def rank(index, query, k=10):
+        """The k best documents containing at least one query term, as (doc_id, score), best first (ties by doc_id)."""
+        terms = tokenize(query)
+        candidates = set()
+        for t in terms:
+            candidates |= set(index["postings"].get(t, {}))
+        scored = [(d, score(index, d, terms)) for d in candidates]
+        scored.sort(key=lambda pair: (-pair[1], pair[0]))
+        return scored[:max(k, 0)]
+  explanation: Two small ideas, diminishing returns for repeats and extra weight for rare words, already give a surprisingly good ranking.
+- id: suggest
+  title: 'Milestone 5: Autocomplete and spelling'
+  difficulty: 5
+  prompt: 'The starter has the index. Write `edit_distance(a, b)` (Levenshtein distance with dynamic programming), `complete(index, prefix, limit=5)` (index terms starting with the lower-cased prefix, ordered by document frequency descending and then alphabetically, at most `limit`; use a sorted term list and `bisect_left`) and `did_you_mean(index, word, max_distance=2)`: normalise `word` with `tokenize`; if that does not give exactly one term, or the term is already in the index, return `None`; otherwise return the index term with the smallest edit distance of at most `max_distance` (ties: higher document frequency first, then alphabetical), or `None` if there is none.'
+  starter: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def edit_distance(a, b):
+        pass
+
+
+    def complete(index, prefix, limit=5):
+        pass
+
+
+    def did_you_mean(index, word, max_distance=2):
+        pass
+  tests:
+  - name: edit distance
+    code: |
+      assert edit_distance("kitten", "sitting") == 3
+      assert edit_distance("same", "same") == 0
+      assert edit_distance("", "abc") == 3 and edit_distance("abc", "") == 3 and edit_distance("", "") == 0
+      assert edit_distance("flaw", "lawn") == 2
+      assert edit_distance("search", "serch") == 1 and edit_distance("search", "searhc") == 2
+      assert edit_distance("abc", "xyz") == 3
+      assert edit_distance("intention", "execution") == edit_distance("execution", "intention") == 5
+  - name: completion
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert complete(index, "s") == ["search"]
+      assert complete(index, "d") == ["dog", "document"]
+      assert complete(index, "do") == ["dog", "document"]
+      assert complete(index, "doc") == ["document"]
+      assert complete(index, "zzz") == []
+      assert complete(index, "DOC") == ["document"]
+      assert complete(index, "", limit=3) == ["dog", "fox", "quick"]
+      assert complete(index, "", limit=0) == []
+  - name: 'completion order: most common first'
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert complete(index, "", limit=5) == ["dog", "fox", "quick", "brown", "document"]
+      top = complete(index, "", limit=100)
+      dfs = [doc_frequency(index, t) for t in top]
+      assert dfs == sorted(dfs, reverse=True)
+      assert sorted(top) == sorted(index["postings"])
+      for df in set(dfs):
+          group = [t for t in top if doc_frequency(index, t) == df]
+          assert group == sorted(group)
+      assert top[:3] == ["dog", "fox", "quick"]
+  - name: did you mean
+    code: |
+      docs = {
+          "d1": "The quick brown fox jumps over the lazy dog",
+          "d2": "A quick brown dog outpaces a quick fox",
+          "d3": "Dogs are loyal; foxes are clever. Quick foxes win.",
+          "d4": "Searching: how search engines index documents",
+          "d5": "Indexing documents for fast searches",
+      }
+      index = build_index(docs)
+
+      assert did_you_mean(index, "serch") == "search"
+      assert did_you_mean(index, "searhc") == "search"
+      assert did_you_mean(index, "quik") == "quick"
+      assert did_you_mean(index, "Documnets") == "document"
+      assert did_you_mean(index, "xyzzy") is None
+      assert did_you_mean(index, "quick") is None          # already correct
+      assert did_you_mean(index, "") is None and did_you_mean(index, "the") is None
+      assert did_you_mean(index, "quick fox") is None
+      assert did_you_mean(index, "foz", max_distance=1) == "fox"
+      assert did_you_mean(index, "dogz", max_distance=0) is None
+  - name: ties go to the more common term
+    code: |
+      index = build_index({"1": "cat cat", "2": "cot", "3": "cut", "4": "cut"})
+      assert did_you_mean(index, "cxt") == "cut"
+      index = build_index({"1": "bat", "2": "bit"})
+      assert did_you_mean(index, "bxt") == "bat"
+  hints:
+  - 'Keep only the previous row of the table: `current[j]` depends on `previous[j]`, `previous[j - 1]` and `current[j - 1]`.'
+  - Compare tuples `(distance, -document_frequency, term)` with `min` or `<` to apply the tie-breaks in order.
+  solution: |
+    import math
+    import re
+    import unicodedata
+    from bisect import bisect_left
+
+    STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how", "in", "is", "it", "of", "on", "or",
+                  "that", "the", "to", "was", "with"}
+
+
+    def _undouble(base):
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+
+
+    def stem(word):
+        """A tiny suffix stripper: searching, searches and searched all become search. Real stemmers (Porter) do more."""
+        if len(word) <= 3:
+            return word
+        if word.endswith("ies") and len(word) > 4:
+            word = word[:-3] + "y"
+        elif word.endswith("ing") and len(word) > 5 and re.search("[aeiouy]", word[:-3]):
+            word = _undouble(word[:-3])
+        elif word.endswith("ed") and len(word) > 4 and re.search("[aeiouy]", word[:-2]):
+            word = _undouble(word[:-2])
+        elif word.endswith("es") and len(word) > 4:
+            word = word[:-2]
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word
+
+
+    def tokenize(text, stop_words=STOP_WORDS):
+        """Normalise text into index terms.
+
+        1. Remove accents (NFKD normalisation, then drop the combining marks) and lower-case the text.
+        2. Take the runs of the letters a-z and digits 0-9 as words.
+        3. Drop words of one character and words in stop_words (before stemming).
+        4. Stem every remaining word with stem().
+        """
+        decomposed = unicodedata.normalize("NFKD", text)
+        plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+        words = re.findall(r"[a-z0-9]+", plain)
+        return [stem(w) for w in words if len(w) > 1 and w not in stop_words]
+
+
+    def term_frequencies(tokens):
+        counts = {}
+        for t in tokens:
+            counts[t] = counts.get(t, 0) + 1
+        return counts
+
+
+    def new_index():
+        return {"postings": {}, "lengths": {}, "docs": {}, "terms": {}}
+
+
+    def add_document(index, doc_id, text):
+        """Index a document (replacing an older version with the same id).
+
+        postings[term][doc_id] is the list of positions of the term in the document's token list.
+        lengths[doc_id] is the number of tokens, docs[doc_id] the original text and terms[doc_id] the set of its terms.
+        """
+        if doc_id in index["docs"]:
+            remove_document(index, doc_id)
+        tokens = tokenize(text)
+        for position, term in enumerate(tokens):
+            index["postings"].setdefault(term, {}).setdefault(doc_id, []).append(position)
+        index["lengths"][doc_id] = len(tokens)
+        index["docs"][doc_id] = text
+        index["terms"][doc_id] = set(tokens)
+
+
+    def remove_document(index, doc_id):
+        """Forget a document. Terms that no document uses any more disappear. Returns False if the id is unknown."""
+        if doc_id not in index["docs"]:
+            return False
+        for term in index["terms"].pop(doc_id):
+            del index["postings"][term][doc_id]
+            if not index["postings"][term]:
+                del index["postings"][term]
+        del index["lengths"][doc_id]
+        del index["docs"][doc_id]
+        return True
+
+
+    def build_index(docs):
+        index = new_index()
+        for doc_id, text in docs.items():
+            add_document(index, doc_id, text)
+        return index
+
+
+    def doc_frequency(index, term):
+        return len(index["postings"].get(term, {}))
+
+
+    def edit_distance(a, b):
+        """Levenshtein distance: the fewest single-character insertions, deletions and substitutions turning a into b."""
+        previous = list(range(len(b) + 1))
+        for i, ca in enumerate(a, start=1):
+            current = [i]
+            for j, cb in enumerate(b, start=1):
+                current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+            previous = current
+        return previous[-1]
+
+
+    def complete(index, prefix, limit=5):
+        """Index terms that start with the (lower-cased) prefix, most common first (by document frequency, then alphabetically)."""
+        prefix = prefix.lower()
+        terms = sorted(index["postings"])
+        matches = []
+        for i in range(bisect_left(terms, prefix), len(terms)):
+            if not terms[i].startswith(prefix):
+                break
+            matches.append(terms[i])
+        matches.sort(key=lambda t: (-doc_frequency(index, t), t))
+        return matches[:max(limit, 0)]
+
+
+    def did_you_mean(index, word, max_distance=2):
+        """Suggest the index term nearest to a misspelt word, or None.
+
+        The word is normalised with tokenize(); it must give exactly one term. If that term is already in the index,
+        or no term is within max_distance edits, return None. Otherwise return the term with the smallest distance,
+        then the highest document frequency, then the alphabetically first.
+        """
+        found = tokenize(word)
+        if len(found) != 1 or found[0] in index["postings"]:
+            return None
+        target = found[0]
+        best = None
+        for term in index["postings"]:
+            if abs(len(term) - len(target)) > max_distance:
+                continue
+            d = edit_distance(target, term)
+            if d <= max_distance:
+                key = (d, -doc_frequency(index, term), term)
+                if best is None or key < best:
+                    best = key
+        return best[2] if best else None
+  explanation: Binary search finds where a prefix starts; dynamic programming measures how far apart two spellings are.
+commonMistakes:
+- title: Normalising documents and queries differently
+  explanation: Both must go through exactly the same tokenizer or terms will never match.
+- title: Rebuilding the whole index for one change
+  explanation: Store enough per document (its term set) to update the index incrementally.
+- title: Counting positions after removing stop words without knowing it
+  explanation: Phrases can match across a removed word; know this limitation or keep positions for every word.
+- title: Unstable ranking order
+  explanation: Break score ties with a fixed key such as the document id.
+- title: Putting untrusted text into HTML unescaped
+  explanation: Escape first, add markup second.
+- title: Comparing a typo with every word, always
+  explanation: Filter candidates by length or n-grams first; edit distance is quadratic in word length.
+summary:
+- An inverted index maps terms to postings so a query becomes a few lookups and set operations.
+- Normalisation (case, accents, stop words, stemming) decides what counts as the same word.
+- Positions enable phrase queries; sets give AND, OR and NOT.
+- TF-IDF rewards repeated and rare words and normalises for document length.
+- Binary search, edit distance and safe escaping make the engine pleasant and safe to use.
+next: u18-showcase
+quiz:
+- type: mcq
+  question: What is an inverted index?
+  options:
+  - A map from each term to the documents that contain it
+  - A list of documents sorted by size
+  - A reversed copy of each document
+  - A compressed file
+  answer: 0
+  explanation: It is inverted because it goes from words to documents rather than documents to words.
+- type: mcq
+  question: Why do queries and documents use the same tokenizer?
+  options:
+  - Otherwise their terms would not match
+  - To save memory
+  - To sort results
+  - It is required by Python
+  answer: 0
+  explanation: A term only matches if both sides are normalised in the same way.
+- type: mcq
+  question: What does IDF make larger?
+  options:
+  - The weight of words that appear in few documents
+  - The weight of very common words
+  - The length of documents
+  - The number of results
+  answer: 0
+  explanation: Rare words are more informative.
+- type: mcq
+  question: Why divide a score by the square root of the document length?
+  options:
+  - So long documents do not win just by containing more words
+  - To make scores integers
+  - To sort alphabetically
+  - To remove stop words
+  answer: 0
+  explanation: Length normalisation keeps the comparison fair.
+- type: mcq
+  question: Which set operation implements the exclusion -linked in a query?
+  options:
+  - Difference
+  - Union
+  - Intersection only
+  - Sorting
+  answer: 0
+  explanation: Remove the excluded documents from the result set.
+- type: mcq
+  question: Why escape document text before adding <mark> tags?
+  options:
+  - Document text is untrusted and could contain HTML or scripts
+  - mark tags are slow
+  - Escaping makes text shorter
+  - Browsers require it for fonts
+  answer: 0
+  explanation: Escape first, add trusted markup second.
+- type: code
+  question: Write `inverted(docs)` where `docs` maps ids to text. Return a dictionary mapping every lower-cased word (split on whitespace, no other cleaning) to the sorted list of ids of the documents that contain it.
+  starter: |
+    def inverted(docs):
+        pass
+  tests:
+  - name: inverted
+    code: |
+      r = inverted({"b": "Big cat", "a": "cat nap", "c": "Cat CAT"})
+      assert r == {"big": ["b"], "cat": ["a", "b", "c"], "nap": ["a"]}
+      assert inverted({}) == {}
+      assert inverted({"x": ""}) == {}
+  solution: |
+    def inverted(docs):
+        result = {}
+        for doc_id in sorted(docs):
+            for word in set(docs[doc_id].lower().split()):
+                result.setdefault(word, []).append(doc_id)
+        return result
