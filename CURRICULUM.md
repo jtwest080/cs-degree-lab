@@ -25,8 +25,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 17 | AI & Machine Learning | ✅ Complete (Phase 16) | 9 | 45 | Mini AI Toolkit (A* search, perfect tic-tac-toe, naive Bayes, linear regression, k-means, a small neural network) |
 | 18 | Capstone Projects | ✅ Complete (Phase 17) | 8 | 40 | Notes Service (accounts, signed tokens, a crash-safe log-structured store, validation, rate limiting and security headers in one web API) |
 | 19 | Linear Algebra (Version 2) | ✅ Complete (Phase 18) | 9 | 45 | Data Lab (exact solver, rank, determinant, least-squares line, power iteration, PageRank, cosine similarity, rotations) |
+| 20 | Calculus (Version 2) | ✅ Complete (Phase 19) | 7 | 35 | Calculus Toolkit (derivative, Simpson integration, bisection and Newton roots, RK4 ODE solver, series sine, gradient, backtracking minimizer) |
 
-Totals: 166 lessons, 783 practice exercises, 166 lesson quizzes (996 multiple-choice questions + 166 coding questions), 19 unit projects, 1571 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Unit 19 done; Units 20 Calculus and 21 Probability & Statistics next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 173 lessons, 818 practice exercises, 173 lesson quizzes (1038 multiple-choice questions + 173 coding questions), 20 unit projects, 1627 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra and 20 Calculus done; Unit 21 Probability & Statistics next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -481,9 +482,25 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Unit 20 can assume:** everything through Unit 19. Calculus (Unit 20) should be taught from zero (limits, derivatives, integrals, series) with numerical code in pure Python, and can use vectors for gradients and matrices for the multivariable chain rule.
 
+## Unit 20: Calculus (Version 2) ✅
+
+| Lesson | Id | Covers |
+|---|---|---|
+| 20.1 Rates of Change and Limits | `u20-limits` | average rate, instantaneous speed as a limit, numeric limit estimates, continuity (removable, jump, infinite) |
+| 20.2 Derivatives and the Rules | `u20-derivatives` | derivative as slope, power/sum/product/quotient/chain rules, tangent lines, gradient checking, a symbolic differentiator |
+| 20.3 Using Derivatives | `u20-applications` | bisection, Newton's method, critical points, optimization, 1D gradient descent |
+| 20.4 Integrals | `u20-integrals` | Riemann sums, trapezoids, Simpson, Fundamental Theorem, distance from speed, average value, adaptive Simpson |
+| 20.5 Differential Equations | `u20-ode` | Euler, RK4, Newton cooling, logistic growth, SIR epidemic |
+| 20.6 Series and Taylor Series | `u20-series` | geometric series, Taylor series of e^x/sin/cos, computing pi, argument reduction |
+| 20.7 Gradients | `u20-gradients` | partial derivatives, gradient, directional derivative, gradient descent, line fit, backtracking |
+
+**Project: Calculus Toolkit.** Learners write `derivative`, `integrate`, `area_between`, `find_root`, `newton`, `solve_ode`, `my_sin`, `gradient` and `minimize`. 12 checklist items, 12 tests.
+
+**Unit 21 can assume:** everything through Unit 20. Probability and statistics should be taught from zero (counting, probability rules, distributions, expectation, Bayes, sampling, hypothesis tests, regression) with seeded random simulation in pure Python, and can use integrals for densities.
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Unit 20 Calculus, Unit 21 Probability & Statistics, then timed exams/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Unit 21 Probability & Statistics, then timed exams/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -510,3 +527,4 @@ Version 2 plan: Unit 20 Calculus, Unit 21 Probability & Statistics, then timed e
 - **Phase 16 (2026-11-13):** complete Unit 17 (9 lessons, 45 exercises, 9 quizzes, Mini AI Toolkit project, 136 glossary terms). No framework changes; all Python, no external libraries.
 - **Phase 17 (2026-11-13):** complete Unit 18 (8 lessons, 40 exercises, 8 quizzes, Notes Service project, 84 glossary terms). No framework changes; all Python. This completes the curriculum.
 - **Phase 18 (2026-11-14):** Version 2 begins. Complete Unit 19 Linear Algebra (9 lessons, 45 exercises, 9 quizzes, Data Lab project, 65 glossary terms). No framework changes; all Python.
+- **Phase 19 (2026-11-14):** Version 2 continues. Complete Unit 20 Calculus (7 lessons, 35 exercises, 7 quizzes, Calculus Toolkit project, 56 glossary terms). No framework changes; all Python.
