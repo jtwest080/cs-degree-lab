@@ -24,8 +24,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 16 | Security | ✅ Complete (Phase 15) | 9 | 44 | Security Toolkit (safe paths, HTML escaping, password hashing, signed cookies, parameterised queries, rate limiting) |
 | 17 | AI & Machine Learning | ✅ Complete (Phase 16) | 9 | 45 | Mini AI Toolkit (A* search, perfect tic-tac-toe, naive Bayes, linear regression, k-means, a small neural network) |
 | 18 | Capstone Projects | ✅ Complete (Phase 17) | 8 | 40 | Notes Service (accounts, signed tokens, a crash-safe log-structured store, validation, rate limiting and security headers in one web API) |
+| 19 | Linear Algebra (Version 2) | ✅ Complete (Phase 18) | 9 | 45 | Data Lab (exact solver, rank, determinant, least-squares line, power iteration, PageRank, cosine similarity, rotations) |
 
-Totals: 157 lessons, 738 practice exercises, 157 lesson quizzes (942 multiple-choice questions + 157 coding questions), 18 unit projects, 1506 glossary terms. All 18 units are complete. Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 166 lessons, 783 practice exercises, 166 lesson quizzes (996 multiple-choice questions + 166 coding questions), 19 unit projects, 1571 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Unit 19 done; Units 20 Calculus and 21 Probability & Statistics next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -462,9 +463,27 @@ Language: Python (Pyodide). Seven capstones built from scratch with the standard
 
 Notes for later maintainers: example outputs must not start with spaces (a YAML literal block would need an indentation indicator), exercise functions are never named `run`, and the lessons avoid output that depends on the Python version (for example exact TypeError messages).
 
+## Unit 19: Linear Algebra (Version 2) ✅
+
+| Lesson | Id | Covers |
+|---|---|---|
+| 19.1 Vectors | `u19-vectors` | arithmetic, dot product, norm, cosine similarity, orthogonality, projection, cross product |
+| 19.2 Matrices | `u19-matrices` | shape, transpose, identity, matrix-vector and matrix-matrix products, powers, rotations, walk counting, Markov chains |
+| 19.3 Systems of Equations | `u19-systems` | row operations, back substitution, Gaussian elimination with partial pivoting, residuals, reduced row echelon form |
+| 19.4 Determinants and Inverses | `u19-inverses` | determinant as area factor, cofactors, elimination, Gauss-Jordan inverse, Cramer's rule, Hill cipher |
+| 19.5 Span, Independence, Basis and Rank | `u19-spaces` | span, independence, basis, rank, pivot columns, null space, rank-nullity, coordinates |
+| 19.6 Linear Transformations | `u19-transforms` | linearity test, matrix from basis images, shears/reflections/projections, composition order, area scaling |
+| 19.7 Orthogonality and Least Squares | `u19-least-squares` | Gram-Schmidt, normal equations, line and polynomial fits, R squared, overfitting |
+| 19.8 Eigenvalues and Eigenvectors | `u19-eigen` | characteristic equation, eigenvectors, power iteration, golden ratio, PageRank |
+| 19.9 Applications | `u19-applications` | covariance, PCA, rank-one approximation (SVD idea), cosine-similarity recommendations |
+
+**Project: Data Lab.** Learners write `solve_system`, `rank`, `determinant`, `line_fit`, `dominant_eigen`, `pagerank`, `cosine_similarity` and `rotate_points`. 12 checklist items, 12 tests.
+
+**Unit 20 can assume:** everything through Unit 19. Calculus (Unit 20) should be taught from zero (limits, derivatives, integrals, series) with numerical code in pure Python, and can use vectors for gradients and matrices for the multivariable chain rule.
+
 ## Plan for remaining units (to refine before each phase)
 
-None: all 18 units are complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Unit 20 Calculus, Unit 21 Probability & Statistics, then timed exams/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -490,3 +509,4 @@ None: all 18 units are complete. Possible future work: more review-deck coverage
 - **Phase 15 (2026-11-13):** complete Unit 16 (9 lessons, 44 exercises, 9 quizzes, Security Toolkit project, 84 glossary terms). The Python test harness now provides `hashlib.pbkdf2_hmac` (missing in Pyodide).
 - **Phase 16 (2026-11-13):** complete Unit 17 (9 lessons, 45 exercises, 9 quizzes, Mini AI Toolkit project, 136 glossary terms). No framework changes; all Python, no external libraries.
 - **Phase 17 (2026-11-13):** complete Unit 18 (8 lessons, 40 exercises, 8 quizzes, Notes Service project, 84 glossary terms). No framework changes; all Python. This completes the curriculum.
+- **Phase 18 (2026-11-14):** Version 2 begins. Complete Unit 19 Linear Algebra (9 lessons, 45 exercises, 9 quizzes, Data Lab project, 65 glossary terms). No framework changes; all Python.
