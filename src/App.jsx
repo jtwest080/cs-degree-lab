@@ -7,6 +7,8 @@ import LessonView from './components/LessonView.jsx';
 import ProjectView from './components/ProjectView.jsx';
 import Review from './components/Review.jsx';
 import Exams from './components/Exams.jsx';
+import { CapstoneList, CapstoneView } from './components/Capstones.jsx';
+import Reading from './components/Reading.jsx';
 import Glossary from './components/Glossary.jsx';
 import Settings from './components/Settings.jsx';
 import { registerServiceWorker } from './lib/installApp.js';
@@ -40,6 +42,12 @@ export default function App() {
       break;
     case 'exams':
       page = <Exams />;
+      break;
+    case 'capstones':
+      page = route.param ? <CapstoneView key={route.param} id={route.param} /> : <CapstoneList />;
+      break;
+    case 'reading':
+      page = <Reading />;
       break;
     case 'glossary':
       page = <Glossary initialQuery={route.param} />;

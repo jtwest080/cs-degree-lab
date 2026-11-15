@@ -37,6 +37,8 @@ export default function Layout({ route, children }) {
           {link(href.dashboard(), 'Dashboard', 'dashboard')}
           {link(href.review(), 'Review', 'review', due)}
           {link(href.exams(), 'Exams', 'exams')}
+          {link(href.capstones(), 'Capstones', 'capstones')}
+          {link(href.reading(), 'Reading', 'reading')}
           {link(href.glossary(), 'Glossary', 'glossary')}
           {link(href.settings(), 'Settings', 'settings')}
           <button className="theme-btn" onClick={cycleTheme} title="Change theme (auto follows your device)">

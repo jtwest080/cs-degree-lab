@@ -13,6 +13,8 @@ const emptyState = () => ({
   projects: {}, // unitNumber -> { checklist: {}, passed, code }
   srs: {}, // cardId -> { box, due }
   exams: [], // past exam attempts, newest first
+  capstones: {}, // capstoneId -> { scores: {criterionIndex: 0-3}, notes, passedAt }
+  reading: {}, // readingId -> ISO date when marked read
   code: {}, // editorKey -> last code typed (so nothing is lost on reload)
   settings: { theme: 'system', unlockAll: false },
   activity: {}, // 'YYYY-MM-DD' -> number of things done that day
