@@ -31,8 +31,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 23 | Compilers (Version 2) | ✅ Complete (Phase 23) | 7 | 35 | Mini Compiler (tokenizer, precedence parser, name checker, three-address code, optimizer, bytecode, assembler, virtual machine) |
 | 24 | Distributed Systems (Version 2) | ✅ Complete (Phase 24) | 7 | 35 | Mini Key-Value Cluster (hash ring, replicas, quorums, read repair, rebalancing, anti-entropy) |
 | 25 | Database Internals (Version 2) | ✅ Complete (Phase 25) | 7 | 35 | Mini Database (typed tables, keys, indexes, planner, SELECT/UPDATE/DELETE, transactions with rollback) |
+| 26 | Computer Graphics (Version 2, elective) | ✅ Complete (Phase 26) | 7 | 35 | Mini 3D Renderer (rotation, perspective, normals and lighting, back-face culling, depth-buffered triangle fill, shaded cube) |
 
-Totals: 209 lessons, 998 practice exercises, 209 lesson quizzes (1254 multiple-choice questions + 209 coding questions), 25 unit projects, 1995 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers and 24 Distributed Systems and 25 Database Internals done, plus a timed Exams page; electives next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 216 lessons, 1033 practice exercises, 216 lesson quizzes (1296 multiple-choice questions + 216 coding questions), 26 unit projects, 2085 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics elective done, plus a timed Exams page; HCI elective, rubric projects and reading lists next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -584,9 +585,25 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Unit 26 can assume:** everything through Unit 25. Later electives can use indexes, transactions, query processing and design theory freely.
 
+## Unit 26: Computer Graphics (Version 2, elective) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 26.1 Pixels, Lines and Triangles | `u26-raster` | canvas, clipping, Bresenham lines, edge functions and barycentric coordinates, circles, flood fill, scanline polygon fill |
+| 26.2 Vectors, Matrices and 3D | `u26-transforms` | dot and cross products, matrix multiplication, 2D and 3D transformation matrices, homogeneous coordinates, composition order, perspective, wireframe cube |
+| 26.3 Colour and Images | `u26-color` | RGB and hex, HSV, alpha blending, luminance, image filters, gamma, dithering, convolution (blur, sharpen, edges), histograms |
+| 26.4 Ray Tracing | `u26-raytrace` | camera rays, ray-sphere intersection, normals, reflection, Lambert lighting, shadows, an ASCII ray tracer |
+| 26.5 Shading and Hidden Surfaces | `u26-shading` | triangle normals and area, back-face culling, Phong lighting, Gouraud shading, depth buffer, triangle renderer |
+| 26.6 Curves, Noise and Fractals | `u26-curves` | lerp, Bezier curves (de Casteljau and Bernstein), splines, smoothstep, value noise and fBm, Mandelbrot set |
+| 26.7 Animation and Physics | `u26-animation` | easing and keyframes, Euler and Verlet integration, bouncing and springs, collisions, particle systems, fixed time step loop |
+
+**Project: Mini 3D Renderer.** Learners write `rotate_y`, `rotate_x`, `transform_vertex`, `project`, `to_screen`, `face_normal`, `face_brightness`, `is_visible`, `fill_triangle` and `render_mesh` (the cube mesh, vector helpers, canvas, depth buffer and barycentric function are given). 9 checklist items, 9 tests.
+
+**Later electives can assume:** everything through Unit 26. Graphics, vectors and matrices, interpolation, simulation by small time steps, and seeded noise are familiar.
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals and the timed exams page are done; next electives (graphics, HCI), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics (elective) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -620,3 +637,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 23 (2026-11-15):** Version 2 continues. Complete Unit 23 Compilers (7 lessons, 35 exercises, 7 quizzes, Mini Compiler project, 63 glossary terms). No framework changes; all Python.
 - **Phase 24 (2026-11-15):** Version 2 continues. Complete Unit 24 Distributed Systems (7 lessons, 35 exercises, 7 quizzes, Mini Key-Value Cluster project, 72 glossary terms). No framework changes; all Python.
 - **Phase 25 (2026-11-15):** Version 2 continues. Complete Unit 25 Database Internals (7 lessons, 35 exercises, 7 quizzes, Mini Database project, 77 glossary terms). No framework changes; all Python.
+- **Phase 26 (2026-11-15):** Version 2 continues. Complete Unit 26 Computer Graphics elective (7 lessons, 35 exercises, 7 quizzes, Mini 3D Renderer project, 90 glossary terms). No framework changes; all Python.
