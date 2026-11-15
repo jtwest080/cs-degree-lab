@@ -1,0 +1,959 @@
+id: u22-randomized
+title: Randomized and Streaming Algorithms
+minutes: 90
+objective: 'Learn how a little randomness makes algorithms faster, simpler and able to work on data too big to store: random pivots, fair shuffles and sampling, Bloom filters, count-min sketches, and MinHash for finding near-duplicate documents. This builds directly on the probability you studied.'
+outcomes:
+- Explain expected-time guarantees of randomized algorithms
+- Implement a fair shuffle and reservoir sampling
+- Build a Bloom filter and predict its false positive rate
+- Count and find frequent items in a stream with small memory
+- Estimate set similarity with MinHash
+sections:
+- heading: Randomness as a tool
+  body: |-
+    Why would a deterministic, logical machine want to flip coins? Because a random choice can defeat a hostile or unlucky input. Quicksort picks a **pivot** (a value to split the list around). If you always take the first element, an already sorted list is the worst case and takes `n squared` steps. If you choose the pivot at *random*, no input is systematically bad: the **expected** running time (the average over the algorithm's own random choices, not over inputs) is `O(n log n)` for *every* input. We call it a **Las Vegas algorithm** when the answer is always correct and only the running time is random. **Quickselect** uses the same idea to find the k-th smallest value, such as the median, in expected `O(n)` time, without sorting everything.
+
+    Randomness also gives fairness. A **shuffle** must make every ordering equally likely. The **Fisher-Yates shuffle** does it: go from the end of the list downwards, swapping each position with a random position at or before it. A common wrong version, swapping each item with a random position anywhere in the list, produces uneven results; this subtle bug has appeared in real card games. With `n` items there are `n!` orderings, and Fisher-Yates reaches each with probability exactly `1/n!`. Be sure to seed random generators when you need *reproducible* results, as in the tests.
+- heading: Streams and sampling
+  body: |-
+    Sometimes data arrives as a **stream**: too large to keep, such as every search on a website today, or sensor readings that never stop. You see each item once, and you have only a little memory. **Reservoir sampling** picks `k` items uniformly at random from a stream whose length you do not know in advance. Keep the first `k` items. The item at position `i` (counting from 0) then replaces a random stored item with probability `k/(i+1)`. A short calculation shows that at every moment each item seen so far is in the sample with equal probability, and you only ever store `k` items.
+
+    **Streaming algorithms** extend this idea: answer questions about huge data with memory far smaller than the data. The **Misra-Gries** algorithm finds frequently occurring items using only `k - 1` counters. It keeps a counter for each candidate, and when a new item arrives with no free counter it lowers *every* counter by one (this cancels `k` different items at once, which can happen at most `n/k` times), so any item occurring more than `n/k` times must survive. A **count-min sketch** estimates how many times any item occurred, using a small table: several rows, each with its own hash function, and `item` adds 1 to one cell per row. Collisions can only add extra counts, so the estimate (the *minimum* over the rows) never underestimates and is usually close.
+- heading: Bloom filters and MinHash
+  body: |-
+    A **Bloom filter** answers "have I seen this item?" with very little memory. It is just an array of bits (0 or 1) and several hash functions. To **add** an item, set the bits at the positions given by its hashes. To **ask**, look at those same positions: if any bit is 0 the item was *definitely never added* (no false negatives); if all are 1 it was *probably* added, but other items might have set those bits by coincidence (a **false positive**). The false positive rate is about `(1 - e^(-kn/m))^k` for `m` bits, `n` items and `k` hash functions, so you can choose `m` to hit a target such as 1 percent. Browsers use Bloom filters to check URLs against lists of dangerous sites, and databases use them to skip disk reads for keys that are not there.
+
+    Finally, **MinHash** finds near-duplicate documents. Cut a document into overlapping pieces called **shingles** (every run of `k` letters or words), giving a set. The **Jaccard similarity** of two sets, overlap divided by union, measures how alike they are. Comparing every pair of a million documents is impossible, but here is the trick: hash every element of a set with a random hash function and keep the *minimum* hash. For two sets, the chance their minimums are equal is exactly their Jaccard similarity. Repeat with 100 hash functions to build a short **signature**, and the fraction of matching positions estimates the similarity, from a 100-number summary instead of the whole document. Search engines use this to detect duplicate web pages.
+examples:
+- title: Random pivots and fair samples
+  intro: Sorting a sorted list safely, selecting the smallest items, shuffling and sampling a stream.
+  code: |
+    import random
+
+
+    def random_quicksort(values, seed=0):
+        """Sort with quicksort using a RANDOM pivot (rng = random.Random(seed); pivot = values[rng.randrange(len(values))]).
+        Split into smaller, equal and larger lists, sort smaller and larger recursively. Return (sorted list, comparisons) where every call
+        on a list with more than 1 item adds len(that list) to the comparison count. The input list is not changed."""
+        rng = random.Random(seed)
+        count = 0
+
+        def sort(items):
+            nonlocal count
+            if len(items) <= 1:
+                return items
+            count += len(items)
+            pivot = items[rng.randrange(len(items))]
+            smaller = [x for x in items if x < pivot]
+            equal = [x for x in items if x == pivot]
+            larger = [x for x in items if x > pivot]
+            return sort(smaller) + equal + sort(larger)
+
+        return sort(list(values)), count
+
+
+    def quickselect(values, k, seed=0):
+        """The k-th smallest value (k = 0 is the smallest) in expected O(n) time: choose a random pivot, split into smaller / equal / larger,
+        and continue in whichever part contains position k. ValueError unless 0 <= k < len(values)."""
+        if not 0 <= k < len(values):
+            raise ValueError("k out of range")
+        rng = random.Random(seed)
+        items = list(values)
+        while True:
+            pivot = items[rng.randrange(len(items))]
+            smaller = [x for x in items if x < pivot]
+            equal = [x for x in items if x == pivot]
+            if k < len(smaller):
+                items = smaller
+            elif k < len(smaller) + len(equal):
+                return pivot
+            else:
+                k -= len(smaller) + len(equal)
+                items = [x for x in items if x > pivot]
+
+
+    def fisher_yates(items, seed=0):
+        """A uniformly random shuffle (rng = random.Random(seed)): for i from the last index down to 1 swap items[i] with items[j],
+        where j = rng.randrange(i + 1). Return a new list; do not change the input."""
+        rng = random.Random(seed)
+        out = list(items)
+        for i in range(len(out) - 1, 0, -1):
+            j = rng.randrange(i + 1)
+            out[i], out[j] = out[j], out[i]
+        return out
+
+
+    def reservoir_sample(stream, k, seed=0):
+        """Choose k items uniformly at random from a stream of unknown length, seeing each item once and storing only k. Keep the first k;
+        for the item with index i >= k, draw j = rng.randrange(i + 1) and if j < k replace reservoir[j] with the item.
+        ValueError if k < 0. If the stream has fewer than k items return them all."""
+        if k < 0:
+            raise ValueError("k must not be negative")
+        rng = random.Random(seed)
+        reservoir = []
+        for i, item in enumerate(stream):
+            if i < k:
+                reservoir.append(item)
+            else:
+                j = rng.randrange(i + 1)
+                if j < k:
+                    reservoir[j] = item
+        return reservoir
+
+    data = list(range(2000))
+    _, steps = random_quicksort(data, seed=1)
+    print("sorting an already sorted list of 2000 used", steps, "comparisons (a naive pivot would use about 2,000,000)")
+    print("the 3 smallest of a shuffled list:", [quickselect(fisher_yates(data, 5), k, 9) for k in range(3)])
+    print("random sample of 5 from a stream of a million:", reservoir_sample(range(1_000_000), 5, seed=2))
+    print("shuffled deck of 8:", fisher_yates(list(range(8)), seed=4))
+  output: |
+    sorting an already sorted list of 2000 used 24423 comparisons (a naive pivot would use about 2,000,000)
+    the 3 smallest of a shuffled list: [0, 1, 2]
+    random sample of 5 from a stream of a million: [436442, 967572, 724012, 190270, 806412]
+    shuffled deck of 8: [1, 6, 5, 4, 7, 0, 2, 3]
+  lines:
+  - line: 75
+    note: Random pivots avoid the worst case.
+  - line: 77
+    note: Fair sample from a million items using five slots.
+- title: Filters, sketches and MinHash
+  intro: A Bloom filter's false alarms match the theory; count words in a tiny table; estimate document similarity.
+  code: |
+    import random
+
+
+    import math
+
+
+    def stable_hash(item, seed=0):
+        """A hash that is the same on every run (Python's built-in hash for strings is randomised): FNV-1a over str(item) with a seed mixed in, then a few shifts and multiplications so that the bits are well scrambled."""
+        h = (2166136261 ^ (seed * 2654435761)) % 2 ** 32
+        for ch in str(item):
+            h = ((h ^ ord(ch)) * 16777619) % 2 ** 32
+        h ^= h >> 16
+        h = (h * 2246822507) % 2 ** 32
+        h ^= h >> 13
+        h = (h * 3266489909) % 2 ** 32
+        h ^= h >> 16
+        return h
+
+
+    def bloom_new(m):
+        """A Bloom filter: a list of m bits, all 0. ValueError if m < 1."""
+        if m < 1:
+            raise ValueError("need at least one bit")
+        return [0] * m
+
+
+    def bloom_add(bits, item, k):
+        """Set k bits: for i in range(k), position stable_hash(item, i) % len(bits)."""
+        for i in range(k):
+            bits[stable_hash(item, i) % len(bits)] = 1
+
+
+    def bloom_contains(bits, item, k):
+        """False means DEFINITELY not added; True means PROBABLY added (all k bits are set)."""
+        return all(bits[stable_hash(item, i) % len(bits)] for i in range(k))
+
+
+    def expected_false_positive_rate(m, n, k):
+        """The theoretical chance that an item never added tests as present, after n items were added to m bits using k hashes:
+        (1 - e^(-k * n / m)) ^ k."""
+        return (1 - math.exp(-k * n / m)) ** k
+
+
+    def best_hash_count(m, n):
+        """The number of hash functions that minimises the false positive rate: round((m / n) * ln 2), at least 1."""
+        return max(1, round(m / n * math.log(2)))
+
+
+    def cm_new(width, depth):
+        """A count-min sketch: `depth` rows of `width` counters, all 0."""
+        return [[0] * width for _ in range(depth)]
+
+
+    def cm_add(table, item, count=1):
+        """Add `count` to one counter per row: row r, column stable_hash(item, r) % width."""
+        width = len(table[0])
+        for r, row in enumerate(table):
+            row[stable_hash(item, r) % width] += count
+
+
+    def cm_estimate(table, item):
+        """The smallest of the item's counters. It never underestimates (other items only add), so the minimum is closest."""
+        width = len(table[0])
+        return min(row[stable_hash(item, r) % width] for r, row in enumerate(table))
+
+
+    def misra_gries(stream, k):
+        """Find the frequent items of a stream with at most k - 1 counters. For each item x: if x has a counter, add 1; else if fewer than
+        k - 1 counters exist, start x at 1; otherwise subtract 1 from every counter and delete those that reach 0. Return the counter
+        dictionary. Every item that occurs more than len(stream) / k times is guaranteed to be in it. ValueError if k < 2."""
+        if k < 2:
+            raise ValueError("k must be at least 2")
+        counters = {}
+        for x in stream:
+            if x in counters:
+                counters[x] += 1
+            elif len(counters) < k - 1:
+                counters[x] = 1
+            else:
+                for key in list(counters):
+                    counters[key] -= 1
+                    if counters[key] == 0:
+                        del counters[key]
+        return counters
+
+
+    def jaccard(a, b):
+        """The exact similarity of two collections treated as sets: size of the overlap divided by size of the union (1.0 if both are empty)."""
+        a, b = set(a), set(b)
+        union = a | b
+        return len(a & b) / len(union) if union else 1.0
+
+
+    def shingles(text, k):
+        """The set of all substrings of length k (k-shingles). ValueError if k < 1; empty set if the text is shorter than k."""
+        if k < 1:
+            raise ValueError("k must be at least 1")
+        return {text[i:i + k] for i in range(len(text) - k + 1)}
+
+
+    def minhash_signature(items, num_hashes, seed=0):
+        """A short fingerprint of a set. With P = 2**61 - 1 and rng = random.Random(seed), make num_hashes pairs (a, b) with
+        a = rng.randrange(1, P) and b = rng.randrange(0, P). Position i of the signature is the minimum over the items of
+        (a * stable_hash(item) + b) % P. ValueError for an empty collection."""
+        items = set(items)
+        if not items:
+            raise ValueError("empty set")
+        P = 2 ** 61 - 1
+        rng = random.Random(seed)
+        params = [(rng.randrange(1, P), rng.randrange(0, P)) for _ in range(num_hashes)]
+        hashed = [stable_hash(x) for x in items]
+        return [min((a * h + b) % P for h in hashed) for a, b in params]
+
+
+    def estimate_jaccard(sig_a, sig_b):
+        """The fraction of positions where two signatures agree: an estimate of the Jaccard similarity. ValueError if lengths differ or are 0."""
+        if len(sig_a) != len(sig_b) or not sig_a:
+            raise ValueError("signatures must have the same non-zero length")
+        return sum(1 for x, y in zip(sig_a, sig_b) if x == y) / len(sig_a)
+
+    bits = bloom_new(2000)
+    seen = ["user%d" % i for i in range(200)]
+    for name in seen:
+        bloom_add(bits, name, 6)
+    print("known user found:", bloom_contains(bits, "user7", 6))
+    wrong = sum(bloom_contains(bits, "other%d" % i, 6) for i in range(1000))
+    print("false alarms among 1000 strangers:", wrong, " theory predicts about", round(1000 * expected_false_positive_rate(2000, 200, 6)))
+    words = "the cat sat on the mat and the cat sat on the hat".split()
+    table = cm_new(40, 4)
+    for w in words:
+        cm_add(table, w)
+    print("estimated count of 'the':", cm_estimate(table, "the"), " 'cat':", cm_estimate(table, "cat"))
+    print("candidates for frequent words (anything above 13/4 uses must be here):", misra_gries(words, 4))
+    a = shingles("data structures and algorithms", 3)
+    b = shingles("data structure and algorithm", 3)
+    print("exact similarity:", round(jaccard(a, b), 3))
+    print("estimated from 200 numbers:", round(estimate_jaccard(minhash_signature(a, 200, 1), minhash_signature(b, 200, 1)), 3))
+  output: |
+    known user found: True
+    false alarms among 1000 strangers: 9  theory predicts about 8
+    estimated count of 'the': 4  'cat': 2
+    candidates for frequent words (anything above 13/4 uses must be here): {'the': 1}
+    exact similarity: 0.8
+    estimated from 200 numbers: 0.79
+  lines:
+  - line: 127
+    note: The measured rate matches the theory.
+  - line: 132
+    note: Never below the true count.
+  - line: 137
+    note: Close to the exact value.
+playground:
+  prompt: Shuffle a list with a seed, then with another, and compare.
+  code: |
+    import random
+    items = list(range(5))
+    random.Random(1).shuffle(items)
+    print(items)
+exercises:
+- id: random-pivot
+  title: 'Random pivots: quicksort and quickselect'
+  difficulty: 4
+  prompt: 'Write `random_quicksort(values, seed=0)`: use `rng = random.Random(seed)`; sort recursively by picking `pivot = items[rng.randrange(len(items))]` and splitting into `smaller`, `equal` and `larger` lists; every call on a list with more than 1 item adds `len(items)` to a comparison counter. Return `(sorted_list, comparisons)` and do not change the input. Write `quickselect(values, k, seed=0)`: the k-th smallest value (`k = 0` is the smallest) by choosing a random pivot, splitting the same way and continuing in the part that contains position `k` (`ValueError` unless `0 <= k < len(values)`).'
+  starter: |-
+    import random
+
+
+    def random_quicksort(values, seed=0):
+        """Sort with quicksort using a RANDOM pivot (rng = random.Random(seed); pivot = values[rng.randrange(len(values))]).
+        Split into smaller, equal and larger lists, sort smaller and larger recursively. Return (sorted list, comparisons) where every call
+        on a list with more than 1 item adds len(that list) to the comparison count. The input list is not changed."""
+        pass
+
+
+    def quickselect(values, k, seed=0):
+        """The k-th smallest value (k = 0 is the smallest) in expected O(n) time: choose a random pivot, split into smaller / equal / larger,
+        and continue in whichever part contains position k. ValueError unless 0 <= k < len(values)."""
+        pass
+  tests:
+  - name: sorting
+    code: |
+      import random
+      rng = random.Random(1)
+      data = [rng.randrange(0, 100) for _ in range(300)]
+      copy = list(data)
+      result, count = random_quicksort(data, 5)
+      assert result == sorted(data) and data == copy
+      assert random_quicksort([], 0) == ([], 0) and random_quicksort([7], 0) == ([7], 0)
+      assert random_quicksort([3, 3, 3, 3], 0)[0] == [3, 3, 3, 3]
+      assert random_quicksort([2, 1], 3)[0] == [1, 2]
+  - name: random pivots beat bad inputs
+    code: |
+      n = 1000
+      ordered = list(range(n))
+      _, c1 = random_quicksort(ordered, 1)
+      _, c2 = random_quicksort(ordered[::-1], 2)
+      assert c1 < 25 * n and c2 < 25 * n
+      assert random_quicksort(ordered, 1) == random_quicksort(ordered, 1)
+      assert all(random_quicksort(list(range(200)), s)[1] < 8000 for s in range(10))
+      same = random_quicksort([5] * 500, 0)[1]
+      assert same == 500
+  - name: quickselect
+    code: |
+      import random
+      rng = random.Random(4)
+      data = [rng.randrange(0, 50) for _ in range(101)]
+      ordered = sorted(data)
+      before = list(data)
+      for k in (0, 1, 50, 99, 100):
+          assert quickselect(data, k, 7) == ordered[k]
+      assert quickselect([9], 0) == 9
+      assert quickselect([4, 4, 4], 2) == 4
+      for k in (-1, 3):
+          try:
+              quickselect([1, 2, 3], k)
+              raise AssertionError("accepted")
+          except ValueError:
+              pass
+      assert data == before
+  hints:
+  - The pivot is chosen at random so no particular input is always bad.
+  solution: |
+    import random
+
+
+    def random_quicksort(values, seed=0):
+        """Sort with quicksort using a RANDOM pivot (rng = random.Random(seed); pivot = values[rng.randrange(len(values))]).
+        Split into smaller, equal and larger lists, sort smaller and larger recursively. Return (sorted list, comparisons) where every call
+        on a list with more than 1 item adds len(that list) to the comparison count. The input list is not changed."""
+        rng = random.Random(seed)
+        count = 0
+
+        def sort(items):
+            nonlocal count
+            if len(items) <= 1:
+                return items
+            count += len(items)
+            pivot = items[rng.randrange(len(items))]
+            smaller = [x for x in items if x < pivot]
+            equal = [x for x in items if x == pivot]
+            larger = [x for x in items if x > pivot]
+            return sort(smaller) + equal + sort(larger)
+
+        return sort(list(values)), count
+
+
+    def quickselect(values, k, seed=0):
+        """The k-th smallest value (k = 0 is the smallest) in expected O(n) time: choose a random pivot, split into smaller / equal / larger,
+        and continue in whichever part contains position k. ValueError unless 0 <= k < len(values)."""
+        if not 0 <= k < len(values):
+            raise ValueError("k out of range")
+        rng = random.Random(seed)
+        items = list(values)
+        while True:
+            pivot = items[rng.randrange(len(items))]
+            smaller = [x for x in items if x < pivot]
+            equal = [x for x in items if x == pivot]
+            if k < len(smaller):
+                items = smaller
+            elif k < len(smaller) + len(equal):
+                return pivot
+            else:
+                k -= len(smaller) + len(equal)
+                items = [x for x in items if x > pivot]
+  explanation: Randomness gives good expected time on every input, not just on lucky ones.
+- id: sampling
+  title: Shuffles and reservoir sampling
+  difficulty: 4
+  prompt: 'Write `fisher_yates(items, seed=0)`: copy the list, use `rng = random.Random(seed)`, and for `i` from the last index down to 1 swap `out[i]` with `out[j]` where `j = rng.randrange(i + 1)`; return the new list. Write `reservoir_sample(stream, k, seed=0)`: choose `k` items uniformly at random from a stream of unknown length while storing only `k` items: keep the first `k`; for the item with index `i >= k` draw `j = rng.randrange(i + 1)` and, if `j < k`, put the item in `reservoir[j]`. `ValueError` if `k < 0`; if the stream has fewer than `k` items return them all.'
+  starter: |-
+    import random
+
+
+    def fisher_yates(items, seed=0):
+        """A uniformly random shuffle (rng = random.Random(seed)): for i from the last index down to 1 swap items[i] with items[j],
+        where j = rng.randrange(i + 1). Return a new list; do not change the input."""
+        pass
+
+
+    def reservoir_sample(stream, k, seed=0):
+        """Choose k items uniformly at random from a stream of unknown length, seeing each item once and storing only k. Keep the first k;
+        for the item with index i >= k, draw j = rng.randrange(i + 1) and if j < k replace reservoir[j] with the item.
+        ValueError if k < 0. If the stream has fewer than k items return them all."""
+        pass
+  tests:
+  - name: shuffle
+    code: |
+      data = list(range(20))
+      s = fisher_yates(data, 3)
+      assert sorted(s) == data and s != data and data == list(range(20))
+      assert fisher_yates(data, 3) == s and fisher_yates(data, 4) != s
+      assert fisher_yates([], 0) == [] and fisher_yates([1], 0) == [1]
+  - name: fair shuffle
+    code: |
+      from collections import Counter
+      counts = Counter()
+      for seed in range(3000):
+          counts[tuple(fisher_yates([1, 2, 3], seed))] += 1
+      assert len(counts) == 6
+      assert all(400 < c < 600 for c in counts.values()), counts
+  - name: reservoir
+    code: |
+      assert reservoir_sample(range(3), 5) == [0, 1, 2]
+      assert reservoir_sample(range(100), 0) == []
+      r = reservoir_sample(range(1000), 10, 1)
+      assert len(r) == 10 and len(set(r)) == 10 and all(0 <= x < 1000 for x in r)
+      assert reservoir_sample(range(1000), 10, 1) == r
+      try:
+          reservoir_sample([1], -1)
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+      from collections import Counter
+      hits = Counter()
+      for seed in range(2000):
+          for x in reservoir_sample(range(10), 3, seed):
+              hits[x] += 1
+      assert all(520 < hits[x] < 680 for x in range(10)), hits
+  hints:
+  - Item i replaces a stored item with probability k / (i + 1), which keeps every item equally likely.
+  solution: |
+    import random
+
+
+    def fisher_yates(items, seed=0):
+        """A uniformly random shuffle (rng = random.Random(seed)): for i from the last index down to 1 swap items[i] with items[j],
+        where j = rng.randrange(i + 1). Return a new list; do not change the input."""
+        rng = random.Random(seed)
+        out = list(items)
+        for i in range(len(out) - 1, 0, -1):
+            j = rng.randrange(i + 1)
+            out[i], out[j] = out[j], out[i]
+        return out
+
+
+    def reservoir_sample(stream, k, seed=0):
+        """Choose k items uniformly at random from a stream of unknown length, seeing each item once and storing only k. Keep the first k;
+        for the item with index i >= k, draw j = rng.randrange(i + 1) and if j < k replace reservoir[j] with the item.
+        ValueError if k < 0. If the stream has fewer than k items return them all."""
+        if k < 0:
+            raise ValueError("k must not be negative")
+        rng = random.Random(seed)
+        reservoir = []
+        for i, item in enumerate(stream):
+            if i < k:
+                reservoir.append(item)
+            else:
+                j = rng.randrange(i + 1)
+                if j < k:
+                    reservoir[j] = item
+        return reservoir
+  explanation: A random sample of a huge stream needs memory for only k items.
+- id: bloom
+  title: Bloom filters
+  difficulty: 4
+  prompt: 'A **Bloom filter** answers ''have I seen this?'' using very little memory, with occasional false ''yes'' answers and never a false ''no''. The starter has `stable_hash(item, seed)` (a hash that is the same on every run). Write `bloom_new(m)` (a list of `m` zeros; `ValueError` if `m < 1`), `bloom_add(bits, item, k)` (set `k` bits at positions `stable_hash(item, i) % len(bits)` for `i` in `range(k)`), `bloom_contains(bits, item, k)` (True only if all `k` of those bits are set), `expected_false_positive_rate(m, n, k)` (the theory: `(1 - e**(-k * n / m)) ** k`) and `best_hash_count(m, n)` (`round(m / n * ln 2)`, at least 1).'
+  starter: |-
+    import math
+
+
+    def stable_hash(item, seed=0):
+        """A hash that is the same on every run (Python's built-in hash for strings is randomised): FNV-1a over str(item) with a seed mixed in, then a few shifts and multiplications so that the bits are well scrambled."""
+        h = (2166136261 ^ (seed * 2654435761)) % 2 ** 32
+        for ch in str(item):
+            h = ((h ^ ord(ch)) * 16777619) % 2 ** 32
+        h ^= h >> 16
+        h = (h * 2246822507) % 2 ** 32
+        h ^= h >> 13
+        h = (h * 3266489909) % 2 ** 32
+        h ^= h >> 16
+        return h
+
+    def bloom_new(m):
+        """A Bloom filter: a list of m bits, all 0. ValueError if m < 1."""
+        pass
+
+
+    def bloom_add(bits, item, k):
+        """Set k bits: for i in range(k), position stable_hash(item, i) % len(bits)."""
+        pass
+
+
+    def bloom_contains(bits, item, k):
+        """False means DEFINITELY not added; True means PROBABLY added (all k bits are set)."""
+        pass
+
+
+    def expected_false_positive_rate(m, n, k):
+        """The theoretical chance that an item never added tests as present, after n items were added to m bits using k hashes:
+        (1 - e^(-k * n / m)) ^ k."""
+        pass
+
+
+    def best_hash_count(m, n):
+        """The number of hash functions that minimises the false positive rate: round((m / n) * ln 2), at least 1."""
+        pass
+  tests:
+  - name: no false negatives
+    code: |
+      bits = bloom_new(500)
+      words = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape"]
+      for w in words:
+          bloom_add(bits, w, 4)
+      assert all(bloom_contains(bits, w, 4) for w in words)
+      assert not bloom_contains(bloom_new(100), "anything", 3)
+      try:
+          bloom_new(0)
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  - name: false positives match the theory
+    code: |
+      m, n, k = 1000, 100, 7
+      bits = bloom_new(m)
+      for i in range(n):
+          bloom_add(bits, "member-%d" % i, k)
+      assert all(bloom_contains(bits, "member-%d" % i, k) for i in range(n))
+      false = sum(bloom_contains(bits, "stranger-%d" % i, k) for i in range(4000))
+      rate = false / 4000
+      assert abs(rate - expected_false_positive_rate(m, n, k)) < 0.01, rate
+      assert rate < 0.03
+  - name: theory
+    code: |
+      assert abs(expected_false_positive_rate(1000, 100, 7) - 0.00819) < 0.0005
+      assert expected_false_positive_rate(1000, 0, 5) == 0
+      assert best_hash_count(1000, 100) == 7
+      assert best_hash_count(8, 100) == 1
+      assert expected_false_positive_rate(1000, 100, 7) < expected_false_positive_rate(1000, 100, 1)
+  hints:
+  - Never-set bits prove an item is absent; all-set bits only suggest it is present.
+  solution: |
+    import math
+
+
+    def stable_hash(item, seed=0):
+        """A hash that is the same on every run (Python's built-in hash for strings is randomised): FNV-1a over str(item) with a seed mixed in, then a few shifts and multiplications so that the bits are well scrambled."""
+        h = (2166136261 ^ (seed * 2654435761)) % 2 ** 32
+        for ch in str(item):
+            h = ((h ^ ord(ch)) * 16777619) % 2 ** 32
+        h ^= h >> 16
+        h = (h * 2246822507) % 2 ** 32
+        h ^= h >> 13
+        h = (h * 3266489909) % 2 ** 32
+        h ^= h >> 16
+        return h
+
+    def bloom_new(m):
+        """A Bloom filter: a list of m bits, all 0. ValueError if m < 1."""
+        if m < 1:
+            raise ValueError("need at least one bit")
+        return [0] * m
+
+
+    def bloom_add(bits, item, k):
+        """Set k bits: for i in range(k), position stable_hash(item, i) % len(bits)."""
+        for i in range(k):
+            bits[stable_hash(item, i) % len(bits)] = 1
+
+
+    def bloom_contains(bits, item, k):
+        """False means DEFINITELY not added; True means PROBABLY added (all k bits are set)."""
+        return all(bits[stable_hash(item, i) % len(bits)] for i in range(k))
+
+
+    def expected_false_positive_rate(m, n, k):
+        """The theoretical chance that an item never added tests as present, after n items were added to m bits using k hashes:
+        (1 - e^(-k * n / m)) ^ k."""
+        return (1 - math.exp(-k * n / m)) ** k
+
+
+    def best_hash_count(m, n):
+        """The number of hash functions that minimises the false positive rate: round((m / n) * ln 2), at least 1."""
+        return max(1, round(m / n * math.log(2)))
+  explanation: A few bits per item buy a fast membership test with a small, tunable error.
+- id: sketches
+  title: Count-min sketch and heavy hitters
+  difficulty: 5
+  prompt: 'The starter has `stable_hash`. Write `cm_new(width, depth)` (`depth` rows of `width` zero counters), `cm_add(table, item, count=1)` (for every row `r` add `count` to column `stable_hash(item, r) % width`) and `cm_estimate(table, item)` (the minimum of the item''s counters: it can only overestimate, never underestimate). Write `misra_gries(stream, k)` (`ValueError` if `k < 2`): keep at most `k - 1` counters; for each item `x`, if `x` has a counter add 1; else if fewer than `k - 1` counters exist start `x` at 1; otherwise subtract 1 from every counter and delete the ones that reach 0. Return the counter dictionary. Every item occurring more than `len(stream) / k` times is guaranteed to survive.'
+  starter: |-
+    import math
+
+
+    def stable_hash(item, seed=0):
+        h = (2166136261 ^ (seed * 2654435761)) % 2 ** 32
+        for ch in str(item):
+            h = ((h ^ ord(ch)) * 16777619) % 2 ** 32
+        h ^= h >> 16
+        h = (h * 2246822507) % 2 ** 32
+        h ^= h >> 13
+        h = (h * 3266489909) % 2 ** 32
+        h ^= h >> 16
+        return h
+
+    def cm_new(width, depth):
+        """A count-min sketch: `depth` rows of `width` counters, all 0."""
+        pass
+
+
+    def cm_add(table, item, count=1):
+        """Add `count` to one counter per row: row r, column stable_hash(item, r) % width."""
+        pass
+
+
+    def cm_estimate(table, item):
+        """The smallest of the item's counters. It never underestimates (other items only add), so the minimum is closest."""
+        pass
+
+
+    def misra_gries(stream, k):
+        """Find the frequent items of a stream with at most k - 1 counters. For each item x: if x has a counter, add 1; else if fewer than
+        k - 1 counters exist, start x at 1; otherwise subtract 1 from every counter and delete those that reach 0. Return the counter
+        dictionary. Every item that occurs more than len(stream) / k times is guaranteed to be in it. ValueError if k < 2."""
+        pass
+  tests:
+  - name: count-min sketch
+    code: |
+      import random
+      rng = random.Random(3)
+      stream = [rng.choice("aaaabbbcc") + str(rng.randrange(3)) for _ in range(500)] + ["hot"] * 120
+      table = cm_new(50, 4)
+      truth = {}
+      for x in stream:
+          cm_add(table, x)
+          truth[x] = truth.get(x, 0) + 1
+      for x, c in truth.items():
+          assert cm_estimate(table, x) >= c
+      assert cm_estimate(table, "hot") >= 120
+      assert cm_estimate(table, "hot") < 120 + 60
+      assert cm_estimate(cm_new(10, 3), "unseen") == 0
+      t = cm_new(20, 3)
+      cm_add(t, "x", 5)
+      assert cm_estimate(t, "x") == 5
+  - name: heavy hitters
+    code: |
+      stream = ["a"] * 60 + ["b"] * 25 + list("cdefghijklmnopqrstuvwxyz")[:15]
+      import random
+      random.Random(1).shuffle(stream)
+      found = misra_gries(stream, 4)
+      assert "a" in found and len(found) <= 3
+      found2 = misra_gries(["x", "y", "x", "z", "x", "w", "x"], 2)
+      assert "x" in found2 and len(found2) <= 1
+      assert misra_gries([], 3) == {}
+      assert misra_gries([1, 1, 1], 2) == {1: 3}
+      try:
+          misra_gries([1], 1)
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  - name: guarantee on random streams
+    code: |
+      import random
+      rng = random.Random(7)
+      for _ in range(50):
+          stream = [rng.choice([1, 1, 1, 2, 3, 4, 5, 6]) for _ in range(rng.randrange(20, 80))]
+          for k in (2, 3, 5):
+              found = misra_gries(stream, k)
+              assert len(found) <= k - 1
+              for item in set(stream):
+                  if stream.count(item) > len(stream) / k:
+                      assert item in found
+  hints:
+  - Subtracting 1 from every counter throws away k distinct items at once, which can only happen n / k times.
+  solution: |
+    import math
+
+
+    def stable_hash(item, seed=0):
+        h = (2166136261 ^ (seed * 2654435761)) % 2 ** 32
+        for ch in str(item):
+            h = ((h ^ ord(ch)) * 16777619) % 2 ** 32
+        h ^= h >> 16
+        h = (h * 2246822507) % 2 ** 32
+        h ^= h >> 13
+        h = (h * 3266489909) % 2 ** 32
+        h ^= h >> 16
+        return h
+
+    def cm_new(width, depth):
+        """A count-min sketch: `depth` rows of `width` counters, all 0."""
+        return [[0] * width for _ in range(depth)]
+
+
+    def cm_add(table, item, count=1):
+        """Add `count` to one counter per row: row r, column stable_hash(item, r) % width."""
+        width = len(table[0])
+        for r, row in enumerate(table):
+            row[stable_hash(item, r) % width] += count
+
+
+    def cm_estimate(table, item):
+        """The smallest of the item's counters. It never underestimates (other items only add), so the minimum is closest."""
+        width = len(table[0])
+        return min(row[stable_hash(item, r) % width] for r, row in enumerate(table))
+
+
+    def misra_gries(stream, k):
+        """Find the frequent items of a stream with at most k - 1 counters. For each item x: if x has a counter, add 1; else if fewer than
+        k - 1 counters exist, start x at 1; otherwise subtract 1 from every counter and delete those that reach 0. Return the counter
+        dictionary. Every item that occurs more than len(stream) / k times is guaranteed to be in it. ValueError if k < 2."""
+        if k < 2:
+            raise ValueError("k must be at least 2")
+        counters = {}
+        for x in stream:
+            if x in counters:
+                counters[x] += 1
+            elif len(counters) < k - 1:
+                counters[x] = 1
+            else:
+                for key in list(counters):
+                    counters[key] -= 1
+                    if counters[key] == 0:
+                        del counters[key]
+        return counters
+  explanation: Sketches summarize enormous streams in tiny, fixed memory with a known error.
+- id: minhash
+  title: 'Capstone: MinHash similarity'
+  difficulty: 5
+  prompt: 'How similar are two documents? The **Jaccard similarity** of two sets is the size of their overlap divided by the size of their union. The starter has `stable_hash`. Write `jaccard(a, b)` (exact; 1.0 if both are empty), `shingles(text, k)` (the set of all substrings of length `k`; `ValueError` if `k < 1`) and `minhash_signature(items, num_hashes, seed=0)`: with `P = 2**61 - 1` and `rng = random.Random(seed)` make `num_hashes` pairs `a = rng.randrange(1, P)`, `b = rng.randrange(0, P)`; position `i` of the signature is the minimum over the items of `(a * stable_hash(item) + b) % P` (`ValueError` for an empty collection). Write `estimate_jaccard(sig_a, sig_b)`: the fraction of positions where the signatures agree (`ValueError` if the lengths differ or are 0). A fraction of agreeing positions estimates the Jaccard similarity!'
+  starter: |-
+    import random
+
+
+    def stable_hash(item, seed=0):
+        h = (2166136261 ^ (seed * 2654435761)) % 2 ** 32
+        for ch in str(item):
+            h = ((h ^ ord(ch)) * 16777619) % 2 ** 32
+        h ^= h >> 16
+        h = (h * 2246822507) % 2 ** 32
+        h ^= h >> 13
+        h = (h * 3266489909) % 2 ** 32
+        h ^= h >> 16
+        return h
+
+    def jaccard(a, b):
+        """The exact similarity of two collections treated as sets: size of the overlap divided by size of the union (1.0 if both are empty)."""
+        pass
+
+
+    def shingles(text, k):
+        """The set of all substrings of length k (k-shingles). ValueError if k < 1; empty set if the text is shorter than k."""
+        pass
+
+
+    def minhash_signature(items, num_hashes, seed=0):
+        """A short fingerprint of a set. With P = 2**61 - 1 and rng = random.Random(seed), make num_hashes pairs (a, b) with
+        a = rng.randrange(1, P) and b = rng.randrange(0, P). Position i of the signature is the minimum over the items of
+        (a * stable_hash(item) + b) % P. ValueError for an empty collection."""
+        pass
+
+
+    def estimate_jaccard(sig_a, sig_b):
+        """The fraction of positions where two signatures agree: an estimate of the Jaccard similarity. ValueError if lengths differ or are 0."""
+        pass
+  tests:
+  - name: exact similarity
+    code: |
+      assert jaccard({1, 2, 3}, {2, 3, 4}) == 0.5
+      assert jaccard([1, 1, 2], [2, 2]) == 0.5
+      assert jaccard([], []) == 1.0 and jaccard([1], []) == 0.0
+      assert shingles("abcd", 2) == {"ab", "bc", "cd"}
+      assert shingles("ab", 3) == set() and shingles("aaaa", 2) == {"aa"}
+      try:
+          shingles("abc", 0)
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  - name: signatures
+    code: |
+      s = minhash_signature({"a", "b", "c"}, 50, 1)
+      assert len(s) == 50 and minhash_signature({"c", "b", "a"}, 50, 1) == s
+      assert estimate_jaccard(s, s) == 1.0
+      assert minhash_signature({"a", "b"}, 50, 1) != s
+      assert minhash_signature({"a", "b", "c"}, 50, 2) != s
+      for a, b in (([1], [1, 2]), ([], [])):
+          try:
+              estimate_jaccard(a, b)
+              raise AssertionError("accepted")
+          except ValueError:
+              pass
+      try:
+          minhash_signature([], 10)
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  - name: estimates are close
+    code: |
+      a = shingles("the quick brown fox jumps over the lazy dog", 3)
+      b = shingles("the quick brown fox leaps over the lazy cat", 3)
+      exact = jaccard(a, b)
+      est = estimate_jaccard(minhash_signature(a, 400, 5), minhash_signature(b, 400, 5))
+      assert abs(est - exact) < 0.1, (est, exact)
+      unrelated = estimate_jaccard(minhash_signature(a, 400, 5), minhash_signature(shingles("zzzzzzzzzzzzzzzzzzzzzz", 3), 400, 5))
+      assert unrelated < 0.05
+      half = list(range(100))
+      other = list(range(50, 150))
+      est2 = estimate_jaccard(minhash_signature(half, 500, 3), minhash_signature(other, 500, 3))
+      assert abs(est2 - 1 / 3) < 0.08, est2
+  hints:
+  - The chance that two sets have the same minimum hash equals their Jaccard similarity.
+  solution: |
+    import random
+
+
+    def stable_hash(item, seed=0):
+        h = (2166136261 ^ (seed * 2654435761)) % 2 ** 32
+        for ch in str(item):
+            h = ((h ^ ord(ch)) * 16777619) % 2 ** 32
+        h ^= h >> 16
+        h = (h * 2246822507) % 2 ** 32
+        h ^= h >> 13
+        h = (h * 3266489909) % 2 ** 32
+        h ^= h >> 16
+        return h
+
+    def jaccard(a, b):
+        """The exact similarity of two collections treated as sets: size of the overlap divided by size of the union (1.0 if both are empty)."""
+        a, b = set(a), set(b)
+        union = a | b
+        return len(a & b) / len(union) if union else 1.0
+
+
+    def shingles(text, k):
+        """The set of all substrings of length k (k-shingles). ValueError if k < 1; empty set if the text is shorter than k."""
+        if k < 1:
+            raise ValueError("k must be at least 1")
+        return {text[i:i + k] for i in range(len(text) - k + 1)}
+
+
+    def minhash_signature(items, num_hashes, seed=0):
+        """A short fingerprint of a set. With P = 2**61 - 1 and rng = random.Random(seed), make num_hashes pairs (a, b) with
+        a = rng.randrange(1, P) and b = rng.randrange(0, P). Position i of the signature is the minimum over the items of
+        (a * stable_hash(item) + b) % P. ValueError for an empty collection."""
+        items = set(items)
+        if not items:
+            raise ValueError("empty set")
+        P = 2 ** 61 - 1
+        rng = random.Random(seed)
+        params = [(rng.randrange(1, P), rng.randrange(0, P)) for _ in range(num_hashes)]
+        hashed = [stable_hash(x) for x in items]
+        return [min((a * h + b) % P for h in hashed) for a, b in params]
+
+
+    def estimate_jaccard(sig_a, sig_b):
+        """The fraction of positions where two signatures agree: an estimate of the Jaccard similarity. ValueError if lengths differ or are 0."""
+        if len(sig_a) != len(sig_b) or not sig_a:
+            raise ValueError("signatures must have the same non-zero length")
+        return sum(1 for x, y in zip(sig_a, sig_b) if x == y) / len(sig_a)
+  explanation: A tiny signature stands in for a whole document when you are hunting for near-duplicates.
+commonMistakes:
+- title: Biased shuffles
+  explanation: Swap position i only with positions from 0 to i (Fisher-Yates). Swapping with any position makes some orders more likely.
+- title: Using Python's built-in hash for sketches
+  explanation: String hashing is randomised per run; use your own stable hash so results are repeatable.
+- title: Expecting a Bloom filter to delete
+  explanation: Clearing a bit might remove other items; standard filters only add.
+- title: Treating a Bloom 'yes' as certain
+  explanation: Yes means probably; only 'no' is certain.
+- title: Forgetting to seed in tests
+  explanation: Unseeded randomness makes failures impossible to reproduce.
+summary:
+- Random choices give good expected time on every input (quicksort, quickselect).
+- Fisher-Yates shuffles uniformly; reservoir sampling draws a fair sample from a stream.
+- Bloom filters give fast membership tests with no false negatives and a tunable false positive rate.
+- Count-min sketches and Misra-Gries summarize frequencies in tiny memory.
+- MinHash estimates set similarity from short signatures.
+next: u22-advanced-ds
+quiz:
+- type: mcq
+  question: What does a random pivot guarantee for quicksort?
+  options:
+  - Expected O(n log n) on every input
+  - Always O(n)
+  - No comparisons
+  - Sorted input is always fastest
+  answer: 0
+  explanation: No input is systematically bad.
+- type: mcq
+  question: What does a Bloom filter never give?
+  options:
+  - A false negative
+  - A false positive
+  - A hash
+  - A bit array
+  answer: 0
+  explanation: If an item was added its bits are set.
+- type: mcq
+  question: Reservoir sampling is useful when...
+  options:
+  - the stream length is unknown and memory is limited
+  - you need the sorted order
+  - you have a tiny list
+  - you want the largest item
+  answer: 0
+  explanation: It keeps k items with fair probability.
+- type: mcq
+  question: A count-min sketch estimate is...
+  options:
+  - never below the true count
+  - never above the true count
+  - always exact
+  - random
+  answer: 0
+  explanation: Collisions only add.
+- type: mcq
+  question: MinHash estimates...
+  options:
+  - Jaccard similarity of two sets
+  - the median
+  - the sum
+  - the sorted order
+  answer: 0
+  explanation: The chance two minima match equals the similarity.
+- type: mcq
+  question: Which shuffle is correct?
+  options:
+  - Swap position i with a random position from 0 to i, going from the end
+  - Swap every item with any random position
+  - Sort by random keys that may repeat badly
+  - Reverse the list
+  answer: 0
+  explanation: Fisher-Yates makes all orderings equally likely.
+- type: code
+  question: Write `jaccard_pair(a, b)` returning the overlap size divided by the union size of the collections `a` and `b` treated as sets (1.0 if both are empty).
+  starter: |
+    def jaccard_pair(a, b):
+        pass
+  tests:
+  - name: jaccard
+    code: |
+      assert jaccard_pair([1, 2, 3], [2, 3, 4]) == 0.5
+      assert jaccard_pair([], []) == 1.0
+      assert jaccard_pair([1], [2]) == 0.0
+      assert jaccard_pair("abc", "abd") == 0.5
+  solution: |
+    def jaccard_pair(a, b):
+        a, b = set(a), set(b)
+        union = a | b
+        return len(a & b) / len(union) if union else 1.0

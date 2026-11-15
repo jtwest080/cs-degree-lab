@@ -27,8 +27,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 19 | Linear Algebra (Version 2) | ✅ Complete (Phase 18) | 9 | 45 | Data Lab (exact solver, rank, determinant, least-squares line, power iteration, PageRank, cosine similarity, rotations) |
 | 20 | Calculus (Version 2) | ✅ Complete (Phase 19) | 7 | 35 | Calculus Toolkit (derivative, Simpson integration, bisection and Newton roots, RK4 ODE solver, series sine, gradient, backtracking minimizer) |
 | 21 | Probability & Statistics (Version 2) | ✅ Complete (Phase 20) | 8 | 40 | Statistics Toolkit (quantiles, normal curve, Bayes, confidence and bootstrap intervals, permutation and A/B tests, regression) |
+| 22 | Advanced Algorithms (Version 2) | ✅ Complete (Phase 22) | 7 | 35 | Algorithm Lab (max flow, SCC, KMP, convex hull, SAT solver, vertex cover approximation, Held-Karp TSP, reservoir sampling, segment tree, inversions) |
 
-Totals: 181 lessons, 858 practice exercises, 181 lesson quizzes (1086 multiple-choice questions + 181 coding questions), 21 unit projects, 1705 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus and 21 Probability & Statistics done; timed exams and deeper core courses next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 188 lessons, 893 practice exercises, 188 lesson quizzes (1128 multiple-choice questions + 188 coding questions), 22 unit projects, 1783 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics and 22 Advanced Algorithms done, plus a timed Exams page; compilers, distributed systems and database internals next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -516,9 +517,25 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Unit 22 can assume:** everything through Unit 21. Later Version 2 work (exams, advanced algorithms, compilers, distributed systems, database internals) can use probability, statistics, linear algebra and calculus freely.
 
+## Unit 22: Advanced Algorithms (Version 2) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 22.1 Maximum Flow and Matching | `u22-flow` | flow networks, residual graphs, Edmonds-Karp, max-flow min-cut, bipartite matching, edge-disjoint paths |
+| 22.2 Strongly Connected Components and Fragile Networks | `u22-scc` | Kosaraju, condensation, bridges and articulation points (disc/low), 2-SAT |
+| 22.3 String Algorithms | `u22-strings` | prefix function and KMP, Z-function, rolling hashes and Rabin-Karp, tries, suffix arrays and LCP |
+| 22.4 Computational Geometry | `u22-geometry` | cross product, shoelace area, segment intersection, point in polygon, convex hull, closest pair, sweep lines |
+| 22.5 NP-Completeness and Coping | `u22-np` | P and NP, verifiers, reductions, DPLL SAT solver, 2-approximation, set cover, TSP (nearest neighbour, 2-opt, Held-Karp) |
+| 22.6 Randomized and Streaming Algorithms | `u22-randomized` | random pivots, Fisher-Yates, reservoir sampling, Bloom filters, count-min, Misra-Gries, MinHash |
+| 22.7 Advanced Data Structures | `u22-advanced-ds` | prefix sums, difference arrays, Fenwick tree, segment tree, sparse table, amortized analysis, inversions, LIS, sliding window minimum |
+
+**Project: Algorithm Lab.** Learners write `max_flow`, `strongly_connected_components`, `kmp_search`, `convex_hull`, `dpll`, `vertex_cover_2approx`, `held_karp`, `reservoir_sample`, `segment_tree_ops` and `count_inversions`. 11 checklist items, 11 tests.
+
+**Unit 23 can assume:** everything through Unit 22. Deeper core courses (compilers, distributed systems, database internals) can use graph algorithms, tries, hashing, randomization and probability freely.
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Units 19-21 (math track) and the timed exams page are done; next/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms and the timed exams page are done; next deeper core courses (compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -548,3 +565,4 @@ Version 2 plan: Units 19-21 (math track) and the timed exams page are done; next
 - **Phase 19 (2026-11-14):** Version 2 continues. Complete Unit 20 Calculus (7 lessons, 35 exercises, 7 quizzes, Calculus Toolkit project, 56 glossary terms). No framework changes; all Python.
 - **Phase 20 (2026-11-14):** Version 2 continues. Complete Unit 21 Probability & Statistics (8 lessons, 40 exercises, 8 quizzes, Statistics Toolkit project, 78 glossary terms). No framework changes; all Python.
 - **Phase 21 (2026-11-15):** Version 2 framework: timed **Exams** page (`#/exams`, `src/components/Exams.jsx`). Quick quiz (15 q), Midterm (30 q) and Final (50 q); questions mixed evenly across chosen units from lesson quiz MCQs; 90 seconds per question with a countdown that auto-submits; no feedback until submit; results with per-unit breakdown, weak-unit drill, answer review and saved attempt history (`exams` in progress state).
+- **Phase 22 (2026-11-15):** Version 2 continues. Complete Unit 22 Advanced Algorithms (7 lessons, 35 exercises, 7 quizzes, Algorithm Lab project, 78 glossary terms). No framework changes; all Python.
