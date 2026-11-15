@@ -1,0 +1,934 @@
+id: u27-state
+title: Events, State and Undo
+minutes: 100
+objective: Understand how interfaces respond to events. You will model screens as state machines, build undo and redo from a history, use the command pattern for an editor, smooth noisy input with debouncing and throttling, and write a reducer that holds the whole state of an app.
+outcomes:
+- Draw an interface as a state machine
+- Find unreachable states
+- Implement undo and redo without modifying old values
+- Invert editing commands
+- Debounce and throttle events
+- Write a pure reducer
+sections:
+- heading: Events and state
+  body: |-
+    Graphical programs are different from the programs you have written so far, which run from the top to the bottom. An interface mostly **waits**. When the user clicks, types, touches or the clock ticks, the system receives an **event** and runs some code, an **event handler**, then waits again. The central loop that collects events and dispatches them is the **event loop**.
+
+    What an event should do depends on what the program remembers, its **state**. A play button means "start" while a video is stopped and "pause" while it is playing. The tidiest way to think about this is a **state machine**: a list of states and, for each state, which events cause a move to which new state. Drawing it out as circles and arrows (a **state diagram**) makes bugs visible before coding: a state with no way out, a state that cannot be reached, or an event that is not handled in a state where it can happen, such as a double click on a Pay button. In code the machine can be a plain dictionary from (state, event) to the next state.
+- heading: Undo, redo and commands
+  body: |-
+    Undo is the safety net that lets people experiment, and it is harder than it looks. One simple design keeps a **history** with three parts: the **past** values, the **present**, and the **future** (the values that were undone). A normal change pushes the present onto the past and **clears the future**, because after undoing and then typing something new, the old future no longer makes sense. Undo moves the present to the front of the future, and redo moves it back. The functions must create new values rather than change old ones, since sharing the same list between history entries would silently corrupt them. This works well when a state is small. A big document would take too much memory, so editors instead store **commands**.
+
+    In the **command pattern** each edit is a small object describing *what* to do, for example "insert 'abc' at position 4". Each command can produce its own **inverse**: the inverse of an insert is a delete of the same length, and the inverse of a delete is an insert of the deleted text, which is why the command must look at the text *before* it runs. Undo applies the inverses from the last to the first. The same list of commands can also be saved, sent to other computers for collaborative editing, or replayed.
+- heading: Timing, gestures and reducers
+  body: |-
+    Events arrive in bursts: typing produces one event per key, scrolling produces hundreds per second. Doing expensive work for every one wastes time. **Debouncing** waits until the events have stopped for a moment: a search box fires one request when you pause, not one per letter. **Throttling** lets an action happen at most once per interval, such as updating a scroll position every 100 milliseconds. Gestures also come from timing: a **tap** and a **long press** differ only in how long the finger stays down, and a **double click** is two clicks within a short **window**.
+
+    Finally, large apps need a disciplined way to change state. In the **reducer** style, all the data lives in one object and every change is described by an **action** such as "add item" or "toggle item 3". A **reducer** is a **pure function** that takes the old state and an action and returns a *new* state without touching the old one. Because the state after any action is determined by the previous state and the action alone, you can log every action, replay them to reproduce a bug, undo by going back to an earlier state, and test the whole app without a screen. This is the idea behind popular frameworks such as Redux and Elm.
+examples:
+- title: A state machine and undo
+  intro: A media player, its reachable states, and an undo history.
+  code: |
+    def step(transitions, state, event):
+        """A STATE MACHINE says what happens when an event arrives in a given state. `transitions` is a dict {(state, event): new_state}. Return the new state; ValueError('no transition from STATE on EVENT') (with the real state and event) if there is none."""
+        if (state, event) not in transitions:
+            raise ValueError("no transition from %s on %s" % (state, event))
+        return transitions[(state, event)]
+
+
+    def run_events(transitions, start, events, strict=False):
+        """Feed a list of events to the machine and return the list of states visited, INCLUDING the start state. An event with no transition is IGNORED (the state stays and is repeated in the list) unless strict is True, in which case the ValueError from step is raised."""
+        state = start
+        visited = [state]
+        for event in events:
+            if (state, event) in transitions:
+                state = transitions[(state, event)]
+            elif strict:
+                step(transitions, state, event)
+            visited.append(state)
+        return visited
+
+
+    def reachable(transitions, start):
+        """The sorted list of states that can be reached from `start` by some sequence of events (including start itself)."""
+        seen = {start}
+        todo = [start]
+        while todo:
+            s = todo.pop()
+            for (a, event), b in transitions.items():
+                if a == s and b not in seen:
+                    seen.add(b)
+                    todo.append(b)
+        return sorted(seen)
+
+
+    def unreachable_states(transitions, start):
+        """States that appear in the transitions (as a source or a target) but can never be reached from `start`, as a sorted list: these are usually bugs."""
+        mentioned = set()
+        for (a, event), b in transitions.items():
+            mentioned.add(a)
+            mentioned.add(b)
+        return sorted(mentioned - set(reachable(transitions, start)))
+
+
+    def new_history(value):
+        """A HISTORY for undo and redo is a dict {"past": [], "present": value, "future": []}: the values before the current one (oldest first), the current value, and the values that were undone (nearest first)."""
+        return {"past": [], "present": value, "future": []}
+
+
+    def apply_change(history, value, max_undo=None):
+        """Make a change: return a NEW history whose present is `value`, whose past gets the old present at its end, and whose future is EMPTY (a new change erases what could be redone). If value equals the present, return an unchanged copy. If max_undo is not None, keep only the newest max_undo entries of the past. Never modify the history you were given."""
+        if value == history["present"]:
+            return {"past": list(history["past"]), "present": history["present"], "future": list(history["future"])}
+        past = history["past"] + [history["present"]]
+        if max_undo is not None:
+            past = past[-max_undo:] if max_undo > 0 else []
+        return {"past": past, "present": value, "future": []}
+
+
+    def undo(history):
+        """Go back one step: the last past value becomes the present and the old present goes to the FRONT of the future. ValueError('nothing to undo') if the past is empty. Return a new history."""
+        if not history["past"]:
+            raise ValueError("nothing to undo")
+        return {"past": history["past"][:-1], "present": history["past"][-1], "future": [history["present"]] + history["future"]}
+
+
+    def redo(history):
+        """Go forward one step: the first future value becomes the present and the old present goes to the END of the past. ValueError('nothing to redo') if the future is empty. Return a new history."""
+        if not history["future"]:
+            raise ValueError("nothing to redo")
+        return {"past": history["past"] + [history["present"]], "present": history["future"][0], "future": history["future"][1:]}
+
+    player = {("stopped", "play"): "playing", ("playing", "pause"): "paused", ("paused", "play"): "playing", ("playing", "stop"): "stopped", ("paused", "stop"): "stopped", ("playing", "ended"): "stopped"}
+    print("state sequence:", run_events(player, "stopped", ["play", "pause", "pause", "play", "ended"]))
+    print("states reachable from stopped:", reachable(player, "stopped"))
+    h = new_history("")
+    for word in ("a", "ab", "abc"):
+        h = apply_change(h, word)
+    h = undo(undo(h))
+    print("after two undos:", h)
+    print("after a redo:", redo(h)["present"], "| after a new change:", apply_change(h, "x"))
+  output: |
+    state sequence: ['stopped', 'playing', 'paused', 'paused', 'playing', 'stopped']
+    states reachable from stopped: ['paused', 'playing', 'stopped']
+    after two undos: {'past': [''], 'present': 'a', 'future': ['ab', 'abc']}
+    after a redo: ab | after a new change: {'past': ['', 'a'], 'present': 'x', 'future': []}
+  lines:
+  - line: 72
+    note: Events with no transition are ignored.
+  - line: 73
+    note: From stopped you can reach every state.
+  - line: 78
+    note: The past, present and future after undoing twice.
+  - line: 79
+    note: A new change clears the future.
+- title: Commands, timing and a reducer
+  intro: Edit and undo a text, smooth bursts of events, and replay a to-do list.
+  code: |
+    def apply_command(text, cmd):
+        """Apply one editing COMMAND to a string and return the new string. A command is a dict: {"type": "insert", "pos": i, "text": s} puts s before index i (ValueError('bad position') unless 0 <= i <= len(text)); {"type": "delete", "pos": i, "count": n} removes n characters starting at i (ValueError('bad range') unless 0 <= i and i + n <= len(text) and n >= 0); anything else is ValueError('unknown command')."""
+        kind = cmd["type"]
+        if kind == "insert":
+            if cmd["pos"] < 0 or cmd["pos"] > len(text):
+                raise ValueError("bad position")
+            return text[:cmd["pos"]] + cmd["text"] + text[cmd["pos"]:]
+        if kind == "delete":
+            if cmd["pos"] < 0 or cmd["count"] < 0 or cmd["pos"] + cmd["count"] > len(text):
+                raise ValueError("bad range")
+            return text[:cmd["pos"]] + text[cmd["pos"] + cmd["count"]:]
+        raise ValueError("unknown command")
+
+
+    def invert_command(text, cmd):
+        """The command that UNDOES `cmd` when applied to the text that results from it. Work it out from the text BEFORE the command: an insert is undone by deleting exactly what was inserted ({"type": "delete", "pos": same, "count": len of the inserted text}); a delete is undone by inserting back the characters that were removed ({"type": "insert", "pos": same, "text": the removed characters})."""
+        if cmd["type"] == "insert":
+            return {"type": "delete", "pos": cmd["pos"], "count": len(cmd["text"])}
+        return {"type": "insert", "pos": cmd["pos"], "text": text[cmd["pos"]:cmd["pos"] + cmd["count"]]}
+
+
+    def run_commands(text, commands):
+        """Apply the commands in order. Return (final text, undo stack) where the undo stack is the list of inverse commands, one per command, in the order the commands were applied (so undoing means taking them from the END)."""
+        stack = []
+        for cmd in commands:
+            inverse = invert_command(text, cmd)
+            text = apply_command(text, cmd)
+            stack.append(inverse)
+        return (text, stack)
+
+
+    def undo_all(text, undo_stack):
+        """Undo everything: apply the inverse commands from the LAST to the FIRST and return the resulting text. The stack itself must not change."""
+        for inverse in reversed(undo_stack):
+            text = apply_command(text, inverse)
+        return text
+
+
+    def debounce(times, wait):
+        """DEBOUNCING waits until events have STOPPED coming before acting (for example searching only when the user pauses typing). `times` is a sorted list of event times in milliseconds. The action fires `wait` ms after an event if no further event arrives within that time (a gap of exactly `wait` counts as no event). Return the list of times at which it fires."""
+        fires = []
+        for i, t in enumerate(times):
+            if i + 1 == len(times) or times[i + 1] - t >= wait:
+                fires.append(t + wait)
+        return fires
+
+
+    def throttle(times, interval):
+        """THROTTLING limits how often something happens (for example handling a scroll). The first event fires; after that an event fires only if at least `interval` ms have passed since the last time it FIRED. Return the list of firing times."""
+        fired = []
+        for t in times:
+            if not fired or t - fired[-1] >= interval:
+                fired.append(t)
+        return fired
+
+
+    def classify_presses(events, threshold):
+        """`events` is a list of ("down", time) and ("up", time) pairs in time order. Each "down" followed by its "up" is a press: 'tap' if it lasted LESS than threshold ms, otherwise 'long'. Ignore an "up" with no "down" before it and a "down" that never gets its "up". Return the list of press names in order."""
+        out = []
+        down = None
+        for kind, t in events:
+            if kind == "down":
+                down = t
+            elif kind == "up" and down is not None:
+                out.append("tap" if t - down < threshold else "long")
+                down = None
+        return out
+
+
+    def classify_clicks(times, window):
+        """Group clicks into gestures: a click belongs to the previous gesture if it comes at most `window` ms after the previous click. Name each gesture by its size: 1 'single', 2 'double', 3 or more 'triple'. Return the list of names (times are sorted)."""
+        names = {1: "single", 2: "double"}
+        groups = []
+        for t in times:
+            if groups and t - groups[-1][-1] <= window:
+                groups[-1].append(t)
+            else:
+                groups.append([t])
+        return [names.get(len(g), "triple") for g in groups]
+
+
+    def initial_state():
+        """A new empty to-do app state: {"items": [], "next_id": 1, "filter": "all"}."""
+        return {"items": [], "next_id": 1, "filter": "all"}
+
+
+    def reduce(state, action):
+        """A REDUCER is a pure function: (old state, action) -> NEW state. It never changes the old state (this makes undo and debugging easy). Actions are dicts with a "type":
+        add (with "text"): append {"id": next_id, "text": text, "done": False} and increase next_id; ValueError('empty text') if the text is blank (only spaces or nothing);
+        toggle (with "id"): flip that item's done flag;
+        edit (with "id" and "text"): change the item's text (same empty check);
+        remove (with "id"): delete the item;
+        clear_done: delete every item that is done;
+        set_filter (with "filter"): "all", "active" or "done", otherwise ValueError('bad filter').
+        ValueError('no such item') for toggle, edit or remove with an unknown id, and ValueError('unknown action') for any other type."""
+        items = [dict(i) for i in state["items"]]
+        kind = action["type"]
+        nxt, flt = state["next_id"], state["filter"]
+        if kind == "add":
+            if not action["text"].strip():
+                raise ValueError("empty text")
+            items.append({"id": nxt, "text": action["text"], "done": False})
+            nxt += 1
+        elif kind in ("toggle", "edit", "remove"):
+            found = [i for i in items if i["id"] == action["id"]]
+            if not found:
+                raise ValueError("no such item")
+            if kind == "toggle":
+                found[0]["done"] = not found[0]["done"]
+            elif kind == "edit":
+                if not action["text"].strip():
+                    raise ValueError("empty text")
+                found[0]["text"] = action["text"]
+            else:
+                items.remove(found[0])
+        elif kind == "clear_done":
+            items = [i for i in items if not i["done"]]
+        elif kind == "set_filter":
+            if action["filter"] not in ("all", "active", "done"):
+                raise ValueError("bad filter")
+            flt = action["filter"]
+        else:
+            raise ValueError("unknown action")
+        return {"items": items, "next_id": nxt, "filter": flt}
+
+
+    def visible_items(state):
+        """The items to show: all of them, only the ones not done ("active"), or only the done ones, according to the filter. Return the list of items (the same dicts)."""
+        if state["filter"] == "active":
+            return [i for i in state["items"] if not i["done"]]
+        if state["filter"] == "done":
+            return [i for i in state["items"] if i["done"]]
+        return list(state["items"])
+
+
+    def count_left(state):
+        """How many items are NOT done."""
+        return sum(1 for i in state["items"] if not i["done"])
+
+
+    def state_after(actions, n=None):
+        """Start from initial_state() and apply the first n actions with reduce (all of them if n is None) and return the resulting state: TIME TRAVEL, because every earlier state can be recomputed."""
+        state = initial_state()
+        for action in (actions if n is None else actions[:n]):
+            state = reduce(state, action)
+        return state
+
+    text, stack = run_commands("", [{"type": "insert", "pos": 0, "text": "Hello"}, {"type": "insert", "pos": 5, "text": " world"}, {"type": "delete", "pos": 0, "count": 1}])
+    print("edited text:", text, "| undone:", repr(undo_all(text, stack)))
+    keys = [0, 80, 150, 900, 950, 2000]
+    print("search fires (debounce 300 ms):", debounce(keys, 300), "| scroll handled (throttle 500 ms):", throttle(keys, 500))
+    print("clicks:", classify_clicks([0, 150, 1000, 5000, 5100, 5200], 300))
+    acts = [{"type": "add", "text": "buy milk"}, {"type": "add", "text": "write essay"}, {"type": "toggle", "id": 1}, {"type": "set_filter", "filter": "active"}]
+    state = state_after(acts)
+    print("visible:", [i["text"] for i in visible_items(state)], "| left:", count_left(state), "| items after each step:", [len(state_after(acts, n)["items"]) for n in range(5)])
+  output: |
+    edited text: ello world | undone: ''
+    search fires (debounce 300 ms): [450, 1250, 2300] | scroll handled (throttle 500 ms): [0, 900, 2000]
+    clicks: ['double', 'single', 'triple']
+    visible: ['write essay'] | left: 1 | items after each step: [0, 1, 2, 2, 2]
+  lines:
+  - line: 149
+    note: Undoing the three commands returns to the empty text.
+  - line: 151
+    note: Debouncing waits for pauses; throttling fires at fixed spacing.
+  - line: 152
+    note: Two clicks close together form a double click.
+  - line: 155
+    note: State after every prefix of the actions shows how it grew.
+playground:
+  prompt: Debounce your own list of key times.
+  code: |
+    times = [0, 50, 120, 700, 760, 2000]
+    wait = 300
+    fires = [t + wait for i, t in enumerate(times) if i + 1 == len(times) or times[i + 1] - t >= wait]
+    print(fires)
+exercises:
+- id: fsm
+  title: State machines
+  difficulty: 3
+  prompt: 'Interfaces are always in some **state** (a button is `idle`, `pressed` or `disabled`; a video is `stopped`, `playing` or `paused`) and **events** (clicks, key presses, timers) move them between states. A **state machine** lists exactly what each event does in each state, which prevents impossible situations. `transitions` is a dict `{(state, event): new_state}`. Write `step(transitions, state, event)`: return the new state, or `ValueError("no transition from STATE on EVENT")` (with the real state and event) if there is none. Write `run_events(transitions, start, events, strict=False)`: feed the events in order and return the list of states visited **including the start** state; an event with no transition is **ignored** (the state is repeated in the list) unless `strict` is `True`, in which case the error from `step` is raised. Write `reachable(transitions, start)`: the sorted list of states that can be reached from `start` (including `start`). Write `unreachable_states(transitions, start)`: states that appear in the transitions (as a source or a target) but can never be reached from `start`, as a sorted list: usually bugs.'
+  starter: |-
+    def step(transitions, state, event):
+        """A STATE MACHINE says what happens when an event arrives in a given state. `transitions` is a dict {(state, event): new_state}. Return the new state; ValueError('no transition from STATE on EVENT') (with the real state and event) if there is none."""
+        pass
+
+
+    def run_events(transitions, start, events, strict=False):
+        """Feed a list of events to the machine and return the list of states visited, INCLUDING the start state. An event with no transition is IGNORED (the state stays and is repeated in the list) unless strict is True, in which case the ValueError from step is raised."""
+        pass
+
+
+    def reachable(transitions, start):
+        """The sorted list of states that can be reached from `start` by some sequence of events (including start itself)."""
+        pass
+
+
+    def unreachable_states(transitions, start):
+        """States that appear in the transitions (as a source or a target) but can never be reached from `start`, as a sorted list: these are usually bugs."""
+        pass
+  tests:
+  - name: one step
+    code: |
+      t = {("stopped", "play"): "playing", ("playing", "pause"): "paused", ("paused", "play"): "playing", ("playing", "stop"): "stopped", ("paused", "stop"): "stopped"}
+      assert step(t, "stopped", "play") == "playing" and step(t, "paused", "stop") == "stopped"
+      for state, event in (("stopped", "pause"), ("playing", "play")):
+          try:
+              step(t, state, event)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "no transition from %s on %s" % (state, event) in str(e)
+  - name: running events
+    code: |
+      t = {("stopped", "play"): "playing", ("playing", "pause"): "paused", ("paused", "play"): "playing", ("playing", "stop"): "stopped", ("paused", "stop"): "stopped"}
+      assert run_events(t, "stopped", ["play", "pause", "play", "stop"]) == ["stopped", "playing", "paused", "playing", "stopped"]
+      assert run_events(t, "stopped", ["pause", "play", "play", "stop"]) == ["stopped", "stopped", "playing", "playing", "stopped"] and run_events(t, "paused", []) == ["paused"]
+      try:
+          run_events(t, "stopped", ["play", "play"], strict=True)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no transition from playing on play" in str(e)
+      assert run_events(t, "stopped", ["play", "stop"], True) == ["stopped", "playing", "stopped"]
+  - name: reachability
+    code: |
+      t = {("a", "go"): "b", ("b", "go"): "c", ("c", "back"): "a", ("x", "go"): "y", ("y", "go"): "a", ("d", "go"): "d"}
+      assert reachable(t, "a") == ["a", "b", "c"] and reachable(t, "x") == ["a", "b", "c", "x", "y"] and reachable(t, "z") == ["z"] and reachable({}, "a") == ["a"]
+      assert unreachable_states(t, "a") == ["d", "x", "y"] and unreachable_states(t, "x") == ["d"] and unreachable_states({("a", "e"): "b"}, "a") == []
+  hints:
+  - 'Reachability is a search: keep a set of seen states and a list of states still to explore.'
+  solution: |
+    def step(transitions, state, event):
+        """A STATE MACHINE says what happens when an event arrives in a given state. `transitions` is a dict {(state, event): new_state}. Return the new state; ValueError('no transition from STATE on EVENT') (with the real state and event) if there is none."""
+        if (state, event) not in transitions:
+            raise ValueError("no transition from %s on %s" % (state, event))
+        return transitions[(state, event)]
+
+
+    def run_events(transitions, start, events, strict=False):
+        """Feed a list of events to the machine and return the list of states visited, INCLUDING the start state. An event with no transition is IGNORED (the state stays and is repeated in the list) unless strict is True, in which case the ValueError from step is raised."""
+        state = start
+        visited = [state]
+        for event in events:
+            if (state, event) in transitions:
+                state = transitions[(state, event)]
+            elif strict:
+                step(transitions, state, event)
+            visited.append(state)
+        return visited
+
+
+    def reachable(transitions, start):
+        """The sorted list of states that can be reached from `start` by some sequence of events (including start itself)."""
+        seen = {start}
+        todo = [start]
+        while todo:
+            s = todo.pop()
+            for (a, event), b in transitions.items():
+                if a == s and b not in seen:
+                    seen.add(b)
+                    todo.append(b)
+        return sorted(seen)
+
+
+    def unreachable_states(transitions, start):
+        """States that appear in the transitions (as a source or a target) but can never be reached from `start`, as a sorted list: these are usually bugs."""
+        mentioned = set()
+        for (a, event), b in transitions.items():
+            mentioned.add(a)
+            mentioned.add(b)
+        return sorted(mentioned - set(reachable(transitions, start)))
+  explanation: Drawing the state machine on paper before coding finds most interface bugs, such as a Pay button that can be pressed twice.
+- id: undo
+  title: Undo and redo
+  difficulty: 4
+  prompt: 'Every good editor lets you undo. A **history** is a dict `{"past": [...], "present": value, "future": [...]}`: the earlier values (oldest first), the current value, and the values that were undone (nearest first). None of your functions may modify the history they receive; each returns a **new** one. Write `new_history(value)` (empty past and future). Write `apply_change(history, value, max_undo=None)`: the new present is `value`, the old present goes to the end of the past, and the **future is emptied** (a new change erases what could be redone); if `value` equals the present return an unchanged copy; if `max_undo` is not `None` keep only the newest `max_undo` entries of the past. Write `undo(history)`: the last past value becomes the present and the old present goes to the **front** of the future (`ValueError("nothing to undo")` if the past is empty). Write `redo(history)`: the first future value becomes the present and the old present goes to the **end** of the past (`ValueError("nothing to redo")` if the future is empty).'
+  starter: |-
+    def new_history(value):
+        """A HISTORY for undo and redo is a dict {"past": [], "present": value, "future": []}: the values before the current one (oldest first), the current value, and the values that were undone (nearest first)."""
+        pass
+
+
+    def apply_change(history, value, max_undo=None):
+        """Make a change: return a NEW history whose present is `value`, whose past gets the old present at its end, and whose future is EMPTY (a new change erases what could be redone). If value equals the present, return an unchanged copy. If max_undo is not None, keep only the newest max_undo entries of the past. Never modify the history you were given."""
+        pass
+
+
+    def undo(history):
+        """Go back one step: the last past value becomes the present and the old present goes to the FRONT of the future. ValueError('nothing to undo') if the past is empty. Return a new history."""
+        pass
+
+
+    def redo(history):
+        """Go forward one step: the first future value becomes the present and the old present goes to the END of the past. ValueError('nothing to redo') if the future is empty. Return a new history."""
+        pass
+  tests:
+  - name: changing
+    code: |
+      h = new_history("a")
+      assert h == {"past": [], "present": "a", "future": []}
+      h2 = apply_change(h, "b")
+      h3 = apply_change(h2, "c")
+      assert h3 == {"past": ["a", "b"], "present": "c", "future": []} and h == {"past": [], "present": "a", "future": []} and h2["past"] == ["a"]
+      same = apply_change(h3, "c")
+      assert same == h3 and same is not h3 and same["past"] is not h3["past"]
+  - name: undo and redo
+    code: |
+      h = new_history(0)
+      for v in (1, 2, 3):
+          h = apply_change(h, v)
+      u = undo(h)
+      assert u == {"past": [0, 1], "present": 2, "future": [3]} and h["present"] == 3
+      u2 = undo(u)
+      assert u2 == {"past": [0], "present": 1, "future": [2, 3]}
+      r = redo(u2)
+      assert r == u and redo(redo(u2)) == h
+      for f, msg in ((lambda: undo(new_history(1)), "nothing to undo"), (lambda: redo(h), "nothing to redo")):
+          try:
+              f()
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: changing after undo
+    code: |
+      h = new_history("a")
+      for v in "bcd":
+          h = apply_change(h, v)
+      h = undo(undo(h))
+      assert h["future"] == ["c", "d"]
+      h = apply_change(h, "x")
+      assert h == {"past": ["a", "b"], "present": "x", "future": []}
+      try:
+          redo(h)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "nothing to redo" in str(e)
+  - name: limited history
+    code: |
+      h = new_history(0)
+      for v in range(1, 8):
+          h = apply_change(h, v, 3)
+      assert h["past"] == [4, 5, 6] and h["present"] == 7
+      z = apply_change(new_history("a"), "b", 0)
+      assert z == {"past": [], "present": "b", "future": []}
+      steps = 0
+      while h["past"]:
+          h = undo(h)
+          steps += 1
+      assert steps == 3 and h["present"] == 4
+  hints:
+  - Build new lists with + and slices; never use append on the lists inside the old history.
+  solution: |
+    def new_history(value):
+        """A HISTORY for undo and redo is a dict {"past": [], "present": value, "future": []}: the values before the current one (oldest first), the current value, and the values that were undone (nearest first)."""
+        return {"past": [], "present": value, "future": []}
+
+
+    def apply_change(history, value, max_undo=None):
+        """Make a change: return a NEW history whose present is `value`, whose past gets the old present at its end, and whose future is EMPTY (a new change erases what could be redone). If value equals the present, return an unchanged copy. If max_undo is not None, keep only the newest max_undo entries of the past. Never modify the history you were given."""
+        if value == history["present"]:
+            return {"past": list(history["past"]), "present": history["present"], "future": list(history["future"])}
+        past = history["past"] + [history["present"]]
+        if max_undo is not None:
+            past = past[-max_undo:] if max_undo > 0 else []
+        return {"past": past, "present": value, "future": []}
+
+
+    def undo(history):
+        """Go back one step: the last past value becomes the present and the old present goes to the FRONT of the future. ValueError('nothing to undo') if the past is empty. Return a new history."""
+        if not history["past"]:
+            raise ValueError("nothing to undo")
+        return {"past": history["past"][:-1], "present": history["past"][-1], "future": [history["present"]] + history["future"]}
+
+
+    def redo(history):
+        """Go forward one step: the first future value becomes the present and the old present goes to the END of the past. ValueError('nothing to redo') if the future is empty. Return a new history."""
+        if not history["future"]:
+            raise ValueError("nothing to redo")
+        return {"past": history["past"] + [history["present"]], "present": history["future"][0], "future": history["future"][1:]}
+  explanation: Undo is the safety net that lets people explore without fear.
+- id: commands
+  title: The command pattern
+  difficulty: 4
+  prompt: 'A text editor can undo precisely if every edit is a **command** (a small description of the change) that can be **inverted**. A command is a dict: `{"type": "insert", "pos": i, "text": s}` puts `s` before index `i`; `{"type": "delete", "pos": i, "count": n}` removes `n` characters from `i`. Write `apply_command(text, cmd)`: return the new string; `ValueError("bad position")` for an insert unless `0 <= i <= len(text)`; `ValueError("bad range")` for a delete unless `0 <= i`, `0 <= n` and `i + n <= len(text)`; `ValueError("unknown command")` for any other type. Write `invert_command(text, cmd)`: the command that **undoes** `cmd`, worked out from the text **before** the command: an insert is undone by a delete of exactly the inserted length at the same position; a delete is undone by an insert, at the same position, of the characters that were removed. Write `run_commands(text, commands)`: apply them in order and return `(final text, undo stack)`, where the undo stack is the list of inverse commands, one per command, in the order the commands were applied. Write `undo_all(text, undo_stack)`: apply the inverses from the **last to the first** and return the text (the stack must not change).'
+  starter: |-
+    def apply_command(text, cmd):
+        """Apply one editing COMMAND to a string and return the new string. A command is a dict: {"type": "insert", "pos": i, "text": s} puts s before index i (ValueError('bad position') unless 0 <= i <= len(text)); {"type": "delete", "pos": i, "count": n} removes n characters starting at i (ValueError('bad range') unless 0 <= i and i + n <= len(text) and n >= 0); anything else is ValueError('unknown command')."""
+        pass
+
+
+    def invert_command(text, cmd):
+        """The command that UNDOES `cmd` when applied to the text that results from it. Work it out from the text BEFORE the command: an insert is undone by deleting exactly what was inserted ({"type": "delete", "pos": same, "count": len of the inserted text}); a delete is undone by inserting back the characters that were removed ({"type": "insert", "pos": same, "text": the removed characters})."""
+        pass
+
+
+    def run_commands(text, commands):
+        """Apply the commands in order. Return (final text, undo stack) where the undo stack is the list of inverse commands, one per command, in the order the commands were applied (so undoing means taking them from the END)."""
+        pass
+
+
+    def undo_all(text, undo_stack):
+        """Undo everything: apply the inverse commands from the LAST to the FIRST and return the resulting text. The stack itself must not change."""
+        pass
+  tests:
+  - name: applying
+    code: |
+      assert apply_command("hello", {"type": "insert", "pos": 5, "text": " world"}) == "hello world" and apply_command("hello", {"type": "insert", "pos": 0, "text": ">"}) == ">hello"
+      assert apply_command("hello", {"type": "delete", "pos": 1, "count": 3}) == "ho" and apply_command("hello", {"type": "delete", "pos": 0, "count": 0}) == "hello" and apply_command("", {"type": "insert", "pos": 0, "text": "x"}) == "x"
+      for cmd, msg in (({"type": "insert", "pos": 6, "text": "x"}, "bad position"), ({"type": "insert", "pos": -1, "text": "x"}, "bad position"), ({"type": "delete", "pos": 3, "count": 3}, "bad range"), ({"type": "delete", "pos": -1, "count": 1}, "bad range"), ({"type": "delete", "pos": 1, "count": -1}, "bad range"), ({"type": "paint"}, "unknown command")):
+          try:
+              apply_command("hello", cmd)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: inverting
+    code: |
+      ins = {"type": "insert", "pos": 2, "text": "XYZ"}
+      dele = {"type": "delete", "pos": 1, "count": 2}
+      assert invert_command("hello", ins) == {"type": "delete", "pos": 2, "count": 3} and invert_command("hello", dele) == {"type": "insert", "pos": 1, "text": "el"}
+      for cmd in (ins, dele):
+          after = apply_command("hello", cmd)
+          assert apply_command(after, invert_command("hello", cmd)) == "hello"
+      assert ins == {"type": "insert", "pos": 2, "text": "XYZ"}
+  - name: running and undoing
+    code: |
+      cmds = [{"type": "insert", "pos": 0, "text": "Hello"}, {"type": "insert", "pos": 5, "text": " world"}, {"type": "delete", "pos": 0, "count": 1}, {"type": "insert", "pos": 0, "text": "J"}, {"type": "delete", "pos": 5, "count": 6}]
+      text, stack = run_commands("", cmds)
+      assert text == "Jello" and len(stack) == 5 and stack[0] == {"type": "delete", "pos": 0, "count": 5} and stack[2] == {"type": "insert", "pos": 0, "text": "H"}
+      assert undo_all(text, stack) == "" and len(stack) == 5
+      assert run_commands("abc", []) == ("abc", []) and undo_all("abc", []) == "abc"
+      text, stack = run_commands("The quick fox", [{"type": "delete", "pos": 4, "count": 6}, {"type": "insert", "pos": 4, "text": "slow "}])
+      assert text == "The slow fox" and undo_all(text, stack) == "The quick fox"
+      try:
+          run_commands("ab", [{"type": "delete", "pos": 0, "count": 5}])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad range" in str(e)
+  hints:
+  - To invert a delete you must remember the deleted text, which is why the original text is passed in.
+  solution: |
+    def apply_command(text, cmd):
+        """Apply one editing COMMAND to a string and return the new string. A command is a dict: {"type": "insert", "pos": i, "text": s} puts s before index i (ValueError('bad position') unless 0 <= i <= len(text)); {"type": "delete", "pos": i, "count": n} removes n characters starting at i (ValueError('bad range') unless 0 <= i and i + n <= len(text) and n >= 0); anything else is ValueError('unknown command')."""
+        kind = cmd["type"]
+        if kind == "insert":
+            if cmd["pos"] < 0 or cmd["pos"] > len(text):
+                raise ValueError("bad position")
+            return text[:cmd["pos"]] + cmd["text"] + text[cmd["pos"]:]
+        if kind == "delete":
+            if cmd["pos"] < 0 or cmd["count"] < 0 or cmd["pos"] + cmd["count"] > len(text):
+                raise ValueError("bad range")
+            return text[:cmd["pos"]] + text[cmd["pos"] + cmd["count"]:]
+        raise ValueError("unknown command")
+
+
+    def invert_command(text, cmd):
+        """The command that UNDOES `cmd` when applied to the text that results from it. Work it out from the text BEFORE the command: an insert is undone by deleting exactly what was inserted ({"type": "delete", "pos": same, "count": len of the inserted text}); a delete is undone by inserting back the characters that were removed ({"type": "insert", "pos": same, "text": the removed characters})."""
+        if cmd["type"] == "insert":
+            return {"type": "delete", "pos": cmd["pos"], "count": len(cmd["text"])}
+        return {"type": "insert", "pos": cmd["pos"], "text": text[cmd["pos"]:cmd["pos"] + cmd["count"]]}
+
+
+    def run_commands(text, commands):
+        """Apply the commands in order. Return (final text, undo stack) where the undo stack is the list of inverse commands, one per command, in the order the commands were applied (so undoing means taking them from the END)."""
+        stack = []
+        for cmd in commands:
+            inverse = invert_command(text, cmd)
+            text = apply_command(text, cmd)
+            stack.append(inverse)
+        return (text, stack)
+
+
+    def undo_all(text, undo_stack):
+        """Undo everything: apply the inverse commands from the LAST to the FIRST and return the resulting text. The stack itself must not change."""
+        for inverse in reversed(undo_stack):
+            text = apply_command(text, inverse)
+        return text
+  explanation: Every undo feature in every editor, from Word to Photoshop, is built from commands like these.
+- id: timing
+  title: Debouncing, throttling and gestures
+  difficulty: 4
+  prompt: 'Input events arrive in bursts, so interfaces smooth them. Times are in **milliseconds**. Write `debounce(times, wait)`: **debouncing** waits until events have **stopped** before acting (such as searching only when the user pauses typing). `times` is a sorted list of event times; the action fires `wait` ms after an event if no further event arrives within that time (a gap of exactly `wait` counts as no event). Return the list of times it fires. Write `throttle(times, interval)`: **throttling** limits how often something happens (such as handling a scroll). The first event fires; after that an event fires only if at least `interval` ms have passed since the last time it **fired**. Return the firing times. Write `classify_presses(events, threshold)`: `events` is a list of `("down", time)` and `("up", time)` pairs in time order. Each `"down"` followed by its `"up"` is a press: `"tap"` if it lasted **less than** `threshold` ms, otherwise `"long"`. Ignore an `"up"` with no `"down"` before it and a `"down"` that never gets its `"up"`. Write `classify_clicks(times, window)`: a click belongs to the previous gesture if it comes **at most** `window` ms after the previous click; name each gesture by its size: 1 `"single"`, 2 `"double"`, 3 or more `"triple"`.'
+  starter: |-
+    def debounce(times, wait):
+        """DEBOUNCING waits until events have STOPPED coming before acting (for example searching only when the user pauses typing). `times` is a sorted list of event times in milliseconds. The action fires `wait` ms after an event if no further event arrives within that time (a gap of exactly `wait` counts as no event). Return the list of times at which it fires."""
+        pass
+
+
+    def throttle(times, interval):
+        """THROTTLING limits how often something happens (for example handling a scroll). The first event fires; after that an event fires only if at least `interval` ms have passed since the last time it FIRED. Return the list of firing times."""
+        pass
+
+
+    def classify_presses(events, threshold):
+        """`events` is a list of ("down", time) and ("up", time) pairs in time order. Each "down" followed by its "up" is a press: 'tap' if it lasted LESS than threshold ms, otherwise 'long'. Ignore an "up" with no "down" before it and a "down" that never gets its "up". Return the list of press names in order."""
+        pass
+
+
+    def classify_clicks(times, window):
+        """Group clicks into gestures: a click belongs to the previous gesture if it comes at most `window` ms after the previous click. Name each gesture by its size: 1 'single', 2 'double', 3 or more 'triple'. Return the list of names (times are sorted)."""
+        pass
+  tests:
+  - name: debounce
+    code: |
+      assert debounce([0, 100, 200, 1000], 300) == [500, 1300] and debounce([], 300) == [] and debounce([50], 100) == [150] and debounce([0, 100], 100) == [100, 200]
+      assert debounce([0, 10, 20, 30], 100) == [130] and debounce([0, 500, 1000], 100) == [100, 600, 1100]
+  - name: throttle
+    code: |
+      assert throttle([0, 10, 20, 100, 105, 250], 100) == [0, 100, 250] and throttle([], 50) == [] and throttle([7], 50) == [7] and throttle([0, 50, 100, 150], 50) == [0, 50, 100, 150]
+      assert throttle([0, 99, 100], 100) == [0, 100] and throttle([5, 6, 7], 0) == [5, 6, 7]
+  - name: presses
+    code: |
+      ev = [("down", 0), ("up", 100), ("down", 300), ("up", 900), ("down", 1000), ("up", 1199)]
+      assert classify_presses(ev, 200) == ["tap", "long", "tap"] and classify_presses(ev, 100) == ["long", "long", "long"]
+      assert classify_presses([("up", 5), ("down", 10), ("up", 20)], 50) == ["tap"] and classify_presses([("down", 0)], 50) == [] and classify_presses([], 50) == [] and classify_presses([("down", 0), ("up", 50)], 50) == ["long"]
+  - name: clicks
+    code: |
+      assert classify_clicks([0, 200, 1000, 1300, 1500, 1700, 5000], 300) == ["double", "triple", "single"] and classify_clicks([], 300) == [] and classify_clicks([10], 300) == ["single"]
+      assert classify_clicks([0, 300], 300) == ["double"] and classify_clicks([0, 301], 300) == ["single", "single"] and classify_clicks([0, 100, 200, 300, 400], 100) == ["triple"]
+  hints:
+  - For debounce, look at the gap to the NEXT event; for throttle, remember when it last fired.
+  solution: |
+    def debounce(times, wait):
+        """DEBOUNCING waits until events have STOPPED coming before acting (for example searching only when the user pauses typing). `times` is a sorted list of event times in milliseconds. The action fires `wait` ms after an event if no further event arrives within that time (a gap of exactly `wait` counts as no event). Return the list of times at which it fires."""
+        fires = []
+        for i, t in enumerate(times):
+            if i + 1 == len(times) or times[i + 1] - t >= wait:
+                fires.append(t + wait)
+        return fires
+
+
+    def throttle(times, interval):
+        """THROTTLING limits how often something happens (for example handling a scroll). The first event fires; after that an event fires only if at least `interval` ms have passed since the last time it FIRED. Return the list of firing times."""
+        fired = []
+        for t in times:
+            if not fired or t - fired[-1] >= interval:
+                fired.append(t)
+        return fired
+
+
+    def classify_presses(events, threshold):
+        """`events` is a list of ("down", time) and ("up", time) pairs in time order. Each "down" followed by its "up" is a press: 'tap' if it lasted LESS than threshold ms, otherwise 'long'. Ignore an "up" with no "down" before it and a "down" that never gets its "up". Return the list of press names in order."""
+        out = []
+        down = None
+        for kind, t in events:
+            if kind == "down":
+                down = t
+            elif kind == "up" and down is not None:
+                out.append("tap" if t - down < threshold else "long")
+                down = None
+        return out
+
+
+    def classify_clicks(times, window):
+        """Group clicks into gestures: a click belongs to the previous gesture if it comes at most `window` ms after the previous click. Name each gesture by its size: 1 'single', 2 'double', 3 or more 'triple'. Return the list of names (times are sorted)."""
+        names = {1: "single", 2: "double"}
+        groups = []
+        for t in times:
+            if groups and t - groups[-1][-1] <= window:
+                groups[-1].append(t)
+            else:
+                groups.append([t])
+        return [names.get(len(g), "triple") for g in groups]
+  explanation: Search boxes use debouncing so that typing five letters sends one request instead of five.
+- id: reducer
+  title: 'Capstone: an app state reducer'
+  difficulty: 5
+  prompt: 'Many modern apps keep all their data in one **state** and change it only through a pure function called a **reducer**: `(old state, action) -> new state`. It never modifies the old state, which makes undo, debugging and time travel easy. Build a to-do list. Write `initial_state()` = `{"items": [], "next_id": 1, "filter": "all"}`. Write `reduce(state, action)` with these actions (dicts with a `"type"`): `add` (with `"text"`) appends `{"id": next_id, "text": text, "done": False}` and increases `next_id` (`ValueError("empty text")` if the text is blank); `toggle` (with `"id"`) flips that item''s `done` flag; `edit` (with `"id"` and `"text"`) changes its text (same empty check); `remove` (with `"id"`) deletes it; `clear_done` deletes every done item; `set_filter` (with `"filter"`: `"all"`, `"active"` or `"done"`, otherwise `ValueError("bad filter")`). `ValueError("no such item")` for toggle, edit or remove with an unknown id and `ValueError("unknown action")` for any other type. Write `visible_items(state)` (the items matching the filter), `count_left(state)` (how many items are **not** done) and `state_after(actions, n=None)`: start from `initial_state()`, apply the first `n` actions (all if `n` is `None`) and return the state: **time travel**.'
+  starter: |-
+    def initial_state():
+        """A new empty to-do app state: {"items": [], "next_id": 1, "filter": "all"}."""
+        pass
+
+
+    def reduce(state, action):
+        """A REDUCER is a pure function: (old state, action) -> NEW state. It never changes the old state (this makes undo and debugging easy). Actions are dicts with a "type":
+        add (with "text"): append {"id": next_id, "text": text, "done": False} and increase next_id; ValueError('empty text') if the text is blank (only spaces or nothing);
+        toggle (with "id"): flip that item's done flag;
+        edit (with "id" and "text"): change the item's text (same empty check);
+        remove (with "id"): delete the item;
+        clear_done: delete every item that is done;
+        set_filter (with "filter"): "all", "active" or "done", otherwise ValueError('bad filter').
+        ValueError('no such item') for toggle, edit or remove with an unknown id, and ValueError('unknown action') for any other type."""
+        pass
+
+
+    def visible_items(state):
+        """The items to show: all of them, only the ones not done ("active"), or only the done ones, according to the filter. Return the list of items (the same dicts)."""
+        pass
+
+
+    def count_left(state):
+        """How many items are NOT done."""
+        pass
+
+
+    def state_after(actions, n=None):
+        """Start from initial_state() and apply the first n actions with reduce (all of them if n is None) and return the resulting state: TIME TRAVEL, because every earlier state can be recomputed."""
+        pass
+  tests:
+  - name: adding and toggling
+    code: |
+      s0 = initial_state()
+      assert s0 == {"items": [], "next_id": 1, "filter": "all"}
+      s1 = reduce(s0, {"type": "add", "text": "milk"})
+      s2 = reduce(s1, {"type": "add", "text": "eggs"})
+      s3 = reduce(s2, {"type": "toggle", "id": 1})
+      assert s3["items"] == [{"id": 1, "text": "milk", "done": True}, {"id": 2, "text": "eggs", "done": False}] and s3["next_id"] == 3
+      assert s0 == {"items": [], "next_id": 1, "filter": "all"} and s2["items"][0]["done"] is False and s1["items"] == [{"id": 1, "text": "milk", "done": False}]
+      assert reduce(s3, {"type": "toggle", "id": 1})["items"][0]["done"] is False
+      for bad, msg in (({"type": "add", "text": "   "}, "empty text"), ({"type": "toggle", "id": 9}, "no such item"), ({"type": "fly"}, "unknown action"), ({"type": "set_filter", "filter": "x"}, "bad filter")):
+          try:
+              reduce(s3, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: editing and removing
+    code: |
+      s = state_after([{"type": "add", "text": "a"}, {"type": "add", "text": "b"}, {"type": "add", "text": "c"}])
+      e = reduce(s, {"type": "edit", "id": 2, "text": "B!"})
+      assert [i["text"] for i in e["items"]] == ["a", "B!", "c"] and [i["text"] for i in s["items"]] == ["a", "b", "c"]
+      r = reduce(e, {"type": "remove", "id": 1})
+      assert [i["id"] for i in r["items"]] == [2, 3] and r["next_id"] == 4
+      assert reduce(r, {"type": "add", "text": "d"})["items"][-1]["id"] == 4
+      for bad, msg in (({"type": "edit", "id": 2, "text": ""}, "empty text"), ({"type": "edit", "id": 7, "text": "x"}, "no such item"), ({"type": "remove", "id": 7}, "no such item")):
+          try:
+              reduce(r, bad)
+              raise AssertionError("accepted")
+          except ValueError as err:
+              assert msg in str(err)
+  - name: filters and counts
+    code: |
+      acts = [{"type": "add", "text": "a"}, {"type": "add", "text": "b"}, {"type": "add", "text": "c"}, {"type": "toggle", "id": 2}]
+      s = state_after(acts)
+      assert count_left(s) == 2 and count_left(initial_state()) == 0
+      assert [i["id"] for i in visible_items(s)] == [1, 2, 3]
+      assert [i["id"] for i in visible_items(reduce(s, {"type": "set_filter", "filter": "active"}))] == [1, 3]
+      assert [i["id"] for i in visible_items(reduce(s, {"type": "set_filter", "filter": "done"}))] == [2]
+      c = reduce(s, {"type": "clear_done"})
+      assert [i["id"] for i in c["items"]] == [1, 3] and c["next_id"] == 4 and c["filter"] == "all"
+  - name: time travel
+    code: |
+      acts = [{"type": "add", "text": "x"}, {"type": "add", "text": "y"}, {"type": "toggle", "id": 1}, {"type": "remove", "id": 2}]
+      assert state_after(acts, 0) == initial_state() and len(state_after(acts, 2)["items"]) == 2 and state_after(acts, 2)["items"][0]["done"] is False
+      assert state_after(acts)["items"] == [{"id": 1, "text": "x", "done": True}] and state_after(acts) == state_after(acts, 4) and state_after(acts, 99) == state_after(acts)
+      assert acts[0] == {"type": "add", "text": "x"} and state_after([]) == initial_state()
+  hints:
+  - Copy the items list (and each item dict) before changing anything, so the old state stays intact.
+  solution: |
+    def initial_state():
+        """A new empty to-do app state: {"items": [], "next_id": 1, "filter": "all"}."""
+        return {"items": [], "next_id": 1, "filter": "all"}
+
+
+    def reduce(state, action):
+        """A REDUCER is a pure function: (old state, action) -> NEW state. It never changes the old state (this makes undo and debugging easy). Actions are dicts with a "type":
+        add (with "text"): append {"id": next_id, "text": text, "done": False} and increase next_id; ValueError('empty text') if the text is blank (only spaces or nothing);
+        toggle (with "id"): flip that item's done flag;
+        edit (with "id" and "text"): change the item's text (same empty check);
+        remove (with "id"): delete the item;
+        clear_done: delete every item that is done;
+        set_filter (with "filter"): "all", "active" or "done", otherwise ValueError('bad filter').
+        ValueError('no such item') for toggle, edit or remove with an unknown id, and ValueError('unknown action') for any other type."""
+        items = [dict(i) for i in state["items"]]
+        kind = action["type"]
+        nxt, flt = state["next_id"], state["filter"]
+        if kind == "add":
+            if not action["text"].strip():
+                raise ValueError("empty text")
+            items.append({"id": nxt, "text": action["text"], "done": False})
+            nxt += 1
+        elif kind in ("toggle", "edit", "remove"):
+            found = [i for i in items if i["id"] == action["id"]]
+            if not found:
+                raise ValueError("no such item")
+            if kind == "toggle":
+                found[0]["done"] = not found[0]["done"]
+            elif kind == "edit":
+                if not action["text"].strip():
+                    raise ValueError("empty text")
+                found[0]["text"] = action["text"]
+            else:
+                items.remove(found[0])
+        elif kind == "clear_done":
+            items = [i for i in items if not i["done"]]
+        elif kind == "set_filter":
+            if action["filter"] not in ("all", "active", "done"):
+                raise ValueError("bad filter")
+            flt = action["filter"]
+        else:
+            raise ValueError("unknown action")
+        return {"items": items, "next_id": nxt, "filter": flt}
+
+
+    def visible_items(state):
+        """The items to show: all of them, only the ones not done ("active"), or only the done ones, according to the filter. Return the list of items (the same dicts)."""
+        if state["filter"] == "active":
+            return [i for i in state["items"] if not i["done"]]
+        if state["filter"] == "done":
+            return [i for i in state["items"] if i["done"]]
+        return list(state["items"])
+
+
+    def count_left(state):
+        """How many items are NOT done."""
+        return sum(1 for i in state["items"] if not i["done"])
+
+
+    def state_after(actions, n=None):
+        """Start from initial_state() and apply the first n actions with reduce (all of them if n is None) and return the resulting state: TIME TRAVEL, because every earlier state can be recomputed."""
+        state = initial_state()
+        for action in (actions if n is None else actions[:n]):
+            state = reduce(state, action)
+        return state
+  explanation: This is the idea behind Redux, Elm and most modern interface frameworks.
+commonMistakes:
+- title: Changing an old state in place
+  explanation: Build a new state so earlier states stay valid.
+- title: Keeping the redo list after a new change
+  explanation: A new change must clear the future.
+- title: Inverting a delete without remembering the text
+  explanation: The inverse needs the removed characters.
+- title: Reacting to every keystroke with a slow search
+  explanation: Debounce the input.
+- title: Forgetting states where an event is impossible
+  explanation: Decide whether to ignore or reject it.
+summary:
+- Interfaces wait for events and react according to their state.
+- A state machine lists what each event does in each state.
+- Undo keeps a past, present and future; new changes clear the future.
+- Commands can invert themselves, which makes editors undoable.
+- Debounce and throttle tame event bursts; reducers make state changes pure and replayable.
+next: u27-layout
+quiz:
+- type: mcq
+  question: What is an event loop?
+  options:
+  - A loop that collects events and runs their handlers
+  - A loop of animations
+  - A repeated menu
+  - A kind of undo
+  answer: 0
+  explanation: The program waits for input.
+- type: mcq
+  question: Why does a new change clear the redo list?
+  options:
+  - The old future no longer follows from the new present
+  - To save memory only
+  - Redo is not allowed
+  - It is a bug
+  answer: 0
+  explanation: History branches are dropped.
+- type: mcq
+  question: What is the inverse of deleting some text?
+  options:
+  - Inserting the deleted text back at the same place
+  - Deleting again
+  - Inserting a space
+  - Nothing
+  answer: 0
+  explanation: You must remember what was deleted.
+- type: mcq
+  question: What does debouncing do?
+  options:
+  - Waits until events stop before acting
+  - Ignores all events
+  - Repeats each event
+  - Sorts events
+  answer: 0
+  explanation: One search per pause.
+- type: mcq
+  question: What is a pure reducer?
+  options:
+  - A function (old state, action) to new state that changes nothing else
+  - A function that edits state in place
+  - A random function
+  - A loop
+  answer: 0
+  explanation: No side effects.
+- type: mcq
+  question: What can you do with a log of all actions of a reducer-based app?
+  options:
+  - Replay it to reproduce any state
+  - Nothing
+  - Only delete it
+  - Speed up the screen
+  answer: 0
+  explanation: Time travel.
+- type: code
+  question: 'Write `toggle_state(state)` for a light switch: return `"on"` if the state is `"off"` and `"off"` if it is `"on"`; raise `ValueError` for any other value.'
+  starter: |
+    def toggle_state(state):
+        pass
+  tests:
+  - name: switch
+    code: |
+      assert toggle_state("off") == "on" and toggle_state("on") == "off"
+      try:
+          toggle_state("broken")
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  solution: |
+    def toggle_state(state):
+        if state == "off":
+            return "on"
+        if state == "on":
+            return "off"
+        raise ValueError("bad state")

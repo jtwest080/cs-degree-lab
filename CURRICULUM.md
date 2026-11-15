@@ -32,8 +32,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 24 | Distributed Systems (Version 2) | ✅ Complete (Phase 24) | 7 | 35 | Mini Key-Value Cluster (hash ring, replicas, quorums, read repair, rebalancing, anti-entropy) |
 | 25 | Database Internals (Version 2) | ✅ Complete (Phase 25) | 7 | 35 | Mini Database (typed tables, keys, indexes, planner, SELECT/UPDATE/DELETE, transactions with rollback) |
 | 26 | Computer Graphics (Version 2, elective) | ✅ Complete (Phase 26) | 7 | 35 | Mini 3D Renderer (rotation, perspective, normals and lighting, back-face culling, depth-buffered triangle fill, shaded cube) |
+| 27 | Human-Computer Interaction (Version 2, elective) | ✅ Complete (Phase 27) | 7 | 35 | Mini UI Toolkit (text layout, drawing, hit testing, keyboard focus, undo/redo state, accessibility audit, event session) |
 
-Totals: 216 lessons, 1033 practice exercises, 216 lesson quizzes (1296 multiple-choice questions + 216 coding questions), 26 unit projects, 2085 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics elective done, plus a timed Exams page; HCI elective, rubric projects and reading lists next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 223 lessons, 1068 practice exercises, 223 lesson quizzes (1338 multiple-choice questions + 223 coding questions), 27 unit projects, 2147 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page; rubric projects and reading lists next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -601,9 +602,25 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Later electives can assume:** everything through Unit 26. Graphics, vectors and matrices, interpolation, simulation by small time steps, and seeded noise are familiar.
 
+## Unit 27: Human-Computer Interaction (Version 2, elective) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 27.1 How People Use Interfaces | `u27-models` | Fitts's law, Hick's law, keystroke-level model, readability scores, predicting task times |
+| 27.2 Accessibility | `u27-access` | WCAG contrast, colour-blindness simulation, HTML structure checks, focus order and traps, accessibility audit |
+| 27.3 Events, State and Undo | `u27-state` | state machines, undo/redo history, command pattern, debounce, throttle, gestures, reducers |
+| 27.4 Layout | `u27-layout` | box model, margin collapse, flow layout, flexbox, grid tracks, responsive cards, wrapping and truncation |
+| 27.5 Forms, Input and Search | `u27-forms` | validation, form rules, trie autocomplete, edit distance, ranked search, snippets, pagination |
+| 27.6 Evaluating Designs | `u27-research` | System Usability Scale, Wilson interval, A/B test z-test and sample size, heuristic evaluation, study analysis |
+| 27.7 Navigation and Design Decisions | `u27-ia` | site graphs and click depth, orphans, card sorting, tree tests, cosine-similarity related pages, RICE and decision matrices |
+
+**Project: Mini UI Toolkit.** Learners write `label_text`, `layout`, `draw`, `hit_test`, `focus_order`, `next_focus`, `apply_action` (undo/redo), `audit` and `simulate` (a canvas, a tree walker and the WCAG contrast formula are given).
+
+**Later units can assume:** everything through Unit 27. Usability laws, accessibility, event-driven state, layout, user studies and site structure are familiar.
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics (elective) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction (electives) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -638,3 +655,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 24 (2026-11-15):** Version 2 continues. Complete Unit 24 Distributed Systems (7 lessons, 35 exercises, 7 quizzes, Mini Key-Value Cluster project, 72 glossary terms). No framework changes; all Python.
 - **Phase 25 (2026-11-15):** Version 2 continues. Complete Unit 25 Database Internals (7 lessons, 35 exercises, 7 quizzes, Mini Database project, 77 glossary terms). No framework changes; all Python.
 - **Phase 26 (2026-11-15):** Version 2 continues. Complete Unit 26 Computer Graphics elective (7 lessons, 35 exercises, 7 quizzes, Mini 3D Renderer project, 90 glossary terms). No framework changes; all Python.
+- **Phase 27 (2026-11-15):** Version 2 continues. Complete Unit 27 Human-Computer Interaction elective (7 lessons, 35 exercises, 7 quizzes, Mini UI Toolkit project, 62 glossary terms). No framework changes; all Python.
