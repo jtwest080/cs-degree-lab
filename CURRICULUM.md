@@ -26,8 +26,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 18 | Capstone Projects | ✅ Complete (Phase 17) | 8 | 40 | Notes Service (accounts, signed tokens, a crash-safe log-structured store, validation, rate limiting and security headers in one web API) |
 | 19 | Linear Algebra (Version 2) | ✅ Complete (Phase 18) | 9 | 45 | Data Lab (exact solver, rank, determinant, least-squares line, power iteration, PageRank, cosine similarity, rotations) |
 | 20 | Calculus (Version 2) | ✅ Complete (Phase 19) | 7 | 35 | Calculus Toolkit (derivative, Simpson integration, bisection and Newton roots, RK4 ODE solver, series sine, gradient, backtracking minimizer) |
+| 21 | Probability & Statistics (Version 2) | ✅ Complete (Phase 20) | 8 | 40 | Statistics Toolkit (quantiles, normal curve, Bayes, confidence and bootstrap intervals, permutation and A/B tests, regression) |
 
-Totals: 173 lessons, 818 practice exercises, 173 lesson quizzes (1038 multiple-choice questions + 173 coding questions), 20 unit projects, 1627 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra and 20 Calculus done; Unit 21 Probability & Statistics next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 181 lessons, 858 practice exercises, 181 lesson quizzes (1086 multiple-choice questions + 181 coding questions), 21 unit projects, 1705 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus and 21 Probability & Statistics done; timed exams and deeper core courses next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -498,9 +499,26 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Unit 21 can assume:** everything through Unit 20. Probability and statistics should be taught from zero (counting, probability rules, distributions, expectation, Bayes, sampling, hypothesis tests, regression) with seeded random simulation in pure Python, and can use integrals for densities.
 
+## Unit 21: Probability & Statistics (Version 2) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 21.1 Probability by Counting | `u21-probability` | sample spaces, dice, complement, independence, inclusion-exclusion, birthday problem, Monte Carlo, Monty Hall |
+| 21.2 Conditional Probability and Bayes | `u21-conditional` | conditional probability, Bayes' rule, medical tests and the base rate fallacy, rejection sampling |
+| 21.3 Random Variables and Distributions | `u21-distributions` | expected value, variance, binomial, geometric, Poisson, coupon collector |
+| 21.4 The Normal Distribution | `u21-normal` | density and CDF, z-scores, empirical rule, central limit theorem, Box-Muller |
+| 21.5 Describing Data | `u21-descriptive` | mean/median/mode, variance and Bessel's correction, quantiles, IQR outliers, correlation, Simpson's paradox |
+| 21.6 Sampling and Confidence Intervals | `u21-sampling` | random samples, standard error, confidence intervals, proportions, bootstrap, sample size |
+| 21.7 Hypothesis Tests and p-values | `u21-hypothesis` | null and alternative, z-tests, permutation tests, A/B tests, power, multiple comparisons |
+| 21.8 Regression and Honest Models | `u21-regression` | least squares, residuals, R squared, slope uncertainty, train/test and cross-validation, Anscombe's quartet |
+
+**Project: Statistics Toolkit.** Learners write `mean`, `std_dev`, `quantile`, `normal_cdf`, `bayes_posterior`, `confidence_interval`, `bootstrap_ci`, `permutation_test`, `ab_test`, `fit_line` and `r_squared`. 12 checklist items, 12 tests.
+
+**Unit 22 can assume:** everything through Unit 21. Later Version 2 work (exams, advanced algorithms, compilers, distributed systems, database internals) can use probability, statistics, linear algebra and calculus freely.
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Unit 21 Probability & Statistics, then timed exams/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track) are done; next timed exams/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -528,3 +546,4 @@ Version 2 plan: Unit 21 Probability & Statistics, then timed exams/finals, deepe
 - **Phase 17 (2026-11-13):** complete Unit 18 (8 lessons, 40 exercises, 8 quizzes, Notes Service project, 84 glossary terms). No framework changes; all Python. This completes the curriculum.
 - **Phase 18 (2026-11-14):** Version 2 begins. Complete Unit 19 Linear Algebra (9 lessons, 45 exercises, 9 quizzes, Data Lab project, 65 glossary terms). No framework changes; all Python.
 - **Phase 19 (2026-11-14):** Version 2 continues. Complete Unit 20 Calculus (7 lessons, 35 exercises, 7 quizzes, Calculus Toolkit project, 56 glossary terms). No framework changes; all Python.
+- **Phase 20 (2026-11-14):** Version 2 continues. Complete Unit 21 Probability & Statistics (8 lessons, 40 exercises, 8 quizzes, Statistics Toolkit project, 78 glossary terms). No framework changes; all Python.
