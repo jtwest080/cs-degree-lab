@@ -6,6 +6,7 @@ import Dashboard from './components/Dashboard.jsx';
 import LessonView from './components/LessonView.jsx';
 import ProjectView from './components/ProjectView.jsx';
 import Review from './components/Review.jsx';
+import Exams from './components/Exams.jsx';
 import Glossary from './components/Glossary.jsx';
 import Settings from './components/Settings.jsx';
 import { registerServiceWorker } from './lib/installApp.js';
@@ -36,6 +37,9 @@ export default function App() {
       break;
     case 'review':
       page = <Review />;
+      break;
+    case 'exams':
+      page = <Exams />;
       break;
     case 'glossary':
       page = <Glossary initialQuery={route.param} />;

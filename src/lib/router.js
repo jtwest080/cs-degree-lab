@@ -25,6 +25,7 @@ export const href = {
   lesson: (id) => `#/lesson/${encodeURIComponent(id)}`,
   project: (unit) => `#/project/${unit}`,
   review: () => '#/review',
+  exams: () => '#/exams',
   glossary: (q) => (q ? `#/glossary/${encodeURIComponent(q)}` : '#/glossary'),
   settings: () => '#/settings',
 };

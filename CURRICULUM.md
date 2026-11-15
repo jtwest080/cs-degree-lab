@@ -518,7 +518,7 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Units 19-21 (math track) are done; next timed exams/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track) and the timed exams page are done; next/finals, deeper core courses (advanced algorithms, compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -547,3 +547,4 @@ Version 2 plan: Units 19-21 (math track) are done; next timed exams/finals, deep
 - **Phase 18 (2026-11-14):** Version 2 begins. Complete Unit 19 Linear Algebra (9 lessons, 45 exercises, 9 quizzes, Data Lab project, 65 glossary terms). No framework changes; all Python.
 - **Phase 19 (2026-11-14):** Version 2 continues. Complete Unit 20 Calculus (7 lessons, 35 exercises, 7 quizzes, Calculus Toolkit project, 56 glossary terms). No framework changes; all Python.
 - **Phase 20 (2026-11-14):** Version 2 continues. Complete Unit 21 Probability & Statistics (8 lessons, 40 exercises, 8 quizzes, Statistics Toolkit project, 78 glossary terms). No framework changes; all Python.
+- **Phase 21 (2026-11-15):** Version 2 framework: timed **Exams** page (`#/exams`, `src/components/Exams.jsx`). Quick quiz (15 q), Midterm (30 q) and Final (50 q); questions mixed evenly across chosen units from lesson quiz MCQs; 90 seconds per question with a countdown that auto-submits; no feedback until submit; results with per-unit breakdown, weak-unit drill, answer review and saved attempt history (`exams` in progress state).

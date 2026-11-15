@@ -36,6 +36,7 @@ export default function Layout({ route, children }) {
         <nav className={menuOpen ? 'open' : ''}>
           {link(href.dashboard(), 'Dashboard', 'dashboard')}
           {link(href.review(), 'Review', 'review', due)}
+          {link(href.exams(), 'Exams', 'exams')}
           {link(href.glossary(), 'Glossary', 'glossary')}
           {link(href.settings(), 'Settings', 'settings')}
           <button className="theme-btn" onClick={cycleTheme} title="Change theme (auto follows your device)">
