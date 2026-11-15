@@ -1,0 +1,1029 @@
+id: u24-replication
+title: Replication and Consistency
+minutes: 100
+objective: Learn how copies of data are kept in step. You will build quorum reads and writes with read repair, resolve conflicts with last-write-wins and version siblings, write counters and sets that merge without coordination (CRDTs), and replicate a log from a leader.
+outcomes:
+- Explain why data is replicated and what can go wrong
+- Choose quorum sizes and explain R + W > N
+- Compare last-write-wins with versioned siblings
+- 'Build CRDTs: grow-only counters, PN counters and OR-sets'
+- Explain leader-based log replication
+sections:
+- heading: Why copy data, and what goes wrong
+  body: |-
+    Copying data to several machines, called **replication**, gives two things: **availability** (the data is still there if a machine fails) and **speed** (a copy can be placed near each user). The price is the hardest problem in the field: keeping the copies *consistent*. If you change one copy, another may not hear about it yet, and for a while different readers see different answers. A system's **consistency model** is the promise it makes about this. **Strong consistency** says every reader sees the latest write, as if there were one copy. **Eventual consistency** says that if writes stop, all copies will *eventually* agree, but a read may be stale in the meantime. Strong is easier to reason about; eventual is faster and keeps working when machines cannot reach each other.
+
+    This trade-off is captured by the **CAP theorem**: when the network **partitions** (some machines cannot talk to others), a system must choose between **consistency** (refuse some requests so that no one sees stale or conflicting data) and **availability** (answer every request, accepting that the answers may disagree). Partitions happen, so the real choice is between C and A *when they do*. A bank ledger usually picks consistency; a shopping cart or a "like" counter often picks availability.
+- heading: Quorums and conflicts
+  body: |-
+    A flexible middle path is the **quorum**. Keep `n` replicas; require a write to be acknowledged by `w` of them and a read to consult `r` of them. If **r + w > n**, every read set must overlap every write set in at least one replica, so a read is guaranteed to see at least one copy of the latest completed write; the reader simply takes the copy with the highest **version number**. Choosing `r` and `w` tunes the system: `w = n, r = 1` makes reads fast and writes fragile; `r = w = 2` of 3 tolerates one failed machine for both. Replicas that missed a write catch up through **read repair** (a read that notices an old copy writes the newer value back to it) and background synchronization. A failed write may still have reached *some* replicas, which is why a write that reports failure can nevertheless appear later.
+
+    When replicas accept writes independently, they can produce **conflicts**. The simplest policy is **last-write-wins** (LWW): keep the write with the latest timestamp. It is easy and always converges, but because clocks disagree (lesson 1) and one of two concurrent updates is silently thrown away, it can lose data. The alternative is to use **vector clocks** (lesson 1) as **version vectors**: if one version's vector is below another's it is obsolete and can be dropped; if they are *concurrent* both are kept as **siblings**, and the application, or the user, merges them later (Amazon's original Dynamo did this with shopping carts).
+- heading: CRDTs and replicated logs
+  body: |-
+    A neater way to avoid conflicts is to design data whose merges *cannot* conflict. A **CRDT** (conflict-free replicated data type) is a data structure with a **merge** operation that is **commutative** (order of arguments does not matter), **associative** (grouping does not matter) and **idempotent** (merging the same thing twice changes nothing). Replicas can then change independently, exchange states in any order, with duplicates and delays, and still all converge to the same value. A **grow-only counter** stores one count per node and merges by taking the maximum for each node; its value is the sum. Putting two together gives a **PN counter** that can also decrease. A **set** is trickier: the **observed-remove set** tags every add with a unique id, and a remove deletes only the tags it has seen, so an add that happens concurrently with a remove wins, and nothing the remover did not know about is lost. Collaborative editors and many databases use CRDTs.
+
+    The other great tool is **state machine replication**. Give every replica the same deterministic program and the same *ordered log of commands*, and they will all end in the same state. A **leader** accepts commands, appends them to its log and sends them to **followers**. Each message says "after position `p`, whose term was `t`, append these entries"; a follower that does not agree about position `p` refuses, and the leader backs up one step at a time until they match, then overwrites the follower's disagreeing entries. A command is **committed** once a majority of the cluster has stored it, at which point it can never be lost, because any future leader must have come from a majority that overlaps. Raft, which you will meet in the next lesson, is built on exactly this log.
+examples:
+- title: Quorums and read repair
+  intro: A write that reaches two of three replicas, a stale read, and a repair.
+  code: |
+    def compare(a, b):
+        """Compare two equal-length vector clocks: 'equal', 'before', 'after' or 'concurrent'."""
+        if a == b:
+            return "equal"
+        if all(x <= y for x, y in zip(a, b)):
+            return "before"
+        if all(x >= y for x, y in zip(a, b)):
+            return "after"
+        return "concurrent"
+
+
+    def quorum_overlaps(n, r, w):
+        """With n replicas, a read that asks r of them and a write that must reach w of them are GUARANTEED to share at least one replica exactly when r + w > n. Return that as a bool.
+        ValueError('bad quorum') unless 1 <= r <= n and 1 <= w <= n."""
+        if not (1 <= r <= n and 1 <= w <= n):
+            raise ValueError("bad quorum")
+        return r + w > n
+
+
+    def tolerated_failures(n, r, w):
+        """How many replicas can be down while reads and writes still succeed: {"read": n - r, "write": n - w}. Same ValueError('bad quorum') check."""
+        if not (1 <= r <= n and 1 <= w <= n):
+            raise ValueError("bad quorum")
+        return {"read": n - r, "write": n - w}
+
+
+    def write_quorum(replicas, up, version, value, w):
+        """`replicas` maps each replica name to its stored (version, value). `up` is the list of replica names that are reachable. Send (version, value) to every reachable replica: a replica stores it only if
+        `version` is higher than the version it holds, but it acknowledges either way. Count the acknowledgements (the names in `up` that are replicas). The stores are APPLIED even if too few replicas
+        answer. Return the number of acknowledgements, or raise ValueError('write failed') if it is less than w (the partial writes remain)."""
+        acks = 0
+        for name in sorted(set(up) & set(replicas)):
+            if version > replicas[name][0]:
+                replicas[name] = (version, value)
+            acks += 1
+        if acks < w:
+            raise ValueError("write failed")
+        return acks
+
+
+    def read_quorum(replicas, up, r):
+        """Contact the first r reachable replicas in sorted name order and return the (version, value) with the highest version among them. ValueError('read failed') if fewer than r replicas are reachable."""
+        reachable = sorted(set(up) & set(replicas))
+        if len(reachable) < r:
+            raise ValueError("read failed")
+        return max((replicas[name] for name in reachable[:r]), key=lambda vv: vv[0])
+
+
+    def read_repair(replicas, up, r):
+        """Like read_quorum, but afterwards bring every CONTACTED replica that held an older version up to the newest (version, value). Return ((version, value), sorted list of the names that were repaired)."""
+        reachable = sorted(set(up) & set(replicas))
+        if len(reachable) < r:
+            raise ValueError("read failed")
+        contacted = reachable[:r]
+        newest = max((replicas[name] for name in contacted), key=lambda vv: vv[0])
+        repaired = []
+        for name in contacted:
+            if replicas[name][0] < newest[0]:
+                replicas[name] = newest
+                repaired.append(name)
+        return newest, sorted(repaired)
+
+    replicas = {"a": (0, None), "b": (0, None), "c": (0, None)}
+    write_quorum(replicas, ["a", "b"], 1, "red", 2)
+    print("replicas after a write that reached a and b:", replicas)
+    print("read from b and c (r=2):", read_quorum(replicas, ["b", "c"], 2))
+    print("read from c alone (r=1):", read_quorum(replicas, ["c"], 1), "<- stale!")
+    print("read repair:", read_repair(replicas, ["a", "b", "c"], 3))
+    print("replicas now:", replicas)
+    print("n=3, r=2, w=2 always overlap:", quorum_overlaps(3, 2, 2), "| n=3, r=1, w=1:", quorum_overlaps(3, 1, 1))
+  output: |
+    replicas after a write that reached a and b: {'a': (1, 'red'), 'b': (1, 'red'), 'c': (0, None)}
+    read from b and c (r=2): (1, 'red')
+    read from c alone (r=1): (0, None) <- stale!
+    read repair: ((1, 'red'), ['c'])
+    replicas now: {'a': (1, 'red'), 'b': (1, 'red'), 'c': (1, 'red')}
+    n=3, r=2, w=2 always overlap: True | n=3, r=1, w=1: False
+  lines:
+  - line: 67
+    note: With r=1 the read missed the replicas that hold the new value.
+  - line: 68
+    note: The old copies are brought up to date.
+- title: Conflicts and CRDTs
+  intro: Last-write-wins against siblings, a counter and a shopping cart that merge.
+  code: |
+    def compare(a, b):
+        """Compare two equal-length vector clocks: 'equal', 'before', 'after' or 'concurrent'."""
+        if a == b:
+            return "equal"
+        if all(x <= y for x, y in zip(a, b)):
+            return "before"
+        if all(x >= y for x, y in zip(a, b)):
+            return "after"
+        return "concurrent"
+
+
+    def lww_merge(a, b):
+        """Last-write-wins. Each write is (timestamp, node, value). Return the write with the higher timestamp; on a tie the one with the larger node name."""
+        return max(a, b, key=lambda w: (w[0], w[1]))
+
+
+    def lww_lost(writes):
+        """The writes that last-write-wins silently throws away: given a list of (timestamp, node, value) writes, return all but the winner, as a list sorted by (timestamp, node) ascending (empty list for no writes)."""
+        ordered = sorted(writes, key=lambda w: (w[0], w[1]))
+        return ordered[:-1]
+
+
+    def resolve_versions(versions):
+        """Keep only the versions that no other version dominates. `versions` is a list of (vector_clock, value) pairs. A version is dominated if another vector is 'after' it (all entries >=, and different).
+        Surviving concurrent versions are called SIBLINGS. Remove exact duplicates and return the survivors sorted by (vector, value)."""
+        unique = []
+        for v in versions:
+            if v not in unique:
+                unique.append(v)
+        keep = [v for v in unique if not any(compare(v[0], o[0]) == "before" for o in unique)]
+        return sorted(keep, key=lambda v: (v[0], repr(v[1])))
+
+
+    def merge_versions(a, b):
+        """The siblings left after combining two replicas' version lists: resolve_versions of the two lists joined."""
+        return resolve_versions(list(a) + list(b))
+
+
+    def gcounter_inc(counter, node, by=1):
+        """A grow-only counter is a dict node -> count. Return a NEW dict with `by` added to the node's entry. ValueError('negative increment') if by < 0."""
+        if by < 0:
+            raise ValueError("negative increment")
+        new = dict(counter)
+        new[node] = new.get(node, 0) + by
+        return new
+
+
+    def gcounter_value(counter):
+        """The counter's value: the sum of all entries."""
+        return sum(counter.values())
+
+
+    def gcounter_merge(a, b):
+        """Merge two grow-only counters: a new dict with, for every node, the LARGER of the two entries."""
+        return {n: max(a.get(n, 0), b.get(n, 0)) for n in set(a) | set(b)}
+
+
+    def pn_new():
+        """A counter that can also go down is a pair {"p": grow-only counter of increments, "n": grow-only counter of decrements}. Return the empty one."""
+        return {"p": {}, "n": {}}
+
+
+    def pn_inc(counter, node, by=1):
+        """A new PN counter with `by` added to the node's increments."""
+        return {"p": gcounter_inc(counter["p"], node, by), "n": dict(counter["n"])}
+
+
+    def pn_dec(counter, node, by=1):
+        """A new PN counter with `by` added to the node's decrements."""
+        return {"p": dict(counter["p"]), "n": gcounter_inc(counter["n"], node, by)}
+
+
+    def pn_value(counter):
+        """Increments minus decrements."""
+        return gcounter_value(counter["p"]) - gcounter_value(counter["n"])
+
+
+    def pn_merge(a, b):
+        """Merge each half with gcounter_merge."""
+        return {"p": gcounter_merge(a["p"], b["p"]), "n": gcounter_merge(a["n"], b["n"])}
+
+
+    def orset_new():
+        """An observed-remove set is {"adds": set of (element, tag), "removes": set of tags}. Return the empty one."""
+        return {"adds": set(), "removes": set()}
+
+
+    def orset_add(s, element, tag):
+        """A NEW set with the pair (element, tag) added. The tag is unique to this add operation."""
+        return {"adds": s["adds"] | {(element, tag)}, "removes": set(s["removes"])}
+
+
+    def orset_remove(s, element):
+        """A NEW set in which every tag currently attached to the element (and not already removed) is recorded as removed. Removing an absent element changes nothing."""
+        tags = {t for e, t in s["adds"] if e == element}
+        return {"adds": set(s["adds"]), "removes": s["removes"] | tags}
+
+
+    def orset_elements(s):
+        """The sorted list of elements that have at least one add whose tag is not in the removed tags."""
+        return sorted({e for e, t in s["adds"] if t not in s["removes"]})
+
+
+    def orset_merge(a, b):
+        """The union of both adds and both removes, as a new set."""
+        return {"adds": a["adds"] | b["adds"], "removes": a["removes"] | b["removes"]}
+
+    print("last write wins:", lww_merge((10, "phone", "blue"), (12, "laptop", "green")))
+    print("it threw away:", lww_lost([(10, "phone", "blue"), (12, "laptop", "green")]))
+    print("siblings kept:", merge_versions([([1, 1, 0], "blue")], [([1, 0, 1], "green")]))
+    likes = gcounter_merge(gcounter_inc({}, "us", 3), gcounter_inc({}, "eu", 5))
+    print("likes:", gcounter_value(likes))
+    cart = orset_merge(orset_remove(orset_add(orset_new(), "pen", "a"), "pen"), orset_add(orset_add(orset_new(), "pen", "a"), "pen", "b"))
+    print("cart after concurrent add and remove:", orset_elements(cart))
+  output: |
+    last write wins: (12, 'laptop', 'green')
+    it threw away: [(10, 'phone', 'blue')]
+    siblings kept: [([1, 0, 1], 'green'), ([1, 1, 0], 'blue')]
+    likes: 8
+    cart after concurrent add and remove: ['pen']
+  lines:
+  - line: 108
+    note: The later timestamp wins.
+  - line: 110
+    note: Both concurrent versions survive.
+  - line: 114
+    note: The concurrent add survives the remove.
+- title: Replicating a log
+  intro: A follower with bad entries is repaired by the leader.
+  code: |
+    def append_entries(log, prev_index, prev_term, entries):
+        """The follower side of log replication (as in Raft). A log is a list of (term, command); entry number i (counting from 1) is log[i - 1]. The leader sends the entries that follow position
+        prev_index, whose term is prev_term (prev_index 0 means 'from the start'). If prev_index > 0 and the follower has no entry there, or the entry's term differs from prev_term, REFUSE: return (False, a copy of the
+        log). Otherwise accept: walk through `entries`; if the follower already has an entry at that position with a DIFFERENT term, delete it and everything after it, then append; if the terms match keep the existing entry;
+        positions beyond the end are appended. Return (True, new log). Never change the input list."""
+        if prev_index > 0 and (len(log) < prev_index or log[prev_index - 1][0] != prev_term):
+            return False, list(log)
+        new = list(log)
+        for offset, entry in enumerate(entries):
+            position = prev_index + offset + 1
+            if len(new) >= position:
+                if new[position - 1][0] != entry[0]:
+                    new = new[:position - 1]
+                    new.append(entry)
+            else:
+                new.append(entry)
+        return True, new
+
+
+    def catch_up(leader_log, follower_log):
+        """How a leader repairs a follower. Start by assuming the follower is up to date (prev_index = len(leader_log)); send append_entries with prev_index, the term of the leader's entry there (0 if prev_index is 0), and the
+        leader's entries after prev_index. If the follower refuses, step prev_index back by one and try again, until it accepts. Return the follower's resulting log."""
+        log = list(follower_log)
+        prev = len(leader_log)
+        while True:
+            prev_term = leader_log[prev - 1][0] if prev > 0 else 0
+            ok, log2 = append_entries(log, prev, prev_term, leader_log[prev:])
+            if ok:
+                return log2
+            prev -= 1
+
+
+    def commit_index(match_index, leader_log, current_term):
+        """How far the log is committed. `match_index` lists, for each FOLLOWER, the highest log position known to be stored there. The cluster is the followers plus the leader (who has all of leader_log). Return the largest N (up to
+        len(leader_log)) such that a MAJORITY of the cluster has at least N entries and the entry at N is from current_term (Raft only counts replicas to commit entries of the current term); 0 if there is none."""
+        total = len(match_index) + 1
+        best = 0
+        for n in range(1, len(leader_log) + 1):
+            have = 1 + sum(1 for m in match_index if m >= n)
+            if have * 2 > total and leader_log[n - 1][0] == current_term:
+                best = n
+        return best
+
+    leader = [(1, "set x"), (1, "set y"), (2, "set z"), (2, "set w")]
+    stale = [(1, "set x"), (1, "set y"), (1, "bad"), (1, "worse")]
+    print("follower refuses a wrong position:", append_entries(stale, 3, 2, [(2, "set w")])[0])
+    print("after catch-up:", catch_up(leader, stale) == leader)
+    print("committed up to:", commit_index([4, 2], leader, 2))
+  output: |
+    follower refuses a wrong position: False
+    after catch-up: True
+    committed up to: 4
+  lines:
+  - line: 46
+    note: The follower's entry at position 3 has the wrong term.
+  - line: 47
+    note: The leader overwrote the bad entries.
+  - line: 48
+    note: A majority holds entries up to 4.
+playground:
+  prompt: Check which (r, w) pairs overlap for 5 replicas.
+  code: |
+    n = 5
+    for r in range(1, n + 1):
+        for w in range(1, n + 1):
+            print(r, w, 'overlap' if r + w > n else 'may be stale')
+exercises:
+- id: quorum
+  title: Quorums and read repair
+  difficulty: 5
+  prompt: 'To survive failures, data is stored on **n replicas**. A write must reach `w` of them and a read asks `r` of them. Write `quorum_overlaps(n, r, w)`: true exactly when `r + w > n`, which guarantees every read quorum shares a replica with every write quorum; and `tolerated_failures(n, r, w)` returning `{"read": n - r, "write": n - w}`. Both raise `ValueError("bad quorum")` unless `1 <= r <= n` and `1 <= w <= n`. Now simulate. `replicas` maps each replica name to its stored `(version, value)`; `up` lists the reachable names. Write `write_quorum(replicas, up, version, value, w)`: send the write to every reachable replica; a replica **stores** it only if `version` is higher than what it holds but **acknowledges** either way. Count the acknowledgements. The stores stay applied even if too few replicas answered. Return the number of acks or raise `ValueError("write failed")` if it is less than `w`. Write `read_quorum(replicas, up, r)`: contact the first `r` reachable replicas in sorted name order and return the `(version, value)` with the highest version (`ValueError("read failed")` if fewer than `r` are reachable). Write `read_repair(replicas, up, r)`: like `read_quorum`, but afterwards update every **contacted** replica that held an older version to the newest; return `((version, value), sorted list of repaired names)`.'
+  starter: |-
+    def quorum_overlaps(n, r, w):
+        """With n replicas, a read that asks r of them and a write that must reach w of them are GUARANTEED to share at least one replica exactly when r + w > n. Return that as a bool.
+        ValueError('bad quorum') unless 1 <= r <= n and 1 <= w <= n."""
+        pass
+
+
+    def tolerated_failures(n, r, w):
+        """How many replicas can be down while reads and writes still succeed: {"read": n - r, "write": n - w}. Same ValueError('bad quorum') check."""
+        pass
+
+
+    def write_quorum(replicas, up, version, value, w):
+        """`replicas` maps each replica name to its stored (version, value). `up` is the list of replica names that are reachable. Send (version, value) to every reachable replica: a replica stores it only if
+        `version` is higher than the version it holds, but it acknowledges either way. Count the acknowledgements (the names in `up` that are replicas). The stores are APPLIED even if too few replicas
+        answer. Return the number of acknowledgements, or raise ValueError('write failed') if it is less than w (the partial writes remain)."""
+        pass
+
+
+    def read_quorum(replicas, up, r):
+        """Contact the first r reachable replicas in sorted name order and return the (version, value) with the highest version among them. ValueError('read failed') if fewer than r replicas are reachable."""
+        pass
+
+
+    def read_repair(replicas, up, r):
+        """Like read_quorum, but afterwards bring every CONTACTED replica that held an older version up to the newest (version, value). Return ((version, value), sorted list of the names that were repaired)."""
+        pass
+  tests:
+  - name: the arithmetic
+    code: |
+      assert quorum_overlaps(3, 2, 2) and quorum_overlaps(5, 3, 3) and quorum_overlaps(3, 1, 3) and quorum_overlaps(3, 3, 1)
+      assert not quorum_overlaps(3, 1, 1) and not quorum_overlaps(5, 2, 3) and not quorum_overlaps(4, 2, 2)
+      assert tolerated_failures(5, 3, 3) == {"read": 2, "write": 2}
+      assert tolerated_failures(3, 1, 3) == {"read": 2, "write": 0}
+      for bad in ((3, 0, 1), (3, 1, 4), (3, 4, 1)):
+          for f in (quorum_overlaps, tolerated_failures):
+              try:
+                  f(*bad)
+                  raise AssertionError("accepted")
+              except ValueError as e:
+                  assert "bad quorum" in str(e)
+  - name: writing
+    code: |
+      rep = {"a": (0, None), "b": (0, None), "c": (0, None)}
+      assert write_quorum(rep, ["a", "b", "c"], 1, "x", 2) == 3
+      assert rep == {"a": (1, "x"), "b": (1, "x"), "c": (1, "x")}
+      assert write_quorum(rep, ["a", "b"], 2, "y", 2) == 2
+      assert rep == {"a": (2, "y"), "b": (2, "y"), "c": (1, "x")}
+      try:
+          write_quorum(rep, ["c"], 3, "z", 2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "write failed" in str(e)
+      assert rep["c"] == (3, "z")
+      assert write_quorum(rep, ["a"], 1, "old", 1) == 1 and rep["a"] == (2, "y")
+      assert write_quorum(rep, ["zzz", "a"], 4, "w", 1) == 1 and rep["a"] == (4, "w")
+  - name: reading
+    code: |
+      rep = {"a": (2, "new"), "b": (1, "old"), "c": (1, "old")}
+      assert read_quorum(rep, ["a", "b", "c"], 2) == (2, "new")
+      assert read_quorum(rep, ["b", "c"], 2) == (1, "old")
+      assert read_quorum(rep, ["b", "c"], 1) == (1, "old")
+      assert read_quorum(rep, ["c", "a"], 2) == (2, "new")
+      assert read_quorum(rep, ["a"], 1) == (2, "new")
+      try:
+          read_quorum(rep, ["a"], 2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "read failed" in str(e)
+  - name: overlapping quorums never read stale data
+    code: |
+      import itertools
+      names = ["a", "b", "c", "d", "e"]
+      for r, w in ((3, 3), (2, 4), (4, 2), (1, 5), (5, 1)):
+          for wset in itertools.combinations(names, w):
+              for rset in itertools.combinations(names, r):
+                  rep = {n: (1, "old") for n in names}
+                  write_quorum(rep, list(wset), 2, "new", w)
+                  assert read_quorum(rep, list(rset), r) == (2, "new"), (r, w, wset, rset)
+      rep = {n: (1, "old") for n in names}
+      write_quorum(rep, ["a"], 2, "new", 1)
+      assert read_quorum(rep, ["b", "c"], 2) == (1, "old")
+  - name: read repair
+    code: |
+      rep = {"a": (3, "v3"), "b": (1, "v1"), "c": (2, "v2")}
+      assert read_repair(rep, ["a", "b", "c"], 2) == ((3, "v3"), ["b"])
+      assert rep == {"a": (3, "v3"), "b": (3, "v3"), "c": (2, "v2")}
+      assert read_repair(rep, ["a", "b", "c"], 3) == ((3, "v3"), ["c"])
+      assert rep == {n: (3, "v3") for n in "abc"}
+      assert read_repair(rep, ["a", "b", "c"], 3) == ((3, "v3"), [])
+      rep = {"a": (1, "x"), "b": (0, None)}
+      assert read_repair(rep, ["b"], 1) == ((0, None), [])
+      try:
+          read_repair(rep, [], 1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "read failed" in str(e)
+  hints:
+  - A write is applied by every reachable replica even if the quorum is not reached.
+  solution: |
+    def quorum_overlaps(n, r, w):
+        """With n replicas, a read that asks r of them and a write that must reach w of them are GUARANTEED to share at least one replica exactly when r + w > n. Return that as a bool.
+        ValueError('bad quorum') unless 1 <= r <= n and 1 <= w <= n."""
+        if not (1 <= r <= n and 1 <= w <= n):
+            raise ValueError("bad quorum")
+        return r + w > n
+
+
+    def tolerated_failures(n, r, w):
+        """How many replicas can be down while reads and writes still succeed: {"read": n - r, "write": n - w}. Same ValueError('bad quorum') check."""
+        if not (1 <= r <= n and 1 <= w <= n):
+            raise ValueError("bad quorum")
+        return {"read": n - r, "write": n - w}
+
+
+    def write_quorum(replicas, up, version, value, w):
+        """`replicas` maps each replica name to its stored (version, value). `up` is the list of replica names that are reachable. Send (version, value) to every reachable replica: a replica stores it only if
+        `version` is higher than the version it holds, but it acknowledges either way. Count the acknowledgements (the names in `up` that are replicas). The stores are APPLIED even if too few replicas
+        answer. Return the number of acknowledgements, or raise ValueError('write failed') if it is less than w (the partial writes remain)."""
+        acks = 0
+        for name in sorted(set(up) & set(replicas)):
+            if version > replicas[name][0]:
+                replicas[name] = (version, value)
+            acks += 1
+        if acks < w:
+            raise ValueError("write failed")
+        return acks
+
+
+    def read_quorum(replicas, up, r):
+        """Contact the first r reachable replicas in sorted name order and return the (version, value) with the highest version among them. ValueError('read failed') if fewer than r replicas are reachable."""
+        reachable = sorted(set(up) & set(replicas))
+        if len(reachable) < r:
+            raise ValueError("read failed")
+        return max((replicas[name] for name in reachable[:r]), key=lambda vv: vv[0])
+
+
+    def read_repair(replicas, up, r):
+        """Like read_quorum, but afterwards bring every CONTACTED replica that held an older version up to the newest (version, value). Return ((version, value), sorted list of the names that were repaired)."""
+        reachable = sorted(set(up) & set(replicas))
+        if len(reachable) < r:
+            raise ValueError("read failed")
+        contacted = reachable[:r]
+        newest = max((replicas[name] for name in contacted), key=lambda vv: vv[0])
+        repaired = []
+        for name in contacted:
+            if replicas[name][0] < newest[0]:
+                replicas[name] = newest
+                repaired.append(name)
+        return newest, sorted(repaired)
+  explanation: Quorums let a system trade availability against freshness by choosing r and w.
+- id: conflicts
+  title: 'Conflicts: last write wins or siblings'
+  difficulty: 5
+  prompt: 'When two replicas accept writes while cut off from each other, their versions **conflict**. The starter has `compare` for vector clocks. Write `lww_merge(a, b)`, **last-write-wins**: each write is `(timestamp, node, value)`; return the write with the higher timestamp, and on a tie the one with the larger node name. Write `lww_lost(writes)`: the writes that LWW silently throws away, all but the winner, as a list sorted by `(timestamp, node)` ascending (empty for no writes). Write `resolve_versions(versions)`: `versions` is a list of `(vector_clock, value)` pairs; remove every version that another version **dominates** (its vector is `before` the other''s), remove exact duplicates, and return the survivors, the **siblings**, sorted by `(vector, value)` (compare values by `repr` when vectors tie). Write `merge_versions(a, b)`: the siblings left after joining two replicas'' version lists.'
+  starter: |-
+    def compare(a, b):
+        """Compare two equal-length vector clocks: 'equal', 'before', 'after' or 'concurrent'."""
+        if a == b:
+            return "equal"
+        if all(x <= y for x, y in zip(a, b)):
+            return "before"
+        if all(x >= y for x, y in zip(a, b)):
+            return "after"
+        return "concurrent"
+
+
+    def lww_merge(a, b):
+        """Last-write-wins. Each write is (timestamp, node, value). Return the write with the higher timestamp; on a tie the one with the larger node name."""
+        pass
+
+
+    def lww_lost(writes):
+        """The writes that last-write-wins silently throws away: given a list of (timestamp, node, value) writes, return all but the winner, as a list sorted by (timestamp, node) ascending (empty list for no writes)."""
+        pass
+
+
+    def resolve_versions(versions):
+        """Keep only the versions that no other version dominates. `versions` is a list of (vector_clock, value) pairs. A version is dominated if another vector is 'after' it (all entries >=, and different).
+        Surviving concurrent versions are called SIBLINGS. Remove exact duplicates and return the survivors sorted by (vector, value)."""
+        pass
+
+
+    def merge_versions(a, b):
+        """The siblings left after combining two replicas' version lists: resolve_versions of the two lists joined."""
+        pass
+  tests:
+  - name: last write wins
+    code: |
+      assert lww_merge((5, "a", "x"), (7, "b", "y")) == (7, "b", "y")
+      assert lww_merge((7, "b", "y"), (5, "a", "x")) == (7, "b", "y")
+      assert lww_merge((5, "a", "x"), (5, "b", "y")) == (5, "b", "y")
+      assert lww_merge((5, "b", "y"), (5, "a", "x")) == (5, "b", "y")
+      assert lww_merge((1, "n", 1), (1, "n", 1)) == (1, "n", 1)
+  - name: what last write wins loses
+    code: |
+      writes = [(3, "c", "cc"), (1, "a", "aa"), (3, "b", "bb"), (2, "a", "a2")]
+      assert lww_lost(writes) == [(1, "a", "aa"), (2, "a", "a2"), (3, "b", "bb")]
+      assert lww_lost([(1, "a", "x")]) == [] and lww_lost([]) == []
+      assert writes[0] == (3, "c", "cc")
+  - name: keeping siblings
+    code: |
+      v = [([1, 0], "a"), ([1, 1], "b"), ([0, 2], "c")]
+      assert resolve_versions(v) == [([0, 2], "c"), ([1, 1], "b")]
+      assert resolve_versions([([1], "a"), ([1], "a")]) == [([1], "a")]
+      assert resolve_versions([([2, 0], "x"), ([0, 2], "y")]) == [([0, 2], "y"), ([2, 0], "x")]
+      assert resolve_versions([([1, 0], "old"), ([2, 0], "new")]) == [([2, 0], "new")]
+      assert resolve_versions([]) == []
+      assert resolve_versions([([1, 1], "a"), ([1, 1], "b")]) == [([1, 1], "a"), ([1, 1], "b")]
+      before = [([1, 0], "a"), ([1, 1], "b")]
+      resolve_versions(before)
+      assert before == [([1, 0], "a"), ([1, 1], "b")]
+  - name: merging replicas
+    code: |
+      left = [([2, 1, 0], "left")]
+      right = [([2, 0, 1], "right")]
+      assert merge_versions(left, right) == [([2, 0, 1], "right"), ([2, 1, 0], "left")]
+      assert merge_versions(left, [([3, 1, 0], "newer")]) == [([3, 1, 0], "newer")]
+      assert merge_versions(left, left) == left
+      assert merge_versions([], []) == []
+      a, b, c = [([1, 0], "p")], [([0, 1], "q")], [([1, 1], "r")]
+      assert merge_versions(merge_versions(a, b), c) == merge_versions(a, merge_versions(b, c)) == [([1, 1], "r")]
+  hints:
+  - A version is discarded only when another vector is strictly after it.
+  solution: |
+    def compare(a, b):
+        """Compare two equal-length vector clocks: 'equal', 'before', 'after' or 'concurrent'."""
+        if a == b:
+            return "equal"
+        if all(x <= y for x, y in zip(a, b)):
+            return "before"
+        if all(x >= y for x, y in zip(a, b)):
+            return "after"
+        return "concurrent"
+
+
+    def lww_merge(a, b):
+        """Last-write-wins. Each write is (timestamp, node, value). Return the write with the higher timestamp; on a tie the one with the larger node name."""
+        return max(a, b, key=lambda w: (w[0], w[1]))
+
+
+    def lww_lost(writes):
+        """The writes that last-write-wins silently throws away: given a list of (timestamp, node, value) writes, return all but the winner, as a list sorted by (timestamp, node) ascending (empty list for no writes)."""
+        ordered = sorted(writes, key=lambda w: (w[0], w[1]))
+        return ordered[:-1]
+
+
+    def resolve_versions(versions):
+        """Keep only the versions that no other version dominates. `versions` is a list of (vector_clock, value) pairs. A version is dominated if another vector is 'after' it (all entries >=, and different).
+        Surviving concurrent versions are called SIBLINGS. Remove exact duplicates and return the survivors sorted by (vector, value)."""
+        unique = []
+        for v in versions:
+            if v not in unique:
+                unique.append(v)
+        keep = [v for v in unique if not any(compare(v[0], o[0]) == "before" for o in unique)]
+        return sorted(keep, key=lambda v: (v[0], repr(v[1])))
+
+
+    def merge_versions(a, b):
+        """The siblings left after combining two replicas' version lists: resolve_versions of the two lists joined."""
+        return resolve_versions(list(a) + list(b))
+  explanation: Last-write-wins is simple but silently loses data; siblings keep every concurrent update for the application to merge.
+- id: counters
+  title: Counters that merge without conflicts
+  difficulty: 5
+  prompt: 'A **CRDT** (conflict-free replicated data type) is a data structure whose copies can be changed independently and then merged in any order, always converging to the same value. Write a **grow-only counter** as a dict `node -> count`: `gcounter_inc(counter, node, by=1)` returns a **new** dict with `by` added to that node''s entry (`ValueError("negative increment")` if `by < 0`); `gcounter_value(counter)` sums the entries; `gcounter_merge(a, b)` takes, for every node, the **larger** of the two entries. Then a counter that can go down, a **PN counter**, as a pair `{"p": increments, "n": decrements}` of grow-only counters: `pn_new()` returns an empty one; `pn_inc(counter, node, by=1)` and `pn_dec(counter, node, by=1)` return **new** counters with the amount added to the `p` or `n` half; `pn_value(counter)` is increments minus decrements; `pn_merge(a, b)` merges each half.'
+  starter: |-
+    def gcounter_inc(counter, node, by=1):
+        """A grow-only counter is a dict node -> count. Return a NEW dict with `by` added to the node's entry. ValueError('negative increment') if by < 0."""
+        pass
+
+
+    def gcounter_value(counter):
+        """The counter's value: the sum of all entries."""
+        pass
+
+
+    def gcounter_merge(a, b):
+        """Merge two grow-only counters: a new dict with, for every node, the LARGER of the two entries."""
+        pass
+
+
+    def pn_new():
+        """A counter that can also go down is a pair {"p": grow-only counter of increments, "n": grow-only counter of decrements}. Return the empty one."""
+        pass
+
+
+    def pn_inc(counter, node, by=1):
+        """A new PN counter with `by` added to the node's increments."""
+        pass
+
+
+    def pn_dec(counter, node, by=1):
+        """A new PN counter with `by` added to the node's decrements."""
+        pass
+
+
+    def pn_value(counter):
+        """Increments minus decrements."""
+        pass
+
+
+    def pn_merge(a, b):
+        """Merge each half with gcounter_merge."""
+        pass
+  tests:
+  - name: grow-only counter
+    code: |
+      c = {}
+      c = gcounter_inc(c, "a")
+      c = gcounter_inc(c, "a", 4)
+      c = gcounter_inc(c, "b", 2)
+      assert c == {"a": 5, "b": 2} and gcounter_value(c) == 7 and gcounter_value({}) == 0
+      original = {"x": 1}
+      new = gcounter_inc(original, "x")
+      assert original == {"x": 1} and new == {"x": 2}
+      assert gcounter_inc({}, "z", 0) == {"z": 0}
+      try:
+          gcounter_inc({}, "a", -1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "negative increment" in str(e)
+  - name: merging replicas
+    code: |
+      r1 = gcounter_inc(gcounter_inc({}, "r1", 3), "r2", 1)
+      r2 = gcounter_inc(gcounter_inc({}, "r2", 4), "r3", 2)
+      merged = gcounter_merge(r1, r2)
+      assert merged == {"r1": 3, "r2": 4, "r3": 2} and gcounter_value(merged) == 9
+      assert gcounter_merge(r1, r2) == gcounter_merge(r2, r1)
+      assert gcounter_merge(r1, r1) == r1
+      r3 = {"r1": 7}
+      assert gcounter_merge(gcounter_merge(r1, r2), r3) == gcounter_merge(r1, gcounter_merge(r2, r3))
+      assert gcounter_merge({}, {}) == {}
+      assert r1 == {"r1": 3, "r2": 1}
+  - name: counters that go down
+    code: |
+      c = pn_new()
+      assert c == {"p": {}, "n": {}} and pn_value(c) == 0
+      c = pn_inc(c, "a", 10)
+      c = pn_dec(c, "a", 3)
+      c = pn_dec(c, "b")
+      assert pn_value(c) == 6 and c == {"p": {"a": 10}, "n": {"a": 3, "b": 1}}
+      base = pn_new()
+      changed = pn_inc(base, "a")
+      assert base == {"p": {}, "n": {}} and changed["p"] == {"a": 1}
+  - name: convergence
+    code: |
+      base = pn_new()
+      x = pn_dec(pn_inc(base, "x", 5), "x", 1)
+      y = pn_inc(pn_dec(base, "y", 2), "y", 7)
+      z = pn_dec(base, "z", 4)
+      m1 = pn_merge(pn_merge(x, y), z)
+      m2 = pn_merge(z, pn_merge(y, x))
+      assert m1 == m2 and pn_value(m1) == (5 - 1) + (7 - 2) - 4 == 5
+      assert pn_merge(x, x) == x and pn_merge(x, y) == pn_merge(y, x)
+      after = pn_inc(x, "x", 1)
+      assert pn_value(pn_merge(x, after)) == pn_value(after)
+  hints:
+  - Merging takes the larger entry per node; that is why it does not matter how often or in what order merges happen.
+  solution: |
+    def gcounter_inc(counter, node, by=1):
+        """A grow-only counter is a dict node -> count. Return a NEW dict with `by` added to the node's entry. ValueError('negative increment') if by < 0."""
+        if by < 0:
+            raise ValueError("negative increment")
+        new = dict(counter)
+        new[node] = new.get(node, 0) + by
+        return new
+
+
+    def gcounter_value(counter):
+        """The counter's value: the sum of all entries."""
+        return sum(counter.values())
+
+
+    def gcounter_merge(a, b):
+        """Merge two grow-only counters: a new dict with, for every node, the LARGER of the two entries."""
+        return {n: max(a.get(n, 0), b.get(n, 0)) for n in set(a) | set(b)}
+
+
+    def pn_new():
+        """A counter that can also go down is a pair {"p": grow-only counter of increments, "n": grow-only counter of decrements}. Return the empty one."""
+        return {"p": {}, "n": {}}
+
+
+    def pn_inc(counter, node, by=1):
+        """A new PN counter with `by` added to the node's increments."""
+        return {"p": gcounter_inc(counter["p"], node, by), "n": dict(counter["n"])}
+
+
+    def pn_dec(counter, node, by=1):
+        """A new PN counter with `by` added to the node's decrements."""
+        return {"p": dict(counter["p"]), "n": gcounter_inc(counter["n"], node, by)}
+
+
+    def pn_value(counter):
+        """Increments minus decrements."""
+        return gcounter_value(counter["p"]) - gcounter_value(counter["n"])
+
+
+    def pn_merge(a, b):
+        """Merge each half with gcounter_merge."""
+        return {"p": gcounter_merge(a["p"], b["p"]), "n": gcounter_merge(a["n"], b["n"])}
+  explanation: CRDTs get consistency without coordination by making every merge commutative, associative and idempotent.
+- id: orset
+  title: A set where adds beat removes
+  difficulty: 5
+  prompt: 'Sets are harder: if one replica adds an element while another removes it, what should the merged set say? An **observed-remove set** (OR-set) gives each add a unique **tag**, and a remove only deletes the adds it has **seen**, so a concurrent add survives. The state is `{"adds": set of (element, tag), "removes": set of tags}`. Write `orset_new()` (empty), `orset_add(s, element, tag)` (a **new** set with `(element, tag)` added), `orset_remove(s, element)` (a **new** set in which every tag currently attached to the element is recorded as removed; removing an absent element changes nothing), `orset_elements(s)` (the sorted list of elements with at least one add whose tag is not in `removes`) and `orset_merge(a, b)` (the union of the adds and the union of the removes, as a new set). Never change the inputs.'
+  starter: |-
+    def orset_new():
+        """An observed-remove set is {"adds": set of (element, tag), "removes": set of tags}. Return the empty one."""
+        pass
+
+
+    def orset_add(s, element, tag):
+        """A NEW set with the pair (element, tag) added. The tag is unique to this add operation."""
+        pass
+
+
+    def orset_remove(s, element):
+        """A NEW set in which every tag currently attached to the element (and not already removed) is recorded as removed. Removing an absent element changes nothing."""
+        pass
+
+
+    def orset_elements(s):
+        """The sorted list of elements that have at least one add whose tag is not in the removed tags."""
+        pass
+
+
+    def orset_merge(a, b):
+        """The union of both adds and both removes, as a new set."""
+        pass
+  tests:
+  - name: adding and removing
+    code: |
+      s = orset_new()
+      assert orset_elements(s) == []
+      s = orset_add(s, "x", "t1")
+      s = orset_add(s, "y", "t2")
+      assert orset_elements(s) == ["x", "y"]
+      s2 = orset_remove(s, "x")
+      assert orset_elements(s2) == ["y"] and orset_elements(s) == ["x", "y"]
+      assert orset_elements(orset_remove(orset_new(), "nope")) == []
+      s3 = orset_add(s2, "x", "t3")
+      assert orset_elements(s3) == ["x", "y"]
+      twice = orset_add(orset_add(orset_new(), "x", "a"), "x", "b")
+      assert orset_elements(twice) == ["x"] and orset_elements(orset_remove(twice, "x")) == []
+  - name: add wins over a concurrent remove
+    code: |
+      base = orset_add(orset_new(), "x", "t1")
+      alice = orset_remove(base, "x")
+      bob = orset_add(base, "x", "t2")
+      merged = orset_merge(alice, bob)
+      assert orset_elements(alice) == [] and orset_elements(bob) == ["x"]
+      assert orset_elements(merged) == ["x"]
+      assert orset_merge(alice, bob) == orset_merge(bob, alice)
+      assert merged["removes"] == {"t1"} and ("x", "t2") in merged["adds"]
+      later = orset_remove(merged, "x")
+      assert orset_elements(later) == []
+  - name: merge laws
+    code: |
+      a = orset_add(orset_add(orset_new(), "p", "1"), "q", "2")
+      b = orset_remove(orset_add(orset_new(), "q", "2"), "q")
+      c = orset_add(orset_new(), "r", "3")
+      assert orset_merge(a, a) == a
+      assert orset_merge(a, b) == orset_merge(b, a)
+      assert orset_merge(orset_merge(a, b), c) == orset_merge(a, orset_merge(b, c))
+      assert orset_elements(orset_merge(orset_merge(a, b), c)) == ["p", "r"]
+      assert orset_elements(orset_merge(orset_new(), orset_new())) == []
+      x = orset_add(orset_new(), "k", "t")
+      y = orset_merge(x, orset_new())
+      y["adds"].add(("zzz", "tt"))
+      assert ("zzz", "tt") not in x["adds"]
+  - name: replicas converge
+    code: |
+      r1 = orset_new()
+      r2 = orset_new()
+      r1 = orset_add(r1, "milk", "r1-1")
+      r2 = orset_add(r2, "eggs", "r2-1")
+      r1 = orset_add(r1, "bread", "r1-2")
+      r2 = orset_merge(r2, r1)
+      r2 = orset_remove(r2, "milk")
+      r1 = orset_add(r1, "milk", "r1-3")
+      r1 = orset_merge(r1, r2)
+      r2 = orset_merge(r2, r1)
+      assert orset_elements(r1) == orset_elements(r2) == ["bread", "eggs", "milk"]
+  hints:
+  - Tag every add uniquely; a remove records only the tags it can see.
+  solution: |
+    def orset_new():
+        """An observed-remove set is {"adds": set of (element, tag), "removes": set of tags}. Return the empty one."""
+        return {"adds": set(), "removes": set()}
+
+
+    def orset_add(s, element, tag):
+        """A NEW set with the pair (element, tag) added. The tag is unique to this add operation."""
+        return {"adds": s["adds"] | {(element, tag)}, "removes": set(s["removes"])}
+
+
+    def orset_remove(s, element):
+        """A NEW set in which every tag currently attached to the element (and not already removed) is recorded as removed. Removing an absent element changes nothing."""
+        tags = {t for e, t in s["adds"] if e == element}
+        return {"adds": set(s["adds"]), "removes": s["removes"] | tags}
+
+
+    def orset_elements(s):
+        """The sorted list of elements that have at least one add whose tag is not in the removed tags."""
+        return sorted({e for e, t in s["adds"] if t not in s["removes"]})
+
+
+    def orset_merge(a, b):
+        """The union of both adds and both removes, as a new set."""
+        return {"adds": a["adds"] | b["adds"], "removes": a["removes"] | b["removes"]}
+  explanation: The OR-set decides a concurrent add and remove in favour of the add, so no item is lost.
+- id: log
+  title: Log replication catch-up
+  difficulty: 5
+  prompt: 'Many systems keep replicas identical by replicating an ordered **log** of commands, with a **leader** sending entries to **followers** (this is the heart of Raft). A log is a list of `(term, command)`; the entry at position `i` (counting from 1) is `log[i - 1]`. Write `append_entries(log, prev_index, prev_term, entries)`, the follower''s rule. The leader sends the entries that follow position `prev_index`, whose term was `prev_term` (`prev_index` 0 means "from the start"). If `prev_index > 0` and the follower has no entry there, or its term differs from `prev_term`, **refuse**: return `(False, a copy of the log)`. Otherwise accept: walk through `entries`; if the follower already has an entry at that position with a **different term**, delete it and everything after it and append; if the terms match, keep the existing entry; positions beyond the end are appended. Return `(True, new log)` and never change the input. Write `catch_up(leader_log, follower_log)`: start with `prev_index = len(leader_log)` and send `append_entries` with that index, the leader''s term at that position (0 if the index is 0) and the leader''s entries after it; if the follower refuses, step `prev_index` back by one and try again until it accepts. Return the follower''s resulting log. Write `commit_index(match_index, leader_log, current_term)`: `match_index` lists, for each **follower**, the highest position known to be stored there; the cluster is the followers plus the leader. Return the largest `N` (up to `len(leader_log)`) such that a **majority** of the cluster holds at least `N` entries **and** the entry at `N` has term `current_term` (Raft only commits entries of the current term by counting replicas); `0` if there is none.'
+  starter: |-
+    def append_entries(log, prev_index, prev_term, entries):
+        """The follower side of log replication (as in Raft). A log is a list of (term, command); entry number i (counting from 1) is log[i - 1]. The leader sends the entries that follow position
+        prev_index, whose term is prev_term (prev_index 0 means 'from the start'). If prev_index > 0 and the follower has no entry there, or the entry's term differs from prev_term, REFUSE: return (False, a copy of the
+        log). Otherwise accept: walk through `entries`; if the follower already has an entry at that position with a DIFFERENT term, delete it and everything after it, then append; if the terms match keep the existing entry;
+        positions beyond the end are appended. Return (True, new log). Never change the input list."""
+        pass
+
+
+    def catch_up(leader_log, follower_log):
+        """How a leader repairs a follower. Start by assuming the follower is up to date (prev_index = len(leader_log)); send append_entries with prev_index, the term of the leader's entry there (0 if prev_index is 0), and the
+        leader's entries after prev_index. If the follower refuses, step prev_index back by one and try again, until it accepts. Return the follower's resulting log."""
+        pass
+
+
+    def commit_index(match_index, leader_log, current_term):
+        """How far the log is committed. `match_index` lists, for each FOLLOWER, the highest log position known to be stored there. The cluster is the followers plus the leader (who has all of leader_log). Return the largest N (up to
+        len(leader_log)) such that a MAJORITY of the cluster has at least N entries and the entry at N is from current_term (Raft only counts replicas to commit entries of the current term); 0 if there is none."""
+        pass
+  tests:
+  - name: the follower's rule
+    code: |
+      log = [(1, "a"), (1, "b")]
+      assert append_entries(log, 2, 1, [(2, "c")]) == (True, [(1, "a"), (1, "b"), (2, "c")])
+      assert append_entries(log, 0, 0, [(1, "a"), (1, "b"), (1, "z")]) == (True, [(1, "a"), (1, "b"), (1, "z")])
+      assert append_entries(log, 3, 1, [(1, "d")]) == (False, log)
+      assert append_entries(log, 2, 2, [(2, "c")]) == (False, log)
+      assert append_entries([], 0, 0, [(1, "x")]) == (True, [(1, "x")])
+      assert append_entries(log, 1, 1, []) == (True, log) and append_entries(log, 1, 1, [])[1] is not log
+      assert log == [(1, "a"), (1, "b")]
+  - name: conflicting entries are overwritten
+    code: |
+      follower = [(1, "a"), (1, "b"), (1, "x"), (1, "y")]
+      ok, new = append_entries(follower, 2, 1, [(2, "c")])
+      assert ok and new == [(1, "a"), (1, "b"), (2, "c")]
+      ok, new = append_entries(follower, 2, 1, [(1, "x")])
+      assert ok and new == follower
+      ok, new = append_entries(follower, 1, 1, [(1, "b"), (3, "q"), (3, "r")])
+      assert ok and new == [(1, "a"), (1, "b"), (3, "q"), (3, "r")]
+      assert follower == [(1, "a"), (1, "b"), (1, "x"), (1, "y")]
+  - name: catching up
+    code: |
+      leader = [(1, "a"), (1, "b"), (2, "c"), (2, "d")]
+      assert catch_up(leader, []) == leader
+      assert catch_up(leader, [(1, "a")]) == leader
+      assert catch_up(leader, leader) == leader
+      assert catch_up(leader, [(1, "a"), (1, "b"), (1, "x"), (1, "y"), (1, "z")]) == leader or catch_up(leader, [(1, "a"), (1, "b"), (1, "x"), (1, "y"), (1, "z")])[:4] == leader
+      assert catch_up(leader, [(1, "a"), (1, "b"), (1, "x")]) == leader
+      assert catch_up(leader, [(5, "w")]) == leader
+      assert catch_up([], [(1, "stale")]) == [(1, "stale")]
+  - name: what is committed
+    code: |
+      log = [(1, "a"), (1, "b"), (2, "c"), (2, "d")]
+      assert commit_index([4, 2], log, 2) == 4
+      assert commit_index([2, 2], log, 2) == 0
+      assert commit_index([3, 3], log, 2) == 3
+      assert commit_index([4, 4], log, 3) == 0
+      assert commit_index([4, 4], log, 2) == 4
+      assert commit_index([], log, 2) == 4
+      assert commit_index([4, 3, 0, 0], log, 2) == 3 or commit_index([4, 3, 0, 0], log, 2) == 0
+      assert commit_index([3, 3, 0, 0], log, 2) == 3
+      assert commit_index([2, 0], [(1, "a"), (1, "b")], 1) == 2 or commit_index([2, 0], [(1, "a"), (1, "b")], 1) == 2
+      assert commit_index([0, 0], [(1, "a")], 1) == 0
+  hints:
+  - Walk back from the end of the leader's log until the follower's log agrees, then send everything after that point.
+  solution: |
+    def append_entries(log, prev_index, prev_term, entries):
+        """The follower side of log replication (as in Raft). A log is a list of (term, command); entry number i (counting from 1) is log[i - 1]. The leader sends the entries that follow position
+        prev_index, whose term is prev_term (prev_index 0 means 'from the start'). If prev_index > 0 and the follower has no entry there, or the entry's term differs from prev_term, REFUSE: return (False, a copy of the
+        log). Otherwise accept: walk through `entries`; if the follower already has an entry at that position with a DIFFERENT term, delete it and everything after it, then append; if the terms match keep the existing entry;
+        positions beyond the end are appended. Return (True, new log). Never change the input list."""
+        if prev_index > 0 and (len(log) < prev_index or log[prev_index - 1][0] != prev_term):
+            return False, list(log)
+        new = list(log)
+        for offset, entry in enumerate(entries):
+            position = prev_index + offset + 1
+            if len(new) >= position:
+                if new[position - 1][0] != entry[0]:
+                    new = new[:position - 1]
+                    new.append(entry)
+            else:
+                new.append(entry)
+        return True, new
+
+
+    def catch_up(leader_log, follower_log):
+        """How a leader repairs a follower. Start by assuming the follower is up to date (prev_index = len(leader_log)); send append_entries with prev_index, the term of the leader's entry there (0 if prev_index is 0), and the
+        leader's entries after prev_index. If the follower refuses, step prev_index back by one and try again, until it accepts. Return the follower's resulting log."""
+        log = list(follower_log)
+        prev = len(leader_log)
+        while True:
+            prev_term = leader_log[prev - 1][0] if prev > 0 else 0
+            ok, log2 = append_entries(log, prev, prev_term, leader_log[prev:])
+            if ok:
+                return log2
+            prev -= 1
+
+
+    def commit_index(match_index, leader_log, current_term):
+        """How far the log is committed. `match_index` lists, for each FOLLOWER, the highest log position known to be stored there. The cluster is the followers plus the leader (who has all of leader_log). Return the largest N (up to
+        len(leader_log)) such that a MAJORITY of the cluster has at least N entries and the entry at N is from current_term (Raft only counts replicas to commit entries of the current term); 0 if there is none."""
+        total = len(match_index) + 1
+        best = 0
+        for n in range(1, len(leader_log) + 1):
+            have = 1 + sum(1 for m in match_index if m >= n)
+            if have * 2 > total and leader_log[n - 1][0] == current_term:
+                best = n
+        return best
+  explanation: A replicated log makes the order of commands the same on every machine, so every machine reaches the same state.
+commonMistakes:
+- title: Choosing r + w <= n and expecting fresh reads
+  explanation: The read set may miss every replica that has the new value.
+- title: Treating a failed write as if nothing happened
+  explanation: Some replicas may have stored it.
+- title: Trusting last-write-wins with unsynchronized clocks
+  explanation: A skewed clock can make an old write win.
+- title: Merging a counter by adding instead of taking the maximum
+  explanation: Merging the same state twice would double-count.
+- title: Letting a remove delete tags it has not seen
+  explanation: It would erase a concurrent add.
+summary:
+- Replication buys availability and speed at the price of consistency.
+- 'CAP: during a partition choose consistency or availability.'
+- Quorums with r + w > n guarantee reads overlap writes.
+- Last-write-wins is simple but loses concurrent updates; siblings keep them.
+- CRDTs merge commutatively, associatively and idempotently, so replicas converge.
+- A leader replicates an ordered log; a majority makes an entry committed.
+next: u24-consensus
+quiz:
+- type: mcq
+  question: With 5 replicas, which choice guarantees a read sees the latest write?
+  options:
+  - r = 3, w = 3
+  - r = 2, w = 3
+  - r = 1, w = 1
+  - r = 2, w = 2
+  answer: 0
+  explanation: 3 + 3 > 5.
+- type: mcq
+  question: What does the CAP theorem say about a network partition?
+  options:
+  - You must choose between consistency and availability
+  - Partitions cannot happen
+  - Both can always be had
+  - Only speed matters
+  answer: 0
+  explanation: One of them must give.
+- type: mcq
+  question: What is a downside of last-write-wins?
+  options:
+  - It can silently discard a concurrent update
+  - It never converges
+  - It needs vector clocks
+  - It is slow
+  answer: 0
+  explanation: One of two concurrent writes disappears.
+- type: mcq
+  question: Why does a grow-only counter merge by taking the maximum per node?
+  options:
+  - Merging twice must change nothing
+  - Maximum is faster
+  - Counts can go negative
+  - It avoids storing nodes
+  answer: 0
+  explanation: That makes merge idempotent.
+- type: mcq
+  question: In an observed-remove set, a concurrent add and remove of the same element result in...
+  options:
+  - the element being present
+  - the element being absent
+  - an error
+  - a duplicate
+  answer: 0
+  explanation: The remove only deleted tags it had seen.
+- type: mcq
+  question: When is a log entry committed in Raft?
+  options:
+  - Once a majority has stored it
+  - When the leader writes it
+  - After one follower acknowledges
+  - After one second
+  answer: 0
+  explanation: A majority overlaps any future leader's supporters.
+- type: code
+  question: Write `needs_repair(replicas, version)` returning the sorted list of replica names whose stored version is lower than `version`. `replicas` maps names to `(version, value)` pairs.
+  starter: |
+    def needs_repair(replicas, version):
+        pass
+  tests:
+  - name: repair
+    code: |
+      rep = {"a": (3, "x"), "b": (1, "y"), "c": (2, "z")}
+      assert needs_repair(rep, 3) == ["b", "c"] and needs_repair(rep, 1) == [] and needs_repair(rep, 9) == ["a", "b", "c"] and needs_repair({}, 1) == []
+  solution: |
+    def needs_repair(replicas, version):
+        return sorted(n for n, (v, _) in replicas.items() if v < version)

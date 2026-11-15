@@ -1,0 +1,804 @@
+id: u24-reliability
+title: 'Surviving Failure: Retries, Limits and Balancing'
+minutes: 90
+objective: Learn the everyday techniques that keep distributed systems up when parts fail or get overloaded. You will write retry with backoff and jitter, a rate limiter, a circuit breaker and three load-balancing policies, then combine them in a protected client. You will also meet the CAP theorem, which names the central trade-off.
+outcomes:
+- Retry safely with exponential backoff and jitter
+- Limit request rates with a token bucket
+- Stop calling failing services with a circuit breaker
+- Balance load with round robin, least connections and power of two choices
+- Explain the CAP theorem and PACELC
+sections:
+- heading: 'Failure is normal: retries, backoff and jitter'
+  body: |-
+    In a distributed system a message can be lost, delayed or answered too late, and a server can crash in the middle of a request. The simplest defence is to **retry**: send the request again. Two rules make retrying safe. First, the operation must be **idempotent**, meaning doing it twice has the same effect as once, which is why the transactions lesson used idempotency keys. Second, the client must not retry carelessly. If a server is overloaded and every client instantly retries, the load doubles and the server never recovers, an effect called a **retry storm**.
+
+    **Exponential backoff** fixes this by waiting longer after each failure: 1 second, then 2, 4, 8 and so on, up to a **cap** so the wait never grows absurd. Even so, thousands of clients that failed at the same moment will all retry at the same moment, again and again, in synchronised waves. **Jitter** adds randomness: with *full jitter* each client waits a random time between zero and its backoff delay, which spreads the retries out smoothly. Real clients also limit the **number of attempts** and use a **timeout** on each attempt, because waiting forever for a dead server is its own failure.
+- heading: 'Protecting servers: rate limits and circuit breakers'
+  body: |-
+    A server also needs to protect *itself*. A **rate limiter** caps how much work each client may demand. The **token bucket** is the classic design: imagine a bucket holding up to `capacity` tokens that refills at `rate` tokens per second. Each request removes a token; if the bucket is empty the request is rejected (or delayed). A full bucket allows a short **burst** of capacity requests at once, while over a long time no more than `rate` per second can get through. Because it only stores two numbers, a token bucket scales to millions of clients.
+
+    The **circuit breaker** protects the *caller*, named after the switch in an electrical fuse box. While a dependency works, the breaker is **closed** and calls pass. After a few failures in a row it trips **open**, and calls fail immediately without even trying, which saves resources and gives the broken service room to recover. After a **cooldown** it goes **half-open**: it allows one trial call. If that succeeds the breaker closes again; if it fails the breaker re-opens for another cooldown. Together, timeouts, retries with backoff, rate limits and circuit breakers are the standard toolkit that stops one failing component from dragging down everything that depends on it, a disaster called a **cascading failure**.
+- heading: Spreading the load, and the CAP theorem
+  body: |-
+    A **load balancer** sits in front of many identical servers and decides which one gets each request. **Round robin** hands out requests in turn: simple, but it ignores how busy each server is. **Least connections** sends each request to the server with the fewest active requests: better, but it needs fresh load information from every server, which is hard at scale. **Power of two choices** is a surprisingly good compromise: for each request pick **two servers at random** and use the less loaded one. With ten servers and a thousand requests, plain random choice leaves a gap of dozens of requests between the busiest and the idlest, while two choices keeps the gap to two or three. Looking at a tiny random sample captures nearly all the benefit of looking at everyone.
+
+    Finally, the big trade-off. The **CAP theorem** says that when the network **partitions** (some machines cannot talk to others), a system must choose between **consistency** (every read sees the latest write, so the cut-off side must refuse to answer) and **availability** (every request gets an answer, though possibly a stale one). It cannot have both during a partition. A bank ledger chooses consistency; a social media feed usually chooses availability. **PACELC** extends the idea: even when there is *no* partition, there is a trade-off between **latency** and consistency, because waiting for more replicas to confirm makes writes safer but slower. Naming which side of these trade-offs each system takes is the first step in designing any distributed system.
+examples:
+- title: Backoff, jitter and rate limiting
+  intro: The waits a retrying client uses, and how a token bucket reacts to a burst.
+  code: |
+    import random
+
+
+    def backoff_delays(attempts, base, cap):
+        """The wait times used by EXPONENTIAL BACKOFF: after failure i (i = 0, 1, ...) wait min(cap, base * 2 ** i). Return a list of `attempts` delays. ValueError('bad parameters') if attempts < 0 or base <= 0 or cap < base."""
+        if attempts < 0 or base <= 0 or cap < base:
+            raise ValueError("bad parameters")
+        return [min(cap, base * 2 ** i) for i in range(attempts)]
+
+
+    def full_jitter(delays, seed):
+        """Spread retries out with FULL JITTER: replace each delay d with a random number between 0 and d. Use rng = random.Random(seed) and round(rng.random() * d, 3) for each delay in order. Return the new list."""
+        rng = random.Random(seed)
+        return [round(rng.random() * d, 3) for d in delays]
+
+
+    def retry_schedule(outcomes, max_attempts, base, cap):
+        """Replay a retrying client. `outcomes` is the list of results of successive attempts (True = success; attempts beyond the list fail). The client tries up to max_attempts times, stopping at the first success. After a failure it waits backoff_delays(...)[i] before the NEXT attempt, but only if another attempt will follow.
+        Return (succeeded, attempts_used, total_wait). ValueError('bad attempts') if max_attempts < 1."""
+        if max_attempts < 1:
+            raise ValueError("bad attempts")
+        delays = backoff_delays(max_attempts, base, cap)
+        wait = 0
+        for i in range(max_attempts):
+            ok = outcomes[i] if i < len(outcomes) else False
+            if ok:
+                return True, i + 1, wait
+            if i + 1 < max_attempts:
+                wait += delays[i]
+        return False, max_attempts, wait
+
+
+    def new_bucket(capacity, rate, now=0):
+        """A TOKEN BUCKET rate limiter: it holds up to `capacity` tokens and gains `rate` tokens per time unit. Return a dict {"capacity", "rate", "tokens": capacity (starts full), "last": now}. ValueError('bad bucket') if capacity < 1 or rate <= 0."""
+        if capacity < 1 or rate <= 0:
+            raise ValueError("bad bucket")
+        return {"capacity": capacity, "rate": rate, "tokens": capacity, "last": now}
+
+
+    def allow(bucket, now, cost=1):
+        """First refill: tokens = min(capacity, tokens + (now - last) * rate) and last = now. Then if tokens >= cost, subtract the cost and return True; otherwise leave the tokens and return False. The bucket dict is changed in place. ValueError('time went backwards') if now < last."""
+        if now < bucket["last"]:
+            raise ValueError("time went backwards")
+        bucket["tokens"] = min(bucket["capacity"], bucket["tokens"] + (now - bucket["last"]) * bucket["rate"])
+        bucket["last"] = now
+        if bucket["tokens"] >= cost:
+            bucket["tokens"] -= cost
+            return True
+        return False
+
+
+    def rate_limit_log(times, capacity, rate):
+        """Run a fresh bucket (created at time 0) over a list of request times (non-decreasing, one token each) and return the list of True/False answers."""
+        bucket = new_bucket(capacity, rate)
+        return [allow(bucket, t) for t in times]
+
+    print("backoff delays:", backoff_delays(6, 1, 20))
+    print("with full jitter:", full_jitter(backoff_delays(6, 1, 20), 1))
+    print("retry [fail, fail, ok]:", retry_schedule([False, False, True], 5, 1, 20))
+    print("rate limiter, 3 token bucket, 6 requests at once, then 1 per tick:", rate_limit_log([0, 0, 0, 0, 0, 0, 1, 2, 3], 3, 1))
+  output: |
+    backoff delays: [1, 2, 4, 8, 16, 20]
+    with full jitter: [0.134, 1.695, 3.055, 2.041, 7.927, 8.99]
+    retry [fail, fail, ok]: (True, 3, 3)
+    rate limiter, 3 token bucket, 6 requests at once, then 1 per tick: [True, True, True, False, False, False, True, True, True]
+  lines:
+  - line: 57
+    note: Each wait doubles until the cap.
+  - line: 58
+    note: Jitter picks a random fraction of each delay.
+  - line: 59
+    note: Two failures cost 1 + 2 time units of waiting.
+  - line: 60
+    note: The burst of 3 is allowed, then one per tick.
+- title: Balancing and a protected client
+  intro: Round robin, two random choices against one, and a client whose circuit breaker trips and recovers.
+  code: |
+    import random
+
+
+    def round_robin(servers, n):
+        """The first n assignments of ROUND ROBIN over the list of servers, in order, cycling. ValueError('no servers') for an empty list."""
+        if not servers:
+            raise ValueError("no servers")
+        return [servers[i % len(servers)] for i in range(n)]
+
+
+    def pick_least(loads):
+        """LEAST CONNECTIONS: from a dict {server: current load} return the server with the smallest load; ties go to the alphabetically first name. ValueError('no servers') if empty."""
+        if not loads:
+            raise ValueError("no servers")
+        return min(sorted(loads), key=lambda s: loads[s])
+
+
+    def power_of_two(servers, requests, seed):
+        """POWER OF TWO CHOICES: every server starts with load 0. For each request pick TWO DIFFERENT random servers (rng = random.Random(seed); servers sorted first; draw a = rng.randrange(len) then b = rng.randrange(len), redrawing both until a != b), and give the request to the one with the smaller load (on a tie the first, a).
+        Return the final loads dict. ValueError('need two servers') if fewer than two servers."""
+        if len(servers) < 2:
+            raise ValueError("need two servers")
+        rng = random.Random(seed)
+        names = sorted(servers)
+        loads = {s: 0 for s in names}
+        for _ in range(requests):
+            while True:
+                a = rng.randrange(len(names))
+                b = rng.randrange(len(names))
+                if a != b:
+                    break
+            x, y = names[a], names[b]
+            loads[y if loads[y] < loads[x] else x] += 1
+        return loads
+
+
+    def imbalance(loads):
+        """The difference between the busiest and the idlest server."""
+        return max(loads.values()) - min(loads.values())
+
+
+    def new_breaker(threshold, cooldown):
+        """A CIRCUIT BREAKER stops calling a failing service. Return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}. ValueError('bad breaker') if threshold < 1 or cooldown < 1."""
+        if threshold < 1 or cooldown < 1:
+            raise ValueError("bad breaker")
+        return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}
+
+
+    def breaker_allow(b, now):
+        """May a call go through right now? Closed or half_open: True. Open: if now - opened >= cooldown, change the state to "half_open" and return True (one trial call); otherwise return False."""
+        if b["state"] == "open":
+            if now - b["opened"] >= b["cooldown"]:
+                b["state"] = "half_open"
+                return True
+            return False
+        return True
+
+
+    def record(b, ok, now):
+        """Report the result of a call that was made. Success: state = "closed" and fails = 0. Failure: if the state is "half_open" the trial failed, so the state becomes "open" with opened = now; otherwise fails += 1 and when fails >= threshold the state becomes "open" with opened = now."""
+        if ok:
+            b["state"] = "closed"
+            b["fails"] = 0
+        elif b["state"] == "half_open":
+            b["state"] = "open"
+            b["opened"] = now
+        else:
+            b["fails"] += 1
+            if b["fails"] >= b["threshold"]:
+                b["state"] = "open"
+                b["opened"] = now
+
+
+    def run_client(script, max_attempts, threshold, cooldown):
+        """A client protected by a circuit breaker. `script` is a list of requests, each a list of attempt outcomes (True/False; attempts beyond the list fail). Time starts at 0 and every attempt, or rejected attempt, advances it by 1. Create a breaker with new_breaker(threshold, cooldown). For each request, for up to max_attempts attempts:
+        if not breaker_allow(b, now): result "rejected", now += 1, stop this request; otherwise now += 1, then call record(b, outcome, now); on success the result is "ok" and the request stops; if all attempts fail the result is "failed". Return the list of results, one per request."""
+        b = new_breaker(threshold, cooldown)
+        now = 0
+        results = []
+        for outs in script:
+            result = "failed"
+            for i in range(max_attempts):
+                if not breaker_allow(b, now):
+                    result = "rejected"
+                    now += 1
+                    break
+                ok = outs[i] if i < len(outs) else False
+                now += 1
+                record(b, ok, now)
+                if ok:
+                    result = "ok"
+                    break
+            results.append(result)
+        return results
+
+    servers = ["s%d" % i for i in range(10)]
+    print("round robin:", round_robin(["a", "b", "c"], 7))
+    loads = power_of_two(servers, 1000, 3)
+    print("power of two choices, 1000 requests over 10 servers: busiest minus idlest =", imbalance(loads))
+    rng = random.Random(3)
+    rand = {s: 0 for s in servers}
+    for _ in range(1000):
+        rand[servers[rng.randrange(10)]] += 1
+    print("one random choice instead:", imbalance(rand))
+    print("protected client:", run_client([[False, False, True], [True], [True], [True], [True], [True]], 3, 2, 5))
+  output: |
+    round robin: ['a', 'b', 'c', 'a', 'b', 'c', 'a']
+    power of two choices, 1000 requests over 10 servers: busiest minus idlest = 2
+    one random choice instead: 21
+    protected client: ['rejected', 'rejected', 'rejected', 'rejected', 'rejected', 'ok']
+  lines:
+  - line: 97
+    note: Servers take turns.
+  - line: 99
+    note: Two choices keep the gap tiny.
+  - line: 104
+    note: One random choice leaves a big gap.
+  - line: 105
+    note: The breaker rejects calls, then recovers after its cooldown.
+playground:
+  prompt: Try other base and cap values to see the backoff delays.
+  code: |
+    delay = 1
+    for attempt in range(8):
+        print('attempt', attempt, 'wait', min(delay, 30))
+        delay = delay * 2
+exercises:
+- id: retry
+  title: Retries with backoff
+  difficulty: 4
+  prompt: 'Networks lose messages, so clients **retry**. Hammering a struggling server makes it worse, so they wait longer after each failure: **exponential backoff**. Write `backoff_delays(attempts, base, cap)`: after failure `i` (0, 1, ...) wait `min(cap, base * 2 ** i)`; return a list of `attempts` delays (`ValueError("bad parameters")` if `attempts < 0`, `base <= 0` or `cap < base`). Clients that all retry on the same schedule collide again, so add **jitter**: `full_jitter(delays, seed)` replaces each delay `d` by a random number between 0 and `d`, computed with `rng = random.Random(seed)` and `round(rng.random() * d, 3)` for each delay in order. Write `retry_schedule(outcomes, max_attempts, base, cap)`: `outcomes` lists the results of successive attempts (`True` = success; attempts beyond the list fail). The client tries up to `max_attempts` times, stopping at the first success, and after a failure waits `backoff_delays(...)[i]` before the next attempt, but **only if** another attempt follows. Return `(succeeded, attempts_used, total_wait)`; `ValueError("bad attempts")` if `max_attempts < 1`.'
+  starter: |-
+    import random
+
+
+    def backoff_delays(attempts, base, cap):
+        """The wait times used by EXPONENTIAL BACKOFF: after failure i (i = 0, 1, ...) wait min(cap, base * 2 ** i). Return a list of `attempts` delays. ValueError('bad parameters') if attempts < 0 or base <= 0 or cap < base."""
+        pass
+
+
+    def full_jitter(delays, seed):
+        """Spread retries out with FULL JITTER: replace each delay d with a random number between 0 and d. Use rng = random.Random(seed) and round(rng.random() * d, 3) for each delay in order. Return the new list."""
+        pass
+
+
+    def retry_schedule(outcomes, max_attempts, base, cap):
+        """Replay a retrying client. `outcomes` is the list of results of successive attempts (True = success; attempts beyond the list fail). The client tries up to max_attempts times, stopping at the first success. After a failure it waits backoff_delays(...)[i] before the NEXT attempt, but only if another attempt will follow.
+        Return (succeeded, attempts_used, total_wait). ValueError('bad attempts') if max_attempts < 1."""
+        pass
+  tests:
+  - name: delays
+    code: |
+      assert backoff_delays(5, 1, 100) == [1, 2, 4, 8, 16]
+      assert backoff_delays(6, 1, 10) == [1, 2, 4, 8, 10, 10]
+      assert backoff_delays(0, 1, 5) == []
+      for bad in ((-1, 1, 5), (3, 0, 5), (3, 4, 2)):
+          try:
+              backoff_delays(*bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad parameters" in str(e)
+  - name: jitter
+    code: |
+      d = backoff_delays(6, 1, 100)
+      j = full_jitter(d, 4)
+      assert len(j) == 6 and all(0 <= x <= y for x, y in zip(j, d))
+      assert j == full_jitter(d, 4) and j != full_jitter(d, 5)
+      assert full_jitter([], 1) == []
+      import random
+      rng = random.Random(4)
+      assert j == [round(rng.random() * x, 3) for x in d]
+  - name: replaying a client
+    code: |
+      assert retry_schedule([True], 5, 1, 100) == (True, 1, 0)
+      assert retry_schedule([False, False, True], 5, 1, 100) == (True, 3, 1 + 2)
+      assert retry_schedule([], 4, 1, 100) == (False, 4, 1 + 2 + 4)
+      assert retry_schedule([False, False, False, True], 3, 1, 100) == (False, 3, 1 + 2)
+      assert retry_schedule([False], 1, 1, 100) == (False, 1, 0)
+      assert retry_schedule([False] * 6 + [True], 8, 1, 4) == (True, 7, 1 + 2 + 4 + 4 + 4 + 4)
+      try:
+          retry_schedule([True], 0, 1, 2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad attempts" in str(e)
+  hints:
+  - 'Only wait between attempts: no wait after the last allowed failure.'
+  solution: |
+    import random
+
+
+    def backoff_delays(attempts, base, cap):
+        """The wait times used by EXPONENTIAL BACKOFF: after failure i (i = 0, 1, ...) wait min(cap, base * 2 ** i). Return a list of `attempts` delays. ValueError('bad parameters') if attempts < 0 or base <= 0 or cap < base."""
+        if attempts < 0 or base <= 0 or cap < base:
+            raise ValueError("bad parameters")
+        return [min(cap, base * 2 ** i) for i in range(attempts)]
+
+
+    def full_jitter(delays, seed):
+        """Spread retries out with FULL JITTER: replace each delay d with a random number between 0 and d. Use rng = random.Random(seed) and round(rng.random() * d, 3) for each delay in order. Return the new list."""
+        rng = random.Random(seed)
+        return [round(rng.random() * d, 3) for d in delays]
+
+
+    def retry_schedule(outcomes, max_attempts, base, cap):
+        """Replay a retrying client. `outcomes` is the list of results of successive attempts (True = success; attempts beyond the list fail). The client tries up to max_attempts times, stopping at the first success. After a failure it waits backoff_delays(...)[i] before the NEXT attempt, but only if another attempt will follow.
+        Return (succeeded, attempts_used, total_wait). ValueError('bad attempts') if max_attempts < 1."""
+        if max_attempts < 1:
+            raise ValueError("bad attempts")
+        delays = backoff_delays(max_attempts, base, cap)
+        wait = 0
+        for i in range(max_attempts):
+            ok = outcomes[i] if i < len(outcomes) else False
+            if ok:
+                return True, i + 1, wait
+            if i + 1 < max_attempts:
+                wait += delays[i]
+        return False, max_attempts, wait
+  explanation: Backoff plus jitter keeps retrying clients from knocking over a server that is trying to recover.
+- id: bucket
+  title: Token bucket rate limiter
+  difficulty: 4
+  prompt: 'A **rate limiter** protects a service from being overwhelmed. A **token bucket** holds up to `capacity` tokens and gains `rate` tokens per time unit; each request spends tokens, so short bursts are allowed but the long-run rate is limited. Write `new_bucket(capacity, rate, now=0)`: a dict `{"capacity", "rate", "tokens": capacity, "last": now}` (full to start); `ValueError("bad bucket")` if `capacity < 1` or `rate <= 0`. Write `allow(bucket, now, cost=1)`: first refill (`tokens = min(capacity, tokens + (now - last) * rate)` and `last = now`), then if `tokens >= cost` subtract the cost and return `True`, otherwise leave the tokens and return `False`. The dict is changed **in place**. `ValueError("time went backwards")` if `now < last`. Write `rate_limit_log(times, capacity, rate)`: run a fresh bucket (created at time 0) over a list of non-decreasing request times, one token each, returning the list of answers.'
+  starter: |-
+    def new_bucket(capacity, rate, now=0):
+        """A TOKEN BUCKET rate limiter: it holds up to `capacity` tokens and gains `rate` tokens per time unit. Return a dict {"capacity", "rate", "tokens": capacity (starts full), "last": now}. ValueError('bad bucket') if capacity < 1 or rate <= 0."""
+        pass
+
+
+    def allow(bucket, now, cost=1):
+        """First refill: tokens = min(capacity, tokens + (now - last) * rate) and last = now. Then if tokens >= cost, subtract the cost and return True; otherwise leave the tokens and return False. The bucket dict is changed in place. ValueError('time went backwards') if now < last."""
+        pass
+
+
+    def rate_limit_log(times, capacity, rate):
+        """Run a fresh bucket (created at time 0) over a list of request times (non-decreasing, one token each) and return the list of True/False answers."""
+        pass
+  tests:
+  - name: the bucket
+    code: |
+      b = new_bucket(3, 1)
+      assert b == {"capacity": 3, "rate": 1, "tokens": 3, "last": 0}
+      assert [allow(b, 0) for _ in range(4)] == [True, True, True, False]
+      assert allow(b, 1) is True and allow(b, 1) is False
+      assert allow(b, 10) is True and b["tokens"] == 2
+      for bad in ((0, 1), (3, 0)):
+          try:
+              new_bucket(*bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad bucket" in str(e)
+  - name: cost and time
+    code: |
+      b = new_bucket(10, 2, 5)
+      assert allow(b, 5, cost=10) is True and allow(b, 5) is False
+      assert allow(b, 6, cost=3) is False and b["tokens"] == 2
+      assert allow(b, 7, cost=3) is True and b["tokens"] == 1
+      try:
+          allow(b, 6)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "backwards" in str(e)
+  - name: a log
+    code: |
+      assert rate_limit_log([0, 0, 0, 0, 1, 1, 2], 2, 1) == [True, True, False, False, True, False, True]
+      assert rate_limit_log([], 2, 1) == []
+      steady = rate_limit_log(list(range(100)), 1, 1)
+      assert all(steady)
+      burst = rate_limit_log([0] * 50, 5, 1)
+      assert sum(burst) == 5
+      long_run = rate_limit_log([t // 2 for t in range(400)], 4, 1)
+      assert 195 <= sum(long_run) <= 205
+  hints:
+  - Refill from the elapsed time before you decide; never add tokens above the capacity.
+  solution: |
+    def new_bucket(capacity, rate, now=0):
+        """A TOKEN BUCKET rate limiter: it holds up to `capacity` tokens and gains `rate` tokens per time unit. Return a dict {"capacity", "rate", "tokens": capacity (starts full), "last": now}. ValueError('bad bucket') if capacity < 1 or rate <= 0."""
+        if capacity < 1 or rate <= 0:
+            raise ValueError("bad bucket")
+        return {"capacity": capacity, "rate": rate, "tokens": capacity, "last": now}
+
+
+    def allow(bucket, now, cost=1):
+        """First refill: tokens = min(capacity, tokens + (now - last) * rate) and last = now. Then if tokens >= cost, subtract the cost and return True; otherwise leave the tokens and return False. The bucket dict is changed in place. ValueError('time went backwards') if now < last."""
+        if now < bucket["last"]:
+            raise ValueError("time went backwards")
+        bucket["tokens"] = min(bucket["capacity"], bucket["tokens"] + (now - bucket["last"]) * bucket["rate"])
+        bucket["last"] = now
+        if bucket["tokens"] >= cost:
+            bucket["tokens"] -= cost
+            return True
+        return False
+
+
+    def rate_limit_log(times, capacity, rate):
+        """Run a fresh bucket (created at time 0) over a list of request times (non-decreasing, one token each) and return the list of True/False answers."""
+        bucket = new_bucket(capacity, rate)
+        return [allow(bucket, t) for t in times]
+  explanation: Token buckets give a service a steady limit while tolerating the bursts real traffic has.
+- id: breaker
+  title: Circuit breaker
+  difficulty: 4
+  prompt: 'When a service is failing, further calls only waste time. A **circuit breaker** has three states: **closed** (calls flow), **open** (calls are rejected immediately) and **half_open** (one trial call is allowed). Write `new_breaker(threshold, cooldown)` returning `{"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}` (`ValueError("bad breaker")` if `threshold < 1` or `cooldown < 1`). Write `breaker_allow(b, now)`: closed or half_open means `True`; open means `False`, **unless** `now - opened >= cooldown`, in which case the state becomes `"half_open"` and it returns `True`. Write `record(b, ok, now)` for the result of a call that was made: success sets the state to `"closed"` and `fails` to 0; a failure when the state is `"half_open"` sets the state to `"open"` with `opened = now`; any other failure adds 1 to `fails`, and when `fails >= threshold` the state becomes `"open"` with `opened = now`. All three change the dict in place.'
+  starter: |-
+    def new_breaker(threshold, cooldown):
+        """A CIRCUIT BREAKER stops calling a failing service. Return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}. ValueError('bad breaker') if threshold < 1 or cooldown < 1."""
+        pass
+
+
+    def breaker_allow(b, now):
+        """May a call go through right now? Closed or half_open: True. Open: if now - opened >= cooldown, change the state to "half_open" and return True (one trial call); otherwise return False."""
+        pass
+
+
+    def record(b, ok, now):
+        """Report the result of a call that was made. Success: state = "closed" and fails = 0. Failure: if the state is "half_open" the trial failed, so the state becomes "open" with opened = now; otherwise fails += 1 and when fails >= threshold the state becomes "open" with opened = now."""
+        pass
+  tests:
+  - name: tripping
+    code: |
+      b = new_breaker(3, 10)
+      assert b["state"] == "closed" and breaker_allow(b, 0)
+      record(b, False, 1); record(b, False, 2)
+      assert b["state"] == "closed" and b["fails"] == 2
+      record(b, True, 3)
+      assert b["fails"] == 0
+      for t in (4, 5, 6):
+          record(b, False, t)
+      assert b["state"] == "open" and b["opened"] == 6
+      for bad in ((0, 1), (1, 0)):
+          try:
+              new_breaker(*bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad breaker" in str(e)
+  - name: cooldown and trial
+    code: |
+      b = new_breaker(1, 5)
+      record(b, False, 2)
+      assert b["state"] == "open"
+      assert breaker_allow(b, 3) is False and breaker_allow(b, 6) is False
+      assert b["state"] == "open"
+      assert breaker_allow(b, 7) is True and b["state"] == "half_open"
+      record(b, False, 8)
+      assert b["state"] == "open" and b["opened"] == 8
+      assert breaker_allow(b, 12) is False and breaker_allow(b, 13) is True
+      record(b, True, 14)
+      assert b["state"] == "closed" and b["fails"] == 0 and breaker_allow(b, 14)
+  - name: independent breakers
+    code: |
+      a, c = new_breaker(1, 3), new_breaker(2, 3)
+      record(a, False, 1)
+      assert a["state"] == "open" and c["state"] == "closed"
+      assert breaker_allow(c, 1) and not breaker_allow(a, 2)
+  hints:
+  - Only the open state rejects calls, and only after the cooldown does it let one trial through.
+  solution: |
+    def new_breaker(threshold, cooldown):
+        """A CIRCUIT BREAKER stops calling a failing service. Return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}. ValueError('bad breaker') if threshold < 1 or cooldown < 1."""
+        if threshold < 1 or cooldown < 1:
+            raise ValueError("bad breaker")
+        return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}
+
+
+    def breaker_allow(b, now):
+        """May a call go through right now? Closed or half_open: True. Open: if now - opened >= cooldown, change the state to "half_open" and return True (one trial call); otherwise return False."""
+        if b["state"] == "open":
+            if now - b["opened"] >= b["cooldown"]:
+                b["state"] = "half_open"
+                return True
+            return False
+        return True
+
+
+    def record(b, ok, now):
+        """Report the result of a call that was made. Success: state = "closed" and fails = 0. Failure: if the state is "half_open" the trial failed, so the state becomes "open" with opened = now; otherwise fails += 1 and when fails >= threshold the state becomes "open" with opened = now."""
+        if ok:
+            b["state"] = "closed"
+            b["fails"] = 0
+        elif b["state"] == "half_open":
+            b["state"] = "open"
+            b["opened"] = now
+        else:
+            b["fails"] += 1
+            if b["fails"] >= b["threshold"]:
+                b["state"] = "open"
+                b["opened"] = now
+  explanation: A breaker lets a failing dependency recover, and lets callers fail fast instead of piling up.
+- id: balance
+  title: Load balancing
+  difficulty: 4
+  prompt: 'A **load balancer** spreads requests over servers. Write `round_robin(servers, n)`: the first `n` assignments cycling through the list in order (`ValueError("no servers")` if empty). Write `pick_least(loads)` for **least connections**: from `{server: current load}` return the server with the smallest load, ties going to the alphabetically first (`ValueError("no servers")` if empty). Write `power_of_two(servers, requests, seed)` for **power of two choices**: every server starts at load 0; for each request pick **two different** random servers (`rng = random.Random(seed)`; sort the servers first; draw `a = rng.randrange(len)` then `b = rng.randrange(len)`, redrawing **both** until `a != b`) and give the request to the one with the smaller load (on a tie, the first, `a`). Return the final loads dict (`ValueError("need two servers")` if fewer than two). Write `imbalance(loads)`: busiest minus idlest.'
+  starter: |-
+    import random
+
+
+    def round_robin(servers, n):
+        """The first n assignments of ROUND ROBIN over the list of servers, in order, cycling. ValueError('no servers') for an empty list."""
+        pass
+
+
+    def pick_least(loads):
+        """LEAST CONNECTIONS: from a dict {server: current load} return the server with the smallest load; ties go to the alphabetically first name. ValueError('no servers') if empty."""
+        pass
+
+
+    def power_of_two(servers, requests, seed):
+        """POWER OF TWO CHOICES: every server starts with load 0. For each request pick TWO DIFFERENT random servers (rng = random.Random(seed); servers sorted first; draw a = rng.randrange(len) then b = rng.randrange(len), redrawing both until a != b), and give the request to the one with the smaller load (on a tie the first, a).
+        Return the final loads dict. ValueError('need two servers') if fewer than two servers."""
+        pass
+
+
+    def imbalance(loads):
+        """The difference between the busiest and the idlest server."""
+        pass
+  tests:
+  - name: simple policies
+    code: |
+      assert round_robin(["a", "b", "c"], 7) == ["a", "b", "c", "a", "b", "c", "a"]
+      assert round_robin(["x"], 3) == ["x", "x", "x"] and round_robin(["a"], 0) == []
+      assert pick_least({"b": 2, "a": 5, "c": 2}) == "b"
+      assert pick_least({"z": 0}) == "z"
+      assert imbalance({"a": 5, "b": 2, "c": 9}) == 7
+      for f, args in ((round_robin, ([], 2)), (pick_least, ({},))):
+          try:
+              f(*args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "no servers" in str(e)
+  - name: two choices
+    code: |
+      S = ["s%d" % i for i in range(10)]
+      loads = power_of_two(S, 1000, 3)
+      assert sum(loads.values()) == 1000 and set(loads) == set(S)
+      assert loads == power_of_two(list(reversed(S)), 1000, 3)
+      assert imbalance(loads) <= 5
+      two = power_of_two(["a", "b"], 11, 0)
+      assert abs(two["a"] - two["b"]) == 1
+      try:
+          power_of_two(["a"], 3, 0)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "two servers" in str(e)
+  - name: it beats purely random choice
+    code: |
+      import random
+      S = ["s%d" % i for i in range(10)]
+      rng = random.Random(7)
+      rand = {s: 0 for s in S}
+      for _ in range(1000):
+          rand[S[rng.randrange(10)]] += 1
+      assert imbalance(power_of_two(S, 1000, 7)) * 4 < imbalance(rand)
+      assert all(imbalance(power_of_two(S, 1000, k)) <= 5 for k in range(10))
+  hints:
+  - Redraw both numbers when they are equal, exactly as described.
+  solution: |
+    import random
+
+
+    def round_robin(servers, n):
+        """The first n assignments of ROUND ROBIN over the list of servers, in order, cycling. ValueError('no servers') for an empty list."""
+        if not servers:
+            raise ValueError("no servers")
+        return [servers[i % len(servers)] for i in range(n)]
+
+
+    def pick_least(loads):
+        """LEAST CONNECTIONS: from a dict {server: current load} return the server with the smallest load; ties go to the alphabetically first name. ValueError('no servers') if empty."""
+        if not loads:
+            raise ValueError("no servers")
+        return min(sorted(loads), key=lambda s: loads[s])
+
+
+    def power_of_two(servers, requests, seed):
+        """POWER OF TWO CHOICES: every server starts with load 0. For each request pick TWO DIFFERENT random servers (rng = random.Random(seed); servers sorted first; draw a = rng.randrange(len) then b = rng.randrange(len), redrawing both until a != b), and give the request to the one with the smaller load (on a tie the first, a).
+        Return the final loads dict. ValueError('need two servers') if fewer than two servers."""
+        if len(servers) < 2:
+            raise ValueError("need two servers")
+        rng = random.Random(seed)
+        names = sorted(servers)
+        loads = {s: 0 for s in names}
+        for _ in range(requests):
+            while True:
+                a = rng.randrange(len(names))
+                b = rng.randrange(len(names))
+                if a != b:
+                    break
+            x, y = names[a], names[b]
+            loads[y if loads[y] < loads[x] else x] += 1
+        return loads
+
+
+    def imbalance(loads):
+        """The difference between the busiest and the idlest server."""
+        return max(loads.values()) - min(loads.values())
+  explanation: Looking at just two random servers gets almost the balance of looking at all of them.
+- id: client
+  title: 'Capstone: a protected client'
+  difficulty: 5
+  prompt: 'The starter has `new_breaker`, `breaker_allow` and `record`. Write `run_client(script, max_attempts, threshold, cooldown)`. `script` is a list of requests, each a list of attempt outcomes (`True`/`False`; attempts beyond the list fail). Time starts at 0, and every attempt, or rejected attempt, advances it by 1. Make a breaker with `new_breaker(threshold, cooldown)`. For each request, for up to `max_attempts` attempts: if `not breaker_allow(b, now)` the result is `"rejected"`, time advances by 1 and this request stops; otherwise time advances by 1, then call `record(b, outcome, now)`; on success the result is `"ok"` and the request stops; if all attempts fail the result is `"failed"`. Return the list of results, one per request.'
+  starter: |-
+    def new_breaker(threshold, cooldown):
+        """A CIRCUIT BREAKER stops calling a failing service. Return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}. ValueError('bad breaker') if threshold < 1 or cooldown < 1."""
+        if threshold < 1 or cooldown < 1:
+            raise ValueError("bad breaker")
+        return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}
+
+
+    def breaker_allow(b, now):
+        """May a call go through right now? Closed or half_open: True. Open: if now - opened >= cooldown, change the state to "half_open" and return True (one trial call); otherwise return False."""
+        if b["state"] == "open":
+            if now - b["opened"] >= b["cooldown"]:
+                b["state"] = "half_open"
+                return True
+            return False
+        return True
+
+
+    def record(b, ok, now):
+        """Report the result of a call that was made. Success: state = "closed" and fails = 0. Failure: if the state is "half_open" the trial failed, so the state becomes "open" with opened = now; otherwise fails += 1 and when fails >= threshold the state becomes "open" with opened = now."""
+        if ok:
+            b["state"] = "closed"
+            b["fails"] = 0
+        elif b["state"] == "half_open":
+            b["state"] = "open"
+            b["opened"] = now
+        else:
+            b["fails"] += 1
+            if b["fails"] >= b["threshold"]:
+                b["state"] = "open"
+                b["opened"] = now
+
+
+    def run_client(script, max_attempts, threshold, cooldown):
+        """A client protected by a circuit breaker. `script` is a list of requests, each a list of attempt outcomes (True/False; attempts beyond the list fail). Time starts at 0 and every attempt, or rejected attempt, advances it by 1. Create a breaker with new_breaker(threshold, cooldown). For each request, for up to max_attempts attempts:
+        if not breaker_allow(b, now): result "rejected", now += 1, stop this request; otherwise now += 1, then call record(b, outcome, now); on success the result is "ok" and the request stops; if all attempts fail the result is "failed". Return the list of results, one per request."""
+        pass
+  tests:
+  - name: healthy service
+    code: |
+      assert run_client([[True], [True], [False, True]], 3, 3, 5) == ["ok", "ok", "ok"]
+      assert run_client([], 3, 3, 5) == []
+      assert run_client([[False]], 1, 5, 5) == ["failed"]
+  - name: the breaker trips and recovers
+    code: |
+      res = run_client([[False, False, True], [True], [True], [True], [True], [True]], 3, 2, 5)
+      assert res == ["rejected", "rejected", "rejected", "rejected", "rejected", "ok"]
+      res = run_client([[False] * 3, [True]], 3, 5, 5)
+      assert res == ["failed", "ok"]
+  - name: a failed trial re-opens it
+    code: |
+      script = [[False, False]] + [[True]] * 6 + [[False]] + [[True]] * 6
+      res = run_client(script, 2, 2, 3)
+      assert res[0] == "failed" and res[1:4] == ["rejected"] * 3
+      assert res[4] == "ok"
+      assert len(res) == len(script) and set(res) <= {"ok", "failed", "rejected"}
+  hints:
+  - Rejected attempts still advance the clock; that is how the cooldown ends.
+  solution: |
+    def new_breaker(threshold, cooldown):
+        """A CIRCUIT BREAKER stops calling a failing service. Return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}. ValueError('bad breaker') if threshold < 1 or cooldown < 1."""
+        if threshold < 1 or cooldown < 1:
+            raise ValueError("bad breaker")
+        return {"state": "closed", "fails": 0, "opened": 0, "threshold": threshold, "cooldown": cooldown}
+
+
+    def breaker_allow(b, now):
+        """May a call go through right now? Closed or half_open: True. Open: if now - opened >= cooldown, change the state to "half_open" and return True (one trial call); otherwise return False."""
+        if b["state"] == "open":
+            if now - b["opened"] >= b["cooldown"]:
+                b["state"] = "half_open"
+                return True
+            return False
+        return True
+
+
+    def record(b, ok, now):
+        """Report the result of a call that was made. Success: state = "closed" and fails = 0. Failure: if the state is "half_open" the trial failed, so the state becomes "open" with opened = now; otherwise fails += 1 and when fails >= threshold the state becomes "open" with opened = now."""
+        if ok:
+            b["state"] = "closed"
+            b["fails"] = 0
+        elif b["state"] == "half_open":
+            b["state"] = "open"
+            b["opened"] = now
+        else:
+            b["fails"] += 1
+            if b["fails"] >= b["threshold"]:
+                b["state"] = "open"
+                b["opened"] = now
+
+
+    def run_client(script, max_attempts, threshold, cooldown):
+        """A client protected by a circuit breaker. `script` is a list of requests, each a list of attempt outcomes (True/False; attempts beyond the list fail). Time starts at 0 and every attempt, or rejected attempt, advances it by 1. Create a breaker with new_breaker(threshold, cooldown). For each request, for up to max_attempts attempts:
+        if not breaker_allow(b, now): result "rejected", now += 1, stop this request; otherwise now += 1, then call record(b, outcome, now); on success the result is "ok" and the request stops; if all attempts fail the result is "failed". Return the list of results, one per request."""
+        b = new_breaker(threshold, cooldown)
+        now = 0
+        results = []
+        for outs in script:
+            result = "failed"
+            for i in range(max_attempts):
+                if not breaker_allow(b, now):
+                    result = "rejected"
+                    now += 1
+                    break
+                ok = outs[i] if i < len(outs) else False
+                now += 1
+                record(b, ok, now)
+                if ok:
+                    result = "ok"
+                    break
+            results.append(result)
+        return results
+  explanation: Breakers, retries and rate limits are combined in real clients to stay polite to struggling servers.
+commonMistakes:
+- title: Retrying non-idempotent operations
+  explanation: Charging a card twice because a reply was lost; use idempotency keys.
+- title: Retrying immediately and forever
+  explanation: That creates retry storms; back off, add jitter and limit the attempts.
+- title: Backoff without jitter
+  explanation: Clients stay in step and hit the server together.
+- title: No timeouts
+  explanation: A call to a dead server can hang for ever.
+- title: Believing a system can be consistent, available and partition tolerant at once
+  explanation: CAP says a partition forces a choice between consistency and availability.
+summary:
+- Retries need idempotent operations, backoff, jitter and an attempt limit.
+- A token bucket allows bursts but limits the long-run rate.
+- A circuit breaker fails fast when a dependency is down and probes for recovery.
+- Power of two choices balances load almost as well as global knowledge.
+- CAP and PACELC name the consistency, availability and latency trade-offs.
+next: u24-project
+quiz:
+- type: mcq
+  question: What does jitter add to exponential backoff?
+  options:
+  - Randomness, so clients do not retry in synchronised waves
+  - More attempts
+  - Encryption
+  - A longer cap
+  answer: 0
+  explanation: It spreads the retries out.
+- type: mcq
+  question: What does an open circuit breaker do?
+  options:
+  - Rejects calls immediately
+  - Retries forever
+  - Doubles the load
+  - Sends calls to every server
+  answer: 0
+  explanation: It fails fast.
+- type: mcq
+  question: A token bucket of capacity 5 and rate 1 per second receives 20 requests at once. How many are allowed?
+  options:
+  - '5'
+  - '1'
+  - '20'
+  - '10'
+  answer: 0
+  explanation: The full bucket allows a burst of its capacity.
+- type: mcq
+  question: Why is power of two choices popular?
+  options:
+  - Two random samples balance load almost as well as knowing every server's load
+  - It needs no servers
+  - It encrypts traffic
+  - It is the oldest method
+  answer: 0
+  explanation: A tiny sample gives most of the benefit.
+- type: mcq
+  question: According to the CAP theorem, what must be chosen during a network partition?
+  options:
+  - Consistency or availability
+  - Speed or price
+  - Latency or size
+  - Tokens or time
+  answer: 0
+  explanation: You cannot have both.
+- type: mcq
+  question: What is a retry storm?
+  options:
+  - Clients retrying at once and overloading a recovering server
+  - A burst of rain
+  - A failed disk
+  - A slow database
+  answer: 0
+  explanation: Careless retries make overload worse.
+- type: code
+  question: Write `doubling(base, n)` returning the list of n delays base, 2*base, 4*base, ... (an empty list for n = 0).
+  starter: |
+    def doubling(base, n):
+        pass
+  tests:
+  - name: doubling
+    code: |
+      assert doubling(1, 4) == [1, 2, 4, 8] and doubling(3, 3) == [3, 6, 12] and doubling(5, 0) == []
+  solution: |
+    def doubling(base, n):
+        return [base * 2 ** i for i in range(n)]

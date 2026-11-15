@@ -1,0 +1,897 @@
+id: u24-gossip
+title: Gossip and Anti-Entropy
+minutes: 90
+objective: Learn how huge clusters stay in sync without a central coordinator. You will simulate gossip, exchange only what is missing between replicas, find differing data with Merkle trees, and detect crashed machines by gossiping heartbeat counters.
+outcomes:
+- Explain epidemic (gossip) dissemination and why it takes about log n rounds
+- Perform anti-entropy using digests
+- Build and compare Merkle trees
+- Detect failures with gossiped heartbeat counters
+- Explain the trade-offs of gossip protocols
+sections:
+- heading: Spreading news like a rumour
+  body: |-
+    A cluster of thousands of machines cannot have one machine tell all the others everything: that machine would be overwhelmed and a single point of failure. **Gossip** (also called **epidemic** protocols) copies how rumours and diseases spread. Every so often, each machine picks a few other machines **at random** and shares what it knows. A machine that has heard the news starts repeating it. The number of informed machines roughly doubles every round at first, so news reaches all `n` machines in about **log₂ n** rounds, 10 rounds for a thousand machines, 20 for a million. Because the targets are random, there is no special machine whose failure stops the news, and a lost message hardly matters because the news will arrive some other way.
+
+    The **fanout** (how many peers each machine contacts per round) tunes the speed against the traffic. Gossip comes in several styles: **push** (tell others what you know), **pull** (ask others what they know) and **push-pull** (do both in one exchange, which is fastest). The guarantee is **probabilistic**: with very high probability everyone learns the news quickly, rather than with certainty by a fixed time. That trade is what lets gossip scale to enormous clusters, and it is how Cassandra, Consul, Amazon S3 and many others spread membership and state.
+- heading: Anti-entropy and Merkle trees
+  body: |-
+    Replicas drift apart, because messages are lost or machines were down. The cure is **anti-entropy**: periodically two replicas compare their data and repair differences. Comparing every record would cost as much as copying everything, so they first exchange a small **digest**, for example the version number of each key. From the digests each side works out which keys it is missing or holds in an older version, and only those entries are transferred. If one replica has version 5 of a key and the other version 3, the newer wins, using the version rules from the replication lesson.
+
+    Even a digest with one entry per key is large for a billion keys. A **Merkle tree** shrinks it to one hash. The leaves are hashes of individual records. Each parent is a hash of its two children, and so on up to a single **root hash** which depends on *every* record. If two replicas have the same root they are identical, and one comparison proves it. If the roots differ, compare the children: the subtree whose hash matches is identical and can be skipped entirely, and the search continues only below hashes that differ. To find one changed record among a million you compare about 40 hashes (two per level, 20 levels) instead of a million. Cassandra and Dynamo use Merkle trees exactly this way, and so do Git and Bitcoin to verify their data.
+- heading: Membership and failure detection by gossip
+  body: |-
+    The same idea can discover which machines are alive. Every node keeps a **view**: a table that holds, for every member, a **heartbeat counter** and the *local time* at which that counter last increased. Each round a node increases its **own** counter, then sends its table to a random peer. A receiving node merges: for each member, whichever counter is higher is newer, and when a counter has *grown*, the receiver records the current local time against it. If a member's counter has not grown for longer than a **failure timeout** `t_fail`, it is **suspected**. A crashed node stops incrementing its counter, so the news "node 3 is at counter 17" stops changing everywhere, and after `t_fail` every node independently concludes that it has failed. No machine needs a global clock, because each node only compares its *own* local times.
+
+    The timeout must be long enough that gossip reliably carries the live nodes' counters to everybody (several times log n rounds), or live nodes will be suspected by mistake. The **SWIM** protocol, used by HashiCorp Serf and Consul, improves on this: a node pings a random peer and, if there is no reply, asks a few other nodes to ping it too before declaring it suspect, which greatly reduces false alarms from one bad network link. These protocols are the quiet machinery that lets a large cluster notice a failure and react within seconds.
+examples:
+- title: Rumours, repair and Merkle
+  intro: How fast a rumour spreads, what two replicas exchange, and how few hashes find one changed key.
+  code: |
+    import random
+
+
+    def gossip_rounds(n, fanout, seed, max_rounds=100):
+        """Simulate PUSH gossip among nodes 0 .. n-1. Node 0 starts with a rumour. In each round, every node that already knows it picks `fanout` DIFFERENT other nodes at random and tells them (all choices in a round use the state at the start of the round).
+        Use rng = random.Random(seed), going through the informed nodes in sorted order, and pick each target with rng.randrange(n), retrying when it is the node itself or already chosen by this node. Return the list of how many nodes know the rumour: [1, after round 1, after round 2, ...],
+        stopping when everyone knows it or after max_rounds rounds. ValueError('bad parameters') if n < 1 or fanout < 1, or if n > 1 and fanout > n - 1. For n = 1 return [1]."""
+        if n < 1 or fanout < 1:
+            raise ValueError("bad parameters")
+        if n == 1:
+            return [1]
+        if fanout > n - 1:
+            raise ValueError("bad parameters")
+        rng = random.Random(seed)
+        informed = {0}
+        counts = [1]
+        while len(informed) < n and len(counts) <= max_rounds:
+            new = set(informed)
+            for node in sorted(informed):
+                chosen = []
+                while len(chosen) < fanout:
+                    p = rng.randrange(n)
+                    if p != node and p not in chosen:
+                        chosen.append(p)
+                new.update(chosen)
+            informed = new
+            counts.append(len(informed))
+        return counts
+
+
+    def rounds_to_cover(counts, n):
+        """The number of rounds after which everyone knows (the first index where the count equals n), or None if that never happens."""
+        for i, c in enumerate(counts):
+            if c == n:
+                return i
+        return None
+
+
+    def average_rounds(n, fanout, seeds):
+        """The mean number of rounds gossip needs to reach all n nodes, over a list of seeds, rounded to 2 decimals. ValueError('did not finish') if some run never reaches everyone, ValueError('no seeds') for an empty list."""
+        if not seeds:
+            raise ValueError("no seeds")
+        totals = []
+        for s in seeds:
+            r = rounds_to_cover(gossip_rounds(n, fanout, s), n)
+            if r is None:
+                raise ValueError("did not finish")
+            totals.append(r)
+        return round(sum(totals) / len(totals), 2)
+
+
+    def merge_stores(a, b):
+        """Merge two replicas of a versioned map {key: (version, value)} into a NEW dict: for each key take the entry with the higher version; on equal versions keep a's entry; keys present on only one side are kept."""
+        merged = dict(b)
+        for k, entry in a.items():
+            if k not in merged or entry[0] >= merged[k][0]:
+                merged[k] = entry
+        return merged
+
+
+    def digest(store):
+        """A compact summary of a replica: {key: version}."""
+        return {k: entry[0] for k, entry in store.items()}
+
+
+    def needs(mine, theirs):
+        """Compare two digests. Return (pull, push): `pull` is the sorted list of keys I must fetch from them (they have it and I do not, or their version is higher); `push` is the sorted list of keys they must fetch from me (I have it and they do not, or my version is higher). Equal versions need nothing."""
+        pull = sorted(k for k, v in theirs.items() if k not in mine or v > mine[k])
+        push = sorted(k for k, v in mine.items() if k not in theirs or v > theirs[k])
+        return pull, push
+
+
+    def reconcile(a, b):
+        """Anti-entropy between two replicas: compare their digests, then transfer ONLY the entries that are needed. Return (new_a, new_b, transferred) with copies of both maps and the number of entries moved in either direction (len(pull) + len(push) from a's point of view)."""
+        pull, push = needs(digest(a), digest(b))
+        new_a, new_b = dict(a), dict(b)
+        for k in pull:
+            new_a[k] = b[k]
+        for k in push:
+            new_b[k] = a[k]
+        return new_a, new_b, len(pull) + len(push)
+
+
+    import hashlib
+
+
+    def h(text):
+        """The first 8 hexadecimal characters of the SHA-256 of the text."""
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def build_merkle(items):
+        """Build a Merkle tree over a list of (key, value) pairs. Sort the items by key. A LEAF hash is h('KEY=VALUE'). Each level above pairs up neighbours: parent = h(left + right); if a level has an odd length the last node is paired with ITSELF. Return the list of levels,
+        from the leaves up to the single root: [[leaf hashes], [next level], ..., [root]]. For no items return [[]]."""
+        level = [h("%s=%s" % (k, v)) for k, v in sorted(items)]
+        levels = [level]
+        while len(level) > 1:
+            level = [h(level[i] + (level[i + 1] if i + 1 < len(level) else level[i])) for i in range(0, len(level), 2)]
+            levels.append(level)
+        return levels
+
+
+    def merkle_root(items):
+        """The root hash of the Merkle tree of the items, or '' for no items."""
+        levels = build_merkle(items)
+        return levels[-1][0] if levels[-1] else ""
+
+
+    def merkle_diff(a, b):
+        """Find which leaves differ between two trees (as returned by build_merkle) of the SAME shape (ValueError('different shapes') otherwise: the same number of levels and the same length at each level), comparing as few hashes as possible. Start by comparing the two roots (that is 1 comparison). If equal,
+        return ([], 1). Otherwise go down: for every differing node, compare its (one or two) children, counting each comparison, and keep following only the ones that differ. Return (sorted list of differing leaf indexes, total number of hash comparisons)."""
+        if [len(x) for x in a] != [len(x) for x in b]:
+            raise ValueError("different shapes")
+        top = len(a) - 1
+        if not a[top]:
+            return [], 0
+        comparisons = 1
+        if a[top][0] == b[top][0]:
+            return [], 1
+        frontier = [0]
+        for level in range(top, 0, -1):
+            nxt = []
+            for i in frontier:
+                for child in (2 * i, 2 * i + 1):
+                    if child < len(a[level - 1]):
+                        comparisons += 1
+                        if a[level - 1][child] != b[level - 1][child]:
+                            nxt.append(child)
+            frontier = nxt
+        return sorted(frontier), comparisons
+
+    counts = gossip_rounds(64, 2, 1)
+    print("nodes that know the rumour after each round:", counts)
+    print("average rounds for 64 nodes, fanout 1 / 2 / 3:", average_rounds(64, 1, range(20)), average_rounds(64, 2, range(20)), average_rounds(64, 3, range(20)))
+    a = {"cart": (3, "apple"), "name": (1, "ada")}
+    b = {"cart": (2, "pear"), "email": (4, "a@x")}
+    na, nb, moved = reconcile(a, b)
+    print("anti-entropy moved", moved, "entries; replicas equal:", na == nb)
+    items = [("key%04d" % i, i) for i in range(1000)]
+    changed = list(items)
+    changed[321] = ("key0321", "edited")
+    diff, comparisons = merkle_diff(build_merkle(items), build_merkle(changed))
+    print("1000 keys, 1 changed: found", diff, "with", comparisons, "hash comparisons")
+  output: |
+    nodes that know the rumour after each round: [1, 3, 9, 22, 46, 61, 62, 64]
+    average rounds for 64 nodes, fanout 1 / 2 / 3: 12.0 6.95 5.35
+    anti-entropy moved 3 entries; replicas equal: True
+    1000 keys, 1 changed: found [321] with 21 hash comparisons
+  lines:
+  - line: 133
+    note: The count roughly doubles each round at first.
+  - line: 134
+    note: More fanout means fewer rounds.
+  - line: 138
+    note: Only the differing entries are moved.
+  - line: 143
+    note: About 2 log n comparisons instead of 1000.
+- title: A crash noticed by gossip
+  intro: Eight nodes gossip heartbeats; when node 3 crashes everyone eventually suspects it and only it.
+  code: |
+    import random
+
+
+    def beat(view, node, now):
+        """A node's heartbeat. A VIEW maps node -> {"hb": heartbeat counter, "seen": the local time that counter last increased}. Return a NEW view (the input is not changed) in which `node`'s counter is one higher and its seen time is `now`; a node that is not in the view gets {"hb": 1, "seen": now}."""
+        new = {k: dict(v) for k, v in view.items()}
+        if node in new:
+            new[node]["hb"] += 1
+            new[node]["seen"] = now
+        else:
+            new[node] = {"hb": 1, "seen": now}
+        return new
+
+
+    def merge_view(mine, received, now):
+        """Merge a view received from a peer into mine, returning a NEW view. A node I have not heard of is added with the received counter and seen = now. For a node I know, if the received counter is HIGHER than mine, take it and set seen = now (news!); otherwise keep my entry."""
+        new = {k: dict(v) for k, v in mine.items()}
+        for node, entry in received.items():
+            if node not in new or entry["hb"] > new[node]["hb"]:
+                new[node] = {"hb": entry["hb"], "seen": now}
+        return new
+
+
+    def failed_nodes(view, now, t_fail):
+        """The sorted list of nodes whose counter has not increased for MORE than t_fail time units (now - seen > t_fail)."""
+        return sorted(n for n, e in view.items() if now - e["seen"] > t_fail)
+
+
+    def simulate_membership(n, rounds, crashed, crash_round, seed, t_fail):
+        """Gossip-style failure detection among nodes 0 .. n-1. Every node starts with a view of all nodes with {"hb": 0, "seen": 0}. Rounds are numbered 1 .. rounds. In round r a node in `crashed` is DEAD if r >= crash_round (it does nothing). Each live node (1) beats (use beat with now = r), then
+        (2) in sorted order each live node picks one random OTHER node with rng.randrange(n) (retrying on itself; rng = random.Random(seed)) and sends it a copy of its view as it stood after step (1) of this round; a message to a dead node is lost; the receiver merges it with merge_view (now = r), processing the messages in sorted sender order. At the end
+        return {live node: failed_nodes(its view, rounds, t_fail)} for every node that never crashed."""
+        rng = random.Random(seed)
+        views = {i: {j: {"hb": 0, "seen": 0} for j in range(n)} for i in range(n)}
+        for r in range(1, rounds + 1):
+            alive = [i for i in range(n) if not (i in crashed and r >= crash_round)]
+            for i in alive:
+                views[i] = beat(views[i], i, r)
+            snap = {i: {k: dict(v) for k, v in views[i].items()} for i in alive}
+            for i in alive:
+                while True:
+                    p = rng.randrange(n)
+                    if p != i:
+                        break
+                if p in alive:
+                    views[p] = merge_view(views[p], snap[i], r)
+        return {i: failed_nodes(views[i], rounds, t_fail) for i in range(n) if i not in crashed}
+
+    healthy = simulate_membership(8, 40, set(), 1, 3, 12)
+    print("no crash, suspicions:", sum(len(v) for v in healthy.values()))
+    crash = simulate_membership(8, 40, {3}, 10, 3, 12)
+    print("node 3 crashed at round 10, what each live node suspects at round 40:")
+    for node in sorted(crash):
+        print(" node", node, "suspects", crash[node])
+  output: |
+    no crash, suspicions: 0
+    node 3 crashed at round 10, what each live node suspects at round 40:
+     node 0 suspects [3]
+     node 1 suspects [3]
+     node 2 suspects [3]
+     node 4 suspects [3]
+     node 5 suspects [3]
+     node 6 suspects [3]
+     node 7 suspects [3]
+  lines:
+  - line: 50
+    note: With a long enough timeout nobody is wrongly suspected.
+  - line: 18
+    note: Every live node suspects exactly node 3.
+playground:
+  prompt: Watch the number of informed nodes double each round if everyone tells one new node.
+  code: |
+    informed = 1
+    for round_number in range(1, 8):
+        informed = informed * 2
+        print('round', round_number, 'informed at most', informed)
+exercises:
+- id: gossip
+  title: Spreading a rumour
+  difficulty: 4
+  prompt: 'In a **gossip** protocol each machine regularly tells a few random others what it knows, like a rumour spreading. Write `gossip_rounds(n, fanout, seed, max_rounds=100)`, a **push** simulation among nodes `0 .. n-1`. Node 0 starts with the rumour. In each round, every node that already knows it picks `fanout` **different** other nodes at random and tells them (all choices in a round use the state at the **start** of the round). Use `rng = random.Random(seed)`, go through the informed nodes in **sorted order**, and pick each target with `rng.randrange(n)`, retrying when it is the node itself or already chosen by this node. Return the list of how many nodes know the rumour: `[1, after round 1, after round 2, ...]`, stopping when everyone knows or after `max_rounds` rounds. Raise `ValueError("bad parameters")` if `n < 1` or `fanout < 1`, or if `n > 1` and `fanout > n - 1`; for `n = 1` return `[1]`. Write `rounds_to_cover(counts, n)`: the first index where the count equals `n`, or `None`. Write `average_rounds(n, fanout, seeds)`: the mean number of rounds to reach everyone over a list of seeds, rounded to 2 decimals (`ValueError("did not finish")` if some run never reaches everyone, `ValueError("no seeds")` for an empty list).'
+  starter: |-
+    import random
+
+
+    def gossip_rounds(n, fanout, seed, max_rounds=100):
+        """Simulate PUSH gossip among nodes 0 .. n-1. Node 0 starts with a rumour. In each round, every node that already knows it picks `fanout` DIFFERENT other nodes at random and tells them (all choices in a round use the state at the start of the round).
+        Use rng = random.Random(seed), going through the informed nodes in sorted order, and pick each target with rng.randrange(n), retrying when it is the node itself or already chosen by this node. Return the list of how many nodes know the rumour: [1, after round 1, after round 2, ...],
+        stopping when everyone knows it or after max_rounds rounds. ValueError('bad parameters') if n < 1 or fanout < 1, or if n > 1 and fanout > n - 1. For n = 1 return [1]."""
+        pass
+
+
+    def rounds_to_cover(counts, n):
+        """The number of rounds after which everyone knows (the first index where the count equals n), or None if that never happens."""
+        pass
+
+
+    def average_rounds(n, fanout, seeds):
+        """The mean number of rounds gossip needs to reach all n nodes, over a list of seeds, rounded to 2 decimals. ValueError('did not finish') if some run never reaches everyone, ValueError('no seeds') for an empty list."""
+        pass
+  tests:
+  - name: one run
+    code: |
+      counts = gossip_rounds(64, 2, 5)
+      assert counts[0] == 1 and counts[-1] == 64
+      assert all(a <= b for a, b in zip(counts, counts[1:]))
+      assert all(counts[i + 1] <= counts[i] * 3 for i in range(len(counts) - 1))
+      assert counts == gossip_rounds(64, 2, 5) and counts != gossip_rounds(64, 2, 6) or len(counts) > 2
+      assert gossip_rounds(1, 1, 0) == [1]
+      assert gossip_rounds(2, 1, 3) == [1, 2]
+      assert len(gossip_rounds(1000, 1, 1, max_rounds=3)) == 4
+  - name: counting rounds
+    code: |
+      assert rounds_to_cover([1, 3, 8, 8], 8) == 2
+      assert rounds_to_cover([1, 2, 3], 8) is None
+      assert rounds_to_cover([1], 1) == 0
+      counts = gossip_rounds(16, 2, 1)
+      assert rounds_to_cover(counts, 16) == len(counts) - 1
+  - name: bad parameters
+    code: |
+      for bad in ((0, 1), (5, 0), (5, 5), (3, 3)):
+          try:
+              gossip_rounds(bad[0], bad[1], 0)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad parameters" in str(e)
+      assert gossip_rounds(3, 2, 0) == [1, 3]
+  - name: rumours spread in about log n rounds
+    code: |
+      avg = average_rounds(64, 2, list(range(20)))
+      assert 5 <= avg <= 9
+      assert average_rounds(64, 1, list(range(20))) > avg > average_rounds(64, 3, list(range(20)))
+      assert average_rounds(256, 2, list(range(10))) < average_rounds(64, 2, list(range(10))) + 4
+      assert average_rounds(2, 1, [1, 2, 3]) == 1.0
+      for bad, msg in ((lambda: average_rounds(8, 2, []), "no seeds"),):
+          try:
+              bad()
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  hints:
+  - Process the informed nodes in sorted order and collect the new ones separately, so the whole round uses the state from its start.
+  solution: |
+    import random
+
+
+    def gossip_rounds(n, fanout, seed, max_rounds=100):
+        """Simulate PUSH gossip among nodes 0 .. n-1. Node 0 starts with a rumour. In each round, every node that already knows it picks `fanout` DIFFERENT other nodes at random and tells them (all choices in a round use the state at the start of the round).
+        Use rng = random.Random(seed), going through the informed nodes in sorted order, and pick each target with rng.randrange(n), retrying when it is the node itself or already chosen by this node. Return the list of how many nodes know the rumour: [1, after round 1, after round 2, ...],
+        stopping when everyone knows it or after max_rounds rounds. ValueError('bad parameters') if n < 1 or fanout < 1, or if n > 1 and fanout > n - 1. For n = 1 return [1]."""
+        if n < 1 or fanout < 1:
+            raise ValueError("bad parameters")
+        if n == 1:
+            return [1]
+        if fanout > n - 1:
+            raise ValueError("bad parameters")
+        rng = random.Random(seed)
+        informed = {0}
+        counts = [1]
+        while len(informed) < n and len(counts) <= max_rounds:
+            new = set(informed)
+            for node in sorted(informed):
+                chosen = []
+                while len(chosen) < fanout:
+                    p = rng.randrange(n)
+                    if p != node and p not in chosen:
+                        chosen.append(p)
+                new.update(chosen)
+            informed = new
+            counts.append(len(informed))
+        return counts
+
+
+    def rounds_to_cover(counts, n):
+        """The number of rounds after which everyone knows (the first index where the count equals n), or None if that never happens."""
+        for i, c in enumerate(counts):
+            if c == n:
+                return i
+        return None
+
+
+    def average_rounds(n, fanout, seeds):
+        """The mean number of rounds gossip needs to reach all n nodes, over a list of seeds, rounded to 2 decimals. ValueError('did not finish') if some run never reaches everyone, ValueError('no seeds') for an empty list."""
+        if not seeds:
+            raise ValueError("no seeds")
+        totals = []
+        for s in seeds:
+            r = rounds_to_cover(gossip_rounds(n, fanout, s), n)
+            if r is None:
+                raise ValueError("did not finish")
+            totals.append(r)
+        return round(sum(totals) / len(totals), 2)
+  explanation: A rumour that each informed machine repeats to a few others reaches everybody in about log n rounds.
+- id: antientropy
+  title: Anti-entropy between replicas
+  difficulty: 4
+  prompt: 'Replicas that fall behind catch up by **anti-entropy**: occasionally two of them compare notes and exchange what the other is missing. A replica is a versioned map `{key: (version, value)}`. Write `merge_stores(a, b)`: a **new** dict taking, for each key, the entry with the **higher** version; on equal versions keep `a`''s entry; keys present on only one side are kept. Write `digest(store)`: the compact summary `{key: version}`. Write `needs(mine, theirs)` for two digests: return `(pull, push)` where `pull` is the sorted list of keys I must fetch from them (they have it and I do not, or their version is higher) and `push` the sorted list of keys they must fetch from me (I have it and they do not, or my version is higher); equal versions need nothing. Write `reconcile(a, b)`: compare digests and then transfer **only** the needed entries; return `(new_a, new_b, transferred)` with copies of both maps and the number of entries moved in either direction, `len(pull) + len(push)`.'
+  starter: |-
+    def merge_stores(a, b):
+        """Merge two replicas of a versioned map {key: (version, value)} into a NEW dict: for each key take the entry with the higher version; on equal versions keep a's entry; keys present on only one side are kept."""
+        pass
+
+
+    def digest(store):
+        """A compact summary of a replica: {key: version}."""
+        pass
+
+
+    def needs(mine, theirs):
+        """Compare two digests. Return (pull, push): `pull` is the sorted list of keys I must fetch from them (they have it and I do not, or their version is higher); `push` is the sorted list of keys they must fetch from me (I have it and they do not, or my version is higher). Equal versions need nothing."""
+        pass
+
+
+    def reconcile(a, b):
+        """Anti-entropy between two replicas: compare their digests, then transfer ONLY the entries that are needed. Return (new_a, new_b, transferred) with copies of both maps and the number of entries moved in either direction (len(pull) + len(push) from a's point of view)."""
+        pass
+  tests:
+  - name: merging
+    code: |
+      a = {"x": (2, "new"), "y": (1, "ay")}
+      b = {"x": (1, "old"), "z": (5, "bz")}
+      assert merge_stores(a, b) == {"x": (2, "new"), "y": (1, "ay"), "z": (5, "bz")}
+      assert merge_stores(b, a) == merge_stores(a, b)
+      assert merge_stores({"k": (1, "a")}, {"k": (1, "b")}) == {"k": (1, "a")}
+      assert merge_stores({}, {}) == {} and a == {"x": (2, "new"), "y": (1, "ay")}
+  - name: digests and needs
+    code: |
+      a = {"x": (2, "new"), "y": (1, "ay")}
+      b = {"x": (1, "old"), "z": (5, "bz")}
+      assert digest(a) == {"x": 2, "y": 1} and digest({}) == {}
+      assert needs(digest(a), digest(b)) == (["z"], ["x", "y"])
+      assert needs(digest(b), digest(a)) == (["x", "y"], ["z"])
+      assert needs({"k": 3}, {"k": 3}) == ([], [])
+      assert needs({}, {}) == ([], [])
+  - name: reconciling
+    code: |
+      a = {"x": (2, "new"), "y": (1, "ay")}
+      b = {"x": (1, "old"), "z": (5, "bz")}
+      na, nb, moved = reconcile(a, b)
+      assert na == nb == {"x": (2, "new"), "y": (1, "ay"), "z": (5, "bz")} and moved == 3
+      assert a == {"x": (2, "new"), "y": (1, "ay")} and b == {"x": (1, "old"), "z": (5, "bz")}
+      na, nb, moved = reconcile(na, nb)
+      assert moved == 0 and na == nb
+      x = {"k%d" % i: (1, i) for i in range(100)}
+      y = dict(x)
+      y["k7"] = (2, "changed")
+      na, nb, moved = reconcile(x, y)
+      assert moved == 1 and na["k7"] == (2, "changed") and na == nb
+  - name: many replicas converge
+    code: |
+      import random
+      rng = random.Random(2)
+      stores = [dict() for _ in range(6)]
+      for step in range(40):
+          s = stores[rng.randrange(6)]
+          key = "key%d" % rng.randrange(8)
+          s[key] = (step + 1, "v%d" % step)
+      for _ in range(6):
+          for i in range(6):
+              j = (i + 1) % 6
+              stores[i], stores[j], _ = reconcile(stores[i], stores[j])
+      for _ in range(6):
+          for i in range(6):
+              j = (i + 1) % 6
+              stores[i], stores[j], _ = reconcile(stores[i], stores[j])
+      assert all(s == stores[0] for s in stores)
+  hints:
+  - Compare only version numbers; send full values for the keys that differ.
+  solution: |
+    def merge_stores(a, b):
+        """Merge two replicas of a versioned map {key: (version, value)} into a NEW dict: for each key take the entry with the higher version; on equal versions keep a's entry; keys present on only one side are kept."""
+        merged = dict(b)
+        for k, entry in a.items():
+            if k not in merged or entry[0] >= merged[k][0]:
+                merged[k] = entry
+        return merged
+
+
+    def digest(store):
+        """A compact summary of a replica: {key: version}."""
+        return {k: entry[0] for k, entry in store.items()}
+
+
+    def needs(mine, theirs):
+        """Compare two digests. Return (pull, push): `pull` is the sorted list of keys I must fetch from them (they have it and I do not, or their version is higher); `push` is the sorted list of keys they must fetch from me (I have it and they do not, or my version is higher). Equal versions need nothing."""
+        pull = sorted(k for k, v in theirs.items() if k not in mine or v > mine[k])
+        push = sorted(k for k, v in mine.items() if k not in theirs or v > theirs[k])
+        return pull, push
+
+
+    def reconcile(a, b):
+        """Anti-entropy between two replicas: compare their digests, then transfer ONLY the entries that are needed. Return (new_a, new_b, transferred) with copies of both maps and the number of entries moved in either direction (len(pull) + len(push) from a's point of view)."""
+        pull, push = needs(digest(a), digest(b))
+        new_a, new_b = dict(a), dict(b)
+        for k in pull:
+            new_a[k] = b[k]
+        for k in push:
+            new_b[k] = a[k]
+        return new_a, new_b, len(pull) + len(push)
+  explanation: Anti-entropy bounds how stale a replica can stay, at the cost of a little background traffic.
+- id: merkle
+  title: Merkle trees
+  difficulty: 5
+  prompt: 'Comparing two big replicas key by key is expensive. A **Merkle tree** summarises a data set so that two copies can find their differences by comparing a few hashes. Write `h(text)` (the first 8 hex characters of the SHA-256 of the text, using `hashlib`) and `build_merkle(items)` for a list of `(key, value)` pairs. Sort the items by key. A **leaf** hash is `h("KEY=VALUE")`. Each level above pairs up neighbours: `parent = h(left + right)`; if a level has an odd length the last node is paired with **itself**. Return the list of levels from the leaves up to the single root: `[[leaf hashes], [next level], ..., [root]]`; for no items return `[[]]`. Write `merkle_root(items)` (the root hash, or `""` for no items). Write `merkle_diff(a, b)` for two trees of the **same shape** (`ValueError("different shapes")` if the number of levels or the length of any level differs): find which leaves differ while comparing as few hashes as possible. Start by comparing the roots (that is **1** comparison). If equal return `([], 1)`. Otherwise go down: for every differing node, compare its (one or two) children, counting each comparison, and keep following only the children that differ. Return `(sorted list of differing leaf indexes, total number of hash comparisons)`. For two empty trees return `([], 0)`.'
+  starter: |-
+    import hashlib
+
+
+    def h(text):
+        """The first 8 hexadecimal characters of the SHA-256 of the text."""
+        pass
+
+
+    def build_merkle(items):
+        """Build a Merkle tree over a list of (key, value) pairs. Sort the items by key. A LEAF hash is h('KEY=VALUE'). Each level above pairs up neighbours: parent = h(left + right); if a level has an odd length the last node is paired with ITSELF. Return the list of levels,
+        from the leaves up to the single root: [[leaf hashes], [next level], ..., [root]]. For no items return [[]]."""
+        pass
+
+
+    def merkle_root(items):
+        """The root hash of the Merkle tree of the items, or '' for no items."""
+        pass
+
+
+    def merkle_diff(a, b):
+        """Find which leaves differ between two trees (as returned by build_merkle) of the SAME shape (ValueError('different shapes') otherwise: the same number of levels and the same length at each level), comparing as few hashes as possible. Start by comparing the two roots (that is 1 comparison). If equal,
+        return ([], 1). Otherwise go down: for every differing node, compare its (one or two) children, counting each comparison, and keep following only the ones that differ. Return (sorted list of differing leaf indexes, total number of hash comparisons)."""
+        pass
+  tests:
+  - name: hashing and building
+    code: |
+      import hashlib
+      assert h("a") == hashlib.sha256(b"a").hexdigest()[:8] and len(h("anything")) == 8
+      levels = build_merkle([("b", 2), ("a", 1)])
+      assert levels[0] == [h("a=1"), h("b=2")]
+      assert levels[1] == [h(h("a=1") + h("b=2"))] and len(levels) == 2
+      three = build_merkle([("a", 1), ("b", 2), ("c", 3)])
+      assert [len(l) for l in three] == [3, 2, 1]
+      assert three[1][1] == h(h("c=3") + h("c=3"))
+      assert build_merkle([]) == [[]] and merkle_root([]) == ""
+      assert build_merkle([("k", "v")]) == [[h("k=v")]] and merkle_root([("k", "v")]) == h("k=v")
+      assert merkle_root([("b", 2), ("a", 1)]) == merkle_root([("a", 1), ("b", 2)])
+      assert merkle_root([("a", 1), ("b", 2)]) != merkle_root([("a", 1), ("b", 3)])
+  - name: finding the difference
+    code: |
+      items = [("k%02d" % i, i) for i in range(16)]
+      other = list(items)
+      other[5] = ("k05", "changed")
+      ta, tb = build_merkle(items), build_merkle(other)
+      diff, comparisons = merkle_diff(ta, tb)
+      assert diff == [5] and comparisons == 1 + 2 * 4
+      assert merkle_diff(ta, ta) == ([], 1)
+      other[12] = ("k12", "also")
+      diff, comparisons = merkle_diff(ta, build_merkle(other))
+      assert diff == [5, 12] and comparisons < 16 + 1
+  - name: it scales
+    code: |
+      items = [("key%04d" % i, i) for i in range(1000)]
+      changed = list(items)
+      changed[777] = ("key0777", -1)
+      diff, comparisons = merkle_diff(build_merkle(items), build_merkle(changed))
+      assert diff == [777] and comparisons <= 1 + 2 * 10
+      big = build_merkle(items)
+      assert len(big) == 11 and len(big[-1]) == 1
+  - name: odd sizes and errors
+    code: |
+      a = [("a", 1), ("b", 2), ("c", 3)]
+      b = [("a", 1), ("b", 2), ("c", 4)]
+      assert merkle_diff(build_merkle(a), build_merkle(b)) == ([2], 1 + 2 + 1)
+      b2 = [("a", 9), ("b", 2), ("c", 3)]
+      assert merkle_diff(build_merkle(a), build_merkle(b2))[0] == [0]
+      try:
+          merkle_diff(build_merkle(a), build_merkle(a + [("d", 4)]))
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "different shapes" in str(e)
+      assert merkle_diff(build_merkle([]), build_merkle([])) == ([], 0)
+  hints:
+  - Compare the roots first; descend only below the nodes whose hashes differ.
+  solution: |
+    import hashlib
+
+
+    def h(text):
+        """The first 8 hexadecimal characters of the SHA-256 of the text."""
+        return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+    def build_merkle(items):
+        """Build a Merkle tree over a list of (key, value) pairs. Sort the items by key. A LEAF hash is h('KEY=VALUE'). Each level above pairs up neighbours: parent = h(left + right); if a level has an odd length the last node is paired with ITSELF. Return the list of levels,
+        from the leaves up to the single root: [[leaf hashes], [next level], ..., [root]]. For no items return [[]]."""
+        level = [h("%s=%s" % (k, v)) for k, v in sorted(items)]
+        levels = [level]
+        while len(level) > 1:
+            level = [h(level[i] + (level[i + 1] if i + 1 < len(level) else level[i])) for i in range(0, len(level), 2)]
+            levels.append(level)
+        return levels
+
+
+    def merkle_root(items):
+        """The root hash of the Merkle tree of the items, or '' for no items."""
+        levels = build_merkle(items)
+        return levels[-1][0] if levels[-1] else ""
+
+
+    def merkle_diff(a, b):
+        """Find which leaves differ between two trees (as returned by build_merkle) of the SAME shape (ValueError('different shapes') otherwise: the same number of levels and the same length at each level), comparing as few hashes as possible. Start by comparing the two roots (that is 1 comparison). If equal,
+        return ([], 1). Otherwise go down: for every differing node, compare its (one or two) children, counting each comparison, and keep following only the ones that differ. Return (sorted list of differing leaf indexes, total number of hash comparisons)."""
+        if [len(x) for x in a] != [len(x) for x in b]:
+            raise ValueError("different shapes")
+        top = len(a) - 1
+        if not a[top]:
+            return [], 0
+        comparisons = 1
+        if a[top][0] == b[top][0]:
+            return [], 1
+        frontier = [0]
+        for level in range(top, 0, -1):
+            nxt = []
+            for i in frontier:
+                for child in (2 * i, 2 * i + 1):
+                    if child < len(a[level - 1]):
+                        comparisons += 1
+                        if a[level - 1][child] != b[level - 1][child]:
+                            nxt.append(child)
+            frontier = nxt
+        return sorted(frontier), comparisons
+  explanation: Merkle trees let replicas of a terabyte of data find a single changed record by comparing a few dozen hashes.
+- id: view
+  title: Membership views
+  difficulty: 4
+  prompt: 'How does a big cluster know which machines are alive without one central list? Each node keeps a **view** `{node: {"hb": heartbeat counter, "seen": local time that counter last increased}}`, increments its own counter regularly and gossips its view. A node whose counter stops rising is suspected. Write `beat(view, node, now)`: return a **new** view (the input is not changed) where `node`''s counter is one higher and its `seen` is `now`; a node not in the view gets `{"hb": 1, "seen": now}`. Write `merge_view(mine, received, now)`: a **new** view in which a node I have not heard of is added with the received counter and `seen = now`, and for a node I know, if the received counter is **higher** than mine I take it and set `seen = now` (that is news), otherwise I keep my entry. Write `failed_nodes(view, now, t_fail)`: the sorted list of nodes whose counter has not increased for **more than** `t_fail` time units (`now - seen > t_fail`).'
+  starter: |-
+    def beat(view, node, now):
+        """A node's heartbeat. A VIEW maps node -> {"hb": heartbeat counter, "seen": the local time that counter last increased}. Return a NEW view (the input is not changed) in which `node`'s counter is one higher and its seen time is `now`; a node that is not in the view gets {"hb": 1, "seen": now}."""
+        pass
+
+
+    def merge_view(mine, received, now):
+        """Merge a view received from a peer into mine, returning a NEW view. A node I have not heard of is added with the received counter and seen = now. For a node I know, if the received counter is HIGHER than mine, take it and set seen = now (news!); otherwise keep my entry."""
+        pass
+
+
+    def failed_nodes(view, now, t_fail):
+        """The sorted list of nodes whose counter has not increased for MORE than t_fail time units (now - seen > t_fail)."""
+        pass
+  tests:
+  - name: beating
+    code: |
+      v = {"a": {"hb": 3, "seen": 5}}
+      nv = beat(v, "a", 9)
+      assert nv == {"a": {"hb": 4, "seen": 9}} and v == {"a": {"hb": 3, "seen": 5}}
+      assert beat(v, "b", 9) == {"a": {"hb": 3, "seen": 5}, "b": {"hb": 1, "seen": 9}}
+      assert beat({}, "x", 1) == {"x": {"hb": 1, "seen": 1}}
+  - name: merging news
+    code: |
+      mine = {"a": {"hb": 3, "seen": 5}, "b": {"hb": 7, "seen": 6}}
+      theirs = {"a": {"hb": 4, "seen": 99}, "b": {"hb": 7, "seen": 99}, "c": {"hb": 2, "seen": 99}}
+      merged = merge_view(mine, theirs, 10)
+      assert merged == {"a": {"hb": 4, "seen": 10}, "b": {"hb": 7, "seen": 6}, "c": {"hb": 2, "seen": 10}}
+      assert mine == {"a": {"hb": 3, "seen": 5}, "b": {"hb": 7, "seen": 6}}
+      assert merge_view(mine, {"a": {"hb": 1, "seen": 0}}, 10) == mine
+      assert merge_view({}, {}, 1) == {}
+      merged["a"]["hb"] = 0
+      assert theirs["a"]["hb"] == 4
+  - name: who has failed
+    code: |
+      view = {"a": {"hb": 9, "seen": 20}, "b": {"hb": 4, "seen": 10}, "c": {"hb": 1, "seen": 0}}
+      assert failed_nodes(view, 20, 10) == ["c"]
+      assert failed_nodes(view, 21, 10) == ["b", "c"]
+      assert failed_nodes(view, 31, 10) == ["a", "b", "c"]
+      assert failed_nodes(view, 5, 10) == []
+      assert failed_nodes({}, 5, 1) == []
+  - name: a node that keeps beating stays alive
+    code: |
+      view = {"a": {"hb": 0, "seen": 0}, "b": {"hb": 0, "seen": 0}}
+      other = dict(view)
+      for t in range(1, 30):
+          other = beat(other, "a", t)
+          if t % 3 == 0:
+              view = merge_view(view, other, t)
+      assert failed_nodes(view, 29, 5) == ["b"]
+  hints:
+  - 'The seen time is local to each node: it records when THIS node learned the counter had grown.'
+  solution: |
+    def beat(view, node, now):
+        """A node's heartbeat. A VIEW maps node -> {"hb": heartbeat counter, "seen": the local time that counter last increased}. Return a NEW view (the input is not changed) in which `node`'s counter is one higher and its seen time is `now`; a node that is not in the view gets {"hb": 1, "seen": now}."""
+        new = {k: dict(v) for k, v in view.items()}
+        if node in new:
+            new[node]["hb"] += 1
+            new[node]["seen"] = now
+        else:
+            new[node] = {"hb": 1, "seen": now}
+        return new
+
+
+    def merge_view(mine, received, now):
+        """Merge a view received from a peer into mine, returning a NEW view. A node I have not heard of is added with the received counter and seen = now. For a node I know, if the received counter is HIGHER than mine, take it and set seen = now (news!); otherwise keep my entry."""
+        new = {k: dict(v) for k, v in mine.items()}
+        for node, entry in received.items():
+            if node not in new or entry["hb"] > new[node]["hb"]:
+                new[node] = {"hb": entry["hb"], "seen": now}
+        return new
+
+
+    def failed_nodes(view, now, t_fail):
+        """The sorted list of nodes whose counter has not increased for MORE than t_fail time units (now - seen > t_fail)."""
+        return sorted(n for n, e in view.items() if now - e["seen"] > t_fail)
+  explanation: 'Gossip membership needs no central server: each node judges others by whether news of them keeps arriving.'
+- id: membership
+  title: 'Capstone: gossip failure detection'
+  difficulty: 5
+  prompt: 'The starter has `beat`, `merge_view` and `failed_nodes`. Write `simulate_membership(n, rounds, crashed, crash_round, seed, t_fail)` for nodes `0 .. n-1`. Every node starts with a view of **all** nodes, each `{"hb": 0, "seen": 0}`. Rounds are numbered `1 .. rounds`. In round `r`, a node in `crashed` is **dead** if `r >= crash_round` (it does nothing). Each live node (1) beats (`beat` with `now = r`); then (2) in sorted order each live node picks one random **other** node with `rng.randrange(n)` (retry if it picks itself; `rng = random.Random(seed)`, one generator for the whole simulation) and sends it a copy of its view **as it stood after step 1 of this round**; a message to a dead node is lost; receivers merge with `merge_view` (`now = r`), processing the messages in sorted sender order. At the end return `{node: failed_nodes(its view, rounds, t_fail)}` for every node that never crashed.'
+  starter: |-
+    import random
+
+
+    def beat(view, node, now):
+        """A node's heartbeat. A VIEW maps node -> {"hb": heartbeat counter, "seen": the local time that counter last increased}. Return a NEW view (the input is not changed) in which `node`'s counter is one higher and its seen time is `now`; a node that is not in the view gets {"hb": 1, "seen": now}."""
+        new = {k: dict(v) for k, v in view.items()}
+        if node in new:
+            new[node]["hb"] += 1
+            new[node]["seen"] = now
+        else:
+            new[node] = {"hb": 1, "seen": now}
+        return new
+
+
+    def merge_view(mine, received, now):
+        """Merge a view received from a peer into mine, returning a NEW view. A node I have not heard of is added with the received counter and seen = now. For a node I know, if the received counter is HIGHER than mine, take it and set seen = now (news!); otherwise keep my entry."""
+        new = {k: dict(v) for k, v in mine.items()}
+        for node, entry in received.items():
+            if node not in new or entry["hb"] > new[node]["hb"]:
+                new[node] = {"hb": entry["hb"], "seen": now}
+        return new
+
+
+    def failed_nodes(view, now, t_fail):
+        """The sorted list of nodes whose counter has not increased for MORE than t_fail time units (now - seen > t_fail)."""
+        return sorted(n for n, e in view.items() if now - e["seen"] > t_fail)
+
+
+    def simulate_membership(n, rounds, crashed, crash_round, seed, t_fail):
+        """Gossip-style failure detection among nodes 0 .. n-1. Every node starts with a view of all nodes with {"hb": 0, "seen": 0}. Rounds are numbered 1 .. rounds. In round r a node in `crashed` is DEAD if r >= crash_round (it does nothing). Each live node (1) beats (use beat with now = r), then
+        (2) in sorted order each live node picks one random OTHER node with rng.randrange(n) (retrying on itself; rng = random.Random(seed)) and sends it a copy of its view as it stood after step (1) of this round; a message to a dead node is lost; the receiver merges it with merge_view (now = r), processing the messages in sorted sender order. At the end
+        return {live node: failed_nodes(its view, rounds, t_fail)} for every node that never crashed."""
+        pass
+  tests:
+  - name: no failures, no suspicions
+    code: |
+      res = simulate_membership(8, 40, set(), 1, 3, 12)
+      assert set(res) == set(range(8)) and all(v == [] for v in res.values())
+      assert simulate_membership(2, 5, set(), 1, 0, 9) == {0: [], 1: []}
+  - name: a crash is noticed by everyone
+    code: |
+      for seed in range(15):
+          res = simulate_membership(8, 40, {3}, 10, seed, 12)
+          assert set(res) == {0, 1, 2, 4, 5, 6, 7}
+          assert all(v == [3] for v in res.values()), (seed, res)
+  - name: two crashes
+    code: |
+      for seed in range(10):
+          res = simulate_membership(10, 50, {2, 7}, 15, seed, 14)
+          assert set(res) == {0, 1, 3, 4, 5, 6, 8, 9}
+          assert all(v == [2, 7] for v in res.values()), (seed, res)
+  - name: a crash that is too recent is not yet noticed
+    code: |
+      res = simulate_membership(8, 12, {3}, 10, 1, 12)
+      assert all(v == [] for v in res.values())
+      res = simulate_membership(6, 30, {0}, 1, 4, 10)
+      assert set(res) == {1, 2, 3, 4, 5} and all(v == [0] for v in res.values())
+  hints:
+  - Take a snapshot of every live view after the beats, then deliver the snapshots, so the order of delivery does not matter.
+  solution: |
+    import random
+
+
+    def beat(view, node, now):
+        """A node's heartbeat. A VIEW maps node -> {"hb": heartbeat counter, "seen": the local time that counter last increased}. Return a NEW view (the input is not changed) in which `node`'s counter is one higher and its seen time is `now`; a node that is not in the view gets {"hb": 1, "seen": now}."""
+        new = {k: dict(v) for k, v in view.items()}
+        if node in new:
+            new[node]["hb"] += 1
+            new[node]["seen"] = now
+        else:
+            new[node] = {"hb": 1, "seen": now}
+        return new
+
+
+    def merge_view(mine, received, now):
+        """Merge a view received from a peer into mine, returning a NEW view. A node I have not heard of is added with the received counter and seen = now. For a node I know, if the received counter is HIGHER than mine, take it and set seen = now (news!); otherwise keep my entry."""
+        new = {k: dict(v) for k, v in mine.items()}
+        for node, entry in received.items():
+            if node not in new or entry["hb"] > new[node]["hb"]:
+                new[node] = {"hb": entry["hb"], "seen": now}
+        return new
+
+
+    def failed_nodes(view, now, t_fail):
+        """The sorted list of nodes whose counter has not increased for MORE than t_fail time units (now - seen > t_fail)."""
+        return sorted(n for n, e in view.items() if now - e["seen"] > t_fail)
+
+
+    def simulate_membership(n, rounds, crashed, crash_round, seed, t_fail):
+        """Gossip-style failure detection among nodes 0 .. n-1. Every node starts with a view of all nodes with {"hb": 0, "seen": 0}. Rounds are numbered 1 .. rounds. In round r a node in `crashed` is DEAD if r >= crash_round (it does nothing). Each live node (1) beats (use beat with now = r), then
+        (2) in sorted order each live node picks one random OTHER node with rng.randrange(n) (retrying on itself; rng = random.Random(seed)) and sends it a copy of its view as it stood after step (1) of this round; a message to a dead node is lost; the receiver merges it with merge_view (now = r), processing the messages in sorted sender order. At the end
+        return {live node: failed_nodes(its view, rounds, t_fail)} for every node that never crashed."""
+        rng = random.Random(seed)
+        views = {i: {j: {"hb": 0, "seen": 0} for j in range(n)} for i in range(n)}
+        for r in range(1, rounds + 1):
+            alive = [i for i in range(n) if not (i in crashed and r >= crash_round)]
+            for i in alive:
+                views[i] = beat(views[i], i, r)
+            snap = {i: {k: dict(v) for k, v in views[i].items()} for i in alive}
+            for i in alive:
+                while True:
+                    p = rng.randrange(n)
+                    if p != i:
+                        break
+                if p in alive:
+                    views[p] = merge_view(views[p], snap[i], r)
+        return {i: failed_nodes(views[i], rounds, t_fail) for i in range(n) if i not in crashed}
+  explanation: Gossip-based failure detection scales to thousands of nodes, because each node only talks to one peer per round.
+commonMistakes:
+- title: Letting every machine talk to every other machine
+  explanation: That is n squared messages; gossip uses a small fanout.
+- title: Setting the failure timeout shorter than the gossip delay
+  explanation: Live nodes would be suspected before news of them arrives.
+- title: Comparing whole data sets in anti-entropy
+  explanation: Compare digests or Merkle roots first.
+- title: Using a global clock in a gossip failure detector
+  explanation: Each node uses its own local times only.
+- title: Following every branch of a Merkle tree
+  explanation: Only subtrees whose hashes differ can contain differences.
+summary:
+- Gossip spreads information to n machines in about log n rounds with no central node.
+- Anti-entropy exchanges digests and transfers only missing or newer entries.
+- A Merkle tree finds differences by comparing a handful of hashes.
+- Gossiped heartbeat counters detect crashes without a global clock.
+- Gossip is probabilistic, which is the price of scale and resilience.
+next: u24-reliability
+quiz:
+- type: mcq
+  question: About how many gossip rounds does it take to inform n machines?
+  options:
+  - log n
+  - n
+  - n squared
+  - '1'
+  answer: 0
+  explanation: The number of informed machines grows exponentially.
+- type: mcq
+  question: What does a Merkle tree's root hash tell you?
+  options:
+  - Whether two data sets are identical
+  - How big the data is
+  - Which key changed
+  - The latest time
+  answer: 0
+  explanation: Equal roots mean equal data.
+- type: mcq
+  question: Why exchange digests in anti-entropy?
+  options:
+  - To transfer only what is missing
+  - To compress data
+  - To elect a leader
+  - To order events
+  answer: 0
+  explanation: Only differences need to move.
+- type: mcq
+  question: In gossip failure detection, how is a crashed node noticed?
+  options:
+  - Its heartbeat counter stops growing
+  - It sends a goodbye message
+  - A server removes it
+  - Its clock stops
+  answer: 0
+  explanation: The news about it stops changing.
+- type: mcq
+  question: Why is gossip said to be probabilistic?
+  options:
+  - Everyone learns with very high probability, not by a fixed deadline
+  - It uses random numbers for encryption
+  - It loses data
+  - It needs a coin
+  answer: 0
+  explanation: Random targets give statistical guarantees.
+- type: mcq
+  question: In a Merkle diff, which children do you compare?
+  options:
+  - Only those of nodes whose hashes differ
+  - All of them
+  - Only leaves
+  - Only the left child
+  answer: 0
+  explanation: Equal subtrees can be skipped.
+- type: code
+  question: Write `missing_keys(mine, theirs)` returning the sorted list of keys that are in `theirs` but not in `mine` (both are dicts).
+  starter: |
+    def missing_keys(mine, theirs):
+        pass
+  tests:
+  - name: missing
+    code: |
+      assert missing_keys({"a": 1}, {"a": 2, "b": 3, "c": 4}) == ["b", "c"] and missing_keys({}, {}) == [] and missing_keys({"x": 1}, {}) == []
+  solution: |
+    def missing_keys(mine, theirs):
+        return sorted(k for k in theirs if k not in mine)

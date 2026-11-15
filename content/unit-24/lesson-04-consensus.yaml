@@ -1,0 +1,871 @@
+id: u24-consensus
+title: Failure Detection and Consensus
+minutes: 100
+objective: Learn how a group of machines that can fail agrees on one thing. You will build a heartbeat failure detector, the bully election algorithm, single-decree Paxos and the voting rules of Raft, and check that two leaders can never be elected in one term.
+outcomes:
+- Explain why failure detection is only a guess
+- Run the bully election
+- Explain Paxos's two phases and its safety rule
+- Apply Raft's voting rules
+- Explain election safety and majorities
+sections:
+- heading: Is it dead, or just slow?
+  body: |-
+    When a machine stops answering, a distributed system faces a puzzle: did it **crash**, or is the network slow, or is it simply busy? From the outside these look identical, and there is no way to be sure. (A famous result, the **FLP impossibility theorem**, shows that in a purely asynchronous network no algorithm can *guarantee* agreement if even one machine may crash. Real systems get around it by using timeouts, which makes them work almost always, and never claiming certainty.)
+
+    The standard tool is the **heartbeat**: every machine regularly sends a small "I am alive" message. A **failure detector** records when it last heard from each machine and **suspects** any whose last heartbeat is older than a **timeout**. Choosing the timeout is a trade-off: too short, and a slow moment triggers a **false suspicion** and needless work; too long, and a real crash goes unnoticed. Good detectors, such as the **phi accrual** detector used in Cassandra, learn what is normal. They measure the *typical gap and its spread* between a machine's heartbeats and set the timeout to the mean plus a few standard deviations, as our `adaptive_timeout` does. The detector's answer is always a *suspicion*, never a fact.
+- heading: Electing a leader
+  body: |-
+    Many designs are simpler if exactly one machine, the **leader**, makes the decisions and the others follow. When the leader is suspected, the rest hold an **election**. The **bully algorithm** gives every machine a number and lets the highest *live* number win: a machine that notices the loss sends ELECTION to every higher machine; any live one answers OK ("I am bigger, stand down") and starts its own election; the highest live machine finds nobody higher, declares itself leader and sends COORDINATOR to everyone. It is easy to understand, but with a false suspicion two machines can each believe they are leader, and it floods the network. That danger, called **split brain**, is why serious systems use a proper consensus protocol instead.
+
+    **Consensus** is the problem of getting a group to agree on a single value so that: only a value that was proposed can be chosen; only one value is chosen; and once chosen, it never changes. Consensus underlies electing a leader, committing a transaction and ordering a log. The key tool is the **majority** (or **quorum**): if every decision needs more than half the machines, any two decisions share a machine, so two conflicting decisions cannot both happen.
+- heading: Paxos and Raft
+  body: |-
+    **Paxos**, by Lamport, is the classic protocol. A **proposer** numbers each attempt with a unique, increasing **proposal number**. In **phase 1** it asks the **acceptors** to *promise* not to accept anything numbered lower, and each promise also reports the highest-numbered proposal that acceptor has already accepted. If a majority promise, the proposer must be careful: if any promise reported an accepted value, it **must propose the one with the highest number** instead of its own. That single rule is what makes Paxos safe, because a value that was chosen by some majority will be seen by any later majority, and so gets carried forward. In **phase 2** it asks the acceptors to accept the value, and if a majority do, the value is **chosen**. Competing proposers may keep interrupting each other, which is why practical systems elect a leader to propose.
+
+    **Raft** solves the same problem in a way designed to be understandable, and is used in etcd, Consul and many databases. Time is cut into numbered **terms**. A server that suspects there is no leader becomes a **candidate**, increments its term and asks the others for votes. Each server votes **at most once per term** and only for a candidate whose log is **at least as up to date** as its own (compared by the term and index of the last entry); a candidate with a **majority** becomes the leader for that term. The one-vote rule plus majorities means two leaders can never be elected in the same term, a property called **election safety**, and the log rule means a new leader always already holds every entry that was committed. Once elected, the leader replicates its log to the others as in the last lesson. Raft makes a replicated, fault-tolerant service possible out of a handful of ordinary machines, and with 2f + 1 machines it keeps working through f failures.
+examples:
+- title: Heartbeats
+  intro: A failure detector suspects the node that went quiet, and an adaptive timeout.
+  code: |
+    import statistics
+
+
+    def last_heartbeats(events):
+        """`events` is a list of (time, node) heartbeat arrivals in any order. Return {node: the latest time that node was heard from}."""
+        last = {}
+        for t, node in events:
+            if node not in last or t > last[node]:
+                last[node] = t
+        return last
+
+
+    def suspected(last_seen, now, timeout):
+        """The sorted list of nodes whose last heartbeat is MORE than `timeout` old: now - last_seen[node] > timeout."""
+        return sorted(n for n, t in last_seen.items() if now - t > timeout)
+
+
+    def detect(events, nodes, now, timeout):
+        """A heartbeat failure detector. Consider only heartbeats with time <= now. Return {node: 'alive' or 'suspected'} for every node in `nodes`: a node is suspected if it has never been heard from, or its latest heartbeat is more than `timeout` old."""
+        last = last_heartbeats([(t, n) for t, n in events if t <= now])
+        return {n: ("suspected" if n not in last or now - last[n] > timeout else "alive") for n in nodes}
+
+
+    def adaptive_timeout(arrivals, k):
+        """Pick a timeout that fits how regular a node's heartbeats really are. `arrivals` is the list of times one node's heartbeats arrived (sort it first). The intervals between consecutive arrivals have a mean
+        and a population standard deviation (statistics.pstdev); return mean + k * deviation rounded to 3 decimals. ValueError('too few heartbeats') if there are fewer than 3 arrivals."""
+        if len(arrivals) < 3:
+            raise ValueError("too few heartbeats")
+        ordered = sorted(arrivals)
+        gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+        return round(statistics.mean(gaps) + k * statistics.pstdev(gaps), 3)
+
+    beats = [(0, "a"), (0, "b"), (0, "c"), (5, "a"), (5, "b"), (10, "a"), (10, "b"), (15, "a")]
+    print("at t=16 with timeout 8:", detect(beats, ["a", "b", "c"], 16, 8))
+    print("who is suspected:", suspected(last_heartbeats(beats), 16, 8))
+    print("adaptive timeout for steady beats:", adaptive_timeout([0, 5, 10, 15], 3), " for jittery beats:", adaptive_timeout([0, 4, 11, 15, 24], 3))
+  output: |
+    at t=16 with timeout 8: {'a': 'alive', 'b': 'alive', 'c': 'suspected'}
+    who is suspected: ['c']
+    adaptive timeout for steady beats: 5.0  for jittery beats: 12.364
+  lines:
+  - line: 34
+    note: c never sent another heartbeat after time 0.
+  - line: 36
+    note: Jittery beats need a larger timeout than steady ones.
+- title: Bully and Paxos
+  intro: An election with the top node down, then two competing Paxos proposers.
+  code: |
+    def bully_election(all_nodes, alive, starter):
+        """The bully algorithm: the highest-numbered live node becomes leader. Simulate it and COUNT messages. A node that runs an election sends an ELECTION message to EVERY node with a higher id (alive or not: it cannot tell) and counts 1 per message sent; each ALIVE higher node
+        replies OK (count 1 per reply) and then runs its own election, unless it already has. A node with no alive higher node wins, and sends a COORDINATOR message to every other ALIVE node (count 1 each). The starter begins the first election.
+        Return (leader, total_messages). ValueError('starter is down') if the starter is not alive."""
+        if starter not in alive:
+            raise ValueError("starter is down")
+        messages = 0
+        ran = set()
+        pending = [starter]
+        leader = None
+        while pending:
+            node = pending.pop(0)
+            if node in ran:
+                continue
+            ran.add(node)
+            higher = [n for n in all_nodes if n > node]
+            messages += len(higher)
+            higher_alive = [n for n in higher if n in alive]
+            messages += len(higher_alive)
+            if higher_alive:
+                pending.extend(higher_alive)
+            else:
+                leader = node
+                messages += len([n for n in alive if n != node])
+        return leader, messages
+
+
+    def new_acceptor():
+        """An acceptor remembers the highest proposal number it has PROMISED and the proposal (number, value) it has ACCEPTED: {"promised": 0, "accepted": None}."""
+        return {"promised": 0, "accepted": None}
+
+
+    def prepare(acceptor, n):
+        """Phase 1b. If n is higher than anything promised so far, promise it: set promised = n and return (True, the accepted proposal or None). Otherwise return (False, None)."""
+        if n > acceptor["promised"]:
+            acceptor["promised"] = n
+            return True, acceptor["accepted"]
+        return False, None
+
+
+    def accept(acceptor, n, value):
+        """Phase 2b. Accept the proposal if n is at least the promised number: set promised = n and accepted = (n, value) and return True. Otherwise return False."""
+        if n >= acceptor["promised"]:
+            acceptor["promised"] = n
+            acceptor["accepted"] = (n, value)
+            return True
+        return False
+
+
+    def propose(acceptors, up, n, value):
+        """Single-decree Paxos from one proposer. `acceptors` maps names to acceptor dicts; `up` lists the reachable names (sorted order when contacting). A MAJORITY is len(acceptors) // 2 + 1. Phase 1: send prepare(n) to every reachable acceptor; if fewer than a majority promise, return None.
+        Choose the value: if any promise reported an accepted proposal, use the value of the one with the HIGHEST number; otherwise use `value`. Phase 2: send accept(n, chosen) to every reachable acceptor; if a majority accept, return the chosen value, else None."""
+        majority = len(acceptors) // 2 + 1
+        reachable = sorted(set(up) & set(acceptors))
+        promises = []
+        for name in reachable:
+            ok, accepted = prepare(acceptors[name], n)
+            if ok:
+                promises.append(accepted)
+        if len(promises) < majority:
+            return None
+        reported = [a for a in promises if a is not None]
+        chosen = max(reported, key=lambda a: a[0])[1] if reported else value
+        acks = sum(1 for name in reachable if accept(acceptors[name], n, chosen))
+        return chosen if acks >= majority else None
+
+    print("bully with 5 nodes, node 5 failed, node 2 notices:", bully_election([1, 2, 3, 4, 5], [1, 2, 3, 4], 2))
+    acceptors = {n: new_acceptor() for n in "abc"}
+    print("proposer 1:", propose(acceptors, ["a", "b", "c"], 1, "red"))
+    print("proposer 2 (wants blue):", propose(acceptors, ["b", "c"], 2, "blue"))
+    print("acceptors hold:", {n: a["accepted"] for n, a in acceptors.items()})
+  output: |
+    bully with 5 nodes, node 5 failed, node 2 notices: (4, 12)
+    proposer 1: red
+    proposer 2 (wants blue): red
+    acceptors hold: {'a': (1, 'red'), 'b': (2, 'red'), 'c': (2, 'red')}
+  lines:
+  - line: 67
+    note: Node 4 is the highest live node, so it wins.
+  - line: 70
+    note: The second proposer must keep the first value.
+  - line: 71
+    note: Every reachable acceptor holds red.
+- title: Raft elections
+  intro: A partitioned minority fails to elect a leader; the majority succeeds.
+  code: |
+    def last_log_info(log):
+        """(term of the last entry, number of entries) of a log, which is a list of (term, command); (0, 0) for an empty log."""
+        return (log[-1][0] if log else 0, len(log))
+
+
+    def request_vote(voter, term, candidate, last_log_term, last_log_index):
+        """A Raft voter decides whether to vote. The voter is {"term": t, "voted_for": name or None, "log": [...]}. Return (granted, new_voter) where new_voter is a COPY (never change the input). Rules: if the request's term is lower than the voter's term, DENY. If it is higher, the
+        voter first moves to that term and forgets its vote (voted_for = None). It GRANTS (and sets voted_for to the candidate) only if it has not voted in this term for a different candidate AND the candidate's log is at least as up to date as its own: compare (last_log_term, last_log_index) with the
+        voter's own last_log_info as tuples, and the candidate's must be >=. A denial caused by a stale term leaves the voter unchanged; other denials keep the (possibly updated) term."""
+        new = {"term": voter["term"], "voted_for": voter["voted_for"], "log": list(voter["log"])}
+        if term < new["term"]:
+            return False, new
+        if term > new["term"]:
+            new["term"] = term
+            new["voted_for"] = None
+        up_to_date = (last_log_term, last_log_index) >= last_log_info(new["log"])
+        if new["voted_for"] in (None, candidate) and up_to_date:
+            new["voted_for"] = candidate
+            return True, new
+        return False, new
+
+
+    def run_election(voters, candidate, term, reachable):
+        """The candidate asks every reachable voter (in sorted name order, ITSELF included if reachable) with request_vote, using its own log's last_log_info. Return (won, sorted list of voters that granted, new voters dict). A candidate not in `reachable`
+        gets no votes. WON means the votes are a majority of ALL voters (len(voters) // 2 + 1). Voters that were not asked, and the input dict, are not changed (voters is {name: voter dict})."""
+        new = {n: {"term": v["term"], "voted_for": v["voted_for"], "log": list(v["log"])} for n, v in voters.items()}
+        granted = []
+        if candidate in reachable:
+            info = last_log_info(voters[candidate]["log"])
+            for name in sorted(set(reachable) & set(voters)):
+                ok, new[name] = request_vote(new[name], term, candidate, info[0], info[1])
+                if ok:
+                    granted.append(name)
+        return len(granted) >= len(voters) // 2 + 1, sorted(granted), new
+
+    def run_elections(voters, attempts):
+        """Run a sequence of election attempts, each (candidate, term, reachable), one after another, with voter state carried from each to the next (use run_election). Return a list of outcomes (candidate, term, won, tuple of granting voters)."""
+        state = voters
+        outcomes = []
+        for candidate, term, reachable in attempts:
+            won, granted, state = run_election(state, candidate, term, reachable)
+            outcomes.append((candidate, term, won, tuple(granted)))
+        return outcomes
+
+
+    def leaders_by_term(outcomes):
+        """Raft's election safety: at most ONE leader per term. From a list of outcomes (candidate, term, won, votes) return {term: the winning candidate} for terms that had a winner; ValueError('two leaders in term T') if two different winners exist for the same term T."""
+        leaders = {}
+        for candidate, term, won, votes in outcomes:
+            if won:
+                if term in leaders and leaders[term] != candidate:
+                    raise ValueError("two leaders in term %d" % term)
+                leaders[term] = candidate
+        return leaders
+
+    voters = {n: {"term": 0, "voted_for": None, "log": []} for n in "abcde"}
+    attempts = [("a", 1, ["a", "b"]), ("c", 2, ["c", "d", "e"]), ("a", 3, ["a", "b", "c", "d", "e"])]
+    for candidate, term, won, votes in run_elections(voters, attempts):
+        print("term", term, "candidate", candidate, "won" if won else "lost", "with votes from", list(votes))
+  output: |
+    term 1 candidate a lost with votes from ['a', 'b']
+    term 2 candidate c won with votes from ['c', 'd', 'e']
+    term 3 candidate a won with votes from ['a', 'b', 'c', 'd', 'e']
+  lines:
+  - line: 40
+    note: Two of five servers cannot win; three of five can.
+playground:
+  prompt: Check by hand that any two majorities of 5 machines must overlap.
+  code: |
+    import itertools
+    names = 'abcde'
+    majorities = list(itertools.combinations(names, 3))
+    print(len(majorities), 'majorities')
+    print(all(set(a) & set(b) for a in majorities for b in majorities))
+exercises:
+- id: detector
+  title: Failure detection
+  difficulty: 4
+  prompt: 'You cannot tell a crashed machine from a slow network, so systems **suspect** failure when heartbeats stop. Write `last_heartbeats(events)`: `events` is a list of `(time, node)` arrivals in any order; return `{node: the latest time heard}`. Write `suspected(last_seen, now, timeout)`: the sorted list of nodes whose last heartbeat is **more than** `timeout` old (`now - last_seen[node] > timeout`). Write `detect(events, nodes, now, timeout)`: consider only heartbeats with `time <= now`; return `{node: "alive" or "suspected"}` for every node in `nodes`, where a node is suspected if it has **never** been heard from or its latest heartbeat is more than `timeout` old. Write `adaptive_timeout(arrivals, k)`: for one node''s heartbeat arrival times (sort them first), take the intervals between consecutive arrivals and return `mean + k * deviation` rounded to 3 decimals, using the population standard deviation `statistics.pstdev`; `ValueError("too few heartbeats")` if there are fewer than 3 arrivals.'
+  starter: |-
+    import statistics
+
+
+    def last_heartbeats(events):
+        """`events` is a list of (time, node) heartbeat arrivals in any order. Return {node: the latest time that node was heard from}."""
+        pass
+
+
+    def suspected(last_seen, now, timeout):
+        """The sorted list of nodes whose last heartbeat is MORE than `timeout` old: now - last_seen[node] > timeout."""
+        pass
+
+
+    def detect(events, nodes, now, timeout):
+        """A heartbeat failure detector. Consider only heartbeats with time <= now. Return {node: 'alive' or 'suspected'} for every node in `nodes`: a node is suspected if it has never been heard from, or its latest heartbeat is more than `timeout` old."""
+        pass
+
+
+    def adaptive_timeout(arrivals, k):
+        """Pick a timeout that fits how regular a node's heartbeats really are. `arrivals` is the list of times one node's heartbeats arrived (sort it first). The intervals between consecutive arrivals have a mean
+        and a population standard deviation (statistics.pstdev); return mean + k * deviation rounded to 3 decimals. ValueError('too few heartbeats') if there are fewer than 3 arrivals."""
+        pass
+  tests:
+  - name: latest heartbeats
+    code: |
+      ev = [(5, "a"), (9, "b"), (7, "a"), (3, "c"), (1, "a")]
+      assert last_heartbeats(ev) == {"a": 7, "b": 9, "c": 3}
+      assert last_heartbeats([]) == {}
+      assert last_heartbeats([(2, "x")]) == {"x": 2}
+  - name: who is suspected
+    code: |
+      seen = {"a": 100, "b": 90, "c": 99}
+      assert suspected(seen, 105, 10) == ["b"]
+      assert suspected(seen, 100, 10) == []
+      assert suspected(seen, 110, 10) == ["b", "c"]
+      assert suspected(seen, 111, 10) == ["a", "b", "c"]
+      assert suspected({}, 5, 1) == []
+      assert suspected({"x": 0}, 10, 10) == [] and suspected({"x": 0}, 11, 10) == ["x"]
+  - name: the detector
+    code: |
+      events = [(1, "a"), (2, "b"), (3, "c"), (11, "a"), (12, "b")]
+      assert detect(events, ["a", "b", "c"], 13, 5) == {"a": "alive", "b": "alive", "c": "suspected"}
+      assert detect(events, ["a", "b", "c"], 4, 5) == {"a": "alive", "b": "alive", "c": "alive"}
+      assert detect(events, ["a", "d"], 13, 5) == {"a": "alive", "d": "suspected"}
+      assert detect([], ["a"], 0, 5) == {"a": "suspected"}
+      assert detect(events, ["a"], 10, 5) == {"a": "suspected"} and detect(events, ["a"], 6, 5) == {"a": "alive"}
+      assert detect(events, ["a"], 5, 5) == {"a": "alive"}
+  - name: adaptive timeouts
+    code: |
+      assert adaptive_timeout([0, 10, 20, 30], 3) == 10.0
+      assert adaptive_timeout([30, 0, 20, 10], 3) == 10.0
+      import statistics
+      gaps = [10, 12, 8]
+      expected = round(statistics.mean(gaps) + 2 * statistics.pstdev(gaps), 3)
+      assert adaptive_timeout([0, 10, 22, 30], 2) == expected == 13.266
+      assert adaptive_timeout([0, 10, 22, 30], 0) == 10.0
+      for few in ([], [1], [1, 2]):
+          try:
+              adaptive_timeout(few, 2)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "too few heartbeats" in str(e)
+      assert adaptive_timeout([0, 1, 2], 5) == 1.0
+  hints:
+  - A heartbeat older than the timeout is the only evidence of failure the detector has.
+  solution: |
+    import statistics
+
+
+    def last_heartbeats(events):
+        """`events` is a list of (time, node) heartbeat arrivals in any order. Return {node: the latest time that node was heard from}."""
+        last = {}
+        for t, node in events:
+            if node not in last or t > last[node]:
+                last[node] = t
+        return last
+
+
+    def suspected(last_seen, now, timeout):
+        """The sorted list of nodes whose last heartbeat is MORE than `timeout` old: now - last_seen[node] > timeout."""
+        return sorted(n for n, t in last_seen.items() if now - t > timeout)
+
+
+    def detect(events, nodes, now, timeout):
+        """A heartbeat failure detector. Consider only heartbeats with time <= now. Return {node: 'alive' or 'suspected'} for every node in `nodes`: a node is suspected if it has never been heard from, or its latest heartbeat is more than `timeout` old."""
+        last = last_heartbeats([(t, n) for t, n in events if t <= now])
+        return {n: ("suspected" if n not in last or now - last[n] > timeout else "alive") for n in nodes}
+
+
+    def adaptive_timeout(arrivals, k):
+        """Pick a timeout that fits how regular a node's heartbeats really are. `arrivals` is the list of times one node's heartbeats arrived (sort it first). The intervals between consecutive arrivals have a mean
+        and a population standard deviation (statistics.pstdev); return mean + k * deviation rounded to 3 decimals. ValueError('too few heartbeats') if there are fewer than 3 arrivals."""
+        if len(arrivals) < 3:
+            raise ValueError("too few heartbeats")
+        ordered = sorted(arrivals)
+        gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+        return round(statistics.mean(gaps) + k * statistics.pstdev(gaps), 3)
+  explanation: 'A failure detector can only guess: a slow network looks exactly like a dead machine.'
+- id: bully
+  title: Electing a leader with the bully algorithm
+  difficulty: 4
+  prompt: Many systems need exactly one machine in charge, a **leader**. When the leader is suspected dead, the survivors hold an **election**. In the **bully algorithm** the highest-numbered live node wins. Write `bully_election(all_nodes, alive, starter)`, simulating it and **counting messages**. A node that runs an election sends an ELECTION message to **every** node with a higher id (alive or not, since it cannot tell) and counts 1 per message sent; each **alive** higher node replies OK (count 1 per reply) and then runs its own election unless it already has. A node with no alive higher node **wins** and sends a COORDINATOR message to every other **alive** node (count 1 each). The starter begins the first election. Return `(leader, total_messages)`. Raise `ValueError("starter is down")` if the starter is not alive.
+  starter: |-
+    def bully_election(all_nodes, alive, starter):
+        """The bully algorithm: the highest-numbered live node becomes leader. Simulate it and COUNT messages. A node that runs an election sends an ELECTION message to EVERY node with a higher id (alive or not: it cannot tell) and counts 1 per message sent; each ALIVE higher node
+        replies OK (count 1 per reply) and then runs its own election, unless it already has. A node with no alive higher node wins, and sends a COORDINATOR message to every other ALIVE node (count 1 each). The starter begins the first election.
+        Return (leader, total_messages). ValueError('starter is down') if the starter is not alive."""
+        pass
+  tests:
+  - name: a small election
+    code: |
+      assert bully_election([1, 2, 3, 4, 5], [1, 2, 3, 5], 2) == (5, 11)
+      assert bully_election([1, 2, 3, 4, 5], [1, 2, 3], 1) == (3, 14)
+  - name: the highest node starts
+    code: |
+      assert bully_election([1, 2, 3, 4, 5], [1, 2, 3, 4, 5], 5) == (5, 4)
+      assert bully_election([1, 2, 3], [3], 3) == (3, 0)
+      assert bully_election([1, 2], [1, 2], 2) == (2, 1)
+  - name: everyone is alive
+    code: |
+      assert bully_election([1, 2, 3], [1, 2, 3], 1) == (3, 8)
+      assert bully_election([1, 2, 3, 4], [1, 2, 3, 4], 1) == (4, 15)
+      leader, messages = bully_election([10, 20, 30], [10, 30], 10)
+      assert leader == 30 and messages == 2 + 1 + 0 + 1
+  - name: a dead starter
+    code: |
+      try:
+          bully_election([1, 2, 3], [1, 2], 3)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "starter is down" in str(e)
+      for starter in (1, 2, 3, 4):
+          assert bully_election([1, 2, 3, 4, 5], [1, 2, 3, 4], starter)[0] == 4
+  hints:
+  - Every alive node higher than the starter ends up running its own election.
+  solution: |
+    def bully_election(all_nodes, alive, starter):
+        """The bully algorithm: the highest-numbered live node becomes leader. Simulate it and COUNT messages. A node that runs an election sends an ELECTION message to EVERY node with a higher id (alive or not: it cannot tell) and counts 1 per message sent; each ALIVE higher node
+        replies OK (count 1 per reply) and then runs its own election, unless it already has. A node with no alive higher node wins, and sends a COORDINATOR message to every other ALIVE node (count 1 each). The starter begins the first election.
+        Return (leader, total_messages). ValueError('starter is down') if the starter is not alive."""
+        if starter not in alive:
+            raise ValueError("starter is down")
+        messages = 0
+        ran = set()
+        pending = [starter]
+        leader = None
+        while pending:
+            node = pending.pop(0)
+            if node in ran:
+                continue
+            ran.add(node)
+            higher = [n for n in all_nodes if n > node]
+            messages += len(higher)
+            higher_alive = [n for n in higher if n in alive]
+            messages += len(higher_alive)
+            if higher_alive:
+                pending.extend(higher_alive)
+            else:
+                leader = node
+                messages += len([n for n in alive if n != node])
+        return leader, messages
+  explanation: The bully algorithm is simple and always picks the highest live node, but it can use many messages.
+- id: paxos
+  title: Single-decree Paxos
+  difficulty: 5
+  prompt: '**Consensus** means getting several machines to agree on one value even though some fail. **Paxos** does it with two phases. An **acceptor** is `{"promised": 0, "accepted": None}`: the highest proposal number it has promised and the proposal `(number, value)` it accepted. Write `new_acceptor()`, `prepare(acceptor, n)` (**phase 1**: if `n` is higher than anything promised so far, set `promised = n` and return `(True, accepted proposal or None)`; otherwise `(False, None)`) and `accept(acceptor, n, value)` (**phase 2**: if `n` is at least the promised number, set `promised = n` and `accepted = (n, value)` and return `True`; otherwise `False`). Both change the acceptor in place. Write `propose(acceptors, up, n, value)` for one proposer: `acceptors` maps names to acceptor dicts and `up` lists the reachable names (contact them in sorted order). A **majority** is `len(acceptors) // 2 + 1`. Phase 1: send `prepare(n)` to every reachable acceptor; if fewer than a majority promise, return `None`. Choose the value: if any promise reported an accepted proposal, use the value of the one with the **highest number**; otherwise use `value`. Phase 2: send `accept(n, chosen)` to every reachable acceptor; if a majority accept, return the chosen value, otherwise `None`.'
+  starter: |-
+    def new_acceptor():
+        """An acceptor remembers the highest proposal number it has PROMISED and the proposal (number, value) it has ACCEPTED: {"promised": 0, "accepted": None}."""
+        pass
+
+
+    def prepare(acceptor, n):
+        """Phase 1b. If n is higher than anything promised so far, promise it: set promised = n and return (True, the accepted proposal or None). Otherwise return (False, None)."""
+        pass
+
+
+    def accept(acceptor, n, value):
+        """Phase 2b. Accept the proposal if n is at least the promised number: set promised = n and accepted = (n, value) and return True. Otherwise return False."""
+        pass
+
+
+    def propose(acceptors, up, n, value):
+        """Single-decree Paxos from one proposer. `acceptors` maps names to acceptor dicts; `up` lists the reachable names (sorted order when contacting). A MAJORITY is len(acceptors) // 2 + 1. Phase 1: send prepare(n) to every reachable acceptor; if fewer than a majority promise, return None.
+        Choose the value: if any promise reported an accepted proposal, use the value of the one with the HIGHEST number; otherwise use `value`. Phase 2: send accept(n, chosen) to every reachable acceptor; if a majority accept, return the chosen value, else None."""
+        pass
+  tests:
+  - name: one proposer
+    code: |
+      accs = {n: new_acceptor() for n in "abc"}
+      assert propose(accs, ["a", "b", "c"], 1, "A") == "A"
+      assert all(a["accepted"] == (1, "A") and a["promised"] == 1 for a in accs.values())
+      accs = {n: new_acceptor() for n in "abc"}
+      assert propose(accs, ["a", "b"], 5, "X") == "X"
+      assert accs["c"] == new_acceptor() and accs["a"]["accepted"] == (5, "X")
+      accs = {n: new_acceptor() for n in "abc"}
+      assert propose(accs, ["a"], 1, "A") is None
+      assert accs["a"]["promised"] == 1 and accs["a"]["accepted"] is None
+  - name: the acceptor rules
+    code: |
+      a = new_acceptor()
+      assert prepare(a, 3) == (True, None) and a["promised"] == 3
+      assert prepare(a, 3) == (False, None) and prepare(a, 2) == (False, None)
+      assert accept(a, 2, "low") is False and a["accepted"] is None
+      assert accept(a, 3, "v") is True and a["accepted"] == (3, "v")
+      assert prepare(a, 4) == (True, (3, "v"))
+      assert accept(a, 5, "w") is True and a["accepted"] == (5, "w") and a["promised"] == 5
+  - name: a later proposer must keep the chosen value
+    code: |
+      accs = {n: new_acceptor() for n in "abc"}
+      assert propose(accs, ["a", "b", "c"], 1, "first") == "first"
+      assert propose(accs, ["b", "c"], 2, "second") == "first"
+      assert propose(accs, ["a", "c"], 3, "third") == "first"
+      assert all(a["accepted"][1] == "first" for a in accs.values() if a["accepted"])
+      assert propose(accs, ["a", "b", "c"], 2, "late") is None
+  - name: competing proposers
+    code: |
+      accs = {n: new_acceptor() for n in "abcde"}
+      assert accs["a"]["promised"] == 0
+      prepare(accs["a"], 1)
+      accept(accs["a"], 1, "A")
+      assert propose(accs, ["b", "c", "d"], 2, "B") == "B"
+      assert propose(accs, ["a", "b", "e"], 3, "C") == "B"
+      accs = {n: new_acceptor() for n in "abc"}
+      prepare(accs["a"], 9)
+      assert propose(accs, ["a", "b", "c"], 4, "low") == "low"
+      assert propose(accs, ["a", "b", "c"], 4, "again") is None
+      accs = {n: new_acceptor() for n in "abc"}
+      for n in "ab":
+          prepare(accs[n], 7)
+      assert propose(accs, ["a", "b", "c"], 6, "x") is None
+  hints:
+  - Phase 1 asks for a promise and learns about earlier accepted values; phase 2 asks acceptors to accept, using the highest earlier value if there was one.
+  solution: |
+    def new_acceptor():
+        """An acceptor remembers the highest proposal number it has PROMISED and the proposal (number, value) it has ACCEPTED: {"promised": 0, "accepted": None}."""
+        return {"promised": 0, "accepted": None}
+
+
+    def prepare(acceptor, n):
+        """Phase 1b. If n is higher than anything promised so far, promise it: set promised = n and return (True, the accepted proposal or None). Otherwise return (False, None)."""
+        if n > acceptor["promised"]:
+            acceptor["promised"] = n
+            return True, acceptor["accepted"]
+        return False, None
+
+
+    def accept(acceptor, n, value):
+        """Phase 2b. Accept the proposal if n is at least the promised number: set promised = n and accepted = (n, value) and return True. Otherwise return False."""
+        if n >= acceptor["promised"]:
+            acceptor["promised"] = n
+            acceptor["accepted"] = (n, value)
+            return True
+        return False
+
+
+    def propose(acceptors, up, n, value):
+        """Single-decree Paxos from one proposer. `acceptors` maps names to acceptor dicts; `up` lists the reachable names (sorted order when contacting). A MAJORITY is len(acceptors) // 2 + 1. Phase 1: send prepare(n) to every reachable acceptor; if fewer than a majority promise, return None.
+        Choose the value: if any promise reported an accepted proposal, use the value of the one with the HIGHEST number; otherwise use `value`. Phase 2: send accept(n, chosen) to every reachable acceptor; if a majority accept, return the chosen value, else None."""
+        majority = len(acceptors) // 2 + 1
+        reachable = sorted(set(up) & set(acceptors))
+        promises = []
+        for name in reachable:
+            ok, accepted = prepare(acceptors[name], n)
+            if ok:
+                promises.append(accepted)
+        if len(promises) < majority:
+            return None
+        reported = [a for a in promises if a is not None]
+        chosen = max(reported, key=lambda a: a[0])[1] if reported else value
+        acks = sum(1 for name in reachable if accept(acceptors[name], n, chosen))
+        return chosen if acks >= majority else None
+  explanation: Paxos is safe because a proposer must adopt any value that might already have been chosen.
+- id: vote
+  title: Voting in Raft
+  difficulty: 5
+  prompt: '**Raft** is a consensus algorithm designed to be understandable. Time is divided into numbered **terms**, and in each term at most one leader is elected by majority vote. The starter has `last_log_info(log)`, the pair `(term of the last entry, number of entries)` of a log (a list of `(term, command)`; `(0, 0)` if empty). Write `request_vote(voter, term, candidate, last_log_term, last_log_index)`. A voter is `{"term": t, "voted_for": name or None, "log": [...]}`. Return `(granted, new_voter)` where `new_voter` is a **copy**; never change the input. Rules: if the request''s `term` is **lower** than the voter''s, deny. If it is **higher**, the voter first moves to that term and forgets its vote (`voted_for = None`). It **grants** (and sets `voted_for` to the candidate) only if it has not voted in this term for a **different** candidate **and** the candidate''s log is at least as up to date as its own: compare `(last_log_term, last_log_index)` with the voter''s own `last_log_info` as tuples, and the candidate''s must be `>=`. Write `run_election(voters, candidate, term, reachable)`: the candidate asks every reachable voter (sorted name order, **itself included** if reachable) using its own log''s `last_log_info`, and returns `(won, sorted list of granting voters, new voters dict)` without changing the input. A candidate not in `reachable` gets no votes. `won` means the votes are a majority of **all** voters (`len(voters) // 2 + 1`). Voters not asked stay unchanged.'
+  starter: |-
+    def last_log_info(log):
+        """(term of the last entry, number of entries) of a log, which is a list of (term, command); (0, 0) for an empty log."""
+        return (log[-1][0] if log else 0, len(log))
+
+
+
+
+    def request_vote(voter, term, candidate, last_log_term, last_log_index):
+        """A Raft voter decides whether to vote. The voter is {"term": t, "voted_for": name or None, "log": [...]}. Return (granted, new_voter) where new_voter is a COPY (never change the input). Rules: if the request's term is lower than the voter's term, DENY. If it is higher, the
+        voter first moves to that term and forgets its vote (voted_for = None). It GRANTS (and sets voted_for to the candidate) only if it has not voted in this term for a different candidate AND the candidate's log is at least as up to date as its own: compare (last_log_term, last_log_index) with the
+        voter's own last_log_info as tuples, and the candidate's must be >=. A denial caused by a stale term leaves the voter unchanged; other denials keep the (possibly updated) term."""
+        pass
+
+
+    def run_election(voters, candidate, term, reachable):
+        """The candidate asks every reachable voter (in sorted name order, ITSELF included if reachable) with request_vote, using its own log's last_log_info. Return (won, sorted list of voters that granted, new voters dict). A candidate not in `reachable`
+        gets no votes. WON means the votes are a majority of ALL voters (len(voters) // 2 + 1). Voters that were not asked, and the input dict, are not changed (voters is {name: voter dict})."""
+        pass
+  tests:
+  - name: last log info
+    code: |
+      assert last_log_info([]) == (0, 0)
+      assert last_log_info([(1, "a"), (3, "b")]) == (3, 2)
+  - name: granting and denying
+    code: |
+      v = {"term": 1, "voted_for": None, "log": [(1, "x")]}
+      ok, new = request_vote(v, 2, "c", 1, 1)
+      assert ok and new == {"term": 2, "voted_for": "c", "log": [(1, "x")]}
+      assert v == {"term": 1, "voted_for": None, "log": [(1, "x")]}
+      ok, new = request_vote(new, 2, "d", 1, 1)
+      assert not ok and new["voted_for"] == "c" and new["term"] == 2
+      ok, new = request_vote(new, 2, "c", 1, 1)
+      assert ok and new["voted_for"] == "c"
+      ok, new = request_vote(new, 1, "d", 5, 5)
+      assert not ok and new == {"term": 2, "voted_for": "c", "log": [(1, "x")]}
+      ok, new = request_vote(new, 3, "d", 1, 1)
+      assert ok and new["term"] == 3 and new["voted_for"] == "d"
+  - name: only up-to-date candidates win votes
+    code: |
+      v = {"term": 1, "voted_for": None, "log": [(1, "a"), (2, "b")]}
+      assert request_vote(v, 2, "c", 2, 2)[0] is True
+      assert request_vote(v, 2, "c", 2, 3)[0] is True
+      assert request_vote(v, 2, "c", 3, 1)[0] is True
+      assert request_vote(v, 2, "c", 2, 1)[0] is False
+      assert request_vote(v, 2, "c", 1, 9)[0] is False
+      assert request_vote(v, 2, "c", 0, 0)[0] is False
+      ok, new = request_vote(v, 2, "c", 1, 9)
+      assert not ok and new["term"] == 2 and new["voted_for"] is None
+      empty = {"term": 0, "voted_for": None, "log": []}
+      assert request_vote(empty, 1, "x", 0, 0)[0] is True
+  - name: running an election
+    code: |
+      log = [(1, "x")]
+      voters = {n: {"term": 1, "voted_for": None, "log": list(log)} for n in "abc"}
+      won, votes, new = run_election(voters, "a", 2, ["a", "b", "c"])
+      assert won and votes == ["a", "b", "c"] and all(v["term"] == 2 and v["voted_for"] == "a" for v in new.values())
+      assert all(v["term"] == 1 and v["voted_for"] is None for v in voters.values())
+      won, votes, new = run_election(voters, "a", 2, ["a", "b"])
+      assert won and votes == ["a", "b"] and new["c"] == voters["c"]
+      won, votes, new = run_election(voters, "a", 2, ["a"])
+      assert not won and votes == ["a"]
+      won, votes, new = run_election(voters, "a", 2, ["b", "c"])
+      assert not won and votes == [] and new == voters
+      voters["b"]["voted_for"] = "c"
+      voters["b"]["term"] = 2
+      won, votes, new = run_election(voters, "a", 2, ["a", "b", "c"])
+      assert won and votes == ["a", "c"]
+      stale = {"a": {"term": 1, "voted_for": None, "log": []}, "b": {"term": 1, "voted_for": None, "log": [(1, "x")]}, "c": {"term": 1, "voted_for": None, "log": [(1, "x")]}}
+      won, votes, new = run_election(stale, "a", 2, ["a", "b", "c"])
+      assert not won and votes == ["a"]
+  hints:
+  - A voter first updates its term if the request is newer, then applies the one-vote-per-term and up-to-date-log rules.
+  solution: |
+    def last_log_info(log):
+        """(term of the last entry, number of entries) of a log, which is a list of (term, command); (0, 0) for an empty log."""
+        return (log[-1][0] if log else 0, len(log))
+
+
+
+
+    def request_vote(voter, term, candidate, last_log_term, last_log_index):
+        """A Raft voter decides whether to vote. The voter is {"term": t, "voted_for": name or None, "log": [...]}. Return (granted, new_voter) where new_voter is a COPY (never change the input). Rules: if the request's term is lower than the voter's term, DENY. If it is higher, the
+        voter first moves to that term and forgets its vote (voted_for = None). It GRANTS (and sets voted_for to the candidate) only if it has not voted in this term for a different candidate AND the candidate's log is at least as up to date as its own: compare (last_log_term, last_log_index) with the
+        voter's own last_log_info as tuples, and the candidate's must be >=. A denial caused by a stale term leaves the voter unchanged; other denials keep the (possibly updated) term."""
+        new = {"term": voter["term"], "voted_for": voter["voted_for"], "log": list(voter["log"])}
+        if term < new["term"]:
+            return False, new
+        if term > new["term"]:
+            new["term"] = term
+            new["voted_for"] = None
+        up_to_date = (last_log_term, last_log_index) >= last_log_info(new["log"])
+        if new["voted_for"] in (None, candidate) and up_to_date:
+            new["voted_for"] = candidate
+            return True, new
+        return False, new
+
+
+    def run_election(voters, candidate, term, reachable):
+        """The candidate asks every reachable voter (in sorted name order, ITSELF included if reachable) with request_vote, using its own log's last_log_info. Return (won, sorted list of voters that granted, new voters dict). A candidate not in `reachable`
+        gets no votes. WON means the votes are a majority of ALL voters (len(voters) // 2 + 1). Voters that were not asked, and the input dict, are not changed (voters is {name: voter dict})."""
+        new = {n: {"term": v["term"], "voted_for": v["voted_for"], "log": list(v["log"])} for n, v in voters.items()}
+        granted = []
+        if candidate in reachable:
+            info = last_log_info(voters[candidate]["log"])
+            for name in sorted(set(reachable) & set(voters)):
+                ok, new[name] = request_vote(new[name], term, candidate, info[0], info[1])
+                if ok:
+                    granted.append(name)
+        return len(granted) >= len(voters) // 2 + 1, sorted(granted), new
+  explanation: The log up-to-date rule guarantees a new leader already holds every committed entry.
+- id: terms
+  title: Election safety
+  difficulty: 5
+  prompt: 'The starter has `run_election`. Write `run_elections(voters, attempts)`: run a sequence of election attempts, each `(candidate, term, reachable)`, one after another, carrying the voter state from each to the next. Return a list of outcomes `(candidate, term, won, tuple of granting voters)`. Write `leaders_by_term(outcomes)`, checking Raft''s **election safety** property, at most **one leader per term**: return `{term: winning candidate}` for terms that had a winner, and raise `ValueError("two leaders in term T")` if two **different** candidates both won term `T`. Because each voter votes at most once per term, two candidates cannot both gather a majority in one term; your tests include random elections that confirm it.'
+  starter: |-
+    def last_log_info(log):
+        """(term of the last entry, number of entries) of a log, which is a list of (term, command); (0, 0) for an empty log."""
+        return (log[-1][0] if log else 0, len(log))
+
+
+    def request_vote(voter, term, candidate, last_log_term, last_log_index):
+        """A Raft voter decides whether to vote. The voter is {"term": t, "voted_for": name or None, "log": [...]}. Return (granted, new_voter) where new_voter is a COPY (never change the input). Rules: if the request's term is lower than the voter's term, DENY. If it is higher, the
+        voter first moves to that term and forgets its vote (voted_for = None). It GRANTS (and sets voted_for to the candidate) only if it has not voted in this term for a different candidate AND the candidate's log is at least as up to date as its own: compare (last_log_term, last_log_index) with the
+        voter's own last_log_info as tuples, and the candidate's must be >=. A denial caused by a stale term leaves the voter unchanged; other denials keep the (possibly updated) term."""
+        new = {"term": voter["term"], "voted_for": voter["voted_for"], "log": list(voter["log"])}
+        if term < new["term"]:
+            return False, new
+        if term > new["term"]:
+            new["term"] = term
+            new["voted_for"] = None
+        up_to_date = (last_log_term, last_log_index) >= last_log_info(new["log"])
+        if new["voted_for"] in (None, candidate) and up_to_date:
+            new["voted_for"] = candidate
+            return True, new
+        return False, new
+
+
+    def run_election(voters, candidate, term, reachable):
+        """The candidate asks every reachable voter (in sorted name order, ITSELF included if reachable) with request_vote, using its own log's last_log_info. Return (won, sorted list of voters that granted, new voters dict). A candidate not in `reachable`
+        gets no votes. WON means the votes are a majority of ALL voters (len(voters) // 2 + 1). Voters that were not asked, and the input dict, are not changed (voters is {name: voter dict})."""
+        new = {n: {"term": v["term"], "voted_for": v["voted_for"], "log": list(v["log"])} for n, v in voters.items()}
+        granted = []
+        if candidate in reachable:
+            info = last_log_info(voters[candidate]["log"])
+            for name in sorted(set(reachable) & set(voters)):
+                ok, new[name] = request_vote(new[name], term, candidate, info[0], info[1])
+                if ok:
+                    granted.append(name)
+        return len(granted) >= len(voters) // 2 + 1, sorted(granted), new
+
+
+    def run_elections(voters, attempts):
+        """Run a sequence of election attempts, each (candidate, term, reachable), one after another, with voter state carried from each to the next (use run_election). Return a list of outcomes (candidate, term, won, tuple of granting voters)."""
+        pass
+
+
+    def leaders_by_term(outcomes):
+        """Raft's election safety: at most ONE leader per term. From a list of outcomes (candidate, term, won, votes) return {term: the winning candidate} for terms that had a winner; ValueError('two leaders in term T') if two different winners exist for the same term T."""
+        pass
+  tests:
+  - name: a sequence of elections
+    code: |
+      voters = {n: {"term": 0, "voted_for": None, "log": []} for n in "abc"}
+      out = run_elections(voters, [("a", 1, ["a", "b", "c"]), ("b", 1, ["a", "b", "c"]), ("b", 2, ["a", "b", "c"])])
+      assert out == [("a", 1, True, ("a", "b", "c")), ("b", 1, False, ()), ("b", 2, True, ("a", "b", "c"))]
+      assert leaders_by_term(out) == {1: "a", 2: "b"}
+      assert voters["a"]["term"] == 0
+      assert run_elections(voters, []) == []
+  - name: a partition and a new leader
+    code: |
+      voters = {n: {"term": 0, "voted_for": None, "log": []} for n in "abcde"}
+      out = run_elections(voters, [("a", 1, ["a", "b"]), ("c", 2, ["c", "d", "e"]), ("a", 3, ["a", "b", "c", "d", "e"])])
+      assert [o[2] for o in out] == [False, True, True]
+      assert leaders_by_term(out) == {2: "c", 3: "a"}
+      assert out[0][3] == ("a", "b")
+  - name: two leaders in one term would be a bug
+    code: |
+      bad = [("a", 1, True, ("a", "b")), ("b", 1, True, ("b", "c"))]
+      try:
+          leaders_by_term(bad)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "two leaders in term 1" in str(e)
+      ok = [("a", 1, True, ("a",)), ("a", 1, True, ("a",)), ("b", 2, False, ()), ("c", 3, True, ("c",))]
+      assert leaders_by_term(ok) == {1: "a", 3: "c"}
+      assert leaders_by_term([]) == {}
+  - name: safety holds in random elections
+    code: |
+      import random
+      rng = random.Random(7)
+      names = list("abcde")
+      for trial in range(60):
+          voters = {n: {"term": 0, "voted_for": None, "log": []} for n in names}
+          attempts = []
+          for _ in range(12):
+              candidate = names[rng.randrange(5)]
+              term = 1 + rng.randrange(4)
+              reachable = [n for n in names if rng.random() < 0.75]
+              attempts.append((candidate, term, reachable))
+          out = run_elections(voters, attempts)
+          leaders = leaders_by_term(out)
+          for candidate, term, won, votes in out:
+              if won:
+                  assert len(votes) >= 3 and leaders[term] == candidate
+  hints:
+  - Chain the voter state through the elections; then group winners by term.
+  solution: |
+    def last_log_info(log):
+        """(term of the last entry, number of entries) of a log, which is a list of (term, command); (0, 0) for an empty log."""
+        return (log[-1][0] if log else 0, len(log))
+
+
+    def request_vote(voter, term, candidate, last_log_term, last_log_index):
+        """A Raft voter decides whether to vote. The voter is {"term": t, "voted_for": name or None, "log": [...]}. Return (granted, new_voter) where new_voter is a COPY (never change the input). Rules: if the request's term is lower than the voter's term, DENY. If it is higher, the
+        voter first moves to that term and forgets its vote (voted_for = None). It GRANTS (and sets voted_for to the candidate) only if it has not voted in this term for a different candidate AND the candidate's log is at least as up to date as its own: compare (last_log_term, last_log_index) with the
+        voter's own last_log_info as tuples, and the candidate's must be >=. A denial caused by a stale term leaves the voter unchanged; other denials keep the (possibly updated) term."""
+        new = {"term": voter["term"], "voted_for": voter["voted_for"], "log": list(voter["log"])}
+        if term < new["term"]:
+            return False, new
+        if term > new["term"]:
+            new["term"] = term
+            new["voted_for"] = None
+        up_to_date = (last_log_term, last_log_index) >= last_log_info(new["log"])
+        if new["voted_for"] in (None, candidate) and up_to_date:
+            new["voted_for"] = candidate
+            return True, new
+        return False, new
+
+
+    def run_election(voters, candidate, term, reachable):
+        """The candidate asks every reachable voter (in sorted name order, ITSELF included if reachable) with request_vote, using its own log's last_log_info. Return (won, sorted list of voters that granted, new voters dict). A candidate not in `reachable`
+        gets no votes. WON means the votes are a majority of ALL voters (len(voters) // 2 + 1). Voters that were not asked, and the input dict, are not changed (voters is {name: voter dict})."""
+        new = {n: {"term": v["term"], "voted_for": v["voted_for"], "log": list(v["log"])} for n, v in voters.items()}
+        granted = []
+        if candidate in reachable:
+            info = last_log_info(voters[candidate]["log"])
+            for name in sorted(set(reachable) & set(voters)):
+                ok, new[name] = request_vote(new[name], term, candidate, info[0], info[1])
+                if ok:
+                    granted.append(name)
+        return len(granted) >= len(voters) // 2 + 1, sorted(granted), new
+
+
+    def run_elections(voters, attempts):
+        """Run a sequence of election attempts, each (candidate, term, reachable), one after another, with voter state carried from each to the next (use run_election). Return a list of outcomes (candidate, term, won, tuple of granting voters)."""
+        state = voters
+        outcomes = []
+        for candidate, term, reachable in attempts:
+            won, granted, state = run_election(state, candidate, term, reachable)
+            outcomes.append((candidate, term, won, tuple(granted)))
+        return outcomes
+
+
+    def leaders_by_term(outcomes):
+        """Raft's election safety: at most ONE leader per term. From a list of outcomes (candidate, term, won, votes) return {term: the winning candidate} for terms that had a winner; ValueError('two leaders in term T') if two different winners exist for the same term T."""
+        leaders = {}
+        for candidate, term, won, votes in outcomes:
+            if won:
+                if term in leaders and leaders[term] != candidate:
+                    raise ValueError("two leaders in term %d" % term)
+                leaders[term] = candidate
+        return leaders
+  explanation: Election safety is why a Raft cluster never has two leaders accepting conflicting writes in the same term.
+commonMistakes:
+- title: Treating a timeout as proof of a crash
+  explanation: It is only a suspicion; the machine may come back.
+- title: A Paxos proposer ignoring earlier accepted values
+  explanation: It must adopt the highest-numbered one or safety is lost.
+- title: Counting a majority of the machines that answered
+  explanation: A majority is of all members, not of the reachable ones.
+- title: Letting a voter vote twice in a term
+  explanation: Two candidates could both win.
+- title: Electing a candidate with an older log
+  explanation: It could overwrite committed entries.
+summary:
+- A crashed machine and a slow one look the same; detectors only suspect.
+- Timeouts trade false alarms against slow detection; adaptive ones learn the normal gaps.
+- The bully algorithm elects the highest live node but is message-hungry and can split the brain.
+- Consensus needs majorities, because any two majorities overlap.
+- Paxos is safe because proposers adopt the highest-numbered accepted value.
+- Raft elects a leader per term with one vote each and an up-to-date-log rule.
+next: u24-transactions
+quiz:
+- type: mcq
+  question: A failure detector based on heartbeats can only...
+  options:
+  - suspect failure
+  - prove failure
+  - prevent failure
+  - repair failure
+  answer: 0
+  explanation: Slow and dead look the same.
+- type: mcq
+  question: Why must two majorities overlap?
+  options:
+  - Each has more than half of the machines
+  - They are the same machines
+  - Majorities are small
+  - The network guarantees it
+  answer: 0
+  explanation: More than half plus more than half exceeds the total.
+- type: mcq
+  question: What must a Paxos proposer do if a promise reports an accepted value?
+  options:
+  - Propose the highest-numbered accepted value
+  - Propose its own value
+  - Abort forever
+  - Wait one second
+  answer: 0
+  explanation: This carries a possibly chosen value forward.
+- type: mcq
+  question: In Raft, how many votes may a server cast in one term?
+  options:
+  - At most one
+  - As many as it likes
+  - Exactly two
+  - None
+  answer: 0
+  explanation: That is the basis of election safety.
+- type: mcq
+  question: Why must a Raft candidate's log be up to date?
+  options:
+  - The new leader must hold all committed entries
+  - To make elections faster
+  - To avoid terms
+  - To reduce messages
+  answer: 0
+  explanation: Otherwise committed data could be lost.
+- type: mcq
+  question: With 5 machines, how many failures can a majority-based system survive?
+  options:
+  - '2'
+  - '3'
+  - '4'
+  - '5'
+  answer: 0
+  explanation: It needs 3 alive.
+- type: code
+  question: Write `majority(n)` returning the smallest number of machines that is more than half of `n`.
+  starter: |
+    def majority(n):
+        pass
+  tests:
+  - name: maj
+    code: |
+      assert majority(1) == 1 and majority(2) == 2 and majority(3) == 2 and majority(4) == 3 and majority(5) == 3 and majority(7) == 4
+  solution: |
+    def majority(n):
+        return n // 2 + 1

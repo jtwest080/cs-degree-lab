@@ -1,0 +1,1051 @@
+id: u24-time
+title: Time, Clocks and Ordering
+minutes: 95
+objective: 'Learn the first big idea of distributed systems: there is no shared clock, so order must come from cause and effect. You will build Lamport clocks, vector clocks, clock synchronization, causal message delivery and consistent snapshots.'
+outcomes:
+- Explain why distributed systems cannot rely on a single clock
+- Define the happened-before relation
+- Implement Lamport and vector clocks
+- Detect concurrent events
+- Explain clock synchronization and consistent cuts
+sections:
+- heading: Why distributed systems are hard
+  body: |-
+    A **distributed system** is a group of computers that cooperate by sending messages to each other. Almost everything you use online is one: a search engine, a bank, a game server. They exist for good reasons. One machine can only hold so much data and handle so many users, and any single machine can break. A group of machines can be bigger and can keep working when some of them fail.
+
+    But a group of machines is not just a bigger machine. Three facts change everything. First, machines talk through a **network**, which delivers messages **late, out of order, duplicated or not at all**. Second, **parts fail independently**: one machine can crash while the others carry on, and often you cannot tell a crashed machine from a slow one. Third, **there is no shared clock**. Every machine has its own clock, and they drift apart by tiny amounts that add up. So when two machines disagree about which of two things happened first, there is no single watch to settle it. This whole unit is about living with those three facts.
+- heading: Happened-before and Lamport clocks
+  body: |-
+    If we cannot trust clock readings, what can we trust? **Cause and effect.** Leslie Lamport defined the **happened-before** relation, written A → B: it holds if A and B are in the same process and A came first, or A is the sending of a message and B is its receiving, or there is a chain of such steps (A → C and C → B). If neither A → B nor B → A, the events are **concurrent**: they could not have influenced each other, so there is no meaningful "first".
+
+    A **Lamport clock** is a counter in every process that respects this relation. The rules: add one for every local event and every send, and stamp the message with the new value; when you **receive** a message, set your counter to the larger of your own value and the message's stamp, then add one. The guarantee is: **if A → B then the stamp of A is smaller than the stamp of B.** The opposite does not hold: a smaller stamp does not prove cause. Break ties between equal stamps by process name, and you get a **total order** that every machine computes identically, which is useful for things such as ordering requests in a shared queue.
+- heading: Vector clocks, causal delivery and snapshots
+  body: |-
+    To detect concurrency exactly, give every process a **vector clock**: a list with one counter per process. A process increments its own entry for each event; when it receives a message it first takes the **entrywise maximum** with the message's vector, then increments its own entry. Compare two vectors entry by entry: if every entry of one is less than or equal to the other's, the first event happened **before** the second; if some entries go each way, the events are **concurrent**. This is precisely the happened-before relation. The price is a vector as long as the number of processes.
+
+    Vectors let us repair the network's disorder. In **causal broadcast**, a process holds back each arriving message until it has delivered everything the message depends on: the next message from that sender, and every message the sender had seen. Held-back messages wait in a **hold-back queue**, so an answer is never shown before its question, which is exactly what a chat or comment system wants.
+
+    A **snapshot** records the state of the whole system. A **cut** chooses a prefix of each process's events. A cut is **consistent** if it never includes a message's receipt without its send, because such a snapshot would show an effect without a cause. (The famous Chandy-Lamport algorithm builds a consistent snapshot of a running system without stopping it.)
+
+    Physical clocks still matter for timeouts and logs, so they are **synchronized**. **Cristian's algorithm** and **NTP** ask a time server and estimate the clock's error: of the round trip, half is assumed to be spent each way, so the offset is estimated as the average of the two one-way differences, and the exchange with the smallest delay is the most trustworthy. The **Berkeley algorithm** has no accurate server; a master collects everyone's clock, ignores wild outliers, averages the rest and tells each machine how much to adjust. Even so, clocks are only synchronized to within some error, which is why careful systems prefer logical clocks for ordering.
+examples:
+- title: Logical clocks
+  intro: Lamport and vector clocks on three processes that exchange two messages.
+  code: |
+    def schedule(processes):
+        """`processes` maps a process name to its list of events: ("local", label), ("send", msg_id) or ("recv", msg_id). Return ONE valid order in which the whole system could have run,
+        as a list of (process, index, event). Go in passes: in each pass visit the processes in sorted name order and run at most ONE event of each (its next one); a recv can only run
+        after its message has been sent (by an earlier step). ValueError('duplicate message id X') if two sends use the same id, and ValueError('deadlock') if events remain but none can run (for example a recv
+        whose message is never sent). Receiving the same message in several processes is allowed."""
+        seen = set()
+        for events in processes.values():
+            for ev in events:
+                if ev[0] == "send":
+                    if ev[1] in seen:
+                        raise ValueError("duplicate message id %s" % (ev[1],))
+                    seen.add(ev[1])
+        pos = {p: 0 for p in processes}
+        sent = set()
+        order = []
+        remaining = sum(len(e) for e in processes.values())
+        while remaining:
+            progressed = False
+            for p in sorted(processes):
+                i = pos[p]
+                if i >= len(processes[p]):
+                    continue
+                ev = processes[p][i]
+                if ev[0] == "recv" and ev[1] not in sent:
+                    continue
+                if ev[0] == "send":
+                    sent.add(ev[1])
+                order.append((p, i, ev))
+                pos[p] += 1
+                remaining -= 1
+                progressed = True
+            if not progressed:
+                raise ValueError("deadlock")
+        return order
+
+
+    def lamport_clocks(processes):
+        """Run the system and give every event a Lamport timestamp. Each process starts at 0. A local event or a send adds 1 to the process's clock (a send stamps the message with the new value);
+        a recv sets the clock to max(own clock, the message's stamp) + 1. Return {process: [timestamp of each event, in order]}."""
+        clock = {p: 0 for p in processes}
+        stamp = {}
+        result = {p: [None] * len(events) for p, events in processes.items()}
+        for p, i, ev in schedule(processes):
+            if ev[0] == "recv":
+                clock[p] = max(clock[p], stamp[ev[1]]) + 1
+            else:
+                clock[p] += 1
+            if ev[0] == "send":
+                stamp[ev[1]] = clock[p]
+            result[p][i] = clock[p]
+        return result
+
+
+    def total_order(processes):
+        """All events as a list of (timestamp, process, index), sorted by timestamp and then by process name, which breaks ties between concurrent events and gives every observer the
+        same total order."""
+        stamps = lamport_clocks(processes)
+        return sorted((t, p, i) for p, ts in stamps.items() for i, t in enumerate(ts))
+
+
+    def vector_clocks(processes):
+        """Give every event a vector clock: a list with one counter per process, in sorted process-name order. Each process starts at all zeros. A local event or a send adds 1 to the
+        process's OWN entry (a send stamps the message with a copy of the new vector); a recv first takes the entrywise maximum of its own vector and the message's vector, then adds 1 to its own entry.
+        Return {process: [vector of each event, in order]} (lists of ints; do not share list objects between events). Use schedule."""
+        names = sorted(processes)
+        where = {p: k for k, p in enumerate(names)}
+        clock = {p: [0] * len(names) for p in names}
+        stamp = {}
+        result = {p: [None] * len(events) for p, events in processes.items()}
+        for p, i, ev in schedule(processes):
+            v = clock[p]
+            if ev[0] == "recv":
+                v = [max(a, b) for a, b in zip(v, stamp[ev[1]])]
+            v = list(v)
+            v[where[p]] += 1
+            clock[p] = v
+            if ev[0] == "send":
+                stamp[ev[1]] = list(v)
+            result[p][i] = list(v)
+        return result
+
+
+    def compare(a, b):
+        """Compare two vectors of the same length: 'equal' if they are identical, 'before' if every entry of a is <= the entry of b (and they differ), 'after' for the reverse, otherwise 'concurrent'."""
+        if a == b:
+            return "equal"
+        if all(x <= y for x, y in zip(a, b)):
+            return "before"
+        if all(x >= y for x, y in zip(a, b)):
+            return "after"
+        return "concurrent"
+
+
+    def happened_before(processes, a, b):
+        """True if event a causally happened before event b; a and b are (process, index) pairs. (An event does not happen before itself.)"""
+        vc = vector_clocks(processes)
+        return compare(vc[a[0]][a[1]], vc[b[0]][b[1]]) == "before"
+
+
+    def concurrent_pairs(processes):
+        """Every pair of events that are concurrent (neither happened before the other), as a sorted list of ((p, i), (q, j)) with (p, i) < (q, j)."""
+        vc = vector_clocks(processes)
+        events = sorted((p, i) for p in processes for i in range(len(processes[p])))
+        out = []
+        for x in range(len(events)):
+            for y in range(x + 1, len(events)):
+                (p, i), (q, j) = events[x], events[y]
+                if compare(vc[p][i], vc[q][j]) == "concurrent":
+                    out.append(((p, i), (q, j)))
+        return out
+
+
+    def ntp_offset(t0, t1, t2, t3):
+        """Estimate a client's clock error from one request/response exchange (Cristian/NTP style). t0: client clock when it sent the request; t1: server clock when it received it;
+        t2: server clock when it replied; t3: client clock when the reply arrived. Return (offset, delay): offset = ((t1 - t0) + (t2 - t3)) / 2 is how far the CLIENT clock is behind the server,
+        and delay = (t3 - t0) - (t2 - t1) is the time spent on the network."""
+        return ((t1 - t0) + (t2 - t3)) / 2, (t3 - t0) - (t2 - t1)
+
+
+    def best_offset(samples):
+        """`samples` is a list of (t0, t1, t2, t3) tuples. Return the (offset, delay) of the sample with the SMALLEST delay (the first of equals): the least delayed exchange is the most trustworthy.
+        ValueError('no samples') for an empty list."""
+        if not samples:
+            raise ValueError("no samples")
+        results = [ntp_offset(*s) for s in samples]
+        return min(results, key=lambda r: r[1])
+
+
+    def berkeley_adjust(clocks, master, max_diff):
+        """Berkeley algorithm. `clocks` maps node names to their current clock readings (the master included). Compute each node's difference from the master's reading; ignore (for the average only) any node
+        whose absolute difference is more than max_diff (a faulty clock). The average difference is taken over the remaining nodes, the master (difference 0) among them. Return a dict giving EVERY node
+        the adjustment (average - its own difference) rounded to 3 decimals, so that adding it to the node's clock makes all the clocks equal."""
+        diffs = {n: c - clocks[master] for n, c in clocks.items()}
+        good = [d for n, d in diffs.items() if abs(d) <= max_diff]
+        avg = sum(good) / len(good)
+        return {n: round(avg - d, 3) for n, d in diffs.items()}
+
+
+    def causal_deliver(names, arrivals):
+        """Causal broadcast delivery at ONE process. `names` is the sorted list of process names; each arrival is (sender, vector, payload) in the order messages reached us, where the vector is the sender's
+        vector clock at the time of sending. Keep a delivered vector D, all zeros at first. A message from sender j with vector V can be DELIVERED when V[j] == D[j] + 1 (it is the next message from j)
+        and V[k] <= D[k] for every other k (we have already delivered everything it depends on); delivering sets D[j] = V[j]. A message that cannot be delivered yet waits in a hold-back queue.
+        After each arrival, repeatedly deliver any waiting message (scanning the queue in arrival order) until none can be delivered. Return (delivered payloads in delivery order, payloads still waiting in arrival order)."""
+        index = {n: k for k, n in enumerate(names)}
+        delivered_vector = [0] * len(names)
+        waiting = []
+        delivered = []
+
+        def ready(sender, vector):
+            j = index[sender]
+            if vector[j] != delivered_vector[j] + 1:
+                return False
+            return all(vector[k] <= delivered_vector[k] for k in range(len(names)) if k != j)
+
+        for message in arrivals:
+            waiting.append(message)
+            progress = True
+            while progress:
+                progress = False
+                for m in list(waiting):
+                    if ready(m[0], m[1]):
+                        waiting.remove(m)
+                        delivered_vector[index[m[0]]] = m[1][index[m[0]]]
+                        delivered.append(m[2])
+                        progress = True
+                        break
+        return delivered, [m[2] for m in waiting]
+
+
+    def is_consistent_cut(processes, cut):
+        """A cut says how many events of each process are included: {process: count}. It is CONSISTENT if no message is received inside the cut but sent outside it: for every included recv, the matching send
+        must also be included. Processes missing from `cut` count as 0. ValueError('bad cut') if a count is negative or larger than the process has events."""
+        send_at = {}
+        for p, events in processes.items():
+            for i, ev in enumerate(events):
+                if ev[0] == "send":
+                    send_at[ev[1]] = (p, i)
+        for p, events in processes.items():
+            if not 0 <= cut.get(p, 0) <= len(events):
+                raise ValueError("bad cut")
+        for p, events in processes.items():
+            for i in range(cut.get(p, 0)):
+                ev = events[i]
+                if ev[0] == "recv":
+                    q, j = send_at[ev[1]]
+                    if j >= cut.get(q, 0):
+                        return False
+        return True
+
+
+    def consistent_cuts(processes):
+        """Every consistent cut, as a sorted list of tuples of counts in sorted process-name order (try every combination of counts)."""
+        names = sorted(processes)
+        result = []
+
+        def build(k, current):
+            if k == len(names):
+                if is_consistent_cut(processes, dict(zip(names, current))):
+                    result.append(tuple(current))
+                return
+            for c in range(len(processes[names[k]]) + 1):
+                build(k + 1, current + [c])
+
+        build(0, [])
+        return sorted(result)
+
+    system = {"A": [("local", "a1"), ("send", "m1"), ("recv", "m2")], "B": [("recv", "m1"), ("send", "m2")], "C": [("local", "c1")]}
+    print("lamport:", lamport_clocks(system))
+    vc = vector_clocks(system)
+    print("vectors:", vc)
+    print("A's send happened before B's reply:", happened_before(system, ("A", 1), ("B", 1)))
+    print("concurrent with C's event:", [pair[0] for pair in concurrent_pairs(system)])
+    print("consistent snapshots:", len(consistent_cuts(system)))
+  output: |
+    lamport: {'A': [1, 2, 5], 'B': [3, 4], 'C': [1]}
+    vectors: {'A': [[1, 0, 0], [2, 0, 0], [3, 2, 0]], 'B': [[2, 1, 0], [2, 2, 0]], 'C': [[0, 0, 1]]}
+    A's send happened before B's reply: True
+    concurrent with C's event: [('A', 0), ('A', 1), ('A', 2), ('B', 0), ('B', 1)]
+    consistent snapshots: 12
+  lines:
+  - line: 208
+    note: Stamps rise along every chain of cause and effect.
+  - line: 210
+    note: One counter per process.
+  - line: 212
+    note: C never talked to anyone, so its event is concurrent with all of theirs.
+- title: Synchronizing and delivering
+  intro: Estimating a clock's error, the Berkeley average, and holding back a reply until its question arrives.
+  code: |
+    def ntp_offset(t0, t1, t2, t3):
+        """Estimate a client's clock error from one request/response exchange (Cristian/NTP style). t0: client clock when it sent the request; t1: server clock when it received it;
+        t2: server clock when it replied; t3: client clock when the reply arrived. Return (offset, delay): offset = ((t1 - t0) + (t2 - t3)) / 2 is how far the CLIENT clock is behind the server,
+        and delay = (t3 - t0) - (t2 - t1) is the time spent on the network."""
+        return ((t1 - t0) + (t2 - t3)) / 2, (t3 - t0) - (t2 - t1)
+
+
+    def best_offset(samples):
+        """`samples` is a list of (t0, t1, t2, t3) tuples. Return the (offset, delay) of the sample with the SMALLEST delay (the first of equals): the least delayed exchange is the most trustworthy.
+        ValueError('no samples') for an empty list."""
+        if not samples:
+            raise ValueError("no samples")
+        results = [ntp_offset(*s) for s in samples]
+        return min(results, key=lambda r: r[1])
+
+
+    def berkeley_adjust(clocks, master, max_diff):
+        """Berkeley algorithm. `clocks` maps node names to their current clock readings (the master included). Compute each node's difference from the master's reading; ignore (for the average only) any node
+        whose absolute difference is more than max_diff (a faulty clock). The average difference is taken over the remaining nodes, the master (difference 0) among them. Return a dict giving EVERY node
+        the adjustment (average - its own difference) rounded to 3 decimals, so that adding it to the node's clock makes all the clocks equal."""
+        diffs = {n: c - clocks[master] for n, c in clocks.items()}
+        good = [d for n, d in diffs.items() if abs(d) <= max_diff]
+        avg = sum(good) / len(good)
+        return {n: round(avg - d, 3) for n, d in diffs.items()}
+
+
+    def causal_deliver(names, arrivals):
+        """Causal broadcast delivery at ONE process. `names` is the sorted list of process names; each arrival is (sender, vector, payload) in the order messages reached us, where the vector is the sender's
+        vector clock at the time of sending. Keep a delivered vector D, all zeros at first. A message from sender j with vector V can be DELIVERED when V[j] == D[j] + 1 (it is the next message from j)
+        and V[k] <= D[k] for every other k (we have already delivered everything it depends on); delivering sets D[j] = V[j]. A message that cannot be delivered yet waits in a hold-back queue.
+        After each arrival, repeatedly deliver any waiting message (scanning the queue in arrival order) until none can be delivered. Return (delivered payloads in delivery order, payloads still waiting in arrival order)."""
+        index = {n: k for k, n in enumerate(names)}
+        delivered_vector = [0] * len(names)
+        waiting = []
+        delivered = []
+
+        def ready(sender, vector):
+            j = index[sender]
+            if vector[j] != delivered_vector[j] + 1:
+                return False
+            return all(vector[k] <= delivered_vector[k] for k in range(len(names)) if k != j)
+
+        for message in arrivals:
+            waiting.append(message)
+            progress = True
+            while progress:
+                progress = False
+                for m in list(waiting):
+                    if ready(m[0], m[1]):
+                        waiting.remove(m)
+                        delivered_vector[index[m[0]]] = m[1][index[m[0]]]
+                        delivered.append(m[2])
+                        progress = True
+                        break
+        return delivered, [m[2] for m in waiting]
+
+    print("one exchange:", ntp_offset(100, 150, 152, 110))
+    samples = [(100, 150, 152, 110), (200, 251, 252, 203), (300, 352, 353, 330)]
+    print("best of three:", best_offset(samples))
+    adjust = berkeley_adjust({"m": 100, "a": 106, "b": 100, "faulty": 190}, "m", 10)
+    print("berkeley:", adjust)
+    arrivals = [("B", [1, 1, 0], "reply"), ("A", [1, 0, 0], "question")]
+    print("arrived:", [a[2] for a in arrivals])
+    print("delivered:", causal_deliver(["A", "B", "C"], arrivals)[0])
+  output: |
+    one exchange: (46.0, 8)
+    best of three: (50.0, 2)
+    berkeley: {'m': 2.0, 'a': -4.0, 'b': 2.0, 'faulty': -88.0}
+    arrived: ['reply', 'question']
+    delivered: ['question', 'reply']
+  lines:
+  - line: 57
+    note: The client clock is 46 behind the server.
+  - line: 61
+    note: The faulty clock is left out of the average but still gets corrected.
+  - line: 64
+    note: The question is delivered before the reply, though the reply arrived first.
+playground:
+  prompt: 'Give each of these events a Lamport timestamp by hand: A does a local event, A sends to B, B receives, B does a local event.'
+  code: |
+    a = 0
+    b = 0
+    a += 1
+    print('A local', a)
+    a += 1
+    stamp = a
+    print('A send', a)
+    b = max(b, stamp) + 1
+    print('B receive', b)
+    b += 1
+    print('B local', b)
+exercises:
+- id: lamport
+  title: Lamport clocks
+  difficulty: 5
+  prompt: 'A distributed system has no shared clock, so we order events by **cause and effect**. A system is a dict from process name to its list of events: `("local", label)`, `("send", msg_id)` or `("recv", msg_id)`. Write `schedule(processes)`: return one valid order in which the whole system could have run, as a list of `(process, index, event)`. Go in **passes**: in each pass visit the processes in sorted name order and run at most **one** event of each (its next one); a `recv` can only run after its message was sent in an earlier step. Raise `ValueError("duplicate message id X")` if two sends use the same id and `ValueError("deadlock")` if events remain but none can run (a `recv` whose message is never sent). Receiving the same message in several processes is allowed. Write `lamport_clocks(processes)`: every process starts at 0; a local event or a send adds 1 to the process''s clock (a send stamps the message with the new value); a `recv` sets the clock to `max(own clock, message stamp) + 1`. Return `{process: [timestamp of each event, in order]}`. Write `total_order(processes)`: all events as `(timestamp, process, index)` sorted by timestamp and then by process name, so every observer sees the same order.'
+  starter: |-
+    def schedule(processes):
+        """`processes` maps a process name to its list of events: ("local", label), ("send", msg_id) or ("recv", msg_id). Return ONE valid order in which the whole system could have run,
+        as a list of (process, index, event). Go in passes: in each pass visit the processes in sorted name order and run at most ONE event of each (its next one); a recv can only run
+        after its message has been sent (by an earlier step). ValueError('duplicate message id X') if two sends use the same id, and ValueError('deadlock') if events remain but none can run (for example a recv
+        whose message is never sent). Receiving the same message in several processes is allowed."""
+        pass
+
+
+    def lamport_clocks(processes):
+        """Run the system and give every event a Lamport timestamp. Each process starts at 0. A local event or a send adds 1 to the process's clock (a send stamps the message with the new value);
+        a recv sets the clock to max(own clock, the message's stamp) + 1. Return {process: [timestamp of each event, in order]}."""
+        pass
+
+
+    def total_order(processes):
+        """All events as a list of (timestamp, process, index), sorted by timestamp and then by process name, which breaks ties between concurrent events and gives every observer the
+        same total order."""
+        pass
+  tests:
+  - name: scheduling
+    code: |
+      system = {"A": [("local", "a1"), ("send", "m1"), ("recv", "m2")], "B": [("recv", "m1"), ("send", "m2")]}
+      order = schedule(system)
+      assert [(p, i) for p, i, e in order] == [("A", 0), ("B", 0)] or len(order) == 5
+      assert len(order) == 5
+      assert [(p, i) for p, i, e in order] == [("A", 0), ("A", 1), ("B", 0), ("B", 1), ("A", 2)] or [(p, i) for p, i, e in order].index(("B", 0)) > [(p, i) for p, i, e in order].index(("A", 1))
+      pos = {(p, i): k for k, (p, i, e) in enumerate(order)}
+      assert pos[("A", 1)] < pos[("B", 0)] < pos[("B", 1)] < pos[("A", 2)]
+      assert order[0] == ("A", 0, ("local", "a1"))
+      assert schedule({}) == []
+      for bad, msg in (({"A": [("recv", "x")]}, "deadlock"), ({"A": [("send", "m")], "B": [("send", "m")]}, "duplicate message id m"),
+                       ({"A": [("recv", "b")], "B": [("recv", "a")]}, "deadlock")):
+          try:
+              schedule(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+      assert len(schedule({"A": [("send", "m")], "B": [("recv", "m")], "C": [("recv", "m")]})) == 3
+  - name: lamport timestamps
+    code: |
+      system = {"A": [("local", "a1"), ("send", "m1"), ("recv", "m2")], "B": [("recv", "m1"), ("send", "m2")]}
+      assert lamport_clocks(system) == {"A": [1, 2, 5], "B": [3, 4]}
+      assert lamport_clocks({"A": [("local", "x"), ("local", "y")], "B": [("local", "z")]}) == {"A": [1, 2], "B": [1]}
+      assert lamport_clocks({}) == {}
+      busy = {"A": [("local", 1), ("local", 2), ("local", 3), ("send", "m")], "B": [("local", 1), ("recv", "m")]}
+      assert lamport_clocks(busy) == {"A": [1, 2, 3, 4], "B": [1, 5]}
+      for sys_ in (system, busy):
+          ts = lamport_clocks(sys_)
+          for p, events in sys_.items():
+              assert all(a < b for a, b in zip(ts[p], ts[p][1:]))
+  - name: sends come before receives
+    code: |
+      system = {"A": [("send", "x"), ("recv", "y"), ("send", "z")], "B": [("recv", "x"), ("send", "y"), ("recv", "z")], "C": [("recv", "x"), ("recv", "z")]}
+      ts = lamport_clocks(system)
+      assert ts["A"] == [1, 4, 5] and ts["B"] == [2, 3, 6] and ts["C"] == [2, 6]
+      assert ts["A"][0] < ts["B"][0] and ts["B"][1] < ts["A"][1] and ts["A"][2] < ts["B"][2] and ts["A"][0] < ts["C"][0]
+  - name: a total order
+    code: |
+      system = {"A": [("local", "a1"), ("send", "m1"), ("recv", "m2")], "B": [("recv", "m1"), ("send", "m2")], "C": [("local", "c1")]}
+      assert total_order(system) == [(1, "A", 0), (1, "C", 0), (2, "A", 1), (3, "B", 0), (4, "B", 1), (5, "A", 2)]
+      assert total_order({}) == []
+      order = total_order({"X": [("local", 1)], "Y": [("local", 1)], "Z": [("local", 1)]})
+      assert [p for t, p, i in order] == ["X", "Y", "Z"]
+  hints:
+  - A recv takes the larger of its own clock and the message's stamp, then adds one.
+  solution: |
+    def schedule(processes):
+        """`processes` maps a process name to its list of events: ("local", label), ("send", msg_id) or ("recv", msg_id). Return ONE valid order in which the whole system could have run,
+        as a list of (process, index, event). Go in passes: in each pass visit the processes in sorted name order and run at most ONE event of each (its next one); a recv can only run
+        after its message has been sent (by an earlier step). ValueError('duplicate message id X') if two sends use the same id, and ValueError('deadlock') if events remain but none can run (for example a recv
+        whose message is never sent). Receiving the same message in several processes is allowed."""
+        seen = set()
+        for events in processes.values():
+            for ev in events:
+                if ev[0] == "send":
+                    if ev[1] in seen:
+                        raise ValueError("duplicate message id %s" % (ev[1],))
+                    seen.add(ev[1])
+        pos = {p: 0 for p in processes}
+        sent = set()
+        order = []
+        remaining = sum(len(e) for e in processes.values())
+        while remaining:
+            progressed = False
+            for p in sorted(processes):
+                i = pos[p]
+                if i >= len(processes[p]):
+                    continue
+                ev = processes[p][i]
+                if ev[0] == "recv" and ev[1] not in sent:
+                    continue
+                if ev[0] == "send":
+                    sent.add(ev[1])
+                order.append((p, i, ev))
+                pos[p] += 1
+                remaining -= 1
+                progressed = True
+            if not progressed:
+                raise ValueError("deadlock")
+        return order
+
+
+    def lamport_clocks(processes):
+        """Run the system and give every event a Lamport timestamp. Each process starts at 0. A local event or a send adds 1 to the process's clock (a send stamps the message with the new value);
+        a recv sets the clock to max(own clock, the message's stamp) + 1. Return {process: [timestamp of each event, in order]}."""
+        clock = {p: 0 for p in processes}
+        stamp = {}
+        result = {p: [None] * len(events) for p, events in processes.items()}
+        for p, i, ev in schedule(processes):
+            if ev[0] == "recv":
+                clock[p] = max(clock[p], stamp[ev[1]]) + 1
+            else:
+                clock[p] += 1
+            if ev[0] == "send":
+                stamp[ev[1]] = clock[p]
+            result[p][i] = clock[p]
+        return result
+
+
+    def total_order(processes):
+        """All events as a list of (timestamp, process, index), sorted by timestamp and then by process name, which breaks ties between concurrent events and gives every observer the
+        same total order."""
+        stamps = lamport_clocks(processes)
+        return sorted((t, p, i) for p, ts in stamps.items() for i, t in enumerate(ts))
+  explanation: Lamport clocks give every event a number consistent with cause and effect, although a bigger number does not prove an event happened later.
+- id: vector
+  title: Vector clocks and concurrency
+  difficulty: 5
+  prompt: 'The starter has `schedule`. A single number cannot tell whether two events are **concurrent**; a **vector clock** can. Write `vector_clocks(processes)`: every event gets a list with one counter per process, in sorted process-name order. Each process starts at all zeros. A local event or a send adds 1 to the process''s **own** entry (a send stamps the message with a copy of the new vector); a `recv` first takes the entrywise **maximum** of its own vector and the message''s vector, then adds 1 to its own entry. Return `{process: [vector of each event, in order]}` (lists of ints; do not share list objects between events). Write `compare(a, b)` for two vectors: `"equal"` if identical, `"before"` if every entry of `a` is <= the entry of `b` (and they differ), `"after"` for the reverse, otherwise `"concurrent"`. Write `happened_before(processes, a, b)` for events given as `(process, index)` pairs (true if `a` causally precedes `b`; an event does not precede itself) and `concurrent_pairs(processes)`: every pair of events that are concurrent, as a sorted list of `((p, i), (q, j))` with `(p, i) < (q, j)`.'
+  starter: |-
+    def schedule(processes):
+        """`processes` maps a process name to its list of events: ("local", label), ("send", msg_id) or ("recv", msg_id). Return ONE valid order in which the whole system could have run,
+        as a list of (process, index, event). Go in passes: in each pass visit the processes in sorted name order and run at most ONE event of each (its next one); a recv can only run
+        after its message has been sent (by an earlier step). ValueError('duplicate message id X') if two sends use the same id, and ValueError('deadlock') if events remain but none can run (for example a recv
+        whose message is never sent). Receiving the same message in several processes is allowed."""
+        seen = set()
+        for events in processes.values():
+            for ev in events:
+                if ev[0] == "send":
+                    if ev[1] in seen:
+                        raise ValueError("duplicate message id %s" % (ev[1],))
+                    seen.add(ev[1])
+        pos = {p: 0 for p in processes}
+        sent = set()
+        order = []
+        remaining = sum(len(e) for e in processes.values())
+        while remaining:
+            progressed = False
+            for p in sorted(processes):
+                i = pos[p]
+                if i >= len(processes[p]):
+                    continue
+                ev = processes[p][i]
+                if ev[0] == "recv" and ev[1] not in sent:
+                    continue
+                if ev[0] == "send":
+                    sent.add(ev[1])
+                order.append((p, i, ev))
+                pos[p] += 1
+                remaining -= 1
+                progressed = True
+            if not progressed:
+                raise ValueError("deadlock")
+        return order
+
+
+    def lamport_clocks(processes):
+        """Run the system and give every event a Lamport timestamp. Each process starts at 0. A local event or a send adds 1 to the process's clock (a send stamps the message with the new value);
+        a recv sets the clock to max(own clock, the message's stamp) + 1. Return {process: [timestamp of each event, in order]}."""
+        clock = {p: 0 for p in processes}
+        stamp = {}
+        result = {p: [None] * len(events) for p, events in processes.items()}
+        for p, i, ev in schedule(processes):
+            if ev[0] == "recv":
+                clock[p] = max(clock[p], stamp[ev[1]]) + 1
+            else:
+                clock[p] += 1
+            if ev[0] == "send":
+                stamp[ev[1]] = clock[p]
+            result[p][i] = clock[p]
+        return result
+
+
+    def total_order(processes):
+        """All events as a list of (timestamp, process, index), sorted by timestamp and then by process name, which breaks ties between concurrent events and gives every observer the
+        same total order."""
+        stamps = lamport_clocks(processes)
+        return sorted((t, p, i) for p, ts in stamps.items() for i, t in enumerate(ts))
+
+
+    def vector_clocks(processes):
+        """Give every event a vector clock: a list with one counter per process, in sorted process-name order. Each process starts at all zeros. A local event or a send adds 1 to the
+        process's OWN entry (a send stamps the message with a copy of the new vector); a recv first takes the entrywise maximum of its own vector and the message's vector, then adds 1 to its own entry.
+        Return {process: [vector of each event, in order]} (lists of ints; do not share list objects between events). Use schedule."""
+        pass
+
+
+    def compare(a, b):
+        """Compare two vectors of the same length: 'equal' if they are identical, 'before' if every entry of a is <= the entry of b (and they differ), 'after' for the reverse, otherwise 'concurrent'."""
+        pass
+
+
+    def happened_before(processes, a, b):
+        """True if event a causally happened before event b; a and b are (process, index) pairs. (An event does not happen before itself.)"""
+        pass
+
+
+    def concurrent_pairs(processes):
+        """Every pair of events that are concurrent (neither happened before the other), as a sorted list of ((p, i), (q, j)) with (p, i) < (q, j)."""
+        pass
+  tests:
+  - name: the vectors
+    code: |
+      system = {"A": [("local", "a1"), ("send", "m1"), ("recv", "m2")], "B": [("recv", "m1"), ("send", "m2")], "C": [("local", "c1")]}
+      vc = vector_clocks(system)
+      assert vc == {"A": [[1, 0, 0], [2, 0, 0], [3, 2, 0]], "B": [[2, 1, 0], [2, 2, 0]], "C": [[0, 0, 1]]}
+      assert vc["A"][0] is not vc["A"][1] and vc["A"][0] == [1, 0, 0]
+      assert vector_clocks({}) == {}
+      two = {"X": [("send", "m")], "Y": [("recv", "m"), ("local", 0)]}
+      assert vector_clocks(two) == {"X": [[1, 0]], "Y": [[1, 1], [1, 2]]}
+  - name: comparing
+    code: |
+      assert compare([1, 2, 3], [1, 2, 3]) == "equal"
+      assert compare([1, 2, 3], [1, 3, 3]) == "before" and compare([2, 2, 3], [1, 2, 3]) == "after"
+      assert compare([1, 0], [0, 1]) == "concurrent" and compare([2, 0, 0], [0, 0, 5]) == "concurrent"
+      assert compare([], []) == "equal"
+      assert compare([0, 0], [0, 1]) == "before"
+  - name: causality
+    code: |
+      system = {"A": [("local", "a1"), ("send", "m1"), ("recv", "m2")], "B": [("recv", "m1"), ("send", "m2")], "C": [("local", "c1")]}
+      assert happened_before(system, ("A", 0), ("A", 2))
+      assert happened_before(system, ("A", 1), ("B", 0))
+      assert happened_before(system, ("A", 0), ("B", 1))
+      assert not happened_before(system, ("B", 1), ("A", 1))
+      assert not happened_before(system, ("A", 0), ("C", 0)) and not happened_before(system, ("C", 0), ("A", 0))
+      assert not happened_before(system, ("A", 1), ("A", 1))
+      assert happened_before(system, ("B", 1), ("A", 2))
+  - name: concurrent events
+    code: |
+      system = {"A": [("local", "a1"), ("send", "m1"), ("recv", "m2")], "B": [("recv", "m1"), ("send", "m2")], "C": [("local", "c1")]}
+      assert concurrent_pairs(system) == [(("A", 0), ("C", 0)), (("A", 1), ("C", 0)), (("A", 2), ("C", 0)), (("B", 0), ("C", 0)), (("B", 1), ("C", 0))]
+      assert concurrent_pairs({"A": [("local", 1), ("local", 2)]}) == []
+      fork = {"A": [("send", "m")], "B": [("recv", "m"), ("local", "b")], "C": [("recv", "m"), ("local", "c")]}
+      assert concurrent_pairs(fork) == [(("B", 0), ("C", 0)), (("B", 0), ("C", 1)), (("B", 1), ("C", 0)), (("B", 1), ("C", 1))]
+      assert concurrent_pairs({}) == []
+  hints:
+  - 'Vector clock rule for recv: take the entrywise maximum first, then add one to your own entry.'
+  solution: |
+    def schedule(processes):
+        """`processes` maps a process name to its list of events: ("local", label), ("send", msg_id) or ("recv", msg_id). Return ONE valid order in which the whole system could have run,
+        as a list of (process, index, event). Go in passes: in each pass visit the processes in sorted name order and run at most ONE event of each (its next one); a recv can only run
+        after its message has been sent (by an earlier step). ValueError('duplicate message id X') if two sends use the same id, and ValueError('deadlock') if events remain but none can run (for example a recv
+        whose message is never sent). Receiving the same message in several processes is allowed."""
+        seen = set()
+        for events in processes.values():
+            for ev in events:
+                if ev[0] == "send":
+                    if ev[1] in seen:
+                        raise ValueError("duplicate message id %s" % (ev[1],))
+                    seen.add(ev[1])
+        pos = {p: 0 for p in processes}
+        sent = set()
+        order = []
+        remaining = sum(len(e) for e in processes.values())
+        while remaining:
+            progressed = False
+            for p in sorted(processes):
+                i = pos[p]
+                if i >= len(processes[p]):
+                    continue
+                ev = processes[p][i]
+                if ev[0] == "recv" and ev[1] not in sent:
+                    continue
+                if ev[0] == "send":
+                    sent.add(ev[1])
+                order.append((p, i, ev))
+                pos[p] += 1
+                remaining -= 1
+                progressed = True
+            if not progressed:
+                raise ValueError("deadlock")
+        return order
+
+
+    def lamport_clocks(processes):
+        """Run the system and give every event a Lamport timestamp. Each process starts at 0. A local event or a send adds 1 to the process's clock (a send stamps the message with the new value);
+        a recv sets the clock to max(own clock, the message's stamp) + 1. Return {process: [timestamp of each event, in order]}."""
+        clock = {p: 0 for p in processes}
+        stamp = {}
+        result = {p: [None] * len(events) for p, events in processes.items()}
+        for p, i, ev in schedule(processes):
+            if ev[0] == "recv":
+                clock[p] = max(clock[p], stamp[ev[1]]) + 1
+            else:
+                clock[p] += 1
+            if ev[0] == "send":
+                stamp[ev[1]] = clock[p]
+            result[p][i] = clock[p]
+        return result
+
+
+    def total_order(processes):
+        """All events as a list of (timestamp, process, index), sorted by timestamp and then by process name, which breaks ties between concurrent events and gives every observer the
+        same total order."""
+        stamps = lamport_clocks(processes)
+        return sorted((t, p, i) for p, ts in stamps.items() for i, t in enumerate(ts))
+
+
+    def vector_clocks(processes):
+        """Give every event a vector clock: a list with one counter per process, in sorted process-name order. Each process starts at all zeros. A local event or a send adds 1 to the
+        process's OWN entry (a send stamps the message with a copy of the new vector); a recv first takes the entrywise maximum of its own vector and the message's vector, then adds 1 to its own entry.
+        Return {process: [vector of each event, in order]} (lists of ints; do not share list objects between events). Use schedule."""
+        names = sorted(processes)
+        where = {p: k for k, p in enumerate(names)}
+        clock = {p: [0] * len(names) for p in names}
+        stamp = {}
+        result = {p: [None] * len(events) for p, events in processes.items()}
+        for p, i, ev in schedule(processes):
+            v = clock[p]
+            if ev[0] == "recv":
+                v = [max(a, b) for a, b in zip(v, stamp[ev[1]])]
+            v = list(v)
+            v[where[p]] += 1
+            clock[p] = v
+            if ev[0] == "send":
+                stamp[ev[1]] = list(v)
+            result[p][i] = list(v)
+        return result
+
+
+    def compare(a, b):
+        """Compare two vectors of the same length: 'equal' if they are identical, 'before' if every entry of a is <= the entry of b (and they differ), 'after' for the reverse, otherwise 'concurrent'."""
+        if a == b:
+            return "equal"
+        if all(x <= y for x, y in zip(a, b)):
+            return "before"
+        if all(x >= y for x, y in zip(a, b)):
+            return "after"
+        return "concurrent"
+
+
+    def happened_before(processes, a, b):
+        """True if event a causally happened before event b; a and b are (process, index) pairs. (An event does not happen before itself.)"""
+        vc = vector_clocks(processes)
+        return compare(vc[a[0]][a[1]], vc[b[0]][b[1]]) == "before"
+
+
+    def concurrent_pairs(processes):
+        """Every pair of events that are concurrent (neither happened before the other), as a sorted list of ((p, i), (q, j)) with (p, i) < (q, j)."""
+        vc = vector_clocks(processes)
+        events = sorted((p, i) for p in processes for i in range(len(processes[p])))
+        out = []
+        for x in range(len(events)):
+            for y in range(x + 1, len(events)):
+                (p, i), (q, j) = events[x], events[y]
+                if compare(vc[p][i], vc[q][j]) == "concurrent":
+                    out.append(((p, i), (q, j)))
+        return out
+  explanation: Vector clocks capture exactly the happened-before relation, so they can tell concurrent events apart.
+- id: sync
+  title: Synchronizing physical clocks
+  difficulty: 4
+  prompt: 'Real clocks drift apart, so systems also **synchronize** them. Write `ntp_offset(t0, t1, t2, t3)` for one request and reply exchange in the style of Cristian''s algorithm and NTP: `t0` is the client clock when it sent the request, `t1` the server clock when it received it, `t2` the server clock when it replied, `t3` the client clock when the reply arrived. Return `(offset, delay)` where `offset = ((t1 - t0) + (t2 - t3)) / 2` is how far the **client** clock is behind the server, and `delay = (t3 - t0) - (t2 - t1)` is the time spent on the network. Write `best_offset(samples)` for a list of `(t0, t1, t2, t3)` tuples: return the `(offset, delay)` of the sample with the **smallest delay** (the first of equals), because the least delayed exchange is the most trustworthy; `ValueError("no samples")` for an empty list. Write `berkeley_adjust(clocks, master, max_diff)`, the **Berkeley algorithm**: `clocks` maps node names to readings (the master included). Compute each node''s difference from the master''s reading; ignore, for the average only, any node whose absolute difference exceeds `max_diff` (a faulty clock). The average difference is taken over the remaining nodes, the master (difference 0) among them. Return a dict giving **every** node the adjustment `average - its own difference`, rounded to 3 decimals, so that adding it to each clock makes them all equal.'
+  starter: |-
+    def ntp_offset(t0, t1, t2, t3):
+        """Estimate a client's clock error from one request/response exchange (Cristian/NTP style). t0: client clock when it sent the request; t1: server clock when it received it;
+        t2: server clock when it replied; t3: client clock when the reply arrived. Return (offset, delay): offset = ((t1 - t0) + (t2 - t3)) / 2 is how far the CLIENT clock is behind the server,
+        and delay = (t3 - t0) - (t2 - t1) is the time spent on the network."""
+        pass
+
+
+    def best_offset(samples):
+        """`samples` is a list of (t0, t1, t2, t3) tuples. Return the (offset, delay) of the sample with the SMALLEST delay (the first of equals): the least delayed exchange is the most trustworthy.
+        ValueError('no samples') for an empty list."""
+        pass
+
+
+    def berkeley_adjust(clocks, master, max_diff):
+        """Berkeley algorithm. `clocks` maps node names to their current clock readings (the master included). Compute each node's difference from the master's reading; ignore (for the average only) any node
+        whose absolute difference is more than max_diff (a faulty clock). The average difference is taken over the remaining nodes, the master (difference 0) among them. Return a dict giving EVERY node
+        the adjustment (average - its own difference) rounded to 3 decimals, so that adding it to the node's clock makes all the clocks equal."""
+        pass
+  tests:
+  - name: one exchange
+    code: |
+      assert ntp_offset(100, 150, 152, 110) == (46.0, 8)
+      assert ntp_offset(0, 5, 5, 10) == (0.0, 10)
+      offset, delay = ntp_offset(1000, 990, 991, 1004)
+      assert offset == -11.5 and delay == 3
+  - name: choosing the best sample
+    code: |
+      samples = [(100, 150, 152, 110), (200, 251, 252, 203), (300, 352, 353, 330)]
+      assert best_offset(samples) == (ntp_offset(200, 251, 252, 203))
+      assert best_offset(samples)[1] == 2
+      assert best_offset([(0, 1, 1, 2), (10, 11, 11, 12)]) == (0.0, 2) or best_offset([(0, 1, 1, 2), (10, 11, 11, 12)])[1] == 2
+      assert best_offset([(0, 5, 6, 10)]) == ntp_offset(0, 5, 6, 10)
+      try:
+          best_offset([])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no samples" in str(e)
+  - name: Berkeley algorithm
+    code: |
+      adj = berkeley_adjust({"m": 100, "a": 104, "b": 96, "c": 200}, "m", 10)
+      assert adj == {"m": 0.0, "a": -4.0, "b": 4.0, "c": -100.0}
+      adj = berkeley_adjust({"m": 100, "a": 106, "b": 100}, "m", 10)
+      assert adj == {"m": 2.0, "a": -4.0, "b": 2.0}
+      clocks = {"m": 100, "a": 106, "b": 100}
+      fixed = {n: clocks[n] + adj[n] for n in clocks}
+      assert len(set(fixed.values())) == 1 and fixed["m"] == 102
+      assert berkeley_adjust({"solo": 50}, "solo", 5) == {"solo": 0.0}
+      adj = berkeley_adjust({"m": 10, "a": 11, "b": 12, "c": 13}, "m", 5)
+      assert adj == {"m": 1.5, "a": 0.5, "b": -0.5, "c": -1.5}
+  hints:
+  - Offset is half the sum of the two one-way differences.
+  solution: |
+    def ntp_offset(t0, t1, t2, t3):
+        """Estimate a client's clock error from one request/response exchange (Cristian/NTP style). t0: client clock when it sent the request; t1: server clock when it received it;
+        t2: server clock when it replied; t3: client clock when the reply arrived. Return (offset, delay): offset = ((t1 - t0) + (t2 - t3)) / 2 is how far the CLIENT clock is behind the server,
+        and delay = (t3 - t0) - (t2 - t1) is the time spent on the network."""
+        return ((t1 - t0) + (t2 - t3)) / 2, (t3 - t0) - (t2 - t1)
+
+
+    def best_offset(samples):
+        """`samples` is a list of (t0, t1, t2, t3) tuples. Return the (offset, delay) of the sample with the SMALLEST delay (the first of equals): the least delayed exchange is the most trustworthy.
+        ValueError('no samples') for an empty list."""
+        if not samples:
+            raise ValueError("no samples")
+        results = [ntp_offset(*s) for s in samples]
+        return min(results, key=lambda r: r[1])
+
+
+    def berkeley_adjust(clocks, master, max_diff):
+        """Berkeley algorithm. `clocks` maps node names to their current clock readings (the master included). Compute each node's difference from the master's reading; ignore (for the average only) any node
+        whose absolute difference is more than max_diff (a faulty clock). The average difference is taken over the remaining nodes, the master (difference 0) among them. Return a dict giving EVERY node
+        the adjustment (average - its own difference) rounded to 3 decimals, so that adding it to the node's clock makes all the clocks equal."""
+        diffs = {n: c - clocks[master] for n, c in clocks.items()}
+        good = [d for n, d in diffs.items() if abs(d) <= max_diff]
+        avg = sum(good) / len(good)
+        return {n: round(avg - d, 3) for n, d in diffs.items()}
+  explanation: Synchronizing physical clocks is always an estimate, limited by the unknown network delay.
+- id: causal
+  title: Causal delivery
+  difficulty: 5
+  prompt: Messages can arrive out of order, so a reply may reach a process before the message it answers. **Causal broadcast** fixes that with vector clocks and a **hold-back queue**. Write `causal_deliver(names, arrivals)` for ONE receiving process. `names` is the sorted list of process names; each arrival is `(sender, vector, payload)`, in the order messages reached us, where `vector` is the sender's vector clock when it sent. Keep a delivered vector `D`, all zeros at first. A message from sender `j` with vector `V` can be **delivered** when `V[j] == D[j] + 1` (it is the next message from `j`) **and** `V[k] <= D[k]` for every other `k` (everything it depends on was already delivered); delivering sets `D[j] = V[j]`. A message that cannot be delivered yet waits in the queue. After each arrival, repeatedly deliver any waiting message (scanning the queue in arrival order, restarting the scan after each delivery) until none can. Return `(delivered payloads in delivery order, payloads still waiting in arrival order)`.
+  starter: |-
+    def causal_deliver(names, arrivals):
+        """Causal broadcast delivery at ONE process. `names` is the sorted list of process names; each arrival is (sender, vector, payload) in the order messages reached us, where the vector is the sender's
+        vector clock at the time of sending. Keep a delivered vector D, all zeros at first. A message from sender j with vector V can be DELIVERED when V[j] == D[j] + 1 (it is the next message from j)
+        and V[k] <= D[k] for every other k (we have already delivered everything it depends on); delivering sets D[j] = V[j]. A message that cannot be delivered yet waits in a hold-back queue.
+        After each arrival, repeatedly deliver any waiting message (scanning the queue in arrival order) until none can be delivered. Return (delivered payloads in delivery order, payloads still waiting in arrival order)."""
+        pass
+  tests:
+  - name: out of order arrival
+    code: |
+      names = ["A", "B", "C"]
+      arrivals = [("B", [1, 1, 0], "reply"), ("A", [1, 0, 0], "question")]
+      assert causal_deliver(names, arrivals) == (["question", "reply"], [])
+      assert causal_deliver(names, []) == ([], [])
+      assert causal_deliver(names, [("A", [1, 0, 0], "x")]) == (["x"], [])
+  - name: missing messages
+    code: |
+      names = ["A", "B", "C"]
+      arrivals = [("A", [3, 0, 0], "third"), ("A", [1, 0, 0], "first")]
+      assert causal_deliver(names, arrivals) == (["first"], ["third"])
+      arrivals = [("A", [3, 0, 0], "third"), ("A", [1, 0, 0], "first"), ("A", [2, 0, 0], "second")]
+      assert causal_deliver(names, arrivals) == (["first", "second", "third"], [])
+      arrivals = [("B", [2, 1, 0], "b1"), ("A", [1, 0, 0], "a1")]
+      assert causal_deliver(names, arrivals) == (["a1"], ["b1"])
+  - name: chains of dependencies
+    code: |
+      names = ["A", "B", "C"]
+      arrivals = [("C", [1, 1, 1], "c1"), ("B", [1, 1, 0], "b1"), ("A", [1, 0, 0], "a1")]
+      assert causal_deliver(names, arrivals) == (["a1", "b1", "c1"], [])
+      arrivals = [("A", [1, 0, 0], "a1"), ("C", [0, 0, 1], "c1"), ("B", [0, 1, 0], "b1")]
+      assert causal_deliver(names, arrivals) == (["a1", "c1", "b1"], [])
+      arrivals = [("B", [0, 1, 0], "b1"), ("A", [2, 0, 0], "a2"), ("C", [1, 1, 1], "c1"), ("A", [1, 0, 0], "a1")]
+      assert causal_deliver(names, arrivals) == (["b1", "a1", "a2", "c1"], [])
+  - name: input is not changed
+    code: |
+      names = ["A", "B"]
+      arrivals = [("B", [1, 1], "r"), ("A", [1, 0], "q")]
+      copy = [(s, list(v), p) for s, v, p in arrivals]
+      causal_deliver(names, arrivals)
+      assert arrivals == copy
+  hints:
+  - Compare the message's vector with what you have delivered so far; keep waiting messages in a list and rescan it.
+  solution: |
+    def causal_deliver(names, arrivals):
+        """Causal broadcast delivery at ONE process. `names` is the sorted list of process names; each arrival is (sender, vector, payload) in the order messages reached us, where the vector is the sender's
+        vector clock at the time of sending. Keep a delivered vector D, all zeros at first. A message from sender j with vector V can be DELIVERED when V[j] == D[j] + 1 (it is the next message from j)
+        and V[k] <= D[k] for every other k (we have already delivered everything it depends on); delivering sets D[j] = V[j]. A message that cannot be delivered yet waits in a hold-back queue.
+        After each arrival, repeatedly deliver any waiting message (scanning the queue in arrival order) until none can be delivered. Return (delivered payloads in delivery order, payloads still waiting in arrival order)."""
+        index = {n: k for k, n in enumerate(names)}
+        delivered_vector = [0] * len(names)
+        waiting = []
+        delivered = []
+
+        def ready(sender, vector):
+            j = index[sender]
+            if vector[j] != delivered_vector[j] + 1:
+                return False
+            return all(vector[k] <= delivered_vector[k] for k in range(len(names)) if k != j)
+
+        for message in arrivals:
+            waiting.append(message)
+            progress = True
+            while progress:
+                progress = False
+                for m in list(waiting):
+                    if ready(m[0], m[1]):
+                        waiting.remove(m)
+                        delivered_vector[index[m[0]]] = m[1][index[m[0]]]
+                        delivered.append(m[2])
+                        progress = True
+                        break
+        return delivered, [m[2] for m in waiting]
+  explanation: A hold-back queue lets a network that reorders messages still deliver them in causal order.
+- id: cuts
+  title: Consistent cuts and snapshots
+  difficulty: 5
+  prompt: 'A **snapshot** of a distributed system records every process at one moment of its own, and must be **consistent**. A **cut** says how many events of each process are included: `{process: count}` (processes missing count as 0). It is **consistent** if no message is received inside the cut but sent outside it: for every included `recv`, the matching `send` must also be included. Write `is_consistent_cut(processes, cut)` (`ValueError("bad cut")` if a count is negative or larger than the process''s number of events) and `consistent_cuts(processes)`, every consistent cut as a **sorted** list of tuples of counts in sorted process-name order (try every combination). Events use the same forms as before: `("local", label)`, `("send", msg_id)`, `("recv", msg_id)`. Every message id is sent exactly once.'
+  starter: |-
+    def is_consistent_cut(processes, cut):
+        """A cut says how many events of each process are included: {process: count}. It is CONSISTENT if no message is received inside the cut but sent outside it: for every included recv, the matching send
+        must also be included. Processes missing from `cut` count as 0. ValueError('bad cut') if a count is negative or larger than the process has events."""
+        pass
+
+
+    def consistent_cuts(processes):
+        """Every consistent cut, as a sorted list of tuples of counts in sorted process-name order (try every combination of counts)."""
+        pass
+  tests:
+  - name: checking cuts
+    code: |
+      system = {"A": [("send", "m1"), ("local", "x")], "B": [("recv", "m1")]}
+      assert is_consistent_cut(system, {"A": 1, "B": 1})
+      assert is_consistent_cut(system, {"A": 0, "B": 0}) and is_consistent_cut(system, {"A": 2, "B": 1})
+      assert not is_consistent_cut(system, {"A": 0, "B": 1})
+      assert is_consistent_cut(system, {"A": 1}) and is_consistent_cut(system, {})
+      for bad in ({"A": 3}, {"B": -1}):
+          try:
+              is_consistent_cut(system, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad cut" in str(e)
+  - name: all consistent cuts
+    code: |
+      system = {"A": [("send", "m1"), ("local", "x")], "B": [("recv", "m1")]}
+      assert consistent_cuts(system) == [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1)]
+      assert consistent_cuts({"A": [("local", 1), ("local", 2)]}) == [(0,), (1,), (2,)]
+      assert consistent_cuts({}) == [()]
+      independent = {"A": [("local", 1)], "B": [("local", 1)]}
+      assert len(consistent_cuts(independent)) == 4
+  - name: two-way conversation
+    code: |
+      chat = {"A": [("send", "q"), ("recv", "r")], "B": [("recv", "q"), ("send", "r")]}
+      cuts = consistent_cuts(chat)
+      assert cuts == [(0, 0), (1, 0), (1, 1), (1, 2), (2, 2)]
+      assert (2, 1) not in cuts and (0, 1) not in cuts and (0, 2) not in cuts
+      assert is_consistent_cut(chat, {"A": 2, "B": 2}) and not is_consistent_cut(chat, {"A": 2, "B": 1})
+  hints:
+  - Index the sends first; then every received message in the cut needs its sender's event inside the cut.
+  solution: |
+    def is_consistent_cut(processes, cut):
+        """A cut says how many events of each process are included: {process: count}. It is CONSISTENT if no message is received inside the cut but sent outside it: for every included recv, the matching send
+        must also be included. Processes missing from `cut` count as 0. ValueError('bad cut') if a count is negative or larger than the process has events."""
+        send_at = {}
+        for p, events in processes.items():
+            for i, ev in enumerate(events):
+                if ev[0] == "send":
+                    send_at[ev[1]] = (p, i)
+        for p, events in processes.items():
+            if not 0 <= cut.get(p, 0) <= len(events):
+                raise ValueError("bad cut")
+        for p, events in processes.items():
+            for i in range(cut.get(p, 0)):
+                ev = events[i]
+                if ev[0] == "recv":
+                    q, j = send_at[ev[1]]
+                    if j >= cut.get(q, 0):
+                        return False
+        return True
+
+
+    def consistent_cuts(processes):
+        """Every consistent cut, as a sorted list of tuples of counts in sorted process-name order (try every combination of counts)."""
+        names = sorted(processes)
+        result = []
+
+        def build(k, current):
+            if k == len(names):
+                if is_consistent_cut(processes, dict(zip(names, current))):
+                    result.append(tuple(current))
+                return
+            for c in range(len(processes[names[k]]) + 1):
+                build(k + 1, current + [c])
+
+        build(0, [])
+        return sorted(result)
+  explanation: Consistent snapshots are how a distributed database can back itself up without freezing.
+commonMistakes:
+- title: Believing a smaller Lamport stamp means 'happened first'
+  explanation: It only means it could have; concurrent events may have any stamps.
+- title: Forgetting to add one after taking the maximum on a receive
+  explanation: The receive itself is an event and must advance the clock.
+- title: Trusting wall-clock time to order events across machines
+  explanation: Clocks drift and are only approximately synchronized.
+- title: Delivering a message as soon as it arrives
+  explanation: It may depend on a message that has not arrived yet.
+- title: Allowing a cut that contains a receive but not its send
+  explanation: It shows an effect without its cause.
+summary:
+- A distributed system has delayed, lost or reordered messages, independent failures and no shared clock.
+- Happened-before is the order given by cause and effect; other events are concurrent.
+- Lamport clocks give a consistent total order but cannot detect concurrency.
+- Vector clocks capture happened-before exactly.
+- Causal delivery holds messages back until their dependencies arrive.
+- Consistent cuts never include an effect without its cause.
+next: u24-partitioning
+quiz:
+- type: mcq
+  question: Which is a defining difficulty of distributed systems?
+  options:
+  - No shared clock and partial failure
+  - Too few computers
+  - Programs cannot use loops
+  - Messages are always instant
+  answer: 0
+  explanation: Everything else follows from these.
+- type: mcq
+  question: If event A happened before event B, then A's Lamport stamp is...
+  options:
+  - smaller than B's
+  - larger than B's
+  - equal to B's
+  - unrelated to B's
+  answer: 0
+  explanation: That is the guarantee.
+- type: mcq
+  question: Two events whose vector clocks are [2, 0] and [0, 3] are...
+  options:
+  - concurrent
+  - A before B
+  - B before A
+  - identical
+  answer: 0
+  explanation: Neither vector is entirely smaller.
+- type: mcq
+  question: What does a receive do to a Lamport clock?
+  options:
+  - max(own, message) + 1
+  - adds the message stamp
+  - resets to zero
+  - nothing
+  answer: 0
+  explanation: It takes the larger, then ticks.
+- type: mcq
+  question: Why hold a message back in causal delivery?
+  options:
+  - It depends on a message that has not arrived
+  - It is too large
+  - It is encrypted
+  - It was sent twice
+  answer: 0
+  explanation: Deliver causes before effects.
+- type: mcq
+  question: A consistent cut never contains...
+  options:
+  - a receive without its send
+  - a local event
+  - two sends
+  - the first event
+  answer: 0
+  explanation: That would show an effect without a cause.
+- type: code
+  question: Write `merge_vectors(a, b)` returning the entrywise maximum of two vector clocks (lists of equal length) as a new list.
+  starter: |
+    def merge_vectors(a, b):
+        pass
+  tests:
+  - name: merge
+    code: |
+      assert merge_vectors([1, 4, 0], [2, 3, 0]) == [2, 4, 0]
+      assert merge_vectors([], []) == []
+      a = [1, 2]
+      b = [0, 5]
+      assert merge_vectors(a, b) == [1, 5] and a == [1, 2] and b == [0, 5]
+  solution: |
+    def merge_vectors(a, b):
+        return [max(x, y) for x, y in zip(a, b)]

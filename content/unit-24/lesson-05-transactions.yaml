@@ -1,0 +1,980 @@
+id: u24-transactions
+title: Distributed Transactions
+minutes: 100
+objective: 'Learn how several machines make a change together: all or nothing. You will write crash recovery from a write-ahead log, two-phase commit and its blocking problem, sagas with compensation, idempotent retries, and a sharded transaction manager with locks.'
+outcomes:
+- Explain atomicity and the write-ahead log
+- Run two-phase commit and explain how it can block
+- Design a saga with compensations
+- Make retried operations idempotent
+- Coordinate a transaction over several shards
+sections:
+- heading: Atomic changes and the write-ahead log
+  body: |-
+    A **transaction** groups several changes into one unit that follows four promises, remembered as **ACID**. **Atomicity**: all the changes happen or none do. **Consistency**: the data's rules still hold afterwards. **Isolation**: concurrent transactions do not see each other's half-finished work. **Durability**: once the system says "committed", the change survives a crash. Transferring 100 pounds between two accounts is the classic example: subtracting from one account and then crashing before adding to the other must never leave the money gone.
+
+    How does one machine give atomicity and durability? With a **write-ahead log** (WAL). Before changing the data, the system appends a description of the change to a log on disk, and writes a `commit` record at the end. If the machine crashes, the **recovery** procedure reads the log: transactions with a `commit` record are **redone**, and those without are ignored or undone, as if they had never started. Disk writes to the data can then be done lazily, because the log is the truth. To keep the log from growing forever, the system occasionally takes a **checkpoint**: a snapshot of the state, after which the old log entries can be thrown away, apart from transactions still in flight. Almost every database, file system and message queue uses a WAL.
+- heading: Two-phase commit and its weakness
+  body: |-
+    When a transaction touches **several machines**, each machine may succeed or fail on its own, yet the outcome must be the same everywhere. **Two-phase commit** (2PC) achieves it with one **coordinator** and several **participants**. In **phase 1**, the coordinator asks each participant to *prepare*: do everything needed to be able to commit (write the change to its log, take the locks) and then vote **yes** or **no**. A yes is a **promise**: the participant can no longer change its mind. In **phase 2**, if *all* voted yes the coordinator records the decision `commit` and tells everyone; if any voted no or did not answer, it decides `abort`. Participants then commit or abort and release their locks. The coordinator writes its decision to its own log before telling anyone, so it can resend after a crash.
+
+    2PC is safe, but it can **block**. If the coordinator crashes after participants voted yes and before they hear the decision, those participants are **uncertain**: committing might contradict an abort decision and the other way round. They must hold their locks and wait for the coordinator to come back, and other transactions queue up behind those locks. Participants can ask each other (*cooperative termination*): if any knows the decision, everyone learns it; but if all are uncertain, nobody can proceed. A theoretical fix is **three-phase commit**, and the practical one is to make the coordinator itself fault-tolerant, for example by running it on a Raft or Paxos group, which is how Google Spanner works.
+- heading: Sagas, idempotency and the real world
+  body: |-
+    Two-phase commit holds locks across machines while waiting for the slowest one, which is too costly for long business processes such as booking a flight, a hotel and a car from three companies who will never share a transaction manager. A **saga** replaces one big transaction with a sequence of small local ones, each paired with a **compensating action** that semantically undoes it (cancel the booking, refund the payment). If step three fails, run the compensations for steps two and one, in reverse. The price is that a saga is not isolated: other users can see the half-finished state, and a compensation is not always a perfect undo (an email already sent stays sent).
+
+    All of these protocols retry messages, because networks lose them, so the same request may be received twice. Delivery guarantees come in three flavours. **At-most-once** (send and forget) may lose messages. **At-least-once** (retry until acknowledged) never loses a message but may duplicate it. True **exactly-once delivery** is impossible in general, but **exactly-once effect** is achievable by making the receiver **idempotent**: attach a unique **idempotency key** to each request, remember which keys were already processed, and ignore repeats. Payment systems such as Stripe's API ask clients to send such a key so that a retried charge is never charged twice. Remembering every key forever costs memory, so real systems keep keys for a limited window and accept a tiny risk beyond it. Taken together, WALs, two-phase commit, sagas and idempotency are the toolbox behind every system that moves money or inventory between machines.
+examples:
+- title: Crashes and two-phase commit
+  intro: Recovery from a log, a normal commit, and what happens when the coordinator dies.
+  code: |
+    def _check_log(log):
+        state = {}
+        for entry in log:
+            kind, tx = entry[0], entry[1]
+            if kind == "begin":
+                if tx in state:
+                    raise ValueError("bad log")
+                state[tx] = "active"
+            elif kind in ("write", "delete"):
+                if state.get(tx) != "active":
+                    raise ValueError("bad log")
+            elif kind in ("commit", "abort"):
+                if state.get(tx) != "active":
+                    raise ValueError("bad log")
+                state[tx] = "committed" if kind == "commit" else "aborted"
+            else:
+                raise ValueError("bad log")
+        return state
+
+
+    def recover(log, db=None):
+        """Crash recovery from a write-ahead log. Entries: ("begin", tx), ("write", tx, key, value), ("delete", tx, key), ("commit", tx), ("abort", tx). Start from a COPY of `db` (empty if None) and REDO, in log order, the writes and deletes of
+        every transaction that COMMITTED; ignore transactions that aborted or were still running when the crash happened. ValueError('bad log') for a malformed log: a begin for a transaction already begun, a write, delete, commit or abort for a transaction that has not begun or has already finished,
+        or an unknown entry kind. Return the new dict."""
+        state = _check_log(log)
+        result = dict(db or {})
+        for entry in log:
+            if entry[0] == "write" and state[entry[1]] == "committed":
+                result[entry[2]] = entry[3]
+            elif entry[0] == "delete" and state[entry[1]] == "committed":
+                result.pop(entry[2], None)
+        return result
+
+
+    def in_flight(log):
+        """The sorted list of transactions that began but neither committed nor aborted (same ValueError('bad log') checks)."""
+        state = _check_log(log)
+        return sorted(tx for tx, s in state.items() if s == "active")
+
+
+    def compact(log, db=None):
+        """Checkpointing: return (snapshot, remaining_log). The snapshot is recover(log, db); the remaining log keeps, in order, only the entries (begin, write, delete) of transactions that are still in flight."""
+        live = set(in_flight(log))
+        return recover(log, db), [e for e in log if e[1] in live]
+
+
+    def decide(votes):
+        """The coordinator's decision from the votes {participant: 'yes' | 'no' | None} (None means no reply): 'commit' only if EVERY participant voted 'yes', otherwise 'abort'. ValueError('no participants') for an empty dict."""
+        if not votes:
+            raise ValueError("no participants")
+        return "commit" if all(v == "yes" for v in votes.values()) else "abort"
+
+
+    def run_2pc(votes, crash=None):
+        """Two-phase commit. Phase 1: every participant has voted (or not replied). A participant that did NOT vote 'yes' aborts at once (state 'aborted'). Phase 2: the coordinator sends its decision. `crash` says what goes wrong:
+        None: every 'yes' voter receives the decision and ends 'committed' or 'aborted' accordingly. 'before_decision': the coordinator dies after collecting the votes but before telling anyone: decision None and every 'yes' voter is stuck in 'uncertain'.
+        'after_decision': the coordinator dies after the decision is made but delivers it only to the FIRST 'yes' voter in sorted order; the other 'yes' voters stay 'uncertain'. Return {'decision': the decision or None, 'states': {participant: state}}."""
+        states = {p: ("uncertain" if v == "yes" else "aborted") for p, v in votes.items()}
+        if crash == "before_decision":
+            return {"decision": None, "states": states}
+        decision = decide(votes)
+        outcome = "committed" if decision == "commit" else "aborted"
+        yes = sorted(p for p, v in votes.items() if v == "yes")
+        told = yes[:1] if crash == "after_decision" else yes
+        for p in told:
+            states[p] = outcome
+        return {"decision": decision, "states": states}
+
+
+    def cooperative_termination(states):
+        """Uncertain participants ask each other. If ANY participant is 'committed', every 'uncertain' one becomes 'committed'; otherwise, if any is 'aborted', every 'uncertain' one becomes 'aborted'; otherwise nothing can be learned. Return (new_states, blocked) where blocked is True if
+        some participant is still 'uncertain' afterwards (it must wait for the coordinator to come back). The input is not changed."""
+        new = dict(states)
+        for outcome in ("committed", "aborted"):
+            if outcome in states.values():
+                for p, s in states.items():
+                    if s == "uncertain":
+                        new[p] = outcome
+                break
+        return new, "uncertain" in new.values()
+
+    log = [("begin", "t1"), ("write", "t1", "balance", 90), ("commit", "t1"), ("begin", "t2"), ("write", "t2", "balance", 0)]
+    print("after a crash, recovered:", recover(log, {"balance": 100}))
+    print("still running at the crash:", in_flight(log))
+    print("all vote yes:", run_2pc({"bank": "yes", "shop": "yes"}))
+    print("coordinator dies:", run_2pc({"bank": "yes", "shop": "yes", "mail": "yes"}, "after_decision"))
+    states = run_2pc({"bank": "yes", "shop": "yes", "mail": "yes"}, "after_decision")["states"]
+    print("they ask each other:", cooperative_termination(states))
+    print("nobody knows:", cooperative_termination(run_2pc({"bank": "yes", "shop": "yes"}, "before_decision")["states"]))
+  output: |
+    after a crash, recovered: {'balance': 90}
+    still running at the crash: ['t2']
+    all vote yes: {'decision': 'commit', 'states': {'bank': 'committed', 'shop': 'committed'}}
+    coordinator dies: {'decision': 'commit', 'states': {'bank': 'committed', 'shop': 'uncertain', 'mail': 'uncertain'}}
+    they ask each other: ({'bank': 'committed', 'shop': 'committed', 'mail': 'committed'}, False)
+    nobody knows: ({'bank': 'uncertain', 'shop': 'uncertain'}, True)
+  lines:
+  - line: 83
+    note: t1 committed and t2 did not, so only t1's write survives.
+  - line: 86
+    note: Only the first participant heard the decision.
+  - line: 88
+    note: The participants learn the decision from the one that knows it.
+  - line: 89
+    note: If nobody knows, they are blocked.
+- title: Sagas, retries and shards
+  intro: Compensating a failed trip, counting retried payments once, and a transaction blocked by a lock.
+  code: |
+    def saga_events(steps, fail_at):
+        """A saga is a list of step names run in order, each with a compensating action. Return the list of events: ('do', name) for each step that runs; if the step at index `fail_at` fails (fail_at is None for no failure) record ('fail', name) and then ('undo', name) for every
+        step that had completed, in REVERSE order, and stop. ValueError('bad index') if fail_at is not None and not a valid step index."""
+        if fail_at is not None and not 0 <= fail_at < len(steps):
+            raise ValueError("bad index")
+        events = []
+        for i, name in enumerate(steps):
+            if i == fail_at:
+                events.append(("fail", name))
+                events.extend(("undo", s) for s in reversed(steps[:i]))
+                return events
+            events.append(("do", name))
+        return events
+
+
+    def transfer_saga(accounts, ops):
+        """Run money operations as a saga. `accounts` maps account names to balances (not changed); ops is a list of ('debit', account, amount) or ('credit', account, amount). A debit fails if the account does not exist or has less than the amount; a credit fails if the account does not
+        exist. Run the operations in order on a copy. If one fails, undo the completed ones in reverse order (a debit is undone by crediting the same amount, a credit by debiting it). Return (success, final accounts, log) where log lists ('do', op) for each operation that
+        succeeded, then ('fail', op) for the failing one and ('undo', op) for each compensation, in the order they happened."""
+        balances = dict(accounts)
+        log = []
+        done = []
+        for op in ops:
+            kind, acct, amount = op
+            ok = acct in balances and (kind == "credit" or balances[acct] >= amount)
+            if not ok:
+                log.append(("fail", op))
+                for prev in reversed(done):
+                    pk, pa, pam = prev
+                    balances[pa] += pam if pk == "debit" else -pam
+                    log.append(("undo", prev))
+                return False, balances, log
+            balances[acct] += amount if kind == "credit" else -amount
+            done.append(op)
+            log.append(("do", op))
+        return True, balances, log
+
+
+    import hashlib
+
+
+    def idempotency_key(*parts):
+        """A deterministic key for a request: the first 16 hexadecimal characters of the SHA-256 of the parts joined with '|' (each converted with str)."""
+        return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+
+    def apply_once(state, request_id, amount):
+        """Idempotent processing. `state` is {'balance': number, 'seen': set of request ids}. If the request id has not been seen, add the amount and remember the id; if it has, change nothing. Return (new_state, applied) where new_state is a NEW dict with a NEW set
+        (the input is not changed) and applied says whether the amount was added."""
+        seen = set(state["seen"])
+        if request_id in seen:
+            return {"balance": state["balance"], "seen": seen}, False
+        seen.add(request_id)
+        return {"balance": state["balance"] + amount, "seen": seen}, True
+
+
+    def apply_all(requests):
+        """Process a list of (request_id, amount) pairs, in order, starting from a balance of 0 and no ids seen, using apply_once, and return the final balance. Duplicate ids (from retries) count once."""
+        state = {"balance": 0, "seen": set()}
+        for rid, amount in requests:
+            state, _ = apply_once(state, rid, amount)
+        return state["balance"]
+
+
+    def apply_with_window(requests, window):
+        """Like apply_all, but remember only the MOST RECENT `window` distinct request ids that were applied (bounded memory). A duplicate whose id has already been forgotten is applied again. Remembering an id puts it at the newest end; when more than `window` ids are
+        remembered, forget the oldest. Return the final balance."""
+        recent = []
+        balance = 0
+        for rid, amount in requests:
+            if rid in recent:
+                continue
+            balance += amount
+            recent.append(rid)
+            if len(recent) > window:
+                recent.pop(0)
+        return balance
+
+
+    def new_shard():
+        """A shard that takes part in transactions: {"data": {}, "locks": {key: tx holding the lock}, "pending": {tx: {key: value}}}."""
+        return {"data": {}, "locks": {}, "pending": {}}
+
+
+    def prepare(shard, tx, writes):
+        """Phase 1 on one shard. If any key in `writes` is locked by a DIFFERENT transaction, vote no: return False and change nothing. Otherwise lock every key for tx, remember writes as pending for tx (a copy) and return True."""
+        if any(shard["locks"].get(k, tx) != tx for k in writes):
+            return False
+        for k in writes:
+            shard["locks"][k] = tx
+        shard["pending"][tx] = dict(writes)
+        return True
+
+
+    def commit(shard, tx):
+        """Phase 2: apply tx's pending writes to the data, release its locks and forget it. ValueError('not prepared') if tx has nothing pending."""
+        if tx not in shard["pending"]:
+            raise ValueError("not prepared")
+        shard["data"].update(shard["pending"].pop(tx))
+        for k in [k for k, holder in shard["locks"].items() if holder == tx]:
+            del shard["locks"][k]
+
+
+    def abort(shard, tx):
+        """Phase 2 (other branch): drop tx's pending writes and release its locks. Harmless if tx is unknown."""
+        shard["pending"].pop(tx, None)
+        for k in [k for k, holder in shard["locks"].items() if holder == tx]:
+            del shard["locks"][k]
+
+
+    def transact(shards, tx, plan):
+        """Two-phase commit across shards. `shards` maps names to shards; `plan` maps shard names to {key: value} writes. Phase 1: prepare each shard in SORTED name order; if any votes no, abort every shard that had already prepared and return 'aborted'. If all vote yes, commit all of them (in sorted name order) and
+        return 'committed'. ValueError('unknown shard') (before touching anything) if the plan names a shard that does not exist."""
+        for name in plan:
+            if name not in shards:
+                raise ValueError("unknown shard")
+        prepared = []
+        for name in sorted(plan):
+            if prepare(shards[name], tx, plan[name]):
+                prepared.append(name)
+            else:
+                for p in prepared:
+                    abort(shards[p], tx)
+                return "aborted"
+        for name in prepared:
+            commit(shards[name], tx)
+        return "committed"
+
+    print(saga_events(["book flight", "book hotel", "book car"], 2))
+    ok, final, log = transfer_saga({"ann": 50, "bob": 10}, [("debit", "ann", 30), ("credit", "bob", 30), ("debit", "bob", 100)])
+    print("saga ok:", ok, "balances:", final)
+    print("retried requests counted once:", apply_all([("pay1", 20), ("pay2", 5), ("pay1", 20), ("pay1", 20)]))
+    shards = {"east": new_shard(), "west": new_shard()}
+    prepare(shards["west"], "other", {"seat": "taken"})
+    print("conflicting transaction:", transact(shards, "t1", {"east": {"seat": "mine"}, "west": {"seat": "mine"}}))
+    commit(shards["west"], "other")
+    print("after the other one finishes:", transact(shards, "t2", {"east": {"seat": "mine"}, "west": {"seat": "mine"}}))
+  output: |
+    [('do', 'book flight'), ('do', 'book hotel'), ('fail', 'book car'), ('undo', 'book hotel'), ('undo', 'book flight')]
+    saga ok: False balances: {'ann': 50, 'bob': 10}
+    retried requests counted once: 25
+    conflicting transaction: aborted
+    after the other one finishes: committed
+  lines:
+  - line: 129
+    note: The steps are compensated in reverse.
+  - line: 131
+    note: The failed debit sends the money back.
+  - line: 132
+    note: Duplicates are ignored.
+  - line: 135
+    note: A lock held by another transaction forces an abort.
+playground:
+  prompt: Try a money transfer that fails halfway, and put the money back by hand.
+  code: |
+    accounts = {'ann': 50, 'bob': 10}
+    accounts['ann'] -= 30
+    print('after debit', accounts)
+    # the credit step fails, so we compensate
+    accounts['ann'] += 30
+    print('after compensation', accounts)
+exercises:
+- id: wal
+  title: Write-ahead logging and recovery
+  difficulty: 5
+  prompt: 'A single machine must also survive crashes without losing or half-applying a change. The classic tool is the **write-ahead log** (WAL): record an intention in a log on disk **before** changing the data. Write `recover(log, db=None)`, crash recovery. Log entries are `("begin", tx)`, `("write", tx, key, value)`, `("delete", tx, key)`, `("commit", tx)` and `("abort", tx)`. Start from a **copy** of `db` (empty if `None`) and **redo**, in log order, the writes and deletes of every transaction that **committed**; ignore transactions that aborted or were still running at the crash. Raise `ValueError("bad log")` for a malformed log: a `begin` for a transaction already begun; a write, delete, commit or abort for a transaction that has not begun or has already finished; or an unknown entry kind. Write `in_flight(log)`: the sorted list of transactions that began but neither committed nor aborted (same checks). Write `compact(log, db=None)`, a **checkpoint**: return `(snapshot, remaining_log)` where the snapshot is `recover(log, db)` and the remaining log keeps, in order, only the entries of transactions that are still in flight.'
+  starter: |-
+    def _check_log(log):
+        pass
+
+
+    def recover(log, db=None):
+        """Crash recovery from a write-ahead log. Entries: ("begin", tx), ("write", tx, key, value), ("delete", tx, key), ("commit", tx), ("abort", tx). Start from a COPY of `db` (empty if None) and REDO, in log order, the writes and deletes of
+        every transaction that COMMITTED; ignore transactions that aborted or were still running when the crash happened. ValueError('bad log') for a malformed log: a begin for a transaction already begun, a write, delete, commit or abort for a transaction that has not begun or has already finished,
+        or an unknown entry kind. Return the new dict."""
+        pass
+
+
+    def in_flight(log):
+        """The sorted list of transactions that began but neither committed nor aborted (same ValueError('bad log') checks)."""
+        pass
+
+
+    def compact(log, db=None):
+        """Checkpointing: return (snapshot, remaining_log). The snapshot is recover(log, db); the remaining log keeps, in order, only the entries (begin, write, delete) of transactions that are still in flight."""
+        pass
+  tests:
+  - name: redo committed work
+    code: |
+      log = [("begin", "t1"), ("write", "t1", "x", 1), ("begin", "t2"), ("write", "t2", "y", 2), ("commit", "t1"), ("write", "t2", "y", 3)]
+      assert recover(log) == {"x": 1}
+      assert recover(log, {"z": 9}) == {"x": 1, "z": 9}
+      assert recover([]) == {} and recover([], {"a": 1}) == {"a": 1}
+      log2 = [("begin", "a"), ("write", "a", "k", 1), ("commit", "a"), ("begin", "b"), ("write", "b", "k", 2), ("commit", "b")]
+      assert recover(log2) == {"k": 2}
+      db = {"x": 0}
+      recover(log, db)
+      assert db == {"x": 0}
+  - name: deletes and aborts
+    code: |
+      log = [("begin", "t1"), ("delete", "t1", "x"), ("commit", "t1"), ("begin", "t2"), ("write", "t2", "q", 5), ("abort", "t2")]
+      assert recover(log, {"x": 9, "y": 1}) == {"y": 1}
+      assert recover([("begin", "t"), ("delete", "t", "nothing"), ("commit", "t")], {"a": 1}) == {"a": 1}
+      assert in_flight(log) == []
+  - name: what was still running
+    code: |
+      log = [("begin", "t3"), ("begin", "t1"), ("write", "t1", "a", 1), ("begin", "t2"), ("commit", "t1"), ("write", "t3", "b", 2)]
+      assert in_flight(log) == ["t2", "t3"]
+      assert in_flight([]) == []
+      assert recover(log) == {"a": 1}
+  - name: malformed logs
+    code: |
+      bad_logs = [[("write", "t", "k", 1)], [("begin", "t"), ("begin", "t")], [("begin", "t"), ("commit", "t"), ("write", "t", "k", 1)],
+                  [("begin", "t"), ("commit", "t"), ("commit", "t")], [("commit", "ghost")], [("begin", "t"), ("explode", "t")], [("begin", "t"), ("abort", "t"), ("abort", "t")]]
+      for bad in bad_logs:
+          for f in (recover, in_flight):
+              try:
+                  f(bad)
+                  raise AssertionError("accepted %r" % (bad,))
+              except ValueError as e:
+                  assert "bad log" in str(e)
+  - name: checkpointing
+    code: |
+      log = [("begin", "t1"), ("write", "t1", "x", 1), ("begin", "t2"), ("write", "t2", "y", 2), ("commit", "t1"), ("write", "t2", "y", 3)]
+      snapshot, rest = compact(log)
+      assert snapshot == {"x": 1}
+      assert rest == [("begin", "t2"), ("write", "t2", "y", 2), ("write", "t2", "y", 3)]
+      snapshot2, rest2 = compact(rest, snapshot)
+      assert snapshot2 == {"x": 1} and rest2 == rest
+      assert compact([]) == ({}, [])
+      done = [("begin", "a"), ("write", "a", "k", 1), ("commit", "a")]
+      assert compact(done, {"z": 0}) == ({"k": 1, "z": 0}, [])
+  hints:
+  - Check the log first, then apply only what committed transactions wrote.
+  solution: |
+    def _check_log(log):
+        state = {}
+        for entry in log:
+            kind, tx = entry[0], entry[1]
+            if kind == "begin":
+                if tx in state:
+                    raise ValueError("bad log")
+                state[tx] = "active"
+            elif kind in ("write", "delete"):
+                if state.get(tx) != "active":
+                    raise ValueError("bad log")
+            elif kind in ("commit", "abort"):
+                if state.get(tx) != "active":
+                    raise ValueError("bad log")
+                state[tx] = "committed" if kind == "commit" else "aborted"
+            else:
+                raise ValueError("bad log")
+        return state
+
+
+    def recover(log, db=None):
+        """Crash recovery from a write-ahead log. Entries: ("begin", tx), ("write", tx, key, value), ("delete", tx, key), ("commit", tx), ("abort", tx). Start from a COPY of `db` (empty if None) and REDO, in log order, the writes and deletes of
+        every transaction that COMMITTED; ignore transactions that aborted or were still running when the crash happened. ValueError('bad log') for a malformed log: a begin for a transaction already begun, a write, delete, commit or abort for a transaction that has not begun or has already finished,
+        or an unknown entry kind. Return the new dict."""
+        state = _check_log(log)
+        result = dict(db or {})
+        for entry in log:
+            if entry[0] == "write" and state[entry[1]] == "committed":
+                result[entry[2]] = entry[3]
+            elif entry[0] == "delete" and state[entry[1]] == "committed":
+                result.pop(entry[2], None)
+        return result
+
+
+    def in_flight(log):
+        """The sorted list of transactions that began but neither committed nor aborted (same ValueError('bad log') checks)."""
+        state = _check_log(log)
+        return sorted(tx for tx, s in state.items() if s == "active")
+
+
+    def compact(log, db=None):
+        """Checkpointing: return (snapshot, remaining_log). The snapshot is recover(log, db); the remaining log keeps, in order, only the entries (begin, write, delete) of transactions that are still in flight."""
+        live = set(in_flight(log))
+        return recover(log, db), [e for e in log if e[1] in live]
+  explanation: A write-ahead log makes a change all-or-nothing even if the power fails halfway.
+- id: twopc
+  title: Two-phase commit and blocking
+  difficulty: 5
+  prompt: 'What if one transaction must change data on several machines, all or none? **Two-phase commit** (2PC) uses a coordinator. **Phase 1:** each participant votes `"yes"` (it has prepared and can commit) or `"no"`, or does not reply (`None`). **Phase 2:** if everyone voted yes the coordinator tells all to commit, otherwise to abort. Write `decide(votes)` for `{participant: "yes" | "no" | None}`: `"commit"` only if **every** participant voted yes, otherwise `"abort"`; `ValueError("no participants")` for an empty dict. Write `run_2pc(votes, crash=None)`. A participant that did **not** vote yes aborts at once (state `"aborted"`). A yes-voter waits in state `"uncertain"` until it hears the decision. With `crash=None`, every yes-voter receives the decision and ends `"committed"` or `"aborted"`. With `crash="before_decision"` the coordinator dies after collecting the votes but before telling anyone: the decision is `None` and every yes-voter stays `"uncertain"`. With `crash="after_decision"` the coordinator dies after deciding but delivers the decision only to the **first** yes-voter in sorted order; the other yes-voters stay `"uncertain"`. Return `{"decision": the decision or None, "states": {participant: state}}`. Write `cooperative_termination(states)`: uncertain participants ask each other. If **any** participant is `"committed"`, every uncertain one becomes `"committed"`; otherwise if any is `"aborted"`, every uncertain one becomes `"aborted"`; otherwise nothing is learned. Return `(new_states, blocked)` where `blocked` is true if some participant is still uncertain. Do not change the input.'
+  starter: |-
+    def decide(votes):
+        """The coordinator's decision from the votes {participant: 'yes' | 'no' | None} (None means no reply): 'commit' only if EVERY participant voted 'yes', otherwise 'abort'. ValueError('no participants') for an empty dict."""
+        pass
+
+
+    def run_2pc(votes, crash=None):
+        """Two-phase commit. Phase 1: every participant has voted (or not replied). A participant that did NOT vote 'yes' aborts at once (state 'aborted'). Phase 2: the coordinator sends its decision. `crash` says what goes wrong:
+        None: every 'yes' voter receives the decision and ends 'committed' or 'aborted' accordingly. 'before_decision': the coordinator dies after collecting the votes but before telling anyone: decision None and every 'yes' voter is stuck in 'uncertain'.
+        'after_decision': the coordinator dies after the decision is made but delivers it only to the FIRST 'yes' voter in sorted order; the other 'yes' voters stay 'uncertain'. Return {'decision': the decision or None, 'states': {participant: state}}."""
+        pass
+
+
+    def cooperative_termination(states):
+        """Uncertain participants ask each other. If ANY participant is 'committed', every 'uncertain' one becomes 'committed'; otherwise, if any is 'aborted', every 'uncertain' one becomes 'aborted'; otherwise nothing can be learned. Return (new_states, blocked) where blocked is True if
+        some participant is still 'uncertain' afterwards (it must wait for the coordinator to come back). The input is not changed."""
+        pass
+  tests:
+  - name: the decision
+    code: |
+      assert decide({"a": "yes", "b": "yes"}) == "commit"
+      assert decide({"a": "yes", "b": "no"}) == "abort"
+      assert decide({"a": "yes", "b": None}) == "abort"
+      assert decide({"a": "yes"}) == "commit" and decide({"a": "no"}) == "abort"
+      try:
+          decide({})
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no participants" in str(e)
+  - name: a normal run
+    code: |
+      assert run_2pc({"a": "yes", "b": "yes", "c": "yes"}) == {"decision": "commit", "states": {"a": "committed", "b": "committed", "c": "committed"}}
+      assert run_2pc({"a": "yes", "b": "no", "c": "yes"}) == {"decision": "abort", "states": {"a": "aborted", "b": "aborted", "c": "aborted"}}
+      assert run_2pc({"a": "yes", "b": None}) == {"decision": "abort", "states": {"a": "aborted", "b": "aborted"}}
+  - name: the coordinator crashes
+    code: |
+      r = run_2pc({"a": "yes", "b": "yes", "c": "no"}, "before_decision")
+      assert r == {"decision": None, "states": {"a": "uncertain", "b": "uncertain", "c": "aborted"}}
+      r = run_2pc({"a": "yes", "b": "yes", "c": "yes"}, "after_decision")
+      assert r == {"decision": "commit", "states": {"a": "committed", "b": "uncertain", "c": "uncertain"}}
+      r = run_2pc({"a": "yes", "b": "no", "c": "yes"}, "after_decision")
+      assert r == {"decision": "abort", "states": {"a": "aborted", "b": "aborted", "c": "uncertain"}}
+      r = run_2pc({"a": "no", "b": "no"}, "after_decision")
+      assert r["states"] == {"a": "aborted", "b": "aborted"}
+      assert run_2pc({"x": "yes"}, "before_decision")["states"] == {"x": "uncertain"}
+  - name: participants help each other
+    code: |
+      states = {"a": "committed", "b": "uncertain", "c": "uncertain"}
+      assert cooperative_termination(states) == ({"a": "committed", "b": "committed", "c": "committed"}, False)
+      assert states == {"a": "committed", "b": "uncertain", "c": "uncertain"}
+      assert cooperative_termination({"a": "aborted", "b": "uncertain"}) == ({"a": "aborted", "b": "aborted"}, False)
+      assert cooperative_termination({"a": "uncertain", "b": "uncertain"}) == ({"a": "uncertain", "b": "uncertain"}, True)
+      assert cooperative_termination({}) == ({}, False)
+      r = run_2pc({"a": "yes", "b": "yes", "c": "no"}, "before_decision")
+      assert cooperative_termination(r["states"]) == ({"a": "aborted", "b": "aborted", "c": "aborted"}, False)
+      r = run_2pc({"a": "yes", "b": "yes"}, "before_decision")
+      assert cooperative_termination(r["states"])[1] is True
+  hints:
+  - A participant that voted yes has promised to commit if told to, so it cannot decide alone.
+  solution: |
+    def decide(votes):
+        """The coordinator's decision from the votes {participant: 'yes' | 'no' | None} (None means no reply): 'commit' only if EVERY participant voted 'yes', otherwise 'abort'. ValueError('no participants') for an empty dict."""
+        if not votes:
+            raise ValueError("no participants")
+        return "commit" if all(v == "yes" for v in votes.values()) else "abort"
+
+
+    def run_2pc(votes, crash=None):
+        """Two-phase commit. Phase 1: every participant has voted (or not replied). A participant that did NOT vote 'yes' aborts at once (state 'aborted'). Phase 2: the coordinator sends its decision. `crash` says what goes wrong:
+        None: every 'yes' voter receives the decision and ends 'committed' or 'aborted' accordingly. 'before_decision': the coordinator dies after collecting the votes but before telling anyone: decision None and every 'yes' voter is stuck in 'uncertain'.
+        'after_decision': the coordinator dies after the decision is made but delivers it only to the FIRST 'yes' voter in sorted order; the other 'yes' voters stay 'uncertain'. Return {'decision': the decision or None, 'states': {participant: state}}."""
+        states = {p: ("uncertain" if v == "yes" else "aborted") for p, v in votes.items()}
+        if crash == "before_decision":
+            return {"decision": None, "states": states}
+        decision = decide(votes)
+        outcome = "committed" if decision == "commit" else "aborted"
+        yes = sorted(p for p, v in votes.items() if v == "yes")
+        told = yes[:1] if crash == "after_decision" else yes
+        for p in told:
+            states[p] = outcome
+        return {"decision": decision, "states": states}
+
+
+    def cooperative_termination(states):
+        """Uncertain participants ask each other. If ANY participant is 'committed', every 'uncertain' one becomes 'committed'; otherwise, if any is 'aborted', every 'uncertain' one becomes 'aborted'; otherwise nothing can be learned. Return (new_states, blocked) where blocked is True if
+        some participant is still 'uncertain' afterwards (it must wait for the coordinator to come back). The input is not changed."""
+        new = dict(states)
+        for outcome in ("committed", "aborted"):
+            if outcome in states.values():
+                for p, s in states.items():
+                    if s == "uncertain":
+                        new[p] = outcome
+                break
+        return new, "uncertain" in new.values()
+  explanation: 'Two-phase commit is simple and safe but can block: uncertain participants must wait for the coordinator.'
+- id: saga
+  title: Sagas and compensation
+  difficulty: 5
+  prompt: 'Locking many machines for a whole business transaction is slow, so long-running work is often a **saga**: a sequence of local steps, each with a **compensating action** that undoes it if a later step fails. Write `saga_events(steps, fail_at)`: `steps` is a list of step names run in order; return the list of events `("do", name)` for each step that runs; if the step at index `fail_at` fails (`fail_at` is `None` for no failure), record `("fail", name)` and then `("undo", name)` for every step that had completed, in **reverse** order, and stop. Raise `ValueError("bad index")` if `fail_at` is not `None` and not a valid step index. Write `transfer_saga(accounts, ops)`: `accounts` maps names to balances (not changed); `ops` is a list of `("debit", account, amount)` or `("credit", account, amount)`. A debit fails if the account does not exist or has less than the amount; a credit fails if the account does not exist. Run the operations in order on a copy; if one fails, undo the completed ones in reverse (a debit is undone by crediting the same amount, a credit by debiting it). Return `(success, final accounts, log)`, where the log lists `("do", op)` for each operation that succeeded, then `("fail", op)` for the failing one and `("undo", op)` for each compensation, in the order they happened.'
+  starter: |-
+    def saga_events(steps, fail_at):
+        """A saga is a list of step names run in order, each with a compensating action. Return the list of events: ('do', name) for each step that runs; if the step at index `fail_at` fails (fail_at is None for no failure) record ('fail', name) and then ('undo', name) for every
+        step that had completed, in REVERSE order, and stop. ValueError('bad index') if fail_at is not None and not a valid step index."""
+        pass
+
+
+    def transfer_saga(accounts, ops):
+        """Run money operations as a saga. `accounts` maps account names to balances (not changed); ops is a list of ('debit', account, amount) or ('credit', account, amount). A debit fails if the account does not exist or has less than the amount; a credit fails if the account does not
+        exist. Run the operations in order on a copy. If one fails, undo the completed ones in reverse order (a debit is undone by crediting the same amount, a credit by debiting it). Return (success, final accounts, log) where log lists ('do', op) for each operation that
+        succeeded, then ('fail', op) for the failing one and ('undo', op) for each compensation, in the order they happened."""
+        pass
+  tests:
+  - name: events of a saga
+    code: |
+      steps = ["reserve seat", "charge card", "send ticket"]
+      assert saga_events(steps, None) == [("do", "reserve seat"), ("do", "charge card"), ("do", "send ticket")]
+      assert saga_events(steps, 2) == [("do", "reserve seat"), ("do", "charge card"), ("fail", "send ticket"), ("undo", "charge card"), ("undo", "reserve seat")]
+      assert saga_events(steps, 0) == [("fail", "reserve seat")]
+      assert saga_events([], None) == []
+      for bad in (3, -1):
+          try:
+              saga_events(steps, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad index" in str(e)
+  - name: a transfer that works
+    code: |
+      acc = {"a": 100, "b": 5}
+      ok, final, log = transfer_saga(acc, [("debit", "a", 40), ("credit", "b", 40)])
+      assert ok and final == {"a": 60, "b": 45}
+      assert log == [("do", ("debit", "a", 40)), ("do", ("credit", "b", 40))]
+      assert acc == {"a": 100, "b": 5}
+      assert transfer_saga(acc, []) == (True, acc, [])
+  - name: a transfer that is undone
+    code: |
+      acc = {"a": 100, "b": 5}
+      ok, final, log = transfer_saga(acc, [("debit", "a", 40), ("credit", "zzz", 40)])
+      assert not ok and final == acc
+      assert log == [("do", ("debit", "a", 40)), ("fail", ("credit", "zzz", 40)), ("undo", ("debit", "a", 40))]
+      ok, final, log = transfer_saga(acc, [("debit", "a", 500)])
+      assert not ok and final == acc and log == [("fail", ("debit", "a", 500))]
+      ok, final, log = transfer_saga(acc, [("debit", "a", 10), ("credit", "b", 10), ("debit", "b", 1000)])
+      assert not ok and final == acc
+      assert log[-2:] == [("undo", ("credit", "b", 10)), ("undo", ("debit", "a", 10))]
+      assert acc == {"a": 100, "b": 5}
+  - name: money is never created or lost
+    code: |
+      import random
+      rng = random.Random(4)
+      names = ["a", "b", "c", "ghost"]
+      for trial in range(100):
+          acc = {"a": rng.randrange(0, 50), "b": rng.randrange(0, 50), "c": rng.randrange(0, 50)}
+          ops = []
+          for _ in range(rng.randrange(1, 6)):
+              ops.append((rng.choice(["debit", "credit"]), names[rng.randrange(4)], rng.randrange(1, 40)))
+          ok, final, log = transfer_saga(acc, ops)
+          if not ok:
+              assert final == acc
+          else:
+              credits = sum(o[2] for o in ops if o[0] == "credit")
+              debits = sum(o[2] for o in ops if o[0] == "debit")
+              assert sum(final.values()) == sum(acc.values()) + credits - debits
+  hints:
+  - Undo only the steps that completed, newest first.
+  solution: |
+    def saga_events(steps, fail_at):
+        """A saga is a list of step names run in order, each with a compensating action. Return the list of events: ('do', name) for each step that runs; if the step at index `fail_at` fails (fail_at is None for no failure) record ('fail', name) and then ('undo', name) for every
+        step that had completed, in REVERSE order, and stop. ValueError('bad index') if fail_at is not None and not a valid step index."""
+        if fail_at is not None and not 0 <= fail_at < len(steps):
+            raise ValueError("bad index")
+        events = []
+        for i, name in enumerate(steps):
+            if i == fail_at:
+                events.append(("fail", name))
+                events.extend(("undo", s) for s in reversed(steps[:i]))
+                return events
+            events.append(("do", name))
+        return events
+
+
+    def transfer_saga(accounts, ops):
+        """Run money operations as a saga. `accounts` maps account names to balances (not changed); ops is a list of ('debit', account, amount) or ('credit', account, amount). A debit fails if the account does not exist or has less than the amount; a credit fails if the account does not
+        exist. Run the operations in order on a copy. If one fails, undo the completed ones in reverse order (a debit is undone by crediting the same amount, a credit by debiting it). Return (success, final accounts, log) where log lists ('do', op) for each operation that
+        succeeded, then ('fail', op) for the failing one and ('undo', op) for each compensation, in the order they happened."""
+        balances = dict(accounts)
+        log = []
+        done = []
+        for op in ops:
+            kind, acct, amount = op
+            ok = acct in balances and (kind == "credit" or balances[acct] >= amount)
+            if not ok:
+                log.append(("fail", op))
+                for prev in reversed(done):
+                    pk, pa, pam = prev
+                    balances[pa] += pam if pk == "debit" else -pam
+                    log.append(("undo", prev))
+                return False, balances, log
+            balances[acct] += amount if kind == "credit" else -amount
+            done.append(op)
+            log.append(("do", op))
+        return True, balances, log
+  explanation: A saga gives up isolation, since others can see the half-done state, in exchange for never holding locks across machines.
+- id: idempotent
+  title: Exactly-once effects with idempotency
+  difficulty: 4
+  prompt: 'A network that retries gives you **at-least-once** delivery: the same request may arrive twice. To make the **effect** happen exactly once, make the operation **idempotent**: doing it twice equals doing it once. Write `idempotency_key(*parts)`: the first 16 hexadecimal characters of the SHA-256 (`hashlib`) of the parts converted with `str` and joined with `"|"`. Write `apply_once(state, request_id, amount)`: `state` is `{"balance": number, "seen": set of request ids}`; if the id has not been seen add the amount and remember the id; if it has, change nothing. Return `(new_state, applied)` where `new_state` is a **new** dict with a **new** set (the input is not changed) and `applied` says whether the amount was added. Write `apply_all(requests)`: process a list of `(request_id, amount)` pairs in order, from a balance of 0 and no ids seen, using `apply_once`, and return the final balance. Write `apply_with_window(requests, window)`: like `apply_all`, but remember only the **most recent** `window` distinct ids that were applied (bounded memory). A duplicate whose id was already forgotten is applied again. Remembering an id puts it at the newest end; when more than `window` ids are remembered, forget the oldest.'
+  starter: |-
+    import hashlib
+
+
+    def idempotency_key(*parts):
+        """A deterministic key for a request: the first 16 hexadecimal characters of the SHA-256 of the parts joined with '|' (each converted with str)."""
+        pass
+
+
+    def apply_once(state, request_id, amount):
+        """Idempotent processing. `state` is {'balance': number, 'seen': set of request ids}. If the request id has not been seen, add the amount and remember the id; if it has, change nothing. Return (new_state, applied) where new_state is a NEW dict with a NEW set
+        (the input is not changed) and applied says whether the amount was added."""
+        pass
+
+
+    def apply_all(requests):
+        """Process a list of (request_id, amount) pairs, in order, starting from a balance of 0 and no ids seen, using apply_once, and return the final balance. Duplicate ids (from retries) count once."""
+        pass
+
+
+    def apply_with_window(requests, window):
+        """Like apply_all, but remember only the MOST RECENT `window` distinct request ids that were applied (bounded memory). A duplicate whose id has already been forgotten is applied again. Remembering an id puts it at the newest end; when more than `window` ids are
+        remembered, forget the oldest. Return the final balance."""
+        pass
+  tests:
+  - name: keys
+    code: |
+      k = idempotency_key("alice", "pay", 25)
+      assert len(k) == 16 and all(c in "0123456789abcdef" for c in k)
+      assert k == idempotency_key("alice", "pay", 25) and k != idempotency_key("alice", "pay", 26)
+      import hashlib
+      assert idempotency_key("a", 1) == hashlib.sha256(b"a|1").hexdigest()[:16]
+      assert idempotency_key("only") == hashlib.sha256(b"only").hexdigest()[:16]
+  - name: applying once
+    code: |
+      state = {"balance": 10, "seen": set()}
+      s1, applied = apply_once(state, "r1", 5)
+      assert applied and s1 == {"balance": 15, "seen": {"r1"}}
+      s2, applied = apply_once(s1, "r1", 5)
+      assert not applied and s2 == s1
+      s3, applied = apply_once(s2, "r2", -3)
+      assert applied and s3["balance"] == 12 and s3["seen"] == {"r1", "r2"}
+      assert state == {"balance": 10, "seen": set()} and s1["seen"] == {"r1"}
+      assert s2["seen"] is not s1["seen"]
+  - name: duplicates from retries
+    code: |
+      requests = [("a", 10), ("b", 5), ("a", 10), ("c", -2), ("b", 5), ("a", 10)]
+      assert apply_all(requests) == 13
+      assert apply_all([]) == 0
+      assert apply_all([("x", 1)] * 5) == 1
+      assert apply_all([("p", 100), ("q", 100), ("p", 100), ("q", 100)]) == 200
+  - name: a bounded memory
+    code: |
+      requests = [("a", 10), ("b", 5), ("c", 1), ("a", 10), ("b", 5)]
+      assert apply_with_window(requests, 10) == apply_all(requests) == 16
+      assert apply_with_window(requests, 2) == 10 + 5 + 1 + 10 + 5 + 0 or apply_with_window(requests, 2) == 31
+      assert apply_with_window(requests, 3) == 16 + 10 or apply_with_window(requests, 3) == 16
+      assert apply_with_window([("a", 1), ("a", 1)], 1) == 1
+      assert apply_with_window([("a", 1), ("b", 1), ("a", 1)], 1) == 3
+      assert apply_with_window([], 5) == 0
+  hints:
+  - Keep a set of request ids that you have already applied.
+  solution: |
+    import hashlib
+
+
+    def idempotency_key(*parts):
+        """A deterministic key for a request: the first 16 hexadecimal characters of the SHA-256 of the parts joined with '|' (each converted with str)."""
+        return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+
+    def apply_once(state, request_id, amount):
+        """Idempotent processing. `state` is {'balance': number, 'seen': set of request ids}. If the request id has not been seen, add the amount and remember the id; if it has, change nothing. Return (new_state, applied) where new_state is a NEW dict with a NEW set
+        (the input is not changed) and applied says whether the amount was added."""
+        seen = set(state["seen"])
+        if request_id in seen:
+            return {"balance": state["balance"], "seen": seen}, False
+        seen.add(request_id)
+        return {"balance": state["balance"] + amount, "seen": seen}, True
+
+
+    def apply_all(requests):
+        """Process a list of (request_id, amount) pairs, in order, starting from a balance of 0 and no ids seen, using apply_once, and return the final balance. Duplicate ids (from retries) count once."""
+        state = {"balance": 0, "seen": set()}
+        for rid, amount in requests:
+            state, _ = apply_once(state, rid, amount)
+        return state["balance"]
+
+
+    def apply_with_window(requests, window):
+        """Like apply_all, but remember only the MOST RECENT `window` distinct request ids that were applied (bounded memory). A duplicate whose id has already been forgotten is applied again. Remembering an id puts it at the newest end; when more than `window` ids are
+        remembered, forget the oldest. Return the final balance."""
+        recent = []
+        balance = 0
+        for rid, amount in requests:
+            if rid in recent:
+                continue
+            balance += amount
+            recent.append(rid)
+            if len(recent) > window:
+                recent.pop(0)
+        return balance
+  explanation: Retries plus idempotency give exactly-once effects, the practical alternative to exactly-once delivery.
+- id: txn
+  title: 'Capstone: transactions across shards'
+  difficulty: 5
+  prompt: 'Combine locking and two-phase commit. A shard is `{"data": {}, "locks": {key: transaction holding it}, "pending": {tx: {key: value}}}`. Write `new_shard()`. Write `prepare(shard, tx, writes)`, **phase 1** on one shard: if any key in `writes` is locked by a **different** transaction, vote no, return `False` and change nothing. Otherwise lock every key for `tx`, store a **copy** of `writes` as pending for `tx` and return `True`. Write `commit(shard, tx)`: apply `tx`''s pending writes to the data, release its locks and forget it; `ValueError("not prepared")` if `tx` has nothing pending. Write `abort(shard, tx)`: drop `tx`''s pending writes and release its locks (harmless if `tx` is unknown). Write `transact(shards, tx, plan)`: `shards` maps names to shards; `plan` maps shard names to `{key: value}` writes. Phase 1: prepare each shard in **sorted name order**; if any votes no, abort every shard that had already prepared and return `"aborted"`. If all vote yes, commit all of them in sorted name order and return `"committed"`. Raise `ValueError("unknown shard")` **before touching anything** if the plan names a shard that does not exist.'
+  starter: |-
+    def new_shard():
+        """A shard that takes part in transactions: {"data": {}, "locks": {key: tx holding the lock}, "pending": {tx: {key: value}}}."""
+        pass
+
+
+    def prepare(shard, tx, writes):
+        """Phase 1 on one shard. If any key in `writes` is locked by a DIFFERENT transaction, vote no: return False and change nothing. Otherwise lock every key for tx, remember writes as pending for tx (a copy) and return True."""
+        pass
+
+
+    def commit(shard, tx):
+        """Phase 2: apply tx's pending writes to the data, release its locks and forget it. ValueError('not prepared') if tx has nothing pending."""
+        pass
+
+
+    def abort(shard, tx):
+        """Phase 2 (other branch): drop tx's pending writes and release its locks. Harmless if tx is unknown."""
+        pass
+
+
+    def transact(shards, tx, plan):
+        """Two-phase commit across shards. `shards` maps names to shards; `plan` maps shard names to {key: value} writes. Phase 1: prepare each shard in SORTED name order; if any votes no, abort every shard that had already prepared and return 'aborted'. If all vote yes, commit all of them (in sorted name order) and
+        return 'committed'. ValueError('unknown shard') (before touching anything) if the plan names a shard that does not exist."""
+        pass
+  tests:
+  - name: one shard
+    code: |
+      s = new_shard()
+      assert s == {"data": {}, "locks": {}, "pending": {}}
+      w = {"x": 1, "y": 2}
+      assert prepare(s, "t1", w) is True
+      assert s["locks"] == {"x": "t1", "y": "t1"} and s["pending"] == {"t1": {"x": 1, "y": 2}} and s["data"] == {}
+      w["x"] = 99
+      assert s["pending"]["t1"]["x"] == 1
+      assert prepare(s, "t2", {"y": 5, "z": 6}) is False
+      assert s["locks"] == {"x": "t1", "y": "t1"} and "t2" not in s["pending"]
+      assert prepare(s, "t2", {"z": 6}) is True
+      commit(s, "t1")
+      assert s["data"] == {"x": 1, "y": 2} and s["locks"] == {"z": "t2"} and "t1" not in s["pending"]
+      abort(s, "t2")
+      assert s["locks"] == {} and s["pending"] == {}
+      abort(s, "nobody")
+      try:
+          commit(s, "t9")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "not prepared" in str(e)
+  - name: a transaction across shards
+    code: |
+      shards = {"east": new_shard(), "west": new_shard()}
+      assert transact(shards, "t1", {"east": {"alice": 50}, "west": {"bob": 70}}) == "committed"
+      assert shards["east"]["data"] == {"alice": 50} and shards["west"]["data"] == {"bob": 70}
+      assert all(s["locks"] == {} and s["pending"] == {} for s in shards.values())
+      assert transact(shards, "t2", {"east": {"alice": 40}}) == "committed" and shards["east"]["data"] == {"alice": 40}
+      try:
+          transact(shards, "t3", {"east": {"q": 1}, "mars": {"q": 1}})
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown shard" in str(e)
+      assert shards["east"]["locks"] == {} and "q" not in shards["east"]["data"]
+  - name: conflicts abort everything
+    code: |
+      shards = {"a": new_shard(), "b": new_shard(), "c": new_shard()}
+      assert prepare(shards["b"], "blocker", {"k": 0}) is True
+      result = transact(shards, "t1", {"a": {"x": 1}, "b": {"k": 5}, "c": {"y": 2}})
+      assert result == "aborted"
+      assert shards["a"]["data"] == {} and shards["c"]["data"] == {}
+      assert shards["a"]["locks"] == {} and shards["a"]["pending"] == {} and shards["c"]["locks"] == {} and "t1" not in shards["b"]["pending"]
+      assert shards["b"]["locks"] == {"k": "blocker"}
+      commit(shards["b"], "blocker")
+      assert transact(shards, "t2", {"a": {"x": 1}, "b": {"k": 5}, "c": {"y": 2}}) == "committed"
+      assert shards["b"]["data"] == {"k": 5} and shards["a"]["data"] == {"x": 1} and shards["c"]["data"] == {"y": 2}
+  - name: all or nothing
+    code: |
+      import random
+      rng = random.Random(11)
+      shards = {n: new_shard() for n in "abcd"}
+      held = {}
+      for i in range(60):
+          tx = "t%d" % i
+          plan = {n: {"k%d" % rng.randrange(3): i} for n in "abcd" if rng.random() < 0.6}
+          if not plan:
+              continue
+          if rng.random() < 0.3:
+              victim = sorted(plan)[rng.randrange(len(plan))]
+              key = sorted(plan[victim])[0]
+              blocker = "blocker%d" % i
+              assert prepare(shards[victim], blocker, {key: -1}) is True
+              held[blocker] = victim
+          before = {n: dict(shards[n]["data"]) for n in plan}
+          result = transact(shards, tx, plan)
+          for n in plan:
+              if result == "committed":
+                  for key, value in plan[n].items():
+                      assert shards[n]["data"][key] == value
+              else:
+                  assert shards[n]["data"] == before[n]
+          assert all(tx not in s["pending"] and tx not in s["locks"].values() for s in shards.values())
+          for blocker, victim in list(held.items()):
+              abort(shards[victim], blocker)
+              del held[blocker]
+  hints:
+  - Prepare every shard first; only if all vote yes does anything change.
+  solution: |
+    def new_shard():
+        """A shard that takes part in transactions: {"data": {}, "locks": {key: tx holding the lock}, "pending": {tx: {key: value}}}."""
+        return {"data": {}, "locks": {}, "pending": {}}
+
+
+    def prepare(shard, tx, writes):
+        """Phase 1 on one shard. If any key in `writes` is locked by a DIFFERENT transaction, vote no: return False and change nothing. Otherwise lock every key for tx, remember writes as pending for tx (a copy) and return True."""
+        if any(shard["locks"].get(k, tx) != tx for k in writes):
+            return False
+        for k in writes:
+            shard["locks"][k] = tx
+        shard["pending"][tx] = dict(writes)
+        return True
+
+
+    def commit(shard, tx):
+        """Phase 2: apply tx's pending writes to the data, release its locks and forget it. ValueError('not prepared') if tx has nothing pending."""
+        if tx not in shard["pending"]:
+            raise ValueError("not prepared")
+        shard["data"].update(shard["pending"].pop(tx))
+        for k in [k for k, holder in shard["locks"].items() if holder == tx]:
+            del shard["locks"][k]
+
+
+    def abort(shard, tx):
+        """Phase 2 (other branch): drop tx's pending writes and release its locks. Harmless if tx is unknown."""
+        shard["pending"].pop(tx, None)
+        for k in [k for k, holder in shard["locks"].items() if holder == tx]:
+            del shard["locks"][k]
+
+
+    def transact(shards, tx, plan):
+        """Two-phase commit across shards. `shards` maps names to shards; `plan` maps shard names to {key: value} writes. Phase 1: prepare each shard in SORTED name order; if any votes no, abort every shard that had already prepared and return 'aborted'. If all vote yes, commit all of them (in sorted name order) and
+        return 'committed'. ValueError('unknown shard') (before touching anything) if the plan names a shard that does not exist."""
+        for name in plan:
+            if name not in shards:
+                raise ValueError("unknown shard")
+        prepared = []
+        for name in sorted(plan):
+            if prepare(shards[name], tx, plan[name]):
+                prepared.append(name)
+            else:
+                for p in prepared:
+                    abort(shards[p], tx)
+                return "aborted"
+        for name in prepared:
+            commit(shards[name], tx)
+        return "committed"
+  explanation: Two-phase commit with locks is how a distributed database makes a multi-shard change atomic.
+commonMistakes:
+- title: Changing data before writing the log
+  explanation: A crash in between loses the information needed to recover.
+- title: Committing a participant that never voted yes
+  explanation: A commit decision requires every vote to be yes.
+- title: Undoing a saga's steps in forward order
+  explanation: Compensations run in reverse, like unwinding a stack.
+- title: Retrying a non-idempotent operation
+  explanation: A retried payment without a key can be charged twice.
+- title: Forgetting to release locks on abort
+  explanation: Other transactions would wait forever.
+summary:
+- ACID transactions are atomic, consistent, isolated and durable.
+- A write-ahead log lets a machine recover all-or-nothing after a crash.
+- Two-phase commit makes a multi-machine change atomic, but can block when the coordinator fails.
+- Sagas use compensating actions instead of distributed locks.
+- Idempotency keys turn at-least-once delivery into exactly-once effects.
+- Sharded databases combine locks with two-phase commit.
+next: u24-gossip
+quiz:
+- type: mcq
+  question: What does the write-ahead log promise?
+  options:
+  - Changes are recorded before they are applied
+  - Data is never lost on any disk
+  - All machines agree on time
+  - Transactions never conflict
+  answer: 0
+  explanation: Recovery reads the log.
+- type: mcq
+  question: When can a 2PC participant not decide alone?
+  options:
+  - After voting yes while waiting for the decision
+  - After voting no
+  - Before preparing
+  - After committing
+  answer: 0
+  explanation: It promised to commit if told to, so it must wait.
+- type: mcq
+  question: A saga undoes a failed process with...
+  options:
+  - compensating actions in reverse order
+  - a rollback of all machines at once
+  - a cluster restart
+  - a larger timeout
+  answer: 0
+  explanation: Each completed step is semantically reversed.
+- type: mcq
+  question: What is the practical way to get exactly-once effect?
+  options:
+  - Idempotent processing with unique request ids
+  - Sending each message once
+  - Disabling retries
+  - Using faster networks
+  answer: 0
+  explanation: Duplicates are recognised and ignored.
+- type: mcq
+  question: What does the C in ACID stand for?
+  options:
+  - Consistency
+  - Concurrency
+  - Compression
+  - Caching
+  answer: 0
+  explanation: The data's rules still hold.
+- type: mcq
+  question: Why do shards lock keys during prepare?
+  options:
+  - So no other transaction changes them before commit
+  - To speed up reads
+  - To compress data
+  - To elect a leader
+  answer: 0
+  explanation: A yes vote is a promise that must stay true.
+- type: code
+  question: Write `writes_of(log, tx)` returning the dict of the last value written to each key by transaction `tx`, in a log of entries like `("write", tx, key, value)` (ignore other entries).
+  starter: |
+    def writes_of(log, tx):
+        pass
+  tests:
+  - name: writes
+    code: |
+      log = [("begin", "a"), ("write", "a", "x", 1), ("write", "b", "x", 9), ("write", "a", "y", 2), ("write", "a", "x", 3), ("commit", "a")]
+      assert writes_of(log, "a") == {"x": 3, "y": 2} and writes_of(log, "b") == {"x": 9} and writes_of(log, "zz") == {} and writes_of([], "a") == {}
+  solution: |
+    def writes_of(log, tx):
+        result = {}
+        for entry in log:
+            if entry[0] == 'write' and entry[1] == tx:
+                result[entry[2]] = entry[3]
+        return result

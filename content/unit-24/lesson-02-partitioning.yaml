@@ -1,0 +1,1336 @@
+id: u24-partitioning
+title: Partitioning and Consistent Hashing
+minutes: 95
+objective: Learn how huge data sets are spread across many machines. You will build consistent hashing with virtual nodes, measure how many keys move and how balanced the load is, place replicas, try rendezvous hashing, and build a sharded store that grows and shrinks.
+outcomes:
+- Explain partitioning (sharding) and why modulo hashing fails
+- Build a consistent-hashing ring with virtual nodes
+- Measure data movement and load balance
+- Place replicas on distinct nodes
+- Compare ring hashing with rendezvous hashing
+sections:
+- heading: Spreading data over many machines
+  body: |-
+    When data grows too large for one computer, we split it into pieces and put the pieces on different machines. This is called **partitioning** or **sharding**; each piece is a **shard**. The key question is: given a key such as a user's name, which machine holds its data? Every client must be able to answer quickly and get the same answer.
+
+    The obvious way is **modulo hashing**: compute a hash number of the key (a **hash function** turns any text into a number that looks random but is always the same for the same text), and take the remainder after dividing by the number of servers. With four servers, `hash(key) % 4` is the server number. It spreads keys evenly and costs nothing. The trouble appears when the number of servers changes. Go from four servers to five and `hash % 5` gives a different answer for almost every key: about four out of five keys move. Moving most of your data every time you add a machine is slow and risky, and a cache would suddenly lose nearly everything.
+
+    (One practical note: Python's built-in `hash` for strings is deliberately randomized on every run, so a different machine would disagree with you. Distributed systems use a fixed hash such as FNV or Murmur, as our `stable_hash` does.)
+- heading: Consistent hashing
+  body: |-
+    **Consistent hashing** solves the moving problem. Imagine all hash values, from 0 to the biggest, arranged on a **ring**, so the last value is followed by the first. Hash each *server* to a point on the ring too. A key belongs to the first server point at or after the key's own point, going clockwise. When a new server is added, it takes over only the arc between itself and the previous server point; every other key keeps its owner. On average only `1/n` of the keys move, instead of almost all of them. Removing a server likewise hands only that server's keys to its neighbour.
+
+    One point per server gives a lumpy result: by chance one server may own a huge arc. The fix is **virtual nodes**: each physical server is placed on the ring many times, under names such as `a#0`, `a#1`, `a#2`, and so on. With hundreds of points per server the arcs average out, the load becomes nearly even, and a new server takes small pieces from *everybody* instead of everything from one neighbour. Virtual nodes also let a stronger machine have more points than a weaker one. The cost is a larger table to search, which is why the lookup uses **binary search** (`bisect`) in a sorted list.
+
+    To survive failures, each key is stored on several servers, its **replicas**. A common choice, used by Amazon's Dynamo and Cassandra, is the **preference list**: starting from the key's position, walk clockwise and collect the first `n` *distinct* physical servers (skipping virtual nodes of a server already chosen, so that copies are really on different machines).
+- heading: Rendezvous hashing and real systems
+  body: |-
+    There is a ring-free alternative called **rendezvous hashing** (or highest random weight). To find a key's server, compute a score for every server from the pair (server, key), and pick the server with the highest score. For replicas, take the top `n`. Add a server and it wins only the keys for which its new score is the highest, so again only about `1/n` of the keys move; remove one and only its keys move to their second choice. It needs no ring or virtual nodes and is easy to get right, but it computes a score per server for every lookup, which is slow for thousands of servers.
+
+    Real systems add more. They often use **fixed partitions**: split the key space into a large fixed number of small partitions (say 1024) and assign partitions to servers, so adding a server just moves some whole partitions, which is simple to schedule and monitor. Some systems partition by **key range** instead (all names from A to F on one server), which makes range scans fast but risks **hot spots**, such as one shard receiving all of today's timestamps. Whatever the method, the pattern is the same: choose a rule that every client can evaluate on its own, that spreads load evenly, and that moves little data when the cluster changes.
+examples:
+- title: How many keys move?
+  intro: Modulo hashing against a ring when a fifth server joins, and the effect of virtual nodes on balance.
+  code: |
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def mod_assign(keys, nodes):
+        """The naive scheme: a dict key -> the node at position stable_hash(key) % len(nodes) in the SORTED list of nodes."""
+        ordered = sorted(nodes)
+        return {k: ordered[stable_hash(k) % len(ordered)] for k in keys}
+
+
+    def moved_keys(keys, before, after):
+        """The sorted keys whose owner differs between two rings (use lookup)."""
+        return sorted(k for k in keys if lookup(before, k) != lookup(after, k))
+
+
+    def rebalance_plan(before, after, keys):
+        """What must be copied when the ring changes: a dict {(old_owner, new_owner): sorted list of keys} covering only keys whose owner changes."""
+        plan = {}
+        for k in keys:
+            old, new = lookup(before, k), lookup(after, k)
+            if old != new:
+                plan.setdefault((old, new), []).append(k)
+        return {pair: sorted(ks) for pair, ks in plan.items()}
+
+
+    def load_distribution(ring, keys):
+        """A dict giving EVERY node on the ring the number of the given keys it owns."""
+        counts = {n: 0 for _, n in ring}
+        for k in keys:
+            counts[lookup(ring, k)] += 1
+        return counts
+
+
+    def imbalance(counts):
+        """How uneven a load is: the largest count divided by the average count, rounded to 3 decimals (1.0 is perfect). 0.0 for an empty dict or when the total is 0."""
+        if not counts or sum(counts.values()) == 0:
+            return 0.0
+        mean = sum(counts.values()) / len(counts)
+        return round(max(counts.values()) / mean, 3)
+
+
+    def ownership(ring):
+        """The fraction of the hash space 0 .. 2**32 owned by each node. A point owns the arc from the previous point (exclusive) up to itself; the FIRST point also owns the wrap-around arc back from
+        the last point. Return {node: fraction} (floats that sum to 1); an empty ring gives {}."""
+        space = 2 ** 32
+        owned = {}
+        for i, (h, n) in enumerate(ring):
+            prev = ring[i - 1][0] if i > 0 else ring[-1][0] - space
+            owned[n] = owned.get(n, 0) + (h - prev)
+        return {n: v / space for n, v in owned.items()}
+
+    keys = ["user%d" % i for i in range(200)]
+    nodes = ["a", "b", "c", "d"]
+    print("naive modulo, 4 to 5 servers: moved", sum(mod_assign(keys, nodes)[k] != mod_assign(keys, nodes + ["e"])[k] for k in keys), "of 200 keys")
+    before = build_ring(nodes, 100)
+    after = build_ring(nodes + ["e"], 100)
+    print("consistent hashing, 4 to 5 servers: moved", len(moved_keys(keys, before, after)), "of 200 keys")
+    print("all moved keys went to:", sorted({new for old, new in rebalance_plan(before, after, keys)}))
+    for v in (1, 10, 200):
+        print("virtual nodes", v, "imbalance", imbalance(load_distribution(build_ring(nodes, v), keys)))
+  output: |
+    naive modulo, 4 to 5 servers: moved 160 of 200 keys
+    consistent hashing, 4 to 5 servers: moved 34 of 200 keys
+    all moved keys went to: ['e']
+    virtual nodes 1 imbalance 1.66
+    virtual nodes 10 imbalance 1.36
+    virtual nodes 200 imbalance 1.18
+  lines:
+  - line: 95
+    note: Almost all the keys move.
+  - line: 98
+    note: Only the new server's share moves.
+  - line: 99
+    note: Every moved key went to the new server.
+  - line: 100
+    note: More virtual nodes bring the imbalance toward 1.0.
+- title: Replicas and a growing store
+  intro: Replica placement, rendezvous hashing and a sharded store that adds a server.
+  code: |
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def preference_list(ring, key, n):
+        """The first n DISTINCT nodes met walking clockwise round the ring from the key's position (the first is the key's owner); these hold the replicas. ValueError('not enough nodes') if the ring has fewer than n distinct nodes."""
+        if len({node for _, node in ring}) < n:
+            raise ValueError("not enough nodes")
+        i = bisect.bisect_left(ring, (stable_hash(key), ""))
+        chosen = []
+        for step in range(len(ring)):
+            node = ring[(i + step) % len(ring)][1]
+            if node not in chosen:
+                chosen.append(node)
+            if len(chosen) == n:
+                break
+        return chosen
+
+
+    def rendezvous_top(nodes, key, n):
+        """Rendezvous (highest random weight) hashing: score each node by stable_hash(NODE + ':' + KEY) and return the n nodes with the HIGHEST scores, best first (ties: smaller name first).
+        ValueError('not enough nodes') if there are fewer than n nodes."""
+        if len(nodes) < n:
+            raise ValueError("not enough nodes")
+        ranked = sorted(nodes, key=lambda node: (-stable_hash(node + ":" + key), node))
+        return ranked[:n]
+
+
+    def rendezvous(nodes, key):
+        """The single node that wins rendezvous hashing for the key. ValueError('empty') for no nodes."""
+        if not nodes:
+            raise ValueError("empty")
+        return rendezvous_top(nodes, key, 1)[0]
+
+
+    def new_store(nodes, vnodes=16):
+        """A sharded key-value store: {"vnodes": vnodes, "ring": ring, "data": {node: {key: value}}} with one empty dict per node."""
+        return {"vnodes": vnodes, "ring": build_ring(nodes, vnodes), "data": {n: {} for n in nodes}}
+
+
+    def put(store, key, value):
+        """Store the value on the node that owns the key and return that node."""
+        node = lookup(store["ring"], key)
+        store["data"][node][key] = value
+        return node
+
+
+    def get(store, key):
+        """The stored value, or None if the key is absent."""
+        return store["data"][lookup(store["ring"], key)].get(key)
+
+
+    def _reshard(store, new_ring):
+        moved = 0
+        for node in list(store["data"]):
+            for key in list(store["data"][node]):
+                target = lookup(new_ring, key)
+                if target != node:
+                    store["data"][target][key] = store["data"][node].pop(key)
+                    moved += 1
+        store["ring"] = new_ring
+        return moved
+
+
+    def add_node(store, node):
+        """Add a node: ValueError('node exists') if present. Create its empty data, build the new ring from all nodes, move every key whose owner changed to its new owner and return how many keys were moved."""
+        if node in store["data"]:
+            raise ValueError("node exists")
+        store["data"][node] = {}
+        return _reshard(store, build_ring(sorted(store["data"]), store["vnodes"]))
+
+
+    def remove_node(store, node):
+        """Remove a node: ValueError('unknown node') if absent, ValueError('last node') if it is the only one. Move all of its keys to their new owners on the ring without it, drop its data and return how many keys were moved."""
+        if node not in store["data"]:
+            raise ValueError("unknown node")
+        if len(store["data"]) == 1:
+            raise ValueError("last node")
+        rest = sorted(n for n in store["data"] if n != node)
+        new_ring = build_ring(rest, store["vnodes"])
+        held = store["data"].pop(node)
+        for key, value in held.items():
+            store["data"][lookup(new_ring, key)][key] = value
+        return _reshard(store, new_ring) + len(held)
+
+    ring = build_ring(["east", "west", "north", "south"], 30)
+    print("replicas for 'cart:42':", preference_list(ring, "cart:42", 3))
+    print("rendezvous picks for 'cart:42':", rendezvous_top(["east", "west", "north", "south"], "cart:42", 3))
+    store = new_store(["a", "b", "c"], 30)
+    for i in range(60):
+        put(store, "item%d" % i, i)
+    print("sizes before:", {n: len(d) for n, d in store["data"].items()})
+    print("moved when adding d:", add_node(store, "d"))
+    print("sizes after:", {n: len(d) for n, d in store["data"].items()})
+    print("item7 is still", get(store, "item7"))
+  output: |
+    replicas for 'cart:42': ['west', 'east', 'north']
+    rendezvous picks for 'cart:42': ['north', 'south', 'west']
+    sizes before: {'a': 18, 'b': 26, 'c': 16}
+    moved when adding d: 15
+    sizes after: {'a': 15, 'b': 15, 'c': 15, 'd': 15}
+    item7 is still 7
+  lines:
+  - line: 128
+    note: Three distinct servers, clockwise from the key.
+  - line: 134
+    note: Only the new server's share is copied.
+  - line: 136
+    note: Reads still find the data after rebalancing.
+playground:
+  prompt: Hash a few words with a tiny hash of your own and see which of three servers each lands on.
+  code: |
+    def tiny(word):
+        total = 0
+        for ch in word:
+            total = total * 31 + ord(ch)
+        return total
+
+    for word in ['apple', 'banana', 'cherry', 'date']:
+        print(word, tiny(word) % 3)
+exercises:
+- id: ring
+  title: The hash ring
+  difficulty: 4
+  prompt: 'The starter has `stable_hash(text)`, a hash that is the same on every run (Python''s own `hash` is randomized for strings). **Consistent hashing** spreads keys over servers so that adding or removing a server moves only a few keys. Write `build_ring(nodes, vnodes)`: a **sorted** list of `(hash, node)` points, where every node gets `vnodes` **virtual nodes**, the points `stable_hash("NODE#I")` for `I` from 0 to `vnodes - 1`. Write `lookup_hash(ring, h)`: the node that owns hash position `h`, the first ring point whose hash is `>= h`, **wrapping around** to the first point if `h` is beyond the last (`ValueError("empty ring")` for an empty ring; `bisect` helps). Write `lookup(ring, key)` (the owner of `stable_hash(key)`) and `assign(ring, keys)`: a dict giving **every** node on the ring (even one that owns nothing) the sorted list of keys it owns.'
+  starter: |-
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        pass
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        pass
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        pass
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        pass
+  tests:
+  - name: building the ring
+    code: |
+      ring = build_ring(["a", "b"], 3)
+      assert len(ring) == 6 and ring == sorted(ring)
+      assert {n for h, n in ring} == {"a", "b"}
+      assert (stable_hash("a#0"), "a") in ring and (stable_hash("b#2"), "b") in ring
+      assert build_ring([], 4) == []
+      assert len(build_ring(["x", "y", "z"], 1)) == 3
+      assert all(0 <= h < 2 ** 32 for h, n in build_ring(["a"], 10))
+  - name: who owns a hash
+    code: |
+      ring = [(10, "a"), (20, "b"), (30, "c")]
+      assert lookup_hash(ring, 5) == "a" and lookup_hash(ring, 10) == "a" and lookup_hash(ring, 11) == "b"
+      assert lookup_hash(ring, 20) == "b" and lookup_hash(ring, 25) == "c" and lookup_hash(ring, 30) == "c"
+      assert lookup_hash(ring, 31) == "a" and lookup_hash(ring, 2 ** 32 - 1) == "a"
+      assert lookup_hash(ring, 0) == "a"
+      try:
+          lookup_hash([], 5)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "empty ring" in str(e)
+      assert lookup_hash([(7, "solo")], 100) == "solo"
+  - name: keys and nodes
+    code: |
+      ring = build_ring(["a", "b", "c"], 8)
+      for key in ("apple", "banana", "cherry"):
+          assert lookup(ring, key) == lookup_hash(ring, stable_hash(key))
+          assert lookup(ring, key) in ("a", "b", "c")
+      keys = ["key%d" % i for i in range(60)]
+      owned = assign(ring, keys)
+      assert set(owned) == {"a", "b", "c"}
+      assert sorted(k for ks in owned.values() for k in ks) == sorted(keys)
+      for node, ks in owned.items():
+          assert ks == sorted(ks) and all(lookup(ring, k) == node for k in ks)
+      assert assign(ring, []) == {"a": [], "b": [], "c": []}
+      assert lookup(ring, "same") == lookup(build_ring(["c", "a", "b"], 8), "same")
+  hints:
+  - Use bisect to find the first point at or after the hash, and take the index modulo the ring length.
+  solution: |
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+  explanation: A ring turns 'which server?' into 'who is next clockwise?'.
+- id: movement
+  title: How many keys move?
+  difficulty: 5
+  prompt: 'The starter has the ring functions. Write `mod_assign(keys, nodes)`, the naive scheme: a dict `key -> node` where the node is at position `stable_hash(key) % len(nodes)` in the **sorted** list of nodes. Write `moved_keys(keys, before, after)`: the sorted keys whose owner differs between two rings. Write `rebalance_plan(before, after, keys)`: what must be copied when the ring changes, a dict `{(old_owner, new_owner): sorted list of keys}` covering only keys whose owner changes. The point of the exercise: with `mod_assign`, adding one server reshuffles almost every key, but on a ring a new server only takes keys from its neighbours.'
+  starter: |-
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def mod_assign(keys, nodes):
+        """The naive scheme: a dict key -> the node at position stable_hash(key) % len(nodes) in the SORTED list of nodes."""
+        pass
+
+
+    def moved_keys(keys, before, after):
+        """The sorted keys whose owner differs between two rings (use lookup)."""
+        pass
+
+
+    def rebalance_plan(before, after, keys):
+        """What must be copied when the ring changes: a dict {(old_owner, new_owner): sorted list of keys} covering only keys whose owner changes."""
+        pass
+  tests:
+  - name: the naive scheme
+    code: |
+      keys = ["key%d" % i for i in range(200)]
+      four = mod_assign(keys, ["d", "c", "b", "a"])
+      assert set(four.values()) == {"a", "b", "c", "d"} and len(four) == 200
+      assert four["key7"] == ["a", "b", "c", "d"][stable_hash("key7") % 4]
+      five = mod_assign(keys, ["a", "b", "c", "d", "e"])
+      changed = sum(four[k] != five[k] for k in keys)
+      assert changed > 120
+      assert mod_assign([], ["a"]) == {}
+  - name: the ring moves far fewer
+    code: |
+      keys = ["key%d" % i for i in range(200)]
+      before = build_ring(["a", "b", "c", "d"], 200)
+      after = build_ring(["a", "b", "c", "d", "e"], 200)
+      moved = moved_keys(keys, before, after)
+      assert moved == sorted(moved) and 0 < len(moved) < 80
+      assert all(lookup(after, k) == "e" for k in moved)
+      assert moved_keys(keys, before, before) == []
+      assert all(lookup(before, k) == lookup(after, k) for k in keys if k not in moved)
+  - name: removing a node
+    code: |
+      keys = ["key%d" % i for i in range(200)]
+      big = build_ring(["a", "b", "c", "d", "e"], 50)
+      small = build_ring(["a", "b", "c", "d"], 50)
+      moved = moved_keys(keys, big, small)
+      assert all(lookup(big, k) == "e" for k in moved)
+      assert set(moved) == {k for k in keys if lookup(big, k) == "e"}
+  - name: a rebalance plan
+    code: |
+      keys = ["key%d" % i for i in range(200)]
+      before = build_ring(["a", "b", "c", "d"], 50)
+      after = build_ring(["a", "b", "c", "d", "e"], 50)
+      plan = rebalance_plan(before, after, keys)
+      assert all(new == "e" and old in "abcd" for old, new in plan)
+      assert sorted(k for ks in plan.values() for k in ks) == moved_keys(keys, before, after)
+      assert all(ks == sorted(ks) for ks in plan.values())
+      assert rebalance_plan(before, before, keys) == {}
+      ring_a = [(10, "a"), (20, "b")]
+      ring_b = [(10, "a"), (15, "c"), (20, "b")]
+      assert rebalance_plan(ring_a, ring_b, []) == {}
+  hints:
+  - Compare each key's owner under the two rings; group the changes by (old owner, new owner).
+  solution: |
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def mod_assign(keys, nodes):
+        """The naive scheme: a dict key -> the node at position stable_hash(key) % len(nodes) in the SORTED list of nodes."""
+        ordered = sorted(nodes)
+        return {k: ordered[stable_hash(k) % len(ordered)] for k in keys}
+
+
+    def moved_keys(keys, before, after):
+        """The sorted keys whose owner differs between two rings (use lookup)."""
+        return sorted(k for k in keys if lookup(before, k) != lookup(after, k))
+
+
+    def rebalance_plan(before, after, keys):
+        """What must be copied when the ring changes: a dict {(old_owner, new_owner): sorted list of keys} covering only keys whose owner changes."""
+        plan = {}
+        for k in keys:
+            old, new = lookup(before, k), lookup(after, k)
+            if old != new:
+                plan.setdefault((old, new), []).append(k)
+        return {pair: sorted(ks) for pair, ks in plan.items()}
+  explanation: Consistent hashing was invented precisely so that adding a cache server did not wipe the cache.
+- id: balance
+  title: Balance and virtual nodes
+  difficulty: 4
+  prompt: 'With few points on the ring, one server can get a huge arc. Write `load_distribution(ring, keys)`: a dict giving **every** node on the ring the number of the given keys it owns. Write `imbalance(counts)`: the largest count divided by the average count, rounded to 3 decimals (`1.0` is perfect); `0.0` for an empty dict or when the total is 0. Write `ownership(ring)`: the **fraction of the hash space** `0 .. 2**32` owned by each node. A point owns the arc from the previous point (exclusive) up to itself; the **first** point also owns the wrap-around arc back from the last point. Return `{node: fraction}` (floats summing to 1; an empty ring gives `{}`). More virtual nodes give a smoother split.'
+  starter: |-
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def load_distribution(ring, keys):
+        """A dict giving EVERY node on the ring the number of the given keys it owns."""
+        pass
+
+
+    def imbalance(counts):
+        """How uneven a load is: the largest count divided by the average count, rounded to 3 decimals (1.0 is perfect). 0.0 for an empty dict or when the total is 0."""
+        pass
+
+
+    def ownership(ring):
+        """The fraction of the hash space 0 .. 2**32 owned by each node. A point owns the arc from the previous point (exclusive) up to itself; the FIRST point also owns the wrap-around arc back from
+        the last point. Return {node: fraction} (floats that sum to 1); an empty ring gives {}."""
+        pass
+  tests:
+  - name: counting load
+    code: |
+      ring = build_ring(["a", "b", "c"], 10)
+      keys = ["k%d" % i for i in range(90)]
+      load = load_distribution(ring, keys)
+      assert set(load) == {"a", "b", "c"} and sum(load.values()) == 90
+      assert load == {n: len(ks) for n, ks in assign(ring, keys).items()}
+      assert load_distribution(ring, []) == {"a": 0, "b": 0, "c": 0}
+      assert load_distribution([], []) == {}
+  - name: imbalance
+    code: |
+      assert imbalance({"a": 10, "b": 10}) == 1.0
+      assert imbalance({"a": 30, "b": 10}) == 1.5
+      assert imbalance({"a": 0, "b": 0}) == 0.0 and imbalance({}) == 0.0
+      assert imbalance({"a": 7}) == 1.0
+      assert imbalance({"a": 1, "b": 2, "c": 6}) == 2.0
+  - name: virtual nodes smooth the load
+    code: |
+      keys = ["key%d" % i for i in range(200)]
+      few = imbalance(load_distribution(build_ring(["a", "b", "c", "d"], 1), keys))
+      many = imbalance(load_distribution(build_ring(["a", "b", "c", "d"], 200), keys))
+      assert many < few and many < 1.3 and few > 1.5
+  - name: owning the hash space
+    code: |
+      ring = [(10, "a"), (20, "b"), (2 ** 31, "a")]
+      share = ownership(ring)
+      space = 2 ** 32
+      assert abs(share["b"] - 10 / space) < 1e-12
+      assert abs(share["a"] - (space - 10) / space) < 1e-12
+      assert abs(sum(share.values()) - 1) < 1e-9
+      assert ownership([(100, "x")]) == {"x": 1.0}
+      assert ownership([]) == {}
+      big = ownership(build_ring(["a", "b", "c", "d"], 100))
+      assert abs(sum(big.values()) - 1) < 1e-9 and all(0.15 < v < 0.35 for v in big.values())
+  hints:
+  - Each point owns the arc back to the previous point; the first point's previous point is the last one, a full turn earlier.
+  solution: |
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def load_distribution(ring, keys):
+        """A dict giving EVERY node on the ring the number of the given keys it owns."""
+        counts = {n: 0 for _, n in ring}
+        for k in keys:
+            counts[lookup(ring, k)] += 1
+        return counts
+
+
+    def imbalance(counts):
+        """How uneven a load is: the largest count divided by the average count, rounded to 3 decimals (1.0 is perfect). 0.0 for an empty dict or when the total is 0."""
+        if not counts or sum(counts.values()) == 0:
+            return 0.0
+        mean = sum(counts.values()) / len(counts)
+        return round(max(counts.values()) / mean, 3)
+
+
+    def ownership(ring):
+        """The fraction of the hash space 0 .. 2**32 owned by each node. A point owns the arc from the previous point (exclusive) up to itself; the FIRST point also owns the wrap-around arc back from
+        the last point. Return {node: fraction} (floats that sum to 1); an empty ring gives {}."""
+        space = 2 ** 32
+        owned = {}
+        for i, (h, n) in enumerate(ring):
+            prev = ring[i - 1][0] if i > 0 else ring[-1][0] - space
+            owned[n] = owned.get(n, 0) + (h - prev)
+        return {n: v / space for n, v in owned.items()}
+  explanation: Virtual nodes trade a bigger routing table for a fairer split of the data.
+- id: replicas
+  title: Replica placement and rendezvous hashing
+  difficulty: 5
+  prompt: 'Data is usually stored on **several** servers. The starter has the ring functions. Write `preference_list(ring, key, n)`: the first `n` **distinct** nodes met walking clockwise round the ring from the key''s position (the first is the key''s owner); these hold the replicas. Several virtual nodes may belong to the same server, so skip repeats. Raise `ValueError("not enough nodes")` if the ring has fewer than `n` distinct nodes. Then a ring-free alternative: **rendezvous hashing** (highest random weight). Write `rendezvous_top(nodes, key, n)`: score each node by `stable_hash(NODE + ":" + KEY)` and return the `n` nodes with the **highest** scores, best first (ties: smaller name first), with `ValueError("not enough nodes")` if there are fewer than `n`; and `rendezvous(nodes, key)`, the single winner (`ValueError("empty")` for no nodes).'
+  starter: |-
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def preference_list(ring, key, n):
+        """The first n DISTINCT nodes met walking clockwise round the ring from the key's position (the first is the key's owner); these hold the replicas. ValueError('not enough nodes') if the ring has fewer than n distinct nodes."""
+        pass
+
+
+    def rendezvous_top(nodes, key, n):
+        """Rendezvous (highest random weight) hashing: score each node by stable_hash(NODE + ':' + KEY) and return the n nodes with the HIGHEST scores, best first (ties: smaller name first).
+        ValueError('not enough nodes') if there are fewer than n nodes."""
+        pass
+
+
+    def rendezvous(nodes, key):
+        """The single node that wins rendezvous hashing for the key. ValueError('empty') for no nodes."""
+        pass
+  tests:
+  - name: replicas on the ring
+    code: |
+      ring = [(10, "a"), (20, "a"), (30, "b"), (40, "c"), (50, "b")]
+      assert preference_list(ring, "anything", 1) == [lookup(ring, "anything")]
+      h = stable_hash("anything")
+      owner = lookup_hash(ring, h)
+      pl = preference_list(ring, "anything", 3)
+      assert pl[0] == owner and len(pl) == 3 and set(pl) == {"a", "b", "c"}
+      big = build_ring(["n1", "n2", "n3", "n4", "n5"], 20)
+      for key in ("x", "y", "z", "w"):
+          pl = preference_list(big, key, 3)
+          assert len(set(pl)) == 3 and pl[0] == lookup(big, key)
+          assert preference_list(big, key, 2) == pl[:2]
+      assert preference_list(big, "x", 5) and len(set(preference_list(big, "x", 5))) == 5
+      try:
+          preference_list(ring, "x", 4)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "not enough nodes" in str(e)
+  - name: clockwise order
+    code: |
+      ring = [(10, "a"), (20, "b"), (30, "a"), (40, "c")]
+      import bisect
+      key = "k"
+      i = bisect.bisect_left(ring, (stable_hash(key), ""))
+      walk = []
+      for step in range(len(ring)):
+          node = ring[(i + step) % len(ring)][1]
+          if node not in walk:
+              walk.append(node)
+      assert preference_list(ring, key, 3) == walk
+      assert preference_list(ring, key, 2) == walk[:2]
+  - name: rendezvous hashing
+    code: |
+      nodes = ["a", "b", "c", "d"]
+      for key in ("alpha", "beta", "gamma", "delta"):
+          best = min(nodes, key=lambda n: (-stable_hash(n + ":" + key), n))
+          assert rendezvous(nodes, key) == best
+          top = rendezvous_top(nodes, key, 3)
+          assert top[0] == best and len(set(top)) == 3 and rendezvous_top(nodes, key, 4)[:3] == top
+      assert rendezvous(["only"], "k") == "only"
+      assert rendezvous(["d", "c", "b", "a"], "key") == rendezvous(["a", "b", "c", "d"], "key")
+      for bad, msg in ((lambda: rendezvous([], "k"), "empty"), (lambda: rendezvous_top(["a"], "k", 2), "not enough nodes")):
+          try:
+              bad()
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: rendezvous moves few keys
+    code: |
+      keys = ["key%d" % i for i in range(300)]
+      four = ["a", "b", "c", "d"]
+      five = four + ["e"]
+      moved = [k for k in keys if rendezvous(four, k) != rendezvous(five, k)]
+      assert all(rendezvous(five, k) == "e" for k in moved)
+      assert 0 < len(moved) < 110
+      spread = {n: sum(rendezvous(five, k) == n for k in keys) for n in five}
+      assert all(30 < c < 90 for c in spread.values())
+  hints:
+  - Walk the ring starting at the key's position and skip nodes already chosen.
+  solution: |
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def preference_list(ring, key, n):
+        """The first n DISTINCT nodes met walking clockwise round the ring from the key's position (the first is the key's owner); these hold the replicas. ValueError('not enough nodes') if the ring has fewer than n distinct nodes."""
+        if len({node for _, node in ring}) < n:
+            raise ValueError("not enough nodes")
+        i = bisect.bisect_left(ring, (stable_hash(key), ""))
+        chosen = []
+        for step in range(len(ring)):
+            node = ring[(i + step) % len(ring)][1]
+            if node not in chosen:
+                chosen.append(node)
+            if len(chosen) == n:
+                break
+        return chosen
+
+
+    def rendezvous_top(nodes, key, n):
+        """Rendezvous (highest random weight) hashing: score each node by stable_hash(NODE + ':' + KEY) and return the n nodes with the HIGHEST scores, best first (ties: smaller name first).
+        ValueError('not enough nodes') if there are fewer than n nodes."""
+        if len(nodes) < n:
+            raise ValueError("not enough nodes")
+        ranked = sorted(nodes, key=lambda node: (-stable_hash(node + ":" + key), node))
+        return ranked[:n]
+
+
+    def rendezvous(nodes, key):
+        """The single node that wins rendezvous hashing for the key. ValueError('empty') for no nodes."""
+        if not nodes:
+            raise ValueError("empty")
+        return rendezvous_top(nodes, key, 1)[0]
+  explanation: Replicas must sit on different servers, or one failure would lose every copy.
+- id: store
+  title: 'Capstone: a sharded store that grows and shrinks'
+  difficulty: 5
+  prompt: 'The starter has the ring tools. Write a small **sharded key-value store**. `new_store(nodes, vnodes=16)` returns `{"vnodes": vnodes, "ring": ring, "data": {node: {key: value}}}` with an empty dict per node. `put(store, key, value)` stores the value on the node that owns the key and returns that node. `get(store, key)` returns the value or `None`. `add_node(store, node)` (`ValueError("node exists")` if present) creates the node''s empty data, builds the new ring from **all** nodes, moves every key whose owner changed to its new owner, and returns how many keys moved. `remove_node(store, node)` (`ValueError("unknown node")` if absent, `ValueError("last node")` if it is the only one) moves **all** of that node''s keys to their new owners on the ring without it, drops its data and returns how many keys were moved. After any change, every key must live on the node that `lookup` names, and `get` must still find it. Hint: a helper that re-homes keys after the ring changes serves both.'
+  starter: |-
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def new_store(nodes, vnodes=16):
+        """A sharded key-value store: {"vnodes": vnodes, "ring": ring, "data": {node: {key: value}}} with one empty dict per node."""
+        pass
+
+
+    def put(store, key, value):
+        """Store the value on the node that owns the key and return that node."""
+        pass
+
+
+    def get(store, key):
+        """The stored value, or None if the key is absent."""
+        pass
+
+
+    def _reshard(store, new_ring):
+        pass
+
+
+    def add_node(store, node):
+        """Add a node: ValueError('node exists') if present. Create its empty data, build the new ring from all nodes, move every key whose owner changed to its new owner and return how many keys were moved."""
+        pass
+
+
+    def remove_node(store, node):
+        """Remove a node: ValueError('unknown node') if absent, ValueError('last node') if it is the only one. Move all of its keys to their new owners on the ring without it, drop its data and return how many keys were moved."""
+        pass
+  tests:
+  - name: putting and getting
+    code: |
+      store = new_store(["a", "b", "c"], 20)
+      assert set(store["data"]) == {"a", "b", "c"} and store["vnodes"] == 20 and store["ring"] == build_ring(["a", "b", "c"], 20)
+      owner = put(store, "name", "ada")
+      assert owner == lookup(store["ring"], "name") and store["data"][owner] == {"name": "ada"}
+      assert get(store, "name") == "ada" and get(store, "missing") is None
+      put(store, "name", "grace")
+      assert get(store, "name") == "grace" and sum(len(d) for d in store["data"].values()) == 1
+  - name: growing
+    code: |
+      store = new_store(["a", "b", "c", "d"], 50)
+      keys = ["key%d" % i for i in range(200)]
+      for i, k in enumerate(keys):
+          put(store, k, i)
+      before_owner = {k: lookup(store["ring"], k) for k in keys}
+      moved = add_node(store, "e")
+      assert 0 < moved < 80 and "e" in store["data"]
+      assert moved == len(store["data"]["e"])
+      for i, k in enumerate(keys):
+          assert get(store, k) == i
+          assert k in store["data"][lookup(store["ring"], k)]
+          if lookup(store["ring"], k) != "e":
+              assert lookup(store["ring"], k) == before_owner[k]
+      assert sum(len(d) for d in store["data"].values()) == 200
+      try:
+          add_node(store, "a")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "node exists" in str(e)
+  - name: shrinking
+    code: |
+      store = new_store(["a", "b", "c", "d"], 50)
+      keys = ["key%d" % i for i in range(200)]
+      for i, k in enumerate(keys):
+          put(store, k, i)
+      held = len(store["data"]["c"])
+      moved = remove_node(store, "c")
+      assert moved == held and "c" not in store["data"]
+      assert all(get(store, k) == i for i, k in enumerate(keys))
+      assert sum(len(d) for d in store["data"].values()) == 200
+      assert all(k in store["data"][lookup(store["ring"], k)] for k in keys)
+      for bad, msg in ((lambda: remove_node(store, "zzz"), "unknown node"),):
+          try:
+              bad()
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+      solo = new_store(["only"], 4)
+      try:
+          remove_node(solo, "only")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "last node" in str(e)
+  - name: there and back again
+    code: |
+      store = new_store(["a", "b", "c"], 30)
+      keys = ["k%d" % i for i in range(120)]
+      for k in keys:
+          put(store, k, k.upper())
+      snapshot = {n: dict(d) for n, d in store["data"].items()}
+      grown = add_node(store, "d")
+      shrunk = remove_node(store, "d")
+      assert grown == shrunk
+      assert store["data"] == snapshot
+      assert all(get(store, k) == k.upper() for k in keys)
+  hints:
+  - After the ring changes, visit every stored key and move it if its owner is different.
+  solution: |
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine (Python's own hash is randomized): FNV-1a over the UTF-8 bytes, followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    import bisect
+
+
+    def build_ring(nodes, vnodes):
+        """A consistent-hashing ring: a sorted list of (hash, node) points. Every node gets `vnodes` virtual nodes, the points stable_hash('NODE#I') for I = 0 .. vnodes - 1."""
+        ring = [(stable_hash("%s#%d" % (n, i)), n) for n in nodes for i in range(vnodes)]
+        ring.sort()
+        return ring
+
+
+    def lookup_hash(ring, h):
+        """The node owning hash position h: the first ring point whose hash is >= h, wrapping around to the first point if h is beyond the last. ValueError('empty ring') for an empty ring."""
+        if not ring:
+            raise ValueError("empty ring")
+        i = bisect.bisect_left(ring, (h, ""))
+        return ring[i % len(ring)][1]
+
+
+    def lookup(ring, key):
+        """The node that owns a key: lookup_hash of stable_hash(key)."""
+        return lookup_hash(ring, stable_hash(key))
+
+
+    def assign(ring, keys):
+        """A dict from EVERY node on the ring (even one that gets nothing) to the sorted list of keys it owns."""
+        result = {n: [] for _, n in ring}
+        for key in keys:
+            result[lookup(ring, key)].append(key)
+        return {n: sorted(ks) for n, ks in result.items()}
+
+
+    def new_store(nodes, vnodes=16):
+        """A sharded key-value store: {"vnodes": vnodes, "ring": ring, "data": {node: {key: value}}} with one empty dict per node."""
+        return {"vnodes": vnodes, "ring": build_ring(nodes, vnodes), "data": {n: {} for n in nodes}}
+
+
+    def put(store, key, value):
+        """Store the value on the node that owns the key and return that node."""
+        node = lookup(store["ring"], key)
+        store["data"][node][key] = value
+        return node
+
+
+    def get(store, key):
+        """The stored value, or None if the key is absent."""
+        return store["data"][lookup(store["ring"], key)].get(key)
+
+
+    def _reshard(store, new_ring):
+        moved = 0
+        for node in list(store["data"]):
+            for key in list(store["data"][node]):
+                target = lookup(new_ring, key)
+                if target != node:
+                    store["data"][target][key] = store["data"][node].pop(key)
+                    moved += 1
+        store["ring"] = new_ring
+        return moved
+
+
+    def add_node(store, node):
+        """Add a node: ValueError('node exists') if present. Create its empty data, build the new ring from all nodes, move every key whose owner changed to its new owner and return how many keys were moved."""
+        if node in store["data"]:
+            raise ValueError("node exists")
+        store["data"][node] = {}
+        return _reshard(store, build_ring(sorted(store["data"]), store["vnodes"]))
+
+
+    def remove_node(store, node):
+        """Remove a node: ValueError('unknown node') if absent, ValueError('last node') if it is the only one. Move all of its keys to their new owners on the ring without it, drop its data and return how many keys were moved."""
+        if node not in store["data"]:
+            raise ValueError("unknown node")
+        if len(store["data"]) == 1:
+            raise ValueError("last node")
+        rest = sorted(n for n in store["data"] if n != node)
+        new_ring = build_ring(rest, store["vnodes"])
+        held = store["data"].pop(node)
+        for key, value in held.items():
+            store["data"][lookup(new_ring, key)][key] = value
+        return _reshard(store, new_ring) + len(held)
+  explanation: Elastic storage systems add and remove machines while serving traffic, moving only what must move.
+commonMistakes:
+- title: Using Python's hash() across machines
+  explanation: String hashes differ between runs, so servers would disagree about where a key lives.
+- title: Forgetting the wrap-around
+  explanation: A key past the last ring point belongs to the first point.
+- title: Putting all replicas on virtual nodes of one server
+  explanation: Walk the ring and skip servers you already chose.
+- title: Using one point per server
+  explanation: The arcs are uneven, so one server gets far more than its share.
+- title: Moving keys one at a time without updating the ring first
+  explanation: Reads would look in the wrong place during the change.
+summary:
+- Sharding splits data across machines; every client must agree where each key lives.
+- Modulo hashing moves almost every key when the server count changes.
+- Consistent hashing moves only about 1/n of the keys.
+- Virtual nodes even out the load.
+- Replicas go on the next distinct servers clockwise.
+- Rendezvous hashing is a simple ring-free alternative.
+next: u24-replication
+quiz:
+- type: mcq
+  question: What goes wrong with hash(key) % n when n changes?
+  options:
+  - Almost every key maps to a different server
+  - Nothing changes
+  - Keys disappear
+  - The hash becomes random
+  answer: 0
+  explanation: The remainder changes for most keys.
+- type: mcq
+  question: About what fraction of keys moves when a server joins a consistent-hashing ring of n servers?
+  options:
+  - 1/n
+  - all of them
+  - half
+  - none
+  answer: 0
+  explanation: The new server takes a fair share.
+- type: mcq
+  question: Why use virtual nodes?
+  options:
+  - To balance the load more evenly
+  - To make keys longer
+  - To store backups
+  - To avoid hashing
+  answer: 0
+  explanation: Many points per server average out lumpy arcs.
+- type: mcq
+  question: How is a key's owner found on a ring?
+  options:
+  - The first server point at or after its hash, wrapping around
+  - The server with the smallest name
+  - Random choice
+  - The last server point
+  answer: 0
+  explanation: Clockwise to the next point.
+- type: mcq
+  question: Why skip repeated servers when building a preference list?
+  options:
+  - So replicas sit on different machines
+  - To save memory
+  - To sort the list
+  - To avoid hashing
+  answer: 0
+  explanation: Copies on one machine would not survive its failure.
+- type: mcq
+  question: A downside of key-range partitioning is...
+  options:
+  - hot spots when many keys fall in one range
+  - it cannot do range scans
+  - it needs a ring
+  - it uses hashes
+  answer: 0
+  explanation: Sequential keys pile onto one shard.
+- type: code
+  question: Write `shard_for(key, shards)` returning the shard name at position `stable_hash(key) % len(shards)` in the SORTED list `shards`, using the function `stable_hash` that is provided (it is defined above the function; do not redefine it).
+  starter: |
+    def stable_hash(text):
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        return h
+
+
+    def shard_for(key, shards):
+        pass
+  tests:
+  - name: shard
+    code: |
+      shards = ["c", "a", "b"]
+      for key in ("x", "y", "zz"):
+          assert shard_for(key, shards) == ["a", "b", "c"][stable_hash(key) % 3]
+      assert shard_for("anything", ["only"]) == "only"
+      assert shards == ["c", "a", "b"]
+  solution: |
+    def stable_hash(text):
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        return h
+
+
+    def shard_for(key, shards):
+        ordered = sorted(shards)
+        return ordered[stable_hash(key) % len(ordered)]

@@ -29,8 +29,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 21 | Probability & Statistics (Version 2) | ✅ Complete (Phase 20) | 8 | 40 | Statistics Toolkit (quantiles, normal curve, Bayes, confidence and bootstrap intervals, permutation and A/B tests, regression) |
 | 22 | Advanced Algorithms (Version 2) | ✅ Complete (Phase 22) | 7 | 35 | Algorithm Lab (max flow, SCC, KMP, convex hull, SAT solver, vertex cover approximation, Held-Karp TSP, reservoir sampling, segment tree, inversions) |
 | 23 | Compilers (Version 2) | ✅ Complete (Phase 23) | 7 | 35 | Mini Compiler (tokenizer, precedence parser, name checker, three-address code, optimizer, bytecode, assembler, virtual machine) |
+| 24 | Distributed Systems (Version 2) | ✅ Complete (Phase 24) | 7 | 35 | Mini Key-Value Cluster (hash ring, replicas, quorums, read repair, rebalancing, anti-entropy) |
 
-Totals: 195 lessons, 928 practice exercises, 195 lesson quizzes (1170 multiple-choice questions + 195 coding questions), 23 unit projects, 1846 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms and 23 Compilers done, plus a timed Exams page; distributed systems and database internals next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 202 lessons, 963 practice exercises, 202 lesson quizzes (1212 multiple-choice questions + 202 coding questions), 24 unit projects, 1918 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers and 24 Distributed Systems done, plus a timed Exams page; database internals next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -550,9 +551,25 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Unit 24 can assume:** everything through Unit 23. Distributed systems and database internals can use automata, trees, graphs, parsing and memory management freely (a SQL engine can reuse the lexer, parser and optimizer ideas).
 
+## Unit 24: Distributed Systems (Version 2) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 24.1 Time, Clocks and Ordering | `u24-time` | clock skew, Lamport and vector clocks, happened-before, NTP and Berkeley sync, causal delivery, consistent cuts |
+| 24.2 Partitioning and Consistent Hashing | `u24-partitioning` | modulo vs consistent hashing, rings and virtual nodes, rendezvous hashing, load balance, a sharded store |
+| 24.3 Replication and CRDTs | `u24-replication` | quorums, read repair, last-writer-wins, version merging, G-counter, PN-counter, OR-set, replicated logs |
+| 24.4 Failure Detection and Consensus | `u24-consensus` | heartbeats, bully election, Paxos, Raft elections and terms |
+| 24.5 Logs and Distributed Transactions | `u24-transactions` | write-ahead log recovery, two-phase commit, sagas, idempotency keys, a sharded transaction |
+| 24.6 Gossip and Anti-Entropy | `u24-gossip` | epidemic spread, anti-entropy digests, Merkle trees, gossip membership and failure detection |
+| 24.7 Surviving Failure | `u24-reliability` | retries with backoff and jitter, token bucket, circuit breaker, load balancing, CAP and PACELC |
+
+**Project: Mini Key-Value Cluster.** Learners write `build_ring`, `make_cluster`, `preference_list`, `put`, `get`, `fail`, `recover`, `rebalance`, `add_node`, `anti_entropy` and `key_counts` (stable_hash is given). 13 checklist items, 13 tests.
+
+**Unit 25 can assume:** everything through Unit 24. Database internals can use logs and write-ahead logging, hashing and partitioning, quorums, and transactions (two-phase commit) freely.
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers and the timed exams page are done; next deeper core courses (distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems and the timed exams page are done; next deeper core course (database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -584,3 +601,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 21 (2026-11-15):** Version 2 framework: timed **Exams** page (`#/exams`, `src/components/Exams.jsx`). Quick quiz (15 q), Midterm (30 q) and Final (50 q); questions mixed evenly across chosen units from lesson quiz MCQs; 90 seconds per question with a countdown that auto-submits; no feedback until submit; results with per-unit breakdown, weak-unit drill, answer review and saved attempt history (`exams` in progress state).
 - **Phase 22 (2026-11-15):** Version 2 continues. Complete Unit 22 Advanced Algorithms (7 lessons, 35 exercises, 7 quizzes, Algorithm Lab project, 78 glossary terms). No framework changes; all Python.
 - **Phase 23 (2026-11-15):** Version 2 continues. Complete Unit 23 Compilers (7 lessons, 35 exercises, 7 quizzes, Mini Compiler project, 63 glossary terms). No framework changes; all Python.
+- **Phase 24 (2026-11-15):** Version 2 continues. Complete Unit 24 Distributed Systems (7 lessons, 35 exercises, 7 quizzes, Mini Key-Value Cluster project, 72 glossary terms). No framework changes; all Python.
