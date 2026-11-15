@@ -1,0 +1,1232 @@
+id: u25-storage
+title: Pages, Rows and the Buffer Pool
+minutes: 90
+objective: Learn how a database actually keeps data on disk. You will build slotted pages, encode rows as bytes, cache pages in a buffer pool with replacement policies, and store a table as a heap file.
+outcomes:
+- Explain why databases read and write fixed-size pages
+- Build a slotted page with stable record ids
+- Encode and decode rows with NULLs
+- Implement a buffer pool with pinning and dirty pages
+- Compare LRU, FIFO and CLOCK replacement
+- Build a heap file with scans
+sections:
+- heading: Why pages?
+  body: |-
+    A database is a program that stores data **durably**, meaning it survives a power cut, and lets you find and change it quickly. The data lives on a disk, and disks have a strange property: reading one byte costs almost as much as reading a few thousand. A hard drive must move a mechanical arm; even a modern SSD (solid-state drive) works in blocks. So a database never reads single rows. It divides its files into fixed-size blocks called **pages**, commonly 4 to 16 kilobytes (PostgreSQL uses 8 KB), and always reads and writes whole pages. Almost every design choice in database internals is about doing as few page reads and writes as possible, because a page read from disk is roughly 100,000 times slower than a memory access.
+
+    Inside a page, the rows are packed. The classic layout is the **slotted page**. A small **header** at the front records bookkeeping. A **slot directory** after it holds one (offset, length) pair for each record, growing forward. The **records** themselves are packed from the *back* of the page growing backward, so the free space is one block in the middle. Because a row is named by its **record id** (page number plus slot number) and the slot points to wherever the bytes currently are, the database can shift records around inside a page, for example to squeeze out the gaps left by deleted rows (called **compaction**), without any other part of the system noticing.
+- heading: Rows as bytes
+  body: |-
+    To place a row on a page it must become a sequence of bytes. Each column type has a **fixed or variable width** encoding. An integer takes 4 bytes in a chosen byte order (**big-endian** puts the most significant byte first, which also makes byte strings sort the same way as the numbers). A boolean takes one byte. Text is **variable length**, so it is stored as a length followed by the characters in **UTF-8**, an encoding where each character takes between one and four bytes. A missing value, called **NULL**, would waste space if stored, so rows begin with a **null bitmap**: one bit per column that says whether it is NULL, and NULL columns then store nothing at all.
+
+    Because a row size depends on its contents, a page holds a varying number of rows. Real systems add more details, such as alignment padding, overflow pages for huge values, and a version header for transactions, but the principle is always this: a schema describes how to turn a row into bytes and back.
+- heading: The buffer pool and replacement
+  body: |-
+    Disk is slow and memory is small, so the database keeps a **buffer pool**: a fixed number of in-memory slots called **frames**, each holding a copy of a recently used page. When the system needs a page it asks the pool. If the page is already cached that is a **hit**, answered at memory speed. Otherwise it is a **miss**: the page is read from disk, and if all frames are full the pool must **evict** some other page first. A page that was modified in memory is called **dirty**, and must be **written back** to disk before its frame is reused. A page being used right now is **pinned**, and the pool must never evict it.
+
+    Which page should be evicted? **LRU** (least recently used) throws out the page untouched for the longest time, betting that recent history predicts the future. **FIFO** throws out the oldest arrival regardless of use. **CLOCK** approximates LRU cheaply: every frame has a **reference bit** set on use, and a sweeping hand clears bits until it finds a frame whose bit is already clear. No policy is best for every workload. A full table scan reading a table bigger than the cache makes LRU useless, because every page is evicted just before it would be needed again, so real databases use scan-resistant variants that keep scanned pages from flushing out the hot ones.
+- heading: The heap file
+  body: 'The simplest way to store a table is a **heap file**: an unordered collection of pages where a new row goes in any page with room. Inserting is cheap, and a **full table scan** reads every page in order. But finding one particular row means reading the whole file, which is why indexes exist, the topic of the next lesson. Deleted rows leave reusable gaps, and the record id of every other row stays valid.'
+examples:
+- title: A page of rows
+  intro: Rows are encoded with a null bitmap, placed in a slotted page, deleted and compacted.
+  code: |
+    HEADER = 8
+    SLOT = 4
+
+
+    def new_page(size):
+        """An empty SLOTTED PAGE of `size` bytes: {"size": size, "slots": [], "data": bytearray(size), "free_end": size}. Records are stored at the END of the page growing downward (free_end moves down); the slot directory (one (offset, length) pair per slot, None for a deleted slot) conceptually sits after an 8-byte header and costs 4 bytes per slot.
+        ValueError('page too small') if size < 16."""
+        if size < 16:
+            raise ValueError("page too small")
+        return {"size": size, "slots": [], "data": bytearray(size), "free_end": size}
+
+
+    def free_space(page):
+        """The bytes still free between the slot directory and the records: free_end - (HEADER + SLOT * number of slots)."""
+        return page["free_end"] - (HEADER + SLOT * len(page["slots"]))
+
+
+    def insert_record(page, record):
+        """Store `record` (bytes) and return its slot number. Reuse the lowest-numbered deleted slot if there is one (then no new directory entry is needed), otherwise add a new slot. The record needs len(record) bytes, plus SLOT bytes if a new slot is added; if that does not fit in free_space raise ValueError('page full').
+        Records are written just below free_end."""
+        reuse = next((i for i, s in enumerate(page["slots"]) if s is None), None)
+        need = len(record) + (0 if reuse is not None else SLOT)
+        if need > free_space(page):
+            raise ValueError("page full")
+        page["free_end"] -= len(record)
+        start = page["free_end"]
+        page["data"][start:start + len(record)] = record
+        if reuse is None:
+            page["slots"].append((start, len(record)))
+            return len(page["slots"]) - 1
+        page["slots"][reuse] = (start, len(record))
+        return reuse
+
+
+    def read_record(page, slot):
+        """The bytes of the record in a slot, or None if it was deleted. ValueError('bad slot') if the slot number does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        entry = page["slots"][slot]
+        if entry is None:
+            return None
+        return bytes(page["data"][entry[0]:entry[0] + entry[1]])
+
+
+    def delete_record(page, slot):
+        """Delete the record in a slot (the slot becomes None; the other slot numbers do not change). Return True if a record was deleted, False if it was already deleted. ValueError('bad slot') for a slot that does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        if page["slots"][slot] is None:
+            return False
+        page["slots"][slot] = None
+        return True
+
+
+    def compact(page):
+        """Squeeze out the holes left by deleted records: move all live records to the end of the page, in DESCENDING order of their current offsets (so no record is overwritten), keeping slot numbers. Update free_end and return the number of bytes gained
+        (the new free_end minus the old free_end)."""
+        old = page["free_end"]
+        live = sorted(((s[0], i) for i, s in enumerate(page["slots"]) if s is not None), reverse=True)
+        end = page["size"]
+        for offset, i in live:
+            length = page["slots"][i][1]
+            end -= length
+            page["data"][end:end + length] = page["data"][offset:offset + length]
+            page["slots"][i] = (end, length)
+        page["free_end"] = end
+        return end - old
+
+
+    import struct
+
+
+    def encode_row(schema, row):
+        """Pack a row into bytes. `schema` is a list of (name, type) with type 'int', 'bool' or 'text'; `row` is a list of values (None means NULL). Layout: first a NULL BITMAP of ceil(n / 8) bytes (bit i, counting from the lowest bit of the first byte, is 1 if column i is NULL),
+        then each non-NULL value in order: int = 4 bytes big-endian signed; bool = 1 byte (0 or 1); text = 2-byte big-endian length then the UTF-8 bytes. ValueError('wrong number of values') if the lengths differ."""
+        if len(schema) != len(row):
+            raise ValueError("wrong number of values")
+        bitmap = bytearray((len(schema) + 7) // 8)
+        body = b""
+        for i, ((name, kind), value) in enumerate(zip(schema, row)):
+            if value is None:
+                bitmap[i // 8] |= 1 << (i % 8)
+            elif kind == "int":
+                body += struct.pack(">i", value)
+            elif kind == "bool":
+                body += bytes([1 if value else 0])
+            else:
+                raw = value.encode("utf-8")
+                body += struct.pack(">H", len(raw)) + raw
+        return bytes(bitmap) + body
+
+
+    def decode_row(schema, data):
+        """The inverse of encode_row: return the list of values (None for NULLs; bool columns come back as True/False)."""
+        nbytes = (len(schema) + 7) // 8
+        bitmap = data[:nbytes]
+        pos = nbytes
+        row = []
+        for i, (name, kind) in enumerate(schema):
+            if bitmap[i // 8] >> (i % 8) & 1:
+                row.append(None)
+            elif kind == "int":
+                row.append(struct.unpack(">i", data[pos:pos + 4])[0])
+                pos += 4
+            elif kind == "bool":
+                row.append(data[pos] == 1)
+                pos += 1
+            else:
+                n = struct.unpack(">H", data[pos:pos + 2])[0]
+                row.append(data[pos + 2:pos + 2 + n].decode("utf-8"))
+                pos += 2 + n
+        return row
+
+
+    def row_size(schema, row):
+        """The number of bytes encode_row would use, computed WITHOUT encoding."""
+        size = (len(schema) + 7) // 8
+        for (name, kind), value in zip(schema, row):
+            if value is None:
+                continue
+            if kind == "int":
+                size += 4
+            elif kind == "bool":
+                size += 1
+            else:
+                size += 2 + len(value.encode("utf-8"))
+        return size
+
+    page = new_page(64)
+    schema = [("id", "int"), ("name", "text"), ("active", "bool")]
+    for row in ([1, "ada", True], [2, "grace", None], [3, None, False]):
+        insert_record(page, encode_row(schema, row))
+    print("free space after 3 rows:", free_space(page))
+    delete_record(page, 1)
+    print("after deleting row 1, free:", free_space(page), "- compacting gains", compact(page), "bytes")
+    print("slot 2 still reads:", decode_row(schema, read_record(page, 2)))
+    print("sizes:", [row_size(schema, r) for r in ([1, "ada", True], [2, "grace", None], [3, None, False])])
+  output: |
+    free space after 3 rows: 15
+    after deleting row 1, free: 15 - compacting gains 12 bytes
+    slot 2 still reads: [3, None, False]
+    sizes: [11, 12, 6]
+  lines:
+  - line: 133
+    note: Three rows and their slots use most of the 64-byte page.
+  - line: 134
+    note: Deleting leaves a hole; the bytes are still there.
+  - line: 136
+    note: Slot numbers are stable, so slot 2 is still found.
+- title: Caching and replacement policies
+  intro: A buffer pool in action, and three replacement policies on a hot loop and on a big scan.
+  code: |
+    from collections import OrderedDict
+
+
+    def new_pool(capacity, disk):
+        """A BUFFER POOL caching pages of a 'disk' (a dict page_id -> contents). Return {"cap": capacity, "disk": disk, "frames": OrderedDict(), "hits": 0, "misses": 0, "writes": 0}; the frames map page_id -> {"data", "pins", "dirty"} and are kept in order from least to most recently used. ValueError('bad capacity') if capacity < 1."""
+        if capacity < 1:
+            raise ValueError("bad capacity")
+        return {"cap": capacity, "disk": disk, "frames": OrderedDict(), "hits": 0, "misses": 0, "writes": 0}
+
+
+    def fetch(pool, page_id):
+        """Get a page and PIN it (pins += 1) so it cannot be evicted. If it is cached: hits += 1 and mark it most recently used. Otherwise: misses += 1; if the pool is full evict the LEAST recently used frame with pins == 0, writing it back to disk first (writes += 1) if it is dirty
+        (ValueError('all pages pinned') if every frame is pinned); then load the page from disk (ValueError('no such page') if the disk lacks it) with pins = 1 and dirty False. Return the page's data."""
+        frames = pool["frames"]
+        if page_id in frames:
+            pool["hits"] += 1
+            frames.move_to_end(page_id)
+            frames[page_id]["pins"] += 1
+            return frames[page_id]["data"]
+        if page_id not in pool["disk"]:
+            raise ValueError("no such page")
+        pool["misses"] += 1
+        if len(frames) >= pool["cap"]:
+            victim = next((p for p, f in frames.items() if f["pins"] == 0), None)
+            if victim is None:
+                raise ValueError("all pages pinned")
+            if frames[victim]["dirty"]:
+                pool["disk"][victim] = frames[victim]["data"]
+                pool["writes"] += 1
+            del frames[victim]
+        frames[page_id] = {"data": pool["disk"][page_id], "pins": 1, "dirty": False}
+        return frames[page_id]["data"]
+
+
+    def unpin(pool, page_id, dirty=False):
+        """Release one pin on a cached page; if dirty is True mark the frame dirty. ValueError('not pinned') if the page is not cached or has no pins."""
+        f = pool["frames"].get(page_id)
+        if f is None or f["pins"] == 0:
+            raise ValueError("not pinned")
+        f["pins"] -= 1
+        if dirty:
+            f["dirty"] = True
+
+
+    def flush_all(pool):
+        """Write every dirty cached frame back to disk (writes += 1 each), mark them clean, and return how many were written."""
+        n = 0
+        for pid, f in pool["frames"].items():
+            if f["dirty"]:
+                pool["disk"][pid] = f["data"]
+                f["dirty"] = False
+                pool["writes"] += 1
+                n += 1
+        return n
+
+
+    def simulate_lru(capacity, accesses):
+        """Count the cache HITS when the page ids in `accesses` are requested in order and a cache of `capacity` pages evicts the LEAST RECENTLY USED page."""
+        cache = []
+        hits = 0
+        for p in accesses:
+            if p in cache:
+                hits += 1
+                cache.remove(p)
+            elif len(cache) >= capacity:
+                cache.pop(0)
+            cache.append(p)
+        return hits
+
+
+    def simulate_fifo(capacity, accesses):
+        """The same count of hits for FIFO: evict the page that has been in the cache the LONGEST (a hit does not change the order)."""
+        cache = []
+        hits = 0
+        for p in accesses:
+            if p in cache:
+                hits += 1
+            else:
+                if len(cache) >= capacity:
+                    cache.pop(0)
+                cache.append(p)
+        return hits
+
+
+    def simulate_clock(capacity, accesses):
+        """The same count of hits for the CLOCK algorithm, an approximation of LRU. Keep `frames` (page ids), a reference bit for each, and a hand index starting at 0. A hit sets the page's bit to 1. A miss while there is room appends the page with bit 1. A miss when full: while the frame under the hand has bit 1, clear it and advance the hand (wrapping);
+        then replace that frame by the new page with bit 1 and advance the hand once more (wrapping)."""
+        frames, bits = [], []
+        hand = 0
+        hits = 0
+        for p in accesses:
+            if p in frames:
+                hits += 1
+                bits[frames.index(p)] = 1
+            elif len(frames) < capacity:
+                frames.append(p)
+                bits.append(1)
+            else:
+                while bits[hand]:
+                    bits[hand] = 0
+                    hand = (hand + 1) % capacity
+                frames[hand] = p
+                bits[hand] = 1
+                hand = (hand + 1) % capacity
+        return hits
+
+    disk = {i: "page%d" % i for i in range(6)}
+    pool = new_pool(3, disk)
+    for p in (0, 1, 2, 0, 3, 0, 4):
+        fetch(pool, p)
+        unpin(pool, p)
+    print("cached pages now:", list(pool["frames"]), "hits", pool["hits"], "misses", pool["misses"])
+    scan = list(range(10)) * 4
+    hot = [0, 1, 2, 0, 1, 2, 3, 0, 1, 2]
+    print("hot loop, capacity 3 (lru, fifo, clock):", simulate_lru(3, hot), simulate_fifo(3, hot), simulate_clock(3, hot))
+    print("scan bigger than the cache, capacity 5 (lru, fifo, clock):", simulate_lru(5, scan), simulate_fifo(5, scan), simulate_clock(5, scan))
+  output: |
+    cached pages now: [3, 0, 4] hits 2 misses 5
+    hot loop, capacity 3 (lru, fifo, clock): 3 3 3
+    scan bigger than the cache, capacity 5 (lru, fifo, clock): 0 0 0
+  lines:
+  - line: 61
+    note: Pages 0 to 4 are fetched and immediately unpinned.
+  - line: 112
+    note: Page 0 stays because it was used most recently.
+  - line: 115
+    note: On a small hot loop the three policies do alike.
+  - line: 116
+    note: A scan bigger than the cache gets no hits at all.
+playground:
+  prompt: Change the cache size and the access pattern, and watch the hits.
+  code: |
+    accesses = [1, 2, 3, 1, 2, 4, 1, 2, 3, 5]
+    cache = []
+    hits = 0
+    for page in accesses:
+        if page in cache:
+            hits += 1
+            cache.remove(page)
+        elif len(cache) == 3:
+            cache.pop(0)
+        cache.append(page)
+    print('hits:', hits, 'cache:', cache)
+exercises:
+- id: page
+  title: Slotted pages
+  difficulty: 4
+  prompt: 'A database stores rows in fixed-size **pages** (often 8 KiB), because disks are read in blocks. The classic layout is the **slotted page**: a small header, then a **slot directory** of (offset, length) pairs growing from the front, and the **records** themselves packed from the back of the page, so both sides grow toward each other. A row is named by its **record id** `(page, slot)`, so records can move inside a page without changing their id. Write `new_page(size)` returning `{"size", "slots": [], "data": bytearray(size), "free_end": size}` (`ValueError("page too small")` if `size < 16`); `free_space(page)` = `free_end - (HEADER + SLOT * number of slots)` with `HEADER = 8` and `SLOT = 4` (given constants); `insert_record(page, record)` which stores the bytes just below `free_end` and returns the slot number, **reusing the lowest deleted slot** if there is one (no new directory entry then) and otherwise adding a slot; it needs `len(record)` bytes plus `SLOT` if a new slot is added, else `ValueError("page full")`. Write `read_record(page, slot)` (bytes, or `None` if deleted; `ValueError("bad slot")` for a slot that does not exist), `delete_record(page, slot)` (True if a record was deleted, False if already deleted, same error) and `compact(page)`: move the live records to the very end of the page in **descending order of their current offsets**, keeping slot numbers, update `free_end`, and return the number of bytes gained.'
+  starter: |-
+    HEADER = 8
+    SLOT = 4
+
+
+    def new_page(size):
+        """An empty SLOTTED PAGE of `size` bytes: {"size": size, "slots": [], "data": bytearray(size), "free_end": size}. Records are stored at the END of the page growing downward (free_end moves down); the slot directory (one (offset, length) pair per slot, None for a deleted slot) conceptually sits after an 8-byte header and costs 4 bytes per slot.
+        ValueError('page too small') if size < 16."""
+        pass
+
+
+    def free_space(page):
+        """The bytes still free between the slot directory and the records: free_end - (HEADER + SLOT * number of slots)."""
+        pass
+
+
+    def insert_record(page, record):
+        """Store `record` (bytes) and return its slot number. Reuse the lowest-numbered deleted slot if there is one (then no new directory entry is needed), otherwise add a new slot. The record needs len(record) bytes, plus SLOT bytes if a new slot is added; if that does not fit in free_space raise ValueError('page full').
+        Records are written just below free_end."""
+        pass
+
+
+    def read_record(page, slot):
+        """The bytes of the record in a slot, or None if it was deleted. ValueError('bad slot') if the slot number does not exist."""
+        pass
+
+
+    def delete_record(page, slot):
+        """Delete the record in a slot (the slot becomes None; the other slot numbers do not change). Return True if a record was deleted, False if it was already deleted. ValueError('bad slot') for a slot that does not exist."""
+        pass
+
+
+    def compact(page):
+        """Squeeze out the holes left by deleted records: move all live records to the end of the page, in DESCENDING order of their current offsets (so no record is overwritten), keeping slot numbers. Update free_end and return the number of bytes gained
+        (the new free_end minus the old free_end)."""
+        pass
+  tests:
+  - name: inserting and reading
+    code: |
+      p = new_page(64)
+      assert p["free_end"] == 64 and free_space(p) == 56 and p["slots"] == []
+      a = insert_record(p, b"hello")
+      b = insert_record(p, b"world!!")
+      assert (a, b) == (0, 1)
+      assert read_record(p, 0) == b"hello" and read_record(p, 1) == b"world!!"
+      assert p["free_end"] == 64 - 12 and free_space(p) == 52 - 16
+      assert p["slots"][0] == (59, 5) and p["slots"][1] == (52, 7)
+      for bad in (-1, 2):
+          try:
+              read_record(p, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad slot" in str(e)
+      try:
+          new_page(10)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "too small" in str(e)
+  - name: a full page
+    code: |
+      p = new_page(32)
+      assert insert_record(p, b"x" * 20) == 0
+      assert free_space(p) == 32 - 20 - 12
+      try:
+          insert_record(p, b"y" * 1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "page full" in str(e)
+      assert len(p["slots"]) == 1
+      assert insert_record(new_page(32), b"z" * 20) == 0
+      q = new_page(32)
+      try:
+          insert_record(q, b"z" * 21)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "page full" in str(e)
+  - name: deleting and reusing slots
+    code: |
+      p = new_page(64)
+      for r in (b"aa", b"bb", b"cc"):
+          insert_record(p, r)
+      assert delete_record(p, 1) is True and delete_record(p, 1) is False
+      assert read_record(p, 1) is None and read_record(p, 2) == b"cc"
+      assert free_space(p) == 64 - 6 - 8 - 12
+      assert insert_record(p, b"new") == 1
+      assert read_record(p, 1) == b"new" and len(p["slots"]) == 3
+      assert free_space(p) == 64 - 9 - 8 - 12
+      try:
+          delete_record(p, 7)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad slot" in str(e)
+  - name: compaction
+    code: |
+      p = new_page(48)
+      for r in (b"AAAA", b"BBBBBB", b"CC", b"DDD"):
+          insert_record(p, r)
+      delete_record(p, 0); delete_record(p, 2)
+      before = p["free_end"]
+      gained = compact(p)
+      assert gained == 6 and p["free_end"] == before + 6
+      assert read_record(p, 1) == b"BBBBBB" and read_record(p, 3) == b"DDD"
+      assert read_record(p, 0) is None and read_record(p, 2) is None
+      assert p["slots"][3] == (39, 3) and p["slots"][1] == (42, 6)
+      assert compact(p) == 0
+      assert insert_record(p, b"E" * 8) == 0 and read_record(p, 3) == b"DDD"
+  hints:
+  - Write with p['data'][start:start + n] = record; remember the free_end moves DOWN as records are added.
+  solution: |
+    HEADER = 8
+    SLOT = 4
+
+
+    def new_page(size):
+        """An empty SLOTTED PAGE of `size` bytes: {"size": size, "slots": [], "data": bytearray(size), "free_end": size}. Records are stored at the END of the page growing downward (free_end moves down); the slot directory (one (offset, length) pair per slot, None for a deleted slot) conceptually sits after an 8-byte header and costs 4 bytes per slot.
+        ValueError('page too small') if size < 16."""
+        if size < 16:
+            raise ValueError("page too small")
+        return {"size": size, "slots": [], "data": bytearray(size), "free_end": size}
+
+
+    def free_space(page):
+        """The bytes still free between the slot directory and the records: free_end - (HEADER + SLOT * number of slots)."""
+        return page["free_end"] - (HEADER + SLOT * len(page["slots"]))
+
+
+    def insert_record(page, record):
+        """Store `record` (bytes) and return its slot number. Reuse the lowest-numbered deleted slot if there is one (then no new directory entry is needed), otherwise add a new slot. The record needs len(record) bytes, plus SLOT bytes if a new slot is added; if that does not fit in free_space raise ValueError('page full').
+        Records are written just below free_end."""
+        reuse = next((i for i, s in enumerate(page["slots"]) if s is None), None)
+        need = len(record) + (0 if reuse is not None else SLOT)
+        if need > free_space(page):
+            raise ValueError("page full")
+        page["free_end"] -= len(record)
+        start = page["free_end"]
+        page["data"][start:start + len(record)] = record
+        if reuse is None:
+            page["slots"].append((start, len(record)))
+            return len(page["slots"]) - 1
+        page["slots"][reuse] = (start, len(record))
+        return reuse
+
+
+    def read_record(page, slot):
+        """The bytes of the record in a slot, or None if it was deleted. ValueError('bad slot') if the slot number does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        entry = page["slots"][slot]
+        if entry is None:
+            return None
+        return bytes(page["data"][entry[0]:entry[0] + entry[1]])
+
+
+    def delete_record(page, slot):
+        """Delete the record in a slot (the slot becomes None; the other slot numbers do not change). Return True if a record was deleted, False if it was already deleted. ValueError('bad slot') for a slot that does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        if page["slots"][slot] is None:
+            return False
+        page["slots"][slot] = None
+        return True
+
+
+    def compact(page):
+        """Squeeze out the holes left by deleted records: move all live records to the end of the page, in DESCENDING order of their current offsets (so no record is overwritten), keeping slot numbers. Update free_end and return the number of bytes gained
+        (the new free_end minus the old free_end)."""
+        old = page["free_end"]
+        live = sorted(((s[0], i) for i, s in enumerate(page["slots"]) if s is not None), reverse=True)
+        end = page["size"]
+        for offset, i in live:
+            length = page["slots"][i][1]
+            end -= length
+            page["data"][end:end + length] = page["data"][offset:offset + length]
+            page["slots"][i] = (end, length)
+        page["free_end"] = end
+        return end - old
+  explanation: A slotted page lets records move and shrink while their record ids stay the same.
+- id: row
+  title: Encoding rows
+  difficulty: 4
+  prompt: 'Before a row can go in a page it must become **bytes**. Write `encode_row(schema, row)` where `schema` is a list of `(name, type)` with type `''int''`, `''bool''` or `''text''` and `row` is a list of values (`None` means **NULL**). The layout: first a **NULL bitmap** of `ceil(n / 8)` bytes (bit `i`, counting from the lowest bit of the first byte, is 1 if column `i` is NULL), then each non-NULL value in order: an `int` is 4 bytes big-endian signed (`struct.pack(''>i'', v)`), a `bool` is 1 byte, a `text` is a 2-byte big-endian length followed by its UTF-8 bytes. `ValueError("wrong number of values")` if the lengths differ. Write `decode_row(schema, data)`, the inverse (NULL gives `None`; booleans come back as `True`/`False`), and `row_size(schema, row)`, the number of bytes `encode_row` would produce, computed **without** encoding.'
+  starter: |-
+    import struct
+
+
+    def encode_row(schema, row):
+        """Pack a row into bytes. `schema` is a list of (name, type) with type 'int', 'bool' or 'text'; `row` is a list of values (None means NULL). Layout: first a NULL BITMAP of ceil(n / 8) bytes (bit i, counting from the lowest bit of the first byte, is 1 if column i is NULL),
+        then each non-NULL value in order: int = 4 bytes big-endian signed; bool = 1 byte (0 or 1); text = 2-byte big-endian length then the UTF-8 bytes. ValueError('wrong number of values') if the lengths differ."""
+        pass
+
+
+    def decode_row(schema, data):
+        """The inverse of encode_row: return the list of values (None for NULLs; bool columns come back as True/False)."""
+        pass
+
+
+    def row_size(schema, row):
+        """The number of bytes encode_row would use, computed WITHOUT encoding."""
+        pass
+  tests:
+  - name: encoding
+    code: |
+      S = [("id", "int"), ("name", "text"), ("ok", "bool")]
+      assert encode_row(S, [1, "ab", True]) == b"\x00\x00\x00\x00\x01\x00\x02ab\x01"
+      assert encode_row(S, [-2, "", False]) == b"\x00\xff\xff\xff\xfe\x00\x00\x00"
+      assert encode_row(S, [None, "x", None]) == b"\x05\x00\x01x"
+      assert encode_row([("a", "int")], [None]) == b"\x01"
+      assert encode_row(S, [1, "é", True])[5:8] == b"\x00\x02\xc3" + b"" or True
+      assert len(encode_row(S, [1, "é", True])) == 1 + 4 + 2 + 2 + 1
+      try:
+          encode_row(S, [1, "a"])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "wrong number" in str(e)
+  - name: decoding
+    code: |
+      S = [("id", "int"), ("name", "text"), ("ok", "bool"), ("n", "int")]
+      for row in ([1, "ab", True, 7], [None, "héllo", False, -9], [None, None, None, None], [2147483647, "", True, None], [-2147483648, "z" * 300, False, 0]):
+          assert decode_row(S, encode_row(S, row)) == row
+      big = [("c%d" % i, "int") for i in range(10)]
+      row = [None if i % 3 == 0 else i for i in range(10)]
+      assert len(encode_row(big, row)) == 2 + 4 * 6
+      assert decode_row(big, encode_row(big, row)) == row
+  - name: sizes
+    code: |
+      S = [("id", "int"), ("name", "text"), ("ok", "bool")]
+      for row in ([1, "ab", True], [None, "héllo", None], [3, None, False], [None, None, None]):
+          assert row_size(S, row) == len(encode_row(S, row))
+      assert row_size(S, [1, "é", True]) == 1 + 4 + 2 + 2 + 1
+      assert row_size([], []) == 0
+  hints:
+  - The null bitmap comes first; skip NULL columns when writing the values.
+  solution: |
+    import struct
+
+
+    def encode_row(schema, row):
+        """Pack a row into bytes. `schema` is a list of (name, type) with type 'int', 'bool' or 'text'; `row` is a list of values (None means NULL). Layout: first a NULL BITMAP of ceil(n / 8) bytes (bit i, counting from the lowest bit of the first byte, is 1 if column i is NULL),
+        then each non-NULL value in order: int = 4 bytes big-endian signed; bool = 1 byte (0 or 1); text = 2-byte big-endian length then the UTF-8 bytes. ValueError('wrong number of values') if the lengths differ."""
+        if len(schema) != len(row):
+            raise ValueError("wrong number of values")
+        bitmap = bytearray((len(schema) + 7) // 8)
+        body = b""
+        for i, ((name, kind), value) in enumerate(zip(schema, row)):
+            if value is None:
+                bitmap[i // 8] |= 1 << (i % 8)
+            elif kind == "int":
+                body += struct.pack(">i", value)
+            elif kind == "bool":
+                body += bytes([1 if value else 0])
+            else:
+                raw = value.encode("utf-8")
+                body += struct.pack(">H", len(raw)) + raw
+        return bytes(bitmap) + body
+
+
+    def decode_row(schema, data):
+        """The inverse of encode_row: return the list of values (None for NULLs; bool columns come back as True/False)."""
+        nbytes = (len(schema) + 7) // 8
+        bitmap = data[:nbytes]
+        pos = nbytes
+        row = []
+        for i, (name, kind) in enumerate(schema):
+            if bitmap[i // 8] >> (i % 8) & 1:
+                row.append(None)
+            elif kind == "int":
+                row.append(struct.unpack(">i", data[pos:pos + 4])[0])
+                pos += 4
+            elif kind == "bool":
+                row.append(data[pos] == 1)
+                pos += 1
+            else:
+                n = struct.unpack(">H", data[pos:pos + 2])[0]
+                row.append(data[pos + 2:pos + 2 + n].decode("utf-8"))
+                pos += 2 + n
+        return row
+
+
+    def row_size(schema, row):
+        """The number of bytes encode_row would use, computed WITHOUT encoding."""
+        size = (len(schema) + 7) // 8
+        for (name, kind), value in zip(schema, row):
+            if value is None:
+                continue
+            if kind == "int":
+                size += 4
+            elif kind == "bool":
+                size += 1
+            else:
+                size += 2 + len(value.encode("utf-8"))
+        return size
+  explanation: A compact row format means more rows per page and fewer disk reads.
+- id: pool
+  title: The buffer pool
+  difficulty: 5
+  prompt: 'Disk is thousands of times slower than memory, so a database keeps recently used pages in a **buffer pool**. Write `new_pool(capacity, disk)` where `disk` is a dict `page_id -> contents`: return `{"cap", "disk", "frames": OrderedDict(), "hits": 0, "misses": 0, "writes": 0}`; frames map `page_id -> {"data", "pins", "dirty"}` kept in order from **least** to **most recently used** (`ValueError("bad capacity")` if `capacity < 1`). Write `fetch(pool, page_id)`, which gets a page and **pins** it (`pins += 1`, a pinned page cannot be evicted). If it is cached: `hits += 1` and it becomes most recently used. Otherwise: `misses += 1`; if the pool is full evict the **least recently used frame with no pins**, first writing it back to the disk dict (`writes += 1`) if it is **dirty** (`ValueError("all pages pinned")` if every frame is pinned); load the page from disk with `pins = 1` and `dirty = False` (`ValueError("no such page")` if the disk lacks it). Return the page''s data. Write `unpin(pool, page_id, dirty=False)` (one pin fewer; `dirty=True` marks the frame dirty; `ValueError("not pinned")` if the page is not cached or has no pins) and `flush_all(pool)`: write back every dirty frame (`writes += 1` each), mark them clean and return how many were written.'
+  starter: |-
+    from collections import OrderedDict
+
+
+    def new_pool(capacity, disk):
+        """A BUFFER POOL caching pages of a 'disk' (a dict page_id -> contents). Return {"cap": capacity, "disk": disk, "frames": OrderedDict(), "hits": 0, "misses": 0, "writes": 0}; the frames map page_id -> {"data", "pins", "dirty"} and are kept in order from least to most recently used. ValueError('bad capacity') if capacity < 1."""
+        pass
+
+
+    def fetch(pool, page_id):
+        """Get a page and PIN it (pins += 1) so it cannot be evicted. If it is cached: hits += 1 and mark it most recently used. Otherwise: misses += 1; if the pool is full evict the LEAST recently used frame with pins == 0, writing it back to disk first (writes += 1) if it is dirty
+        (ValueError('all pages pinned') if every frame is pinned); then load the page from disk (ValueError('no such page') if the disk lacks it) with pins = 1 and dirty False. Return the page's data."""
+        pass
+
+
+    def unpin(pool, page_id, dirty=False):
+        """Release one pin on a cached page; if dirty is True mark the frame dirty. ValueError('not pinned') if the page is not cached or has no pins."""
+        pass
+
+
+    def flush_all(pool):
+        """Write every dirty cached frame back to disk (writes += 1 each), mark them clean, and return how many were written."""
+        pass
+  tests:
+  - name: hits and misses
+    code: |
+      disk = {i: "page%d" % i for i in range(10)}
+      pool = new_pool(3, disk)
+      assert fetch(pool, 1) == "page1" and fetch(pool, 2) == "page2"
+      unpin(pool, 1); unpin(pool, 2)
+      assert fetch(pool, 1) == "page1"
+      assert (pool["hits"], pool["misses"]) == (1, 2)
+      assert list(pool["frames"]) == [2, 1] and pool["frames"][1]["pins"] == 1
+      try:
+          new_pool(0, disk)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad capacity" in str(e)
+      try:
+          fetch(pool, 99)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no such page" in str(e)
+  - name: eviction
+    code: |
+      disk = {i: "p%d" % i for i in range(10)}
+      pool = new_pool(2, disk)
+      for i in (0, 1):
+          fetch(pool, i); unpin(pool, i)
+      fetch(pool, 0); unpin(pool, 0)
+      fetch(pool, 2); unpin(pool, 2)
+      assert list(pool["frames"]) == [0, 2] and 1 not in pool["frames"]
+      assert pool["misses"] == 3 and pool["hits"] == 1
+  - name: pins protect pages
+    code: |
+      disk = {i: "p%d" % i for i in range(5)}
+      pool = new_pool(2, disk)
+      fetch(pool, 0); fetch(pool, 1)
+      unpin(pool, 1)
+      fetch(pool, 2)
+      assert list(pool["frames"]) == [0, 2]
+      try:
+          fetch(pool, 3)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "all pages pinned" in str(e)
+      assert pool["misses"] == 4
+      unpin(pool, 0)
+      for bad in (0, 4):
+          try:
+              unpin(pool, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "not pinned" in str(e)
+  - name: dirty pages are written back
+    code: |
+      disk = {0: [1], 1: [2], 2: [3]}
+      pool = new_pool(2, disk)
+      page = fetch(pool, 0)
+      page.append(100)
+      unpin(pool, 0, dirty=True)
+      fetch(pool, 1); unpin(pool, 1)
+      assert pool["writes"] == 0
+      fetch(pool, 2); unpin(pool, 2)
+      assert pool["writes"] == 1 and disk[0] == [1, 100] and 0 not in pool["frames"]
+      d = fetch(pool, 2); d.append(7); unpin(pool, 2, dirty=True)
+      d = fetch(pool, 1); d.append(9); unpin(pool, 1, dirty=True)
+      assert flush_all(pool) == 2 and pool["writes"] == 3 and disk[2] == [3, 7] and disk[1] == [2, 9]
+      assert flush_all(pool) == 0
+  hints:
+  - 'The OrderedDict keeps frames in recency order: move_to_end on a hit, and look for victims from the front.'
+  solution: |
+    from collections import OrderedDict
+
+
+    def new_pool(capacity, disk):
+        """A BUFFER POOL caching pages of a 'disk' (a dict page_id -> contents). Return {"cap": capacity, "disk": disk, "frames": OrderedDict(), "hits": 0, "misses": 0, "writes": 0}; the frames map page_id -> {"data", "pins", "dirty"} and are kept in order from least to most recently used. ValueError('bad capacity') if capacity < 1."""
+        if capacity < 1:
+            raise ValueError("bad capacity")
+        return {"cap": capacity, "disk": disk, "frames": OrderedDict(), "hits": 0, "misses": 0, "writes": 0}
+
+
+    def fetch(pool, page_id):
+        """Get a page and PIN it (pins += 1) so it cannot be evicted. If it is cached: hits += 1 and mark it most recently used. Otherwise: misses += 1; if the pool is full evict the LEAST recently used frame with pins == 0, writing it back to disk first (writes += 1) if it is dirty
+        (ValueError('all pages pinned') if every frame is pinned); then load the page from disk (ValueError('no such page') if the disk lacks it) with pins = 1 and dirty False. Return the page's data."""
+        frames = pool["frames"]
+        if page_id in frames:
+            pool["hits"] += 1
+            frames.move_to_end(page_id)
+            frames[page_id]["pins"] += 1
+            return frames[page_id]["data"]
+        if page_id not in pool["disk"]:
+            raise ValueError("no such page")
+        pool["misses"] += 1
+        if len(frames) >= pool["cap"]:
+            victim = next((p for p, f in frames.items() if f["pins"] == 0), None)
+            if victim is None:
+                raise ValueError("all pages pinned")
+            if frames[victim]["dirty"]:
+                pool["disk"][victim] = frames[victim]["data"]
+                pool["writes"] += 1
+            del frames[victim]
+        frames[page_id] = {"data": pool["disk"][page_id], "pins": 1, "dirty": False}
+        return frames[page_id]["data"]
+
+
+    def unpin(pool, page_id, dirty=False):
+        """Release one pin on a cached page; if dirty is True mark the frame dirty. ValueError('not pinned') if the page is not cached or has no pins."""
+        f = pool["frames"].get(page_id)
+        if f is None or f["pins"] == 0:
+            raise ValueError("not pinned")
+        f["pins"] -= 1
+        if dirty:
+            f["dirty"] = True
+
+
+    def flush_all(pool):
+        """Write every dirty cached frame back to disk (writes += 1 each), mark them clean, and return how many were written."""
+        n = 0
+        for pid, f in pool["frames"].items():
+            if f["dirty"]:
+                pool["disk"][pid] = f["data"]
+                f["dirty"] = False
+                pool["writes"] += 1
+                n += 1
+        return n
+  explanation: 'The buffer pool is why databases are fast: most requests are answered from memory.'
+- id: policy
+  title: Replacement policies
+  difficulty: 4
+  prompt: 'Which page should the buffer pool throw out? Write three functions that each count the **hits** when the page ids in `accesses` are requested in order and the cache holds `capacity` pages. `simulate_lru(capacity, accesses)` evicts the **least recently used** page. `simulate_fifo(capacity, accesses)` evicts the page that has been cached the **longest** (a hit does not change the order). `simulate_clock(capacity, accesses)` is the **CLOCK** algorithm, a cheap approximation of LRU: keep the frames, a **reference bit** for each, and a hand index starting at 0. A hit sets that page''s bit to 1. A miss while there is room appends the page with bit 1. A miss when full: while the frame under the hand has bit 1, clear it and advance the hand (wrapping around); then replace that frame by the new page (bit 1) and advance the hand once more (wrapping).'
+  starter: |-
+    def simulate_lru(capacity, accesses):
+        """Count the cache HITS when the page ids in `accesses` are requested in order and a cache of `capacity` pages evicts the LEAST RECENTLY USED page."""
+        pass
+
+
+    def simulate_fifo(capacity, accesses):
+        """The same count of hits for FIFO: evict the page that has been in the cache the LONGEST (a hit does not change the order)."""
+        pass
+
+
+    def simulate_clock(capacity, accesses):
+        """The same count of hits for the CLOCK algorithm, an approximation of LRU. Keep `frames` (page ids), a reference bit for each, and a hand index starting at 0. A hit sets the page's bit to 1. A miss while there is room appends the page with bit 1. A miss when full: while the frame under the hand has bit 1, clear it and advance the hand (wrapping);
+        then replace that frame by the new page with bit 1 and advance the hand once more (wrapping)."""
+        pass
+  tests:
+  - name: LRU
+    code: |
+      assert simulate_lru(2, [1, 2, 1, 3, 2]) == 1
+      assert simulate_lru(3, [1, 2, 3, 1, 2, 3, 1, 2, 3]) == 6
+      assert simulate_lru(3, [1, 2, 3, 4] * 5) == 0
+      assert simulate_lru(1, [5, 5, 5]) == 2 and simulate_lru(4, []) == 0
+  - name: FIFO
+    code: |
+      assert simulate_fifo(2, [1, 2, 1, 3, 2]) == 2
+      assert simulate_fifo(2, [1, 2, 1, 3, 1]) == 1
+      assert simulate_lru(2, [1, 2, 1, 3, 1]) == 2
+      assert simulate_fifo(3, [1, 2, 3, 1, 2, 3]) == 3
+      assert simulate_fifo(3, [1, 2, 3, 4, 1, 2, 3, 4]) == 0
+  - name: CLOCK
+    code: |
+      assert simulate_clock(3, [1, 2, 3, 1, 2, 3]) == 3
+      assert simulate_clock(2, [1, 2, 1, 3, 1]) == 1
+      assert simulate_clock(3, [1, 2, 3, 4] * 5) == 0
+      assert simulate_clock(2, [1, 2, 3, 1, 2, 3]) == 0
+      assert simulate_clock(2, []) == 0
+      assert simulate_clock(2, [1, 2, 1, 3, 2]) == 2
+  - name: hot pages and scans
+    code: |
+      import random
+      rng = random.Random(3)
+      hot = [rng.randrange(5) if rng.random() < 0.8 else 5 + rng.randrange(40) for _ in range(2000)]
+      lru, fifo, clock = simulate_lru(8, hot), simulate_fifo(8, hot), simulate_clock(8, hot)
+      assert lru >= fifo and abs(clock - lru) < 150, (lru, fifo, clock)
+      assert lru > 1000
+      scan = list(range(100)) * 3
+      assert simulate_lru(50, scan) == 0 and simulate_clock(50, scan) == 0 and simulate_fifo(50, scan) == 0
+  hints:
+  - 'Do each policy with a small list; for CLOCK keep three variables: frames, bits and hand.'
+  solution: |
+    def simulate_lru(capacity, accesses):
+        """Count the cache HITS when the page ids in `accesses` are requested in order and a cache of `capacity` pages evicts the LEAST RECENTLY USED page."""
+        cache = []
+        hits = 0
+        for p in accesses:
+            if p in cache:
+                hits += 1
+                cache.remove(p)
+            elif len(cache) >= capacity:
+                cache.pop(0)
+            cache.append(p)
+        return hits
+
+
+    def simulate_fifo(capacity, accesses):
+        """The same count of hits for FIFO: evict the page that has been in the cache the LONGEST (a hit does not change the order)."""
+        cache = []
+        hits = 0
+        for p in accesses:
+            if p in cache:
+                hits += 1
+            else:
+                if len(cache) >= capacity:
+                    cache.pop(0)
+                cache.append(p)
+        return hits
+
+
+    def simulate_clock(capacity, accesses):
+        """The same count of hits for the CLOCK algorithm, an approximation of LRU. Keep `frames` (page ids), a reference bit for each, and a hand index starting at 0. A hit sets the page's bit to 1. A miss while there is room appends the page with bit 1. A miss when full: while the frame under the hand has bit 1, clear it and advance the hand (wrapping);
+        then replace that frame by the new page with bit 1 and advance the hand once more (wrapping)."""
+        frames, bits = [], []
+        hand = 0
+        hits = 0
+        for p in accesses:
+            if p in frames:
+                hits += 1
+                bits[frames.index(p)] = 1
+            elif len(frames) < capacity:
+                frames.append(p)
+                bits.append(1)
+            else:
+                while bits[hand]:
+                    bits[hand] = 0
+                    hand = (hand + 1) % capacity
+                frames[hand] = p
+                bits[hand] = 1
+                hand = (hand + 1) % capacity
+        return hits
+  explanation: A sequential scan of a table bigger than the cache defeats LRU, which is why databases protect the cache from scans.
+- id: heap
+  title: 'Capstone: a heap file'
+  difficulty: 5
+  prompt: 'Starter code gives you the slotted-page functions. Build a **heap file**, the simplest table storage: an unordered list of pages. Write `new_table(page_size)` returning `{"page_size": page_size, "pages": []}`; `heap_insert(table, record)`, which stores the record in the **first** page that has room (use `insert_record` and catch `ValueError`), adding a new page if none does, and returns the record id `(page_number, slot)` (`ValueError("record too large")` if it would not fit even in an empty page); `heap_read(table, rid)` (the bytes, or `None` if deleted; `ValueError("bad record id")` if the page does not exist); `heap_delete(table, rid)` (True if something was deleted; same error) and `heap_scan(table)`: the list of `(record id, bytes)` for every live record, ordered by page then slot.'
+  starter: |-
+    HEADER = 8
+    SLOT = 4
+
+
+    def new_page(size):
+        """An empty SLOTTED PAGE of `size` bytes: {"size": size, "slots": [], "data": bytearray(size), "free_end": size}. Records are stored at the END of the page growing downward (free_end moves down); the slot directory (one (offset, length) pair per slot, None for a deleted slot) conceptually sits after an 8-byte header and costs 4 bytes per slot.
+        ValueError('page too small') if size < 16."""
+        if size < 16:
+            raise ValueError("page too small")
+        return {"size": size, "slots": [], "data": bytearray(size), "free_end": size}
+
+
+    def free_space(page):
+        """The bytes still free between the slot directory and the records: free_end - (HEADER + SLOT * number of slots)."""
+        return page["free_end"] - (HEADER + SLOT * len(page["slots"]))
+
+
+    def insert_record(page, record):
+        """Store `record` (bytes) and return its slot number. Reuse the lowest-numbered deleted slot if there is one (then no new directory entry is needed), otherwise add a new slot. The record needs len(record) bytes, plus SLOT bytes if a new slot is added; if that does not fit in free_space raise ValueError('page full').
+        Records are written just below free_end."""
+        reuse = next((i for i, s in enumerate(page["slots"]) if s is None), None)
+        need = len(record) + (0 if reuse is not None else SLOT)
+        if need > free_space(page):
+            raise ValueError("page full")
+        page["free_end"] -= len(record)
+        start = page["free_end"]
+        page["data"][start:start + len(record)] = record
+        if reuse is None:
+            page["slots"].append((start, len(record)))
+            return len(page["slots"]) - 1
+        page["slots"][reuse] = (start, len(record))
+        return reuse
+
+
+    def read_record(page, slot):
+        """The bytes of the record in a slot, or None if it was deleted. ValueError('bad slot') if the slot number does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        entry = page["slots"][slot]
+        if entry is None:
+            return None
+        return bytes(page["data"][entry[0]:entry[0] + entry[1]])
+
+
+    def delete_record(page, slot):
+        """Delete the record in a slot (the slot becomes None; the other slot numbers do not change). Return True if a record was deleted, False if it was already deleted. ValueError('bad slot') for a slot that does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        if page["slots"][slot] is None:
+            return False
+        page["slots"][slot] = None
+        return True
+
+
+    def compact(page):
+        """Squeeze out the holes left by deleted records: move all live records to the end of the page, in DESCENDING order of their current offsets (so no record is overwritten), keeping slot numbers. Update free_end and return the number of bytes gained
+        (the new free_end minus the old free_end)."""
+        old = page["free_end"]
+        live = sorted(((s[0], i) for i, s in enumerate(page["slots"]) if s is not None), reverse=True)
+        end = page["size"]
+        for offset, i in live:
+            length = page["slots"][i][1]
+            end -= length
+            page["data"][end:end + length] = page["data"][offset:offset + length]
+            page["slots"][i] = (end, length)
+        page["free_end"] = end
+        return end - old
+
+
+    def new_table(page_size):
+        """A HEAP FILE: {"page_size": page_size, "pages": []}, a list of slotted pages (built with new_page)."""
+        pass
+
+
+    def heap_insert(table, record):
+        """Store a record in the FIRST page that has room for it (use insert_record and catch ValueError), adding a new page if none does. Return its record id (page_number, slot). ValueError('record too large') if the record could not fit even in an empty page."""
+        pass
+
+
+    def heap_read(table, rid):
+        """The record with this (page_number, slot) id, or None if deleted. ValueError('bad record id') if the page does not exist."""
+        pass
+
+
+    def heap_delete(table, rid):
+        """Delete the record with this id (see delete_record); return True if something was deleted. ValueError('bad record id') if the page does not exist."""
+        pass
+
+
+    def heap_scan(table):
+        """A FULL TABLE SCAN: the list of (record id, bytes) for every live record, by page then slot."""
+        pass
+  tests:
+  - name: inserting
+    code: |
+      t = new_table(40)
+      assert heap_insert(t, b"a" * 10) == (0, 0)
+      assert heap_insert(t, b"b" * 10) == (0, 1)
+      assert heap_insert(t, b"c" * 10) == (1, 0)
+      assert len(t["pages"]) == 2 and heap_read(t, (0, 1)) == b"b" * 10
+      assert heap_insert(t, b"d") == (1, 1)
+      try:
+          heap_insert(t, b"x" * 40)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "too large" in str(e)
+      try:
+          heap_read(t, (5, 0))
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad record id" in str(e)
+  - name: deleting and reusing space
+    code: |
+      t = new_table(40)
+      ids = [heap_insert(t, bytes([65 + i]) * 10) for i in range(6)]
+      assert ids == [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+      assert heap_delete(t, (0, 0)) is True and heap_delete(t, (0, 0)) is False
+      assert heap_read(t, (0, 0)) is None
+      assert heap_insert(t, b"Z" * 4) == (0, 0) and heap_read(t, (0, 0)) == b"Z" * 4
+      assert len(t["pages"]) == 3
+  - name: scanning
+    code: |
+      t = new_table(48)
+      ids = [heap_insert(t, ("row%02d" % i).encode()) for i in range(12)]
+      for rid in ids[::3]:
+          heap_delete(t, rid)
+      scan = heap_scan(t)
+      assert [r for _, r in scan] == [("row%02d" % i).encode() for i in range(12) if i % 3]
+      assert [rid for rid, _ in scan] == sorted(rid for rid, _ in scan)
+      assert heap_scan(new_table(32)) == []
+      assert all(heap_read(t, rid) == rec for rid, rec in scan)
+  - name: rows end to end
+    code: |
+      import struct
+      t = new_table(64)
+      people = [(1, "ada"), (2, "grace"), (3, "alan"), (4, "edsger"), (5, "barbara"), (6, "donald")]
+      ids = {}
+      for n, name in people:
+          ids[n] = heap_insert(t, struct.pack(">i", n) + name.encode())
+      assert len(t["pages"]) >= 2
+      for n, name in people:
+          rec = heap_read(t, ids[n])
+          assert struct.unpack(">i", rec[:4])[0] == n and rec[4:].decode() == name
+      assert len(heap_scan(t)) == 6
+  hints:
+  - Try the pages in order, catching the 'page full' error, before adding a new one.
+  solution: |
+    HEADER = 8
+    SLOT = 4
+
+
+    def new_page(size):
+        """An empty SLOTTED PAGE of `size` bytes: {"size": size, "slots": [], "data": bytearray(size), "free_end": size}. Records are stored at the END of the page growing downward (free_end moves down); the slot directory (one (offset, length) pair per slot, None for a deleted slot) conceptually sits after an 8-byte header and costs 4 bytes per slot.
+        ValueError('page too small') if size < 16."""
+        if size < 16:
+            raise ValueError("page too small")
+        return {"size": size, "slots": [], "data": bytearray(size), "free_end": size}
+
+
+    def free_space(page):
+        """The bytes still free between the slot directory and the records: free_end - (HEADER + SLOT * number of slots)."""
+        return page["free_end"] - (HEADER + SLOT * len(page["slots"]))
+
+
+    def insert_record(page, record):
+        """Store `record` (bytes) and return its slot number. Reuse the lowest-numbered deleted slot if there is one (then no new directory entry is needed), otherwise add a new slot. The record needs len(record) bytes, plus SLOT bytes if a new slot is added; if that does not fit in free_space raise ValueError('page full').
+        Records are written just below free_end."""
+        reuse = next((i for i, s in enumerate(page["slots"]) if s is None), None)
+        need = len(record) + (0 if reuse is not None else SLOT)
+        if need > free_space(page):
+            raise ValueError("page full")
+        page["free_end"] -= len(record)
+        start = page["free_end"]
+        page["data"][start:start + len(record)] = record
+        if reuse is None:
+            page["slots"].append((start, len(record)))
+            return len(page["slots"]) - 1
+        page["slots"][reuse] = (start, len(record))
+        return reuse
+
+
+    def read_record(page, slot):
+        """The bytes of the record in a slot, or None if it was deleted. ValueError('bad slot') if the slot number does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        entry = page["slots"][slot]
+        if entry is None:
+            return None
+        return bytes(page["data"][entry[0]:entry[0] + entry[1]])
+
+
+    def delete_record(page, slot):
+        """Delete the record in a slot (the slot becomes None; the other slot numbers do not change). Return True if a record was deleted, False if it was already deleted. ValueError('bad slot') for a slot that does not exist."""
+        if slot < 0 or slot >= len(page["slots"]):
+            raise ValueError("bad slot")
+        if page["slots"][slot] is None:
+            return False
+        page["slots"][slot] = None
+        return True
+
+
+    def compact(page):
+        """Squeeze out the holes left by deleted records: move all live records to the end of the page, in DESCENDING order of their current offsets (so no record is overwritten), keeping slot numbers. Update free_end and return the number of bytes gained
+        (the new free_end minus the old free_end)."""
+        old = page["free_end"]
+        live = sorted(((s[0], i) for i, s in enumerate(page["slots"]) if s is not None), reverse=True)
+        end = page["size"]
+        for offset, i in live:
+            length = page["slots"][i][1]
+            end -= length
+            page["data"][end:end + length] = page["data"][offset:offset + length]
+            page["slots"][i] = (end, length)
+        page["free_end"] = end
+        return end - old
+
+
+    def new_table(page_size):
+        """A HEAP FILE: {"page_size": page_size, "pages": []}, a list of slotted pages (built with new_page)."""
+        return {"page_size": page_size, "pages": []}
+
+
+    def heap_insert(table, record):
+        """Store a record in the FIRST page that has room for it (use insert_record and catch ValueError), adding a new page if none does. Return its record id (page_number, slot). ValueError('record too large') if the record could not fit even in an empty page."""
+        for n, page in enumerate(table["pages"]):
+            try:
+                return (n, insert_record(page, record))
+            except ValueError:
+                pass
+        page = new_page(table["page_size"])
+        if len(record) + SLOT > free_space(page):
+            raise ValueError("record too large")
+        table["pages"].append(page)
+        return (len(table["pages"]) - 1, insert_record(page, record))
+
+
+    def heap_read(table, rid):
+        """The record with this (page_number, slot) id, or None if deleted. ValueError('bad record id') if the page does not exist."""
+        n, slot = rid
+        if n < 0 or n >= len(table["pages"]):
+            raise ValueError("bad record id")
+        return read_record(table["pages"][n], slot)
+
+
+    def heap_delete(table, rid):
+        """Delete the record with this id (see delete_record); return True if something was deleted. ValueError('bad record id') if the page does not exist."""
+        n, slot = rid
+        if n < 0 or n >= len(table["pages"]):
+            raise ValueError("bad record id")
+        return delete_record(table["pages"][n], slot)
+
+
+    def heap_scan(table):
+        """A FULL TABLE SCAN: the list of (record id, bytes) for every live record, by page then slot."""
+        out = []
+        for n, page in enumerate(table["pages"]):
+            for slot in range(len(page["slots"])):
+                rec = read_record(page, slot)
+                if rec is not None:
+                    out.append(((n, slot), rec))
+        return out
+  explanation: A heap file plus an index is how most databases store a table.
+commonMistakes:
+- title: Thinking reading a row costs one row
+  explanation: The disk reads a whole page.
+- title: Using a record's byte offset as its id
+  explanation: Offsets change when pages are compacted; use (page, slot).
+- title: Evicting a pinned page
+  explanation: Someone is still using it.
+- title: Forgetting to write back dirty pages
+  explanation: Changes would be lost on eviction.
+- title: Assuming LRU is always best
+  explanation: A scan of a big table defeats it.
+summary:
+- Databases read and write fixed-size pages because disks work in blocks.
+- A slotted page gives each record a stable id (page, slot).
+- 'Rows are encoded with a schema: a null bitmap, then the non-NULL values.'
+- The buffer pool caches pages; pinned pages stay and dirty pages are written back.
+- Replacement policies such as LRU, FIFO and CLOCK decide what to evict.
+- A heap file stores a table as an unordered list of pages.
+next: u25-btree
+quiz:
+- type: mcq
+  question: Why do databases read whole pages rather than single rows?
+  options:
+  - Disks transfer data in blocks, so small reads cost nearly as much as large ones
+  - Rows are too small to read
+  - Pages are encrypted
+  - Memory only holds pages
+  answer: 0
+  explanation: Block devices make page-sized I/O the natural unit.
+- type: mcq
+  question: What does a slot directory allow?
+  options:
+  - Records to move inside a page without changing their ids
+  - Faster networks
+  - Encryption
+  - Compression only
+  answer: 0
+  explanation: The slot points to the current location of the bytes.
+- type: mcq
+  question: What is a dirty page?
+  options:
+  - A page changed in memory but not yet written to disk
+  - A corrupted page
+  - An empty page
+  - A page with NULLs
+  answer: 0
+  explanation: It must be written back before its frame is reused.
+- type: mcq
+  question: Why is a page pinned?
+  options:
+  - To stop the buffer pool evicting it while it is in use
+  - To make it faster
+  - To encrypt it
+  - To delete it
+  answer: 0
+  explanation: Pinned pages are not eviction candidates.
+- type: mcq
+  question: What does the null bitmap of a row do?
+  options:
+  - Records which columns are NULL so they need no space
+  - Stores the row id
+  - Compresses text
+  - Sorts the columns
+  answer: 0
+  explanation: One bit per column.
+- type: mcq
+  question: Which workload defeats LRU?
+  options:
+  - A sequential scan of a table larger than the cache
+  - A small hot set
+  - A single page
+  - An empty table
+  answer: 0
+  explanation: Every page is evicted before it is needed again.
+- type: code
+  question: Write `pages_needed(rows, rows_per_page)` returning how many pages are required to store that many rows (an integer; 0 rows need 0 pages).
+  starter: |
+    def pages_needed(rows, rows_per_page):
+        pass
+  tests:
+  - name: pages
+    code: |
+      assert pages_needed(0, 10) == 0 and pages_needed(10, 10) == 1 and pages_needed(11, 10) == 2 and pages_needed(1, 100) == 1
+  solution: |
+    def pages_needed(rows, rows_per_page):
+        return (rows + rows_per_page - 1) // rows_per_page

@@ -1,0 +1,905 @@
+id: u25-optimizer
+title: The Query Optimizer
+minutes: 100
+objective: Learn how a database chooses among thousands of ways to run a query. You will compute statistics and selectivity, build a page-read cost model, use histograms for skewed data, choose a join order and rewrite plans by pushing filters down.
+outcomes:
+- Explain what a query optimizer does
+- Estimate how many rows a condition matches
+- Compare an index scan with a full scan using costs
+- Use histograms to estimate skewed data
+- Choose a join order that keeps intermediate results small
+- Rewrite plans by filter push-down
+sections:
+- heading: Many ways to answer one question
+  body: 'SQL says *what* you want, never *how*, so the database must pick a plan. Even a simple query has options: read the whole table, or use an index? And a join of five tables can be done in 120 different orders, using several join algorithms for each step, giving millions of possible plans whose speeds can differ by factors of a million. The **query optimizer** is the component that searches for a good plan. It cannot try every plan by actually running it, so it **estimates** the cost of each plan and picks the cheapest. Its estimates come from **statistics** that the database collects about every table.'
+- heading: Statistics and selectivity
+  body: |-
+    For each column the database remembers the number of rows, the number of **distinct** values, the smallest and largest values, and the number of NULLs. From these it computes the **selectivity** of a condition: the fraction of rows that pass. If a column has 100 distinct values, `col = 5` is expected to match about 1/100 of the rows. If values run from 0 to 100 evenly, `col < 25` matches about a quarter. With several conditions the optimizer usually multiplies the selectivities, assuming the columns are **independent**. That assumption is often false (city and postal code are strongly related), which is a classic source of bad estimates.
+
+    Real data is rarely uniform, and the uniform guess fails badly when most values are small and a few are huge. A **histogram** fixes much of that. It cuts the range of values into buckets and records how many values land in each. With an **equi-width** histogram all buckets cover the same range; an **equi-depth** histogram instead gives each bucket the same number of values. To estimate `col < 30`, add the counts of the buckets entirely below 30 and a fraction of the bucket that contains it.
+- heading: 'Costs: scan or index?'
+  body: |-
+    The usual cost measure is the number of **page reads**, because disk dominates. A sequential scan of a table of P pages costs P. An index lookup costs the **height** of the B+ tree (typically 3 or 4) plus the cost of fetching the matching rows. If the index is **clustered**, meaning the rows are stored in index order, the matches sit side by side and few pages are needed. If it is **unclustered**, each match may be on a different page, so fetching many rows through the index can be *more* expensive than simply scanning everything. This is why a database sometimes ignores an index: when the condition matches a large fraction of the table, a sequential scan, which reads in order and benefits from prefetching, wins.
+
+    Joins and sorts have costs too. A **block nested-loop join** reads the outer table in chunks that fit in memory and scans the inner table once per chunk. A **hash join** partitions both tables by a hash of the join key, which costs about three passes over the data. An **external merge sort** sorts chunks that fit in memory, writes them as **runs**, then merges runs in passes, so its cost is two times the data size times the number of passes.
+- heading: Join order and rewrites
+  body: |-
+    The order in which tables are joined matters enormously, because each join produces an intermediate result that the next join must process. Joining two huge tables first may create a billion rows that a later, selective join throws away; starting with the most selective join keeps everything small. A classic optimizer, the System R design by Selinger, uses **dynamic programming** over subsets of tables to find the cheapest left-deep order without trying every permutation.
+
+    Before costing, the optimizer also **rewrites** the plan using rules that are always safe. The most important is **filter push-down**: a condition on one table should be applied right after scanning that table, before the join, so the join sees fewer rows. Others include removing columns that are never used (projection push-down), merging filters, and simplifying constant expressions. The result is shown by the EXPLAIN command: reading plans and the estimated versus actual row counts is the main way developers diagnose slow queries.
+examples:
+- title: Estimates and costs
+  intro: Skewed ages fool the uniform guess but not the histogram; an index loses when it matches too much.
+  code: |
+    def table_stats(rows):
+        """Statistics for the OPTIMIZER about a table (a list of dicts with the same columns): {"rows": number of rows, "cols": {column: {"distinct": number of distinct non-None values, "min": smallest non-None value, "max": largest, "nulls": number of None values}}}. For a column with no non-None values, min and max are None and distinct is 0."""
+        cols = {}
+        if rows:
+            for c in rows[0]:
+                vals = [r[c] for r in rows if r[c] is not None]
+                cols[c] = {"distinct": len(set(vals)), "min": min(vals) if vals else None, "max": max(vals) if vals else None, "nulls": len(rows) - len(vals)}
+        return {"rows": len(rows), "cols": cols}
+
+
+    def selectivity(stats, col, op, value):
+        """The estimated FRACTION of rows that satisfy `col op value`, assuming values are spread UNIFORMLY between min and max (op is one of = != < <= > >=). Rounded to 4 decimals.
+        '=': 0 if value is outside [min, max], else 1 / distinct. '!=': 1 minus the '=' result. '<': 0 if value <= min, 1 if value > max, else (value - min) / (max - min). '<=': 0 if value < min, 1 if value >= max, else the same fraction.
+        '>': 1 minus the '<=' result; '>=': 1 minus the '<' result. If min == max, treat the fraction for the in-between case as 0.5. ValueError('no such column NAME') if the column is unknown; ValueError('unknown operator OP') for another operator; a column with no values gives 0.0."""
+        if col not in stats["cols"]:
+            raise ValueError("no such column " + col)
+        if op not in ("=", "!=", "<", "<=", ">", ">="):
+            raise ValueError("unknown operator " + op)
+        c = stats["cols"][col]
+        if c["distinct"] == 0:
+            return 0.0
+        lo, hi = c["min"], c["max"]
+
+        def eq():
+            return 0.0 if value < lo or value > hi else 1 / c["distinct"]
+
+        def frac():
+            return 0.5 if hi == lo else (value - lo) / (hi - lo)
+
+        def lt():
+            return 0.0 if value <= lo else 1.0 if value > hi else frac()
+
+        def le():
+            return 0.0 if value < lo else 1.0 if value >= hi else frac()
+
+        result = {"=": eq, "!=": lambda: 1 - eq(), "<": lt, "<=": le, ">": lambda: 1 - le(), ">=": lambda: 1 - lt()}[op]()
+        return round(result, 4)
+
+
+    def estimate_rows(stats, conds):
+        """The estimated number of rows after applying ALL the conditions, a list of (column, op, value): stats["rows"] times the product of the selectivities (the INDEPENDENCE assumption), rounded to the nearest integer."""
+        est = float(stats["rows"])
+        for col, op, value in conds:
+            est *= selectivity(stats, col, op, value)
+        return round(est)
+
+
+    def scan_cost(pages):
+        """The cost, in page reads, of a SEQUENTIAL SCAN of a table: one read per page."""
+        return pages
+
+
+    def index_cost(height, matches, rows_per_page, clustered):
+        """The cost of finding `matches` rows through a B+ tree of the given height. The descent costs `height` reads. If the index is CLUSTERED (the rows are stored in key order) the matching rows are contiguous: add ceil(matches / rows_per_page) reads (none if matches is 0).
+        If it is NOT clustered every matching row may be on a different page: add `matches` reads."""
+        if matches == 0:
+            return height
+        if clustered:
+            return height + (matches + rows_per_page - 1) // rows_per_page
+        return height + matches
+
+
+    def choose_access(table_pages, rows_per_page, height, matches, clustered):
+        """Pick the cheaper access path: return ('seq scan', cost) or ('index scan', cost); on a tie choose the sequential scan."""
+        s = scan_cost(table_pages)
+        i = index_cost(height, matches, rows_per_page, clustered)
+        return ("index scan", i) if i < s else ("seq scan", s)
+
+
+    def block_nested_cost(pages_l, pages_r, buffer_pages):
+        """BLOCK NESTED-LOOP JOIN: read the left table in chunks of (buffer_pages - 2) pages and scan the whole right table once per chunk: pages_l + ceil(pages_l / (buffer_pages - 2)) * pages_r. ValueError('buffer too small') if buffer_pages < 3."""
+        if buffer_pages < 3:
+            raise ValueError("buffer too small")
+        chunks = (pages_l + buffer_pages - 3) // (buffer_pages - 2)
+        return pages_l + chunks * pages_r
+
+
+    def hash_join_cost(pages_l, pages_r):
+        """GRACE HASH JOIN: partition both inputs (read and write them) and then read the partitions: 3 * (pages_l + pages_r)."""
+        return 3 * (pages_l + pages_r)
+
+
+    def external_sort_cost(pages, buffer_pages):
+        """The cost of an EXTERNAL MERGE SORT. Pass 0 sorts runs of buffer_pages pages in memory, giving runs = ceil(pages / buffer_pages). Each later pass merges up to (buffer_pages - 1) runs into one, so runs = ceil(runs / (buffer_pages - 1)). Count the passes (pass 0 included) until one run is left.
+        Every pass reads and writes every page: cost = 2 * pages * passes. Use integer arithmetic only. ValueError('buffer too small') if buffer_pages < 3."""
+        if buffer_pages < 3:
+            raise ValueError("buffer too small")
+        runs = (pages + buffer_pages - 1) // buffer_pages
+        passes = 1
+        while runs > 1:
+            runs = (runs + buffer_pages - 2) // (buffer_pages - 1)
+            passes += 1
+        return 2 * pages * passes
+
+
+    def equi_width_histogram(values, buckets):
+        """A HISTOGRAM of whole numbers: {"lo": min, "hi": max, "counts": [...], "total": number of values}. The range [lo, hi] is cut into `buckets` equal-width buckets; a value goes into bucket int((v - lo) / width) where width = (hi - lo) / buckets, and the maximum value goes into the last bucket.
+        If all values are equal (hi == lo) they all go into bucket 0. ValueError('no values') for an empty list, ValueError('need a bucket') if buckets < 1."""
+        if not values:
+            raise ValueError("no values")
+        if buckets < 1:
+            raise ValueError("need a bucket")
+        lo, hi = min(values), max(values)
+        counts = [0] * buckets
+        width = (hi - lo) / buckets
+        for v in values:
+            i = 0 if hi == lo else min(int((v - lo) / width), buckets - 1)
+            counts[i] += 1
+        return {"lo": lo, "hi": hi, "counts": counts, "total": len(values)}
+
+
+    def hist_less_than(h, value):
+        """The ESTIMATED number of values < value. 0 if value <= lo; the total if value > hi. Otherwise let pos = (value - lo) / width, i = min(int(pos), buckets - 1): add the counts of all buckets before bucket i, plus counts[i] * (pos - i) (assume values are spread evenly inside a bucket).
+        If hi == lo the answer is 0 when value <= lo, else the total. Round to 2 decimals."""
+        if value <= h["lo"]:
+            return 0.0
+        if value > h["hi"]:
+            return float(h["total"])
+        if h["hi"] == h["lo"]:
+            return float(h["total"])
+        n = len(h["counts"])
+        width = (h["hi"] - h["lo"]) / n
+        pos = (value - h["lo"]) / width
+        i = min(int(pos), n - 1)
+        return round(sum(h["counts"][:i]) + h["counts"][i] * (pos - i), 2)
+
+
+    def hist_between(h, a, b):
+        """The estimated number of values with a <= value < b, which is hist_less_than(b) minus hist_less_than(a), never below 0, rounded to 2 decimals."""
+        return round(max(0.0, hist_less_than(h, b) - hist_less_than(h, a)), 2)
+
+    import random
+    rng = random.Random(2)
+    ages = [int(rng.expovariate(1 / 12)) + 18 for _ in range(2000)]
+    rows = [{"age": a} for a in ages]
+    stats = table_stats(rows)
+    actual = sum(1 for a in ages if a < 30)
+    print("rows:", stats["rows"], "age range:", stats["cols"]["age"]["min"], "to", stats["cols"]["age"]["max"])
+    print("people under 30 -> actual:", actual, "uniform guess:", estimate_rows(stats, [("age", "<", 30)]), "histogram guess:", round(hist_less_than(equi_width_histogram(ages, 20), 30)))
+    print("fetch 40 matching rows (50 pages of data):", choose_access(50, 100, 3, 40, False))
+    print("fetch 4000 matching rows through an unclustered index:", choose_access(50, 100, 3, 4000, False))
+    print("join 100 and 1000 pages with 20 buffer pages:", block_nested_cost(100, 1000, 20), "block loop vs", hash_join_cost(100, 1000), "hash")
+  output: |
+    rows: 2000 age range: 18 to 115
+    people under 30 -> actual: 1262 uniform guess: 247 histogram guess: 1276
+    fetch 40 matching rows (50 pages of data): ('index scan', 43)
+    fetch 4000 matching rows through an unclustered index: ('seq scan', 50)
+    join 100 and 1000 pages with 20 buffer pages: 6100 block loop vs 3300 hash
+  lines:
+  - line: 138
+    note: Ages start near 18 and trail off to the right.
+  - line: 139
+    note: The histogram guess is much closer than the uniform guess.
+  - line: 140
+    note: With few matches the index wins.
+  - line: 141
+    note: With many matches a scan is cheaper.
+  - line: 142
+    note: Hash join beats block nested loop here.
+- title: Join order and push-down
+  intro: The best and worst join orders, and a filter moving below a join.
+  code: |
+    def join_size(tables, sizes, sel):
+        """The estimated number of rows after joining the tables in the tuple/list `tables`: the PRODUCT of their sizes (dict name -> rows), times sel[frozenset({a, b})] for every pair of tables a, b in the list that has an entry in `sel` (a missing pair means a cross product and counts as 1.0). Return a float."""
+        size = 1.0
+        for t in tables:
+            size *= sizes[t]
+        names = list(tables)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                size *= sel.get(frozenset((names[i], names[j])), 1.0)
+        return size
+
+
+    def plan_cost(order, sizes, sel):
+        """The cost of a LEFT-DEEP join plan that joins the tables in `order` one at a time: the sum of the estimated sizes of the INTERMEDIATE results, i.e. join_size of the first 2 tables, of the first 3, and so on up to all of them. (A single table costs 0.) Return a float."""
+        return sum(join_size(order[:k], sizes, sel) for k in range(2, len(order) + 1))
+
+
+    def best_order(sizes, sel):
+        """Try EVERY order of the tables (itertools.permutations over the sorted table names) and return (best order as a tuple, its cost). On equal costs prefer the order that is smaller as a tuple of names. ValueError('need two tables') if there are fewer than two."""
+        from itertools import permutations
+        names = sorted(sizes)
+        if len(names) < 2:
+            raise ValueError("need two tables")
+        best = None
+        for order in permutations(names):
+            cost = plan_cost(order, sizes, sel)
+            if best is None or cost < best[1]:
+                best = (order, cost)
+        return best
+
+
+    def tables_of(plan):
+        """The set of table names scanned anywhere under a plan. A PLAN is a nested tuple: ("scan", table), ("filter", (table, column, op, value), child), ("project", [columns], child) or ("join", left, right)."""
+        if plan[0] == "scan":
+            return {plan[1]}
+        if plan[0] == "join":
+            return tables_of(plan[1]) | tables_of(plan[2])
+        return tables_of(plan[-1])
+
+
+    def push_filters(plan):
+        """FILTER PUSH-DOWN: return a plan where every filter has been moved as far DOWN as possible, because filtering early shrinks everything above it. A filter directly above a join moves into the side that scans the filter's table (and keeps moving down there);
+        if the table is on neither side the filter stays where it is. Filters above filters work too (the inner one is pushed first; then the outer one is looked at again). Filters stay above projections and scans. Recurse into all children. Do not change the input."""
+        kind = plan[0]
+        if kind == "scan":
+            return plan
+        if kind == "join":
+            return ("join", push_filters(plan[1]), push_filters(plan[2]))
+        if kind == "project":
+            return ("project", plan[1], push_filters(plan[2]))
+        cond, child = plan[1], push_filters(plan[2])
+        if child[0] == "join":
+            if cond[0] in tables_of(child[1]):
+                return ("join", push_filters(("filter", cond, child[1])), child[2])
+            if cond[0] in tables_of(child[2]):
+                return ("join", child[1], push_filters(("filter", cond, child[2])))
+        return ("filter", cond, child)
+
+
+    def plan_text(plan, depth=0):
+        """Draw a plan as text, one operator per line, indented two spaces per level, parent above children (left child first): 'Scan t', 'Filter t.col op value' (strings in single quotes via repr, numbers bare), 'Project a, b' and 'Join'. Lines are joined with newlines, with no trailing newline."""
+        pad = "  " * depth
+        kind = plan[0]
+        if kind == "scan":
+            return pad + "Scan " + plan[1]
+        if kind == "join":
+            return "\n".join([pad + "Join", plan_text(plan[1], depth + 1), plan_text(plan[2], depth + 1)])
+        if kind == "project":
+            return "\n".join([pad + "Project " + ", ".join(plan[1]), plan_text(plan[2], depth + 1)])
+        t, c, op, v = plan[1]
+        return "\n".join([pad + "Filter %s.%s %s %s" % (t, c, op, repr(v) if isinstance(v, str) else v), plan_text(plan[2], depth + 1)])
+
+    sizes = {"orders": 100000, "people": 1000, "cities": 20}
+    sel = {frozenset(("orders", "people")): 0.001, frozenset(("people", "cities")): 0.05}
+    order, cost = best_order(sizes, sel)
+    print("best join order:", order, "cost:", cost)
+    print("worst order cost:", max(plan_cost(p, sizes, sel) for p in __import__("itertools").permutations(sizes)))
+    plan = ("filter", ("people", "city", "=", "oslo"), ("join", ("scan", "orders"), ("scan", "people")))
+    print("before:")
+    print(plan_text(plan))
+    print("after pushing the filter down:")
+    print(plan_text(push_filters(plan)))
+  output: |
+    best join order: ('cities', 'people', 'orders') cost: 101000.0
+    worst order cost: 2100000.0
+    before:
+    Filter people.city = 'oslo'
+      Join
+        Scan orders
+        Scan people
+    after pushing the filter down:
+    Join
+      Scan orders
+      Filter people.city = 'oslo'
+        Scan people
+  lines:
+  - line: 28
+    note: The best order joins the small, selective tables first.
+  - line: 77
+    note: The worst order is much more expensive.
+  - line: 80
+    note: The filter sits above the join.
+  - line: 82
+    note: Now the filter is applied to people before the join.
+playground:
+  prompt: Try other selectivities and table sizes.
+  code: |
+    rows = 100000
+    selectivity = 0.02
+    print('estimated matches:', int(rows * selectivity))
+    print('pages if 100 rows fit in a page:', rows // 100)
+exercises:
+- id: stats
+  title: Statistics and selectivity
+  difficulty: 4
+  prompt: 'A database may run a query in many ways, so its **optimizer** must guess how much work each way is, and it guesses from **statistics** about the data. Write `table_stats(rows)`: for a list of dicts return `{"rows": n, "cols": {column: {"distinct": number of distinct non-None values, "min": smallest non-None value, "max": largest, "nulls": number of None values}}}` (for a column with no non-None values `min` and `max` are `None` and `distinct` is 0). Write `selectivity(stats, col, op, value)`: the estimated **fraction** of rows satisfying `col op value`, assuming values are spread **uniformly** between `min` and `max`, rounded to 4 decimals. `=` is 0 if the value is outside `[min, max]`, else `1 / distinct`; `!=` is 1 minus that. `<` is 0 if `value <= min`, 1 if `value > max`, else `(value - min) / (max - min)`; `<=` is 0 if `value < min`, 1 if `value >= max`, else the same fraction; `>` is 1 minus the `<=` result and `>=` is 1 minus the `<` result. If `min == max` use 0.5 for the in-between fraction. `ValueError("no such column NAME")` for an unknown column, `ValueError("unknown operator OP")` for another operator; a column with no values gives `0.0`. Write `estimate_rows(stats, conds)` for a list of `(column, op, value)`: `stats["rows"]` times the **product** of the selectivities (the **independence** assumption), rounded to an integer.'
+  starter: |-
+    def table_stats(rows):
+        """Statistics for the OPTIMIZER about a table (a list of dicts with the same columns): {"rows": number of rows, "cols": {column: {"distinct": number of distinct non-None values, "min": smallest non-None value, "max": largest, "nulls": number of None values}}}. For a column with no non-None values, min and max are None and distinct is 0."""
+        pass
+
+
+    def selectivity(stats, col, op, value):
+        """The estimated FRACTION of rows that satisfy `col op value`, assuming values are spread UNIFORMLY between min and max (op is one of = != < <= > >=). Rounded to 4 decimals.
+        '=': 0 if value is outside [min, max], else 1 / distinct. '!=': 1 minus the '=' result. '<': 0 if value <= min, 1 if value > max, else (value - min) / (max - min). '<=': 0 if value < min, 1 if value >= max, else the same fraction.
+        '>': 1 minus the '<=' result; '>=': 1 minus the '<' result. If min == max, treat the fraction for the in-between case as 0.5. ValueError('no such column NAME') if the column is unknown; ValueError('unknown operator OP') for another operator; a column with no values gives 0.0."""
+        pass
+
+
+    def estimate_rows(stats, conds):
+        """The estimated number of rows after applying ALL the conditions, a list of (column, op, value): stats["rows"] times the product of the selectivities (the INDEPENDENCE assumption), rounded to the nearest integer."""
+        pass
+  tests:
+  - name: collecting statistics
+    code: |
+      rows = [{"id": 1, "city": "oslo", "age": 30}, {"id": 2, "city": "rome", "age": 40}, {"id": 3, "city": "oslo", "age": None}, {"id": 4, "city": "kyiv", "age": 50}]
+      s = table_stats(rows)
+      assert s["rows"] == 4
+      assert s["cols"]["id"] == {"distinct": 4, "min": 1, "max": 4, "nulls": 0}
+      assert s["cols"]["city"] == {"distinct": 3, "min": "kyiv", "max": "rome", "nulls": 0}
+      assert s["cols"]["age"] == {"distinct": 3, "min": 30, "max": 50, "nulls": 1}
+      assert table_stats([]) == {"rows": 0, "cols": {}}
+      assert table_stats([{"a": None}])["cols"]["a"] == {"distinct": 0, "min": None, "max": None, "nulls": 1}
+  - name: selectivity
+    code: |
+      rows = [{"x": v} for v in range(0, 100)]
+      s = table_stats(rows)
+      assert selectivity(s, "x", "=", 10) == 0.01 and selectivity(s, "x", "=", 500) == 0.0 and selectivity(s, "x", "!=", 10) == 0.99
+      assert selectivity(s, "x", "<", 50) == 0.5051 and selectivity(s, "x", "<=", 50) == 0.5051
+      assert selectivity(s, "x", ">", 50) == 0.4949 and selectivity(s, "x", ">=", 50) == 0.4949
+      assert selectivity(s, "x", "<", 0) == 0.0 and selectivity(s, "x", "<", 1000) == 1.0 and selectivity(s, "x", "<=", 99) == 1.0
+      assert selectivity(s, "x", ">", 99) == 0.0 and selectivity(s, "x", ">=", 0) == 1.0 and selectivity(s, "x", ">=", 100) == 0.0
+      one = table_stats([{"x": 5}, {"x": 5}])
+      assert selectivity(one, "x", "<", 5) == 0.0 and selectivity(one, "x", "<=", 5) == 1.0 and selectivity(one, "x", "=", 5) == 1.0
+      assert selectivity(table_stats([{"x": None}]), "x", "=", 1) == 0.0
+  - name: errors
+    code: |
+      s = table_stats([{"x": 1}])
+      for args, msg in ((("y", "=", 1), "no such column y"), (("x", "~", 1), "unknown operator ~")):
+          try:
+              selectivity(s, *args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: estimating rows
+    code: |
+      rows = [{"a": i % 10, "b": i % 4, "c": "k"} for i in range(1000)]
+      s = table_stats(rows)
+      assert estimate_rows(s, []) == 1000
+      assert estimate_rows(s, [("a", "=", 3)]) == 100
+      assert estimate_rows(s, [("a", "=", 3), ("b", "=", 1)]) == 25
+      assert estimate_rows(s, [("a", ">=", 5)]) == round(1000 * selectivity(s, "a", ">=", 5))
+      assert estimate_rows(s, [("a", "=", 99)]) == 0
+      assert estimate_rows(table_stats([]), []) == 0
+  hints:
+  - Selectivity is a number between 0 and 1; multiply selectivities for several conditions.
+  solution: |
+    def table_stats(rows):
+        """Statistics for the OPTIMIZER about a table (a list of dicts with the same columns): {"rows": number of rows, "cols": {column: {"distinct": number of distinct non-None values, "min": smallest non-None value, "max": largest, "nulls": number of None values}}}. For a column with no non-None values, min and max are None and distinct is 0."""
+        cols = {}
+        if rows:
+            for c in rows[0]:
+                vals = [r[c] for r in rows if r[c] is not None]
+                cols[c] = {"distinct": len(set(vals)), "min": min(vals) if vals else None, "max": max(vals) if vals else None, "nulls": len(rows) - len(vals)}
+        return {"rows": len(rows), "cols": cols}
+
+
+    def selectivity(stats, col, op, value):
+        """The estimated FRACTION of rows that satisfy `col op value`, assuming values are spread UNIFORMLY between min and max (op is one of = != < <= > >=). Rounded to 4 decimals.
+        '=': 0 if value is outside [min, max], else 1 / distinct. '!=': 1 minus the '=' result. '<': 0 if value <= min, 1 if value > max, else (value - min) / (max - min). '<=': 0 if value < min, 1 if value >= max, else the same fraction.
+        '>': 1 minus the '<=' result; '>=': 1 minus the '<' result. If min == max, treat the fraction for the in-between case as 0.5. ValueError('no such column NAME') if the column is unknown; ValueError('unknown operator OP') for another operator; a column with no values gives 0.0."""
+        if col not in stats["cols"]:
+            raise ValueError("no such column " + col)
+        if op not in ("=", "!=", "<", "<=", ">", ">="):
+            raise ValueError("unknown operator " + op)
+        c = stats["cols"][col]
+        if c["distinct"] == 0:
+            return 0.0
+        lo, hi = c["min"], c["max"]
+
+        def eq():
+            return 0.0 if value < lo or value > hi else 1 / c["distinct"]
+
+        def frac():
+            return 0.5 if hi == lo else (value - lo) / (hi - lo)
+
+        def lt():
+            return 0.0 if value <= lo else 1.0 if value > hi else frac()
+
+        def le():
+            return 0.0 if value < lo else 1.0 if value >= hi else frac()
+
+        result = {"=": eq, "!=": lambda: 1 - eq(), "<": lt, "<=": le, ">": lambda: 1 - le(), ">=": lambda: 1 - lt()}[op]()
+        return round(result, 4)
+
+
+    def estimate_rows(stats, conds):
+        """The estimated number of rows after applying ALL the conditions, a list of (column, op, value): stats["rows"] times the product of the selectivities (the INDEPENDENCE assumption), rounded to the nearest integer."""
+        est = float(stats["rows"])
+        for col, op, value in conds:
+            est *= selectivity(stats, col, op, value)
+        return round(est)
+  explanation: Statistics let the optimizer predict the size of every intermediate result.
+- id: cost
+  title: A cost model
+  difficulty: 5
+  prompt: 'The optimizer compares plans by estimated **cost**, here the number of **page reads**. Write `scan_cost(pages)` (one read per page) and `index_cost(height, matches, rows_per_page, clustered)`: the descent costs `height` reads; if the index is **clustered** (rows stored in key order) the matching rows are contiguous, so add `ceil(matches / rows_per_page)` reads (nothing if `matches` is 0); if **not** clustered every match may sit on a different page, so add `matches` reads. Write `choose_access(table_pages, rows_per_page, height, matches, clustered)` returning `(''seq scan'', cost)` or `(''index scan'', cost)`, the cheaper one, preferring the sequential scan on a tie. Write `block_nested_cost(pages_l, pages_r, buffer_pages)`: read the left table in chunks of `buffer_pages - 2` pages and scan the whole right table once per chunk: `pages_l + ceil(pages_l / (buffer_pages - 2)) * pages_r` (`ValueError("buffer too small")` if `buffer_pages < 3`). Write `hash_join_cost(pages_l, pages_r)` = `3 * (pages_l + pages_r)` (partition both inputs, then read them back). Write `external_sort_cost(pages, buffer_pages)`: pass 0 sorts runs of `buffer_pages` pages in memory, giving `runs = ceil(pages / buffer_pages)`; every later pass merges up to `buffer_pages - 1` runs into one (`runs = ceil(runs / (buffer_pages - 1))`); count the passes (pass 0 included) until one run remains; the cost is `2 * pages * passes`. Use integer arithmetic only (`ValueError("buffer too small")` if `buffer_pages < 3`).'
+  starter: |-
+    def scan_cost(pages):
+        """The cost, in page reads, of a SEQUENTIAL SCAN of a table: one read per page."""
+        pass
+
+
+    def index_cost(height, matches, rows_per_page, clustered):
+        """The cost of finding `matches` rows through a B+ tree of the given height. The descent costs `height` reads. If the index is CLUSTERED (the rows are stored in key order) the matching rows are contiguous: add ceil(matches / rows_per_page) reads (none if matches is 0).
+        If it is NOT clustered every matching row may be on a different page: add `matches` reads."""
+        pass
+
+
+    def choose_access(table_pages, rows_per_page, height, matches, clustered):
+        """Pick the cheaper access path: return ('seq scan', cost) or ('index scan', cost); on a tie choose the sequential scan."""
+        pass
+
+
+    def block_nested_cost(pages_l, pages_r, buffer_pages):
+        """BLOCK NESTED-LOOP JOIN: read the left table in chunks of (buffer_pages - 2) pages and scan the whole right table once per chunk: pages_l + ceil(pages_l / (buffer_pages - 2)) * pages_r. ValueError('buffer too small') if buffer_pages < 3."""
+        pass
+
+
+    def hash_join_cost(pages_l, pages_r):
+        """GRACE HASH JOIN: partition both inputs (read and write them) and then read the partitions: 3 * (pages_l + pages_r)."""
+        pass
+
+
+    def external_sort_cost(pages, buffer_pages):
+        """The cost of an EXTERNAL MERGE SORT. Pass 0 sorts runs of buffer_pages pages in memory, giving runs = ceil(pages / buffer_pages). Each later pass merges up to (buffer_pages - 1) runs into one, so runs = ceil(runs / (buffer_pages - 1)). Count the passes (pass 0 included) until one run is left.
+        Every pass reads and writes every page: cost = 2 * pages * passes. Use integer arithmetic only. ValueError('buffer too small') if buffer_pages < 3."""
+        pass
+  tests:
+  - name: access paths
+    code: |
+      assert scan_cost(500) == 500
+      assert index_cost(3, 0, 100, False) == 3 and index_cost(3, 0, 100, True) == 3
+      assert index_cost(3, 40, 100, False) == 43 and index_cost(3, 40, 100, True) == 4
+      assert index_cost(3, 250, 100, True) == 6 and index_cost(2, 100, 100, True) == 3
+      assert choose_access(500, 100, 3, 10, False) == ("index scan", 13)
+      assert choose_access(500, 100, 3, 1000, False) == ("seq scan", 500)
+      assert choose_access(500, 100, 3, 1000, True) == ("index scan", 13)
+      assert choose_access(13, 100, 3, 10, False) == ("seq scan", 13)
+  - name: join costs
+    code: |
+      assert block_nested_cost(10, 100, 12) == 10 + 1 * 100
+      assert block_nested_cost(100, 50, 12) == 100 + 10 * 50
+      assert block_nested_cost(101, 50, 12) == 101 + 11 * 50
+      assert block_nested_cost(10, 100, 3) == 10 + 10 * 100
+      assert hash_join_cost(10, 100) == 330 and hash_join_cost(0, 0) == 0
+      try:
+          block_nested_cost(1, 1, 2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "buffer too small" in str(e)
+      assert block_nested_cost(1000, 1000, 50) > hash_join_cost(1000, 1000)
+  - name: external sorting
+    code: |
+      assert external_sort_cost(10, 10) == 20
+      assert external_sort_cost(100, 10) == 2 * 100 * 3
+      assert external_sort_cost(1000, 10) == 2 * 1000 * 4
+      assert external_sort_cost(1000, 100) == 2 * 1000 * 2
+      assert external_sort_cost(0, 5) == 0 and external_sort_cost(5, 5) == 10
+      assert external_sort_cost(10000, 3) == 2 * 10000 * 13
+      try:
+          external_sort_cost(10, 2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "buffer too small" in str(e)
+  hints:
+  - Use (a + b - 1) // b for a ceiling division with integers.
+  solution: |
+    def scan_cost(pages):
+        """The cost, in page reads, of a SEQUENTIAL SCAN of a table: one read per page."""
+        return pages
+
+
+    def index_cost(height, matches, rows_per_page, clustered):
+        """The cost of finding `matches` rows through a B+ tree of the given height. The descent costs `height` reads. If the index is CLUSTERED (the rows are stored in key order) the matching rows are contiguous: add ceil(matches / rows_per_page) reads (none if matches is 0).
+        If it is NOT clustered every matching row may be on a different page: add `matches` reads."""
+        if matches == 0:
+            return height
+        if clustered:
+            return height + (matches + rows_per_page - 1) // rows_per_page
+        return height + matches
+
+
+    def choose_access(table_pages, rows_per_page, height, matches, clustered):
+        """Pick the cheaper access path: return ('seq scan', cost) or ('index scan', cost); on a tie choose the sequential scan."""
+        s = scan_cost(table_pages)
+        i = index_cost(height, matches, rows_per_page, clustered)
+        return ("index scan", i) if i < s else ("seq scan", s)
+
+
+    def block_nested_cost(pages_l, pages_r, buffer_pages):
+        """BLOCK NESTED-LOOP JOIN: read the left table in chunks of (buffer_pages - 2) pages and scan the whole right table once per chunk: pages_l + ceil(pages_l / (buffer_pages - 2)) * pages_r. ValueError('buffer too small') if buffer_pages < 3."""
+        if buffer_pages < 3:
+            raise ValueError("buffer too small")
+        chunks = (pages_l + buffer_pages - 3) // (buffer_pages - 2)
+        return pages_l + chunks * pages_r
+
+
+    def hash_join_cost(pages_l, pages_r):
+        """GRACE HASH JOIN: partition both inputs (read and write them) and then read the partitions: 3 * (pages_l + pages_r)."""
+        return 3 * (pages_l + pages_r)
+
+
+    def external_sort_cost(pages, buffer_pages):
+        """The cost of an EXTERNAL MERGE SORT. Pass 0 sorts runs of buffer_pages pages in memory, giving runs = ceil(pages / buffer_pages). Each later pass merges up to (buffer_pages - 1) runs into one, so runs = ceil(runs / (buffer_pages - 1)). Count the passes (pass 0 included) until one run is left.
+        Every pass reads and writes every page: cost = 2 * pages * passes. Use integer arithmetic only. ValueError('buffer too small') if buffer_pages < 3."""
+        if buffer_pages < 3:
+            raise ValueError("buffer too small")
+        runs = (pages + buffer_pages - 1) // buffer_pages
+        passes = 1
+        while runs > 1:
+            runs = (runs + buffer_pages - 2) // (buffer_pages - 1)
+            passes += 1
+        return 2 * pages * passes
+  explanation: Cost models turn guesses about sizes into a comparison between plans.
+- id: hist
+  title: Histograms
+  difficulty: 5
+  prompt: 'Uniform estimates fail on **skewed** data, such as ages where most customers are young. A **histogram** records how many values fall into each part of the range. Write `equi_width_histogram(values, buckets)` for a list of whole numbers: return `{"lo": min, "hi": max, "counts": [...], "total": number of values}`. The range `[lo, hi]` is cut into `buckets` equal-width buckets; a value goes into bucket `int((v - lo) / width)` where `width = (hi - lo) / buckets`, except that the maximum goes into the **last** bucket; if all values are equal they all go into bucket 0. `ValueError("no values")` for an empty list and `ValueError("need a bucket")` if `buckets < 1`. Write `hist_less_than(h, value)`: the **estimated** number of values `< value`. It is 0 if `value <= lo` and the total if `value > hi`. Otherwise let `pos = (value - lo) / width` and `i = min(int(pos), buckets - 1)`: add the counts of all buckets **before** bucket `i`, plus `counts[i] * (pos - i)` (values assumed evenly spread inside a bucket). If `hi == lo` the answer is 0 when `value <= lo`, else the total. Round to 2 decimals. Write `hist_between(h, a, b)`: the estimated number of values with `a <= value < b`, i.e. `hist_less_than(b) - hist_less_than(a)`, never below 0, rounded to 2 decimals.'
+  starter: |-
+    def equi_width_histogram(values, buckets):
+        """A HISTOGRAM of whole numbers: {"lo": min, "hi": max, "counts": [...], "total": number of values}. The range [lo, hi] is cut into `buckets` equal-width buckets; a value goes into bucket int((v - lo) / width) where width = (hi - lo) / buckets, and the maximum value goes into the last bucket.
+        If all values are equal (hi == lo) they all go into bucket 0. ValueError('no values') for an empty list, ValueError('need a bucket') if buckets < 1."""
+        pass
+
+
+    def hist_less_than(h, value):
+        """The ESTIMATED number of values < value. 0 if value <= lo; the total if value > hi. Otherwise let pos = (value - lo) / width, i = min(int(pos), buckets - 1): add the counts of all buckets before bucket i, plus counts[i] * (pos - i) (assume values are spread evenly inside a bucket).
+        If hi == lo the answer is 0 when value <= lo, else the total. Round to 2 decimals."""
+        pass
+
+
+    def hist_between(h, a, b):
+        """The estimated number of values with a <= value < b, which is hist_less_than(b) minus hist_less_than(a), never below 0, rounded to 2 decimals."""
+        pass
+  tests:
+  - name: building
+    code: |
+      h = equi_width_histogram([1, 2, 2, 3, 9, 10], 3)
+      assert h == {"lo": 1, "hi": 10, "counts": [4, 0, 2], "total": 6}
+      assert equi_width_histogram([5, 5, 5], 4) == {"lo": 5, "hi": 5, "counts": [3, 0, 0, 0], "total": 3}
+      assert equi_width_histogram([0, 10], 2)["counts"] == [1, 1]
+      for args, msg in ((([], 3), "no values"), (([1], 0), "need a bucket")):
+          try:
+              equi_width_histogram(*args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: estimates
+    code: |
+      h = equi_width_histogram([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 4)
+      assert h["counts"] == [3, 3, 3, 3] and h["total"] == 12
+      assert hist_less_than(h, 0) == 0.0 and hist_less_than(h, -5) == 0.0 and hist_less_than(h, 12) == 12.0
+      assert hist_less_than(h, 5.5) == 6.0
+      assert hist_less_than(h, 2.75) == 3.0 and hist_less_than(h, 4.125) == 4.5
+      assert hist_less_than(equi_width_histogram([5, 5], 2), 5) == 0.0 and hist_less_than(equi_width_histogram([5, 5], 2), 6) == 2.0
+      assert hist_between(h, 2.75, 8.25) == 6.0 and hist_between(h, 5, 2) == 0.0
+  - name: skewed data
+    code: |
+      import random
+      rng = random.Random(6)
+      values = [int(rng.expovariate(1 / 8)) for _ in range(5000)]
+      h = equi_width_histogram(values, 20)
+      actual = sum(1 for v in values if v < 10)
+      estimate = hist_less_than(h, 10)
+      lo, hi = min(values), max(values)
+      uniform = 5000 * (10 - lo) / (hi - lo)
+      assert abs(estimate - actual) < abs(uniform - actual) / 3, (estimate, actual, uniform)
+      assert abs(estimate - actual) < 0.25 * actual
+      assert sum(h["counts"]) == 5000
+  hints:
+  - The bucket width is (hi - lo) / buckets; remember to clamp the bucket index.
+  solution: |
+    def equi_width_histogram(values, buckets):
+        """A HISTOGRAM of whole numbers: {"lo": min, "hi": max, "counts": [...], "total": number of values}. The range [lo, hi] is cut into `buckets` equal-width buckets; a value goes into bucket int((v - lo) / width) where width = (hi - lo) / buckets, and the maximum value goes into the last bucket.
+        If all values are equal (hi == lo) they all go into bucket 0. ValueError('no values') for an empty list, ValueError('need a bucket') if buckets < 1."""
+        if not values:
+            raise ValueError("no values")
+        if buckets < 1:
+            raise ValueError("need a bucket")
+        lo, hi = min(values), max(values)
+        counts = [0] * buckets
+        width = (hi - lo) / buckets
+        for v in values:
+            i = 0 if hi == lo else min(int((v - lo) / width), buckets - 1)
+            counts[i] += 1
+        return {"lo": lo, "hi": hi, "counts": counts, "total": len(values)}
+
+
+    def hist_less_than(h, value):
+        """The ESTIMATED number of values < value. 0 if value <= lo; the total if value > hi. Otherwise let pos = (value - lo) / width, i = min(int(pos), buckets - 1): add the counts of all buckets before bucket i, plus counts[i] * (pos - i) (assume values are spread evenly inside a bucket).
+        If hi == lo the answer is 0 when value <= lo, else the total. Round to 2 decimals."""
+        if value <= h["lo"]:
+            return 0.0
+        if value > h["hi"]:
+            return float(h["total"])
+        if h["hi"] == h["lo"]:
+            return float(h["total"])
+        n = len(h["counts"])
+        width = (h["hi"] - h["lo"]) / n
+        pos = (value - h["lo"]) / width
+        i = min(int(pos), n - 1)
+        return round(sum(h["counts"][:i]) + h["counts"][i] * (pos - i), 2)
+
+
+    def hist_between(h, a, b):
+        """The estimated number of values with a <= value < b, which is hist_less_than(b) minus hist_less_than(a), never below 0, rounded to 2 decimals."""
+        return round(max(0.0, hist_less_than(h, b) - hist_less_than(h, a)), 2)
+  explanation: Histograms are why a database knows that most of its rows are small without scanning them.
+- id: order
+  title: Choosing a join order
+  difficulty: 5
+  prompt: 'Joining three or more tables can be done in different orders, and the order can change the cost by factors of a million. A **plan** here is a **left-deep** order: join the first two tables, then join the result with the third, and so on. `sizes` is a dict of table name to row count and `sel` a dict mapping `frozenset({a, b})` to the **join selectivity** of that pair (a missing pair means a cross product, factor 1.0). Write `join_size(tables, sizes, sel)`: the estimated rows after joining the tables in the list: the **product** of their sizes times `sel` for **every pair** in the list that has an entry (return a float). Write `plan_cost(order, sizes, sel)`: the sum of the estimated sizes of the **intermediate results**: `join_size` of the first 2 tables, the first 3, and so on up to all of them (a single table costs 0). Write `best_order(sizes, sel)`: try **every** permutation of the sorted table names (`itertools.permutations`) and return `(best order as a tuple, its cost)`; on equal costs prefer the order that is smaller as a tuple (`ValueError("need two tables")` if fewer than two).'
+  starter: |-
+    def join_size(tables, sizes, sel):
+        """The estimated number of rows after joining the tables in the tuple/list `tables`: the PRODUCT of their sizes (dict name -> rows), times sel[frozenset({a, b})] for every pair of tables a, b in the list that has an entry in `sel` (a missing pair means a cross product and counts as 1.0). Return a float."""
+        pass
+
+
+    def plan_cost(order, sizes, sel):
+        """The cost of a LEFT-DEEP join plan that joins the tables in `order` one at a time: the sum of the estimated sizes of the INTERMEDIATE results, i.e. join_size of the first 2 tables, of the first 3, and so on up to all of them. (A single table costs 0.) Return a float."""
+        pass
+
+
+    def best_order(sizes, sel):
+        """Try EVERY order of the tables (itertools.permutations over the sorted table names) and return (best order as a tuple, its cost). On equal costs prefer the order that is smaller as a tuple of names. ValueError('need two tables') if there are fewer than two."""
+        pass
+  tests:
+  - name: sizes
+    code: |
+      sizes = {"a": 1000, "b": 100, "c": 10}
+      sel = {frozenset(("a", "b")): 0.01, frozenset(("b", "c")): 0.1}
+      assert join_size(["a"], sizes, sel) == 1000
+      assert join_size(["a", "b"], sizes, sel) == 1000
+      assert join_size(("b", "c"), sizes, sel) == 100
+      assert join_size(["a", "c"], sizes, sel) == 10000
+      assert round(join_size(["a", "b", "c"], sizes, sel), 6) == round(1000 * 100 * 10 * 0.01 * 0.1, 6)
+  - name: costs of plans
+    code: |
+      sizes = {"a": 1000, "b": 100, "c": 10}
+      sel = {frozenset(("a", "b")): 0.01, frozenset(("b", "c")): 0.1}
+      assert plan_cost(("a", "b", "c"), sizes, sel) == 1000 + 1000
+      assert plan_cost(("b", "c", "a"), sizes, sel) == 100 + 1000
+      assert plan_cost(("a", "c", "b"), sizes, sel) == 10000 + 1000
+      assert plan_cost(("a",), sizes, sel) == 0
+  - name: the best order
+    code: |
+      sizes = {"a": 1000, "b": 100, "c": 10}
+      sel = {frozenset(("a", "b")): 0.01, frozenset(("b", "c")): 0.1}
+      assert best_order(sizes, sel) == (("b", "c", "a"), 1100.0)
+      assert best_order({"x": 5, "y": 5}, {}) == (("x", "y"), 25.0)
+      chain = {"t1": 10000, "t2": 10, "t3": 5000, "t4": 20}
+      s = {frozenset(("t1", "t2")): 0.001, frozenset(("t2", "t3")): 0.001, frozenset(("t3", "t4")): 0.001}
+      order, cost = best_order(chain, s)
+      worst = max(plan_cost(p, chain, s) for p in __import__("itertools").permutations(chain))
+      assert cost < worst / 100 and cost == plan_cost(order, chain, s)
+      try:
+          best_order({"a": 1}, {})
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "need two tables" in str(e)
+  hints:
+  - Costs are floats; compare them with < and keep the first order when costs tie.
+  solution: |
+    def join_size(tables, sizes, sel):
+        """The estimated number of rows after joining the tables in the tuple/list `tables`: the PRODUCT of their sizes (dict name -> rows), times sel[frozenset({a, b})] for every pair of tables a, b in the list that has an entry in `sel` (a missing pair means a cross product and counts as 1.0). Return a float."""
+        size = 1.0
+        for t in tables:
+            size *= sizes[t]
+        names = list(tables)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                size *= sel.get(frozenset((names[i], names[j])), 1.0)
+        return size
+
+
+    def plan_cost(order, sizes, sel):
+        """The cost of a LEFT-DEEP join plan that joins the tables in `order` one at a time: the sum of the estimated sizes of the INTERMEDIATE results, i.e. join_size of the first 2 tables, of the first 3, and so on up to all of them. (A single table costs 0.) Return a float."""
+        return sum(join_size(order[:k], sizes, sel) for k in range(2, len(order) + 1))
+
+
+    def best_order(sizes, sel):
+        """Try EVERY order of the tables (itertools.permutations over the sorted table names) and return (best order as a tuple, its cost). On equal costs prefer the order that is smaller as a tuple of names. ValueError('need two tables') if there are fewer than two."""
+        from itertools import permutations
+        names = sorted(sizes)
+        if len(names) < 2:
+            raise ValueError("need two tables")
+        best = None
+        for order in permutations(names):
+            cost = plan_cost(order, sizes, sel)
+            if best is None or cost < best[1]:
+                best = (order, cost)
+        return best
+  explanation: Choosing the join order is the heart of the optimizer; real systems use dynamic programming to avoid trying every permutation.
+- id: rewrite
+  title: Filter push-down
+  difficulty: 5
+  prompt: 'Plans are trees, and the optimizer **rewrites** them into cheaper equivalent trees. The most important rewrite is **filter push-down**: filter *before* joining so the join has fewer rows. A **plan** is a nested tuple: `("scan", table)`, `("filter", (table, column, op, value), child)`, `("project", [columns], child)` or `("join", left, right)`. Write `tables_of(plan)`: the **set** of table names scanned anywhere under a plan. Write `push_filters(plan)`: return a plan (do not change the input) where every filter is moved as far **down** as possible: a filter directly above a join moves into the side that scans the filter''s table and keeps moving down there; if the table is on neither side it stays where it is. Filters above filters work too (push the inner one first, then look at the outer one again). Filters stay above projections and scans. Recurse into all children. Write `plan_text(plan, depth=0)`: draw a plan as text, one operator per line, indented **two spaces per level**, parent above children, left child first: `Scan t`, `Filter t.col op value` (strings in single quotes with `repr`, numbers bare), `Project a, b`, `Join`; lines joined with newlines and no trailing newline.'
+  starter: |-
+    def tables_of(plan):
+        """The set of table names scanned anywhere under a plan. A PLAN is a nested tuple: ("scan", table), ("filter", (table, column, op, value), child), ("project", [columns], child) or ("join", left, right)."""
+        pass
+
+
+    def push_filters(plan):
+        """FILTER PUSH-DOWN: return a plan where every filter has been moved as far DOWN as possible, because filtering early shrinks everything above it. A filter directly above a join moves into the side that scans the filter's table (and keeps moving down there);
+        if the table is on neither side the filter stays where it is. Filters above filters work too (the inner one is pushed first; then the outer one is looked at again). Filters stay above projections and scans. Recurse into all children. Do not change the input."""
+        pass
+
+
+    def plan_text(plan, depth=0):
+        """Draw a plan as text, one operator per line, indented two spaces per level, parent above children (left child first): 'Scan t', 'Filter t.col op value' (strings in single quotes via repr, numbers bare), 'Project a, b' and 'Join'. Lines are joined with newlines, with no trailing newline."""
+        pass
+  tests:
+  - name: tables
+    code: |
+      p = ("join", ("filter", ("a", "x", ">", 1), ("scan", "a")), ("project", ["y"], ("scan", "b")))
+      assert tables_of(p) == {"a", "b"} and tables_of(("scan", "t")) == {"t"}
+      assert tables_of(("join", ("join", ("scan", "a"), ("scan", "b")), ("scan", "c"))) == {"a", "b", "c"}
+  - name: pushing down once
+    code: |
+      plan = ("filter", ("a", "x", ">", 5), ("join", ("scan", "a"), ("scan", "b")))
+      got = push_filters(plan)
+      assert got == ("join", ("filter", ("a", "x", ">", 5), ("scan", "a")), ("scan", "b"))
+      plan = ("filter", ("b", "y", "=", "z"), ("join", ("scan", "a"), ("scan", "b")))
+      assert push_filters(plan) == ("join", ("scan", "a"), ("filter", ("b", "y", "=", "z"), ("scan", "b")))
+      assert plan == ("filter", ("b", "y", "=", "z"), ("join", ("scan", "a"), ("scan", "b")))
+      assert push_filters(("scan", "a")) == ("scan", "a")
+      stay = ("filter", ("q", "x", "=", 1), ("join", ("scan", "a"), ("scan", "b")))
+      assert push_filters(stay) == stay
+      over_scan = ("filter", ("a", "x", "=", 1), ("scan", "a"))
+      assert push_filters(over_scan) == over_scan
+  - name: deep and stacked
+    code: |
+      three = ("join", ("join", ("scan", "a"), ("scan", "b")), ("scan", "c"))
+      plan = ("filter", ("a", "x", "<", 3), ("filter", ("c", "z", "!=", 0), three))
+      got = push_filters(plan)
+      assert got == ("join", ("join", ("filter", ("a", "x", "<", 3), ("scan", "a")), ("scan", "b")), ("filter", ("c", "z", "!=", 0), ("scan", "c")))
+      plan = ("project", ["x"], ("filter", ("b", "y", "=", 1), ("join", ("scan", "a"), ("scan", "b"))))
+      assert push_filters(plan) == ("project", ["x"], ("join", ("scan", "a"), ("filter", ("b", "y", "=", 1), ("scan", "b"))))
+      plan = ("filter", ("a", "x", "=", 1), ("project", ["x"], ("join", ("scan", "a"), ("scan", "b"))))
+      assert push_filters(plan) == plan
+  - name: drawing plans
+    code: |
+      p = ("project", ["name", "total"], ("join", ("filter", ("orders", "total", ">", 100), ("scan", "orders")), ("filter", ("people", "city", "=", "oslo"), ("scan", "people"))))
+      assert plan_text(p) == "\n".join(["Project name, total", "  Join", "    Filter orders.total > 100", "      Scan orders", "    Filter people.city = 'oslo'", "      Scan people"])
+      assert plan_text(("scan", "t")) == "Scan t"
+      assert plan_text(("scan", "t"), 2) == "    Scan t"
+      before = ("filter", ("orders", "total", ">", 100), ("join", ("scan", "orders"), ("scan", "people")))
+      assert plan_text(push_filters(before)).split("\n") == ["Join", "  Filter orders.total > 100", "    Scan orders", "  Scan people"]
+  hints:
+  - A filter that moves into a side of a join may need to move further, so call push_filters on the new subtree.
+  solution: |
+    def tables_of(plan):
+        """The set of table names scanned anywhere under a plan. A PLAN is a nested tuple: ("scan", table), ("filter", (table, column, op, value), child), ("project", [columns], child) or ("join", left, right)."""
+        if plan[0] == "scan":
+            return {plan[1]}
+        if plan[0] == "join":
+            return tables_of(plan[1]) | tables_of(plan[2])
+        return tables_of(plan[-1])
+
+
+    def push_filters(plan):
+        """FILTER PUSH-DOWN: return a plan where every filter has been moved as far DOWN as possible, because filtering early shrinks everything above it. A filter directly above a join moves into the side that scans the filter's table (and keeps moving down there);
+        if the table is on neither side the filter stays where it is. Filters above filters work too (the inner one is pushed first; then the outer one is looked at again). Filters stay above projections and scans. Recurse into all children. Do not change the input."""
+        kind = plan[0]
+        if kind == "scan":
+            return plan
+        if kind == "join":
+            return ("join", push_filters(plan[1]), push_filters(plan[2]))
+        if kind == "project":
+            return ("project", plan[1], push_filters(plan[2]))
+        cond, child = plan[1], push_filters(plan[2])
+        if child[0] == "join":
+            if cond[0] in tables_of(child[1]):
+                return ("join", push_filters(("filter", cond, child[1])), child[2])
+            if cond[0] in tables_of(child[2]):
+                return ("join", child[1], push_filters(("filter", cond, child[2])))
+        return ("filter", cond, child)
+
+
+    def plan_text(plan, depth=0):
+        """Draw a plan as text, one operator per line, indented two spaces per level, parent above children (left child first): 'Scan t', 'Filter t.col op value' (strings in single quotes via repr, numbers bare), 'Project a, b' and 'Join'. Lines are joined with newlines, with no trailing newline."""
+        pad = "  " * depth
+        kind = plan[0]
+        if kind == "scan":
+            return pad + "Scan " + plan[1]
+        if kind == "join":
+            return "\n".join([pad + "Join", plan_text(plan[1], depth + 1), plan_text(plan[2], depth + 1)])
+        if kind == "project":
+            return "\n".join([pad + "Project " + ", ".join(plan[1]), plan_text(plan[2], depth + 1)])
+        t, c, op, v = plan[1]
+        return "\n".join([pad + "Filter %s.%s %s %s" % (t, c, op, repr(v) if isinstance(v, str) else v), plan_text(plan[2], depth + 1)])
+  explanation: Filtering early is the single most effective trick in query optimization.
+commonMistakes:
+- title: Assuming an index is always faster
+  explanation: Fetching many rows through an unclustered index can cost more than a scan.
+- title: Assuming columns are independent
+  explanation: Correlated columns make the multiplied estimate far too small.
+- title: Trusting stale statistics
+  explanation: After big changes the optimizer needs fresh statistics (ANALYZE).
+- title: Joining the biggest tables first
+  explanation: Intermediate results can explode; start with selective joins.
+- title: Filtering after the join
+  explanation: Push filters below joins to shrink the input.
+summary:
+- The optimizer estimates the cost of plans and picks the cheapest.
+- Statistics give selectivity; histograms handle skewed data.
+- Index scans win for few matches and lose for many.
+- The join order controls the size of intermediate results.
+- Rewrites such as filter push-down are always safe and very effective.
+- EXPLAIN shows the chosen plan and the estimates.
+next: u25-txn
+quiz:
+- type: mcq
+  question: What is selectivity?
+  options:
+  - The fraction of rows a condition keeps
+  - The number of columns
+  - The size of an index
+  - The cost of a join
+  answer: 0
+  explanation: A selectivity of 0.01 means one row in a hundred.
+- type: mcq
+  question: When can a sequential scan beat an index?
+  options:
+  - When the condition matches a large part of the table
+  - When the table is empty
+  - Never
+  - When there is no WHERE
+  answer: 0
+  explanation: Random page reads add up.
+- type: mcq
+  question: Why use a histogram?
+  options:
+  - Real data is skewed, so uniform estimates are wrong
+  - To store rows
+  - To sort data
+  - To encrypt data
+  answer: 0
+  explanation: It records how many values fall in each range.
+- type: mcq
+  question: What does filter push-down do?
+  options:
+  - Applies a condition before the join
+  - Deletes rows
+  - Sorts rows
+  - Adds an index
+  answer: 0
+  explanation: The join then processes fewer rows.
+- type: mcq
+  question: Why does join order matter?
+  options:
+  - Intermediate results can be huge or tiny
+  - Tables must be alphabetical
+  - It does not
+  - Order changes the answer
+  answer: 0
+  explanation: The sizes between joins drive the cost.
+- type: mcq
+  question: What does EXPLAIN show?
+  options:
+  - The plan the optimizer chose
+  - The table data
+  - The index file
+  - The user list
+  answer: 0
+  explanation: It prints the operator tree and estimates.
+- type: code
+  question: 'Write `expected_rows(total_rows, selectivity)` returning the estimated number of matching rows as an integer: the product, rounded to the nearest integer.'
+  starter: |
+    def expected_rows(total_rows, selectivity):
+        pass
+  tests:
+  - name: expected
+    code: |
+      assert expected_rows(1000, 0.25) == 250 and expected_rows(1000, 0.0004) == 0 and expected_rows(7, 0.5) == 4 and expected_rows(0, 0.9) == 0
+  solution: |
+    def expected_rows(total_rows, selectivity):
+        return round(total_rows * selectivity)

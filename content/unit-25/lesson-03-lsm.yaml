@@ -1,0 +1,1364 @@
+id: u25-lsm
+title: LSM Trees and Bloom Filters
+minutes: 90
+objective: 'Learn the second great way to store data: the log-structured merge tree used by Cassandra, RocksDB, LevelDB and many others. You will write SSTables, a memtable with tombstones, compaction, and Bloom filters that avoid useless disk reads.'
+outcomes:
+- Explain why LSM trees make writes fast
+- Build SSTables and merge them
+- Delete with tombstones
+- Compact tables and scan ranges
+- Use Bloom filters to skip tables
+- Compare LSM trees with B+ trees
+sections:
+- heading: Writes without seeking
+  body: |-
+    A B+ tree updates a page in the middle of a file, which forces the disk to jump around (a **random write**). Disks, including SSDs, are far faster at **sequential writes**, appending one block after another. The **log-structured merge tree**, or **LSM tree**, is designed around that fact. Instead of changing data in place it never modifies a file after writing it.
+
+    Here is how it works. Every write first goes into the **memtable**, a sorted structure in memory (a balanced tree or skip list), and also into a **write-ahead log** so a crash cannot lose it. When the memtable gets full it is written to disk in one sequential pass as an **SSTable**, a *sorted string table*: an immutable file whose entries are sorted by key, with an index to find a key quickly by binary search. Writes are therefore very fast: an in-memory insert plus an occasional big sequential write. That is why Cassandra, RocksDB, LevelDB and HBase use LSM trees for write-heavy workloads such as logs, messaging and time series.
+- heading: Reads, deletes and compaction
+  body: |-
+    The price is paid when reading. A key may live in the memtable or in any of several SSTables, with older versions of the same key in older files. A read checks the memtable first, then the SSTables from **newest to oldest**, and the first version it finds is the answer. Deleting is a special write. Since files are never changed, a delete writes a **tombstone**, a marker saying "this key is gone", which hides the older values below it.
+
+    Left alone, SSTables accumulate and reads get slower. So background threads perform **compaction**: they merge several sorted tables into one larger one, a fast sequential pass like the merge step of merge sort. During a merge the newer version of each key wins, and once a tombstone has been merged with all the older tables that could contain the key it can finally be discarded, reclaiming space. Compaction strategies decide *which* tables to merge: **size-tiered** merges tables of similar size, and **leveled** compaction keeps tables in levels, each ten times bigger than the one above, with non-overlapping key ranges. All of them trade extra background writing (**write amplification**) against read speed and space.
+- heading: Bloom filters
+  body: |-
+    To look up a key that is not in the database, a naive read would have to search every SSTable. A **Bloom filter**, named after Burton Bloom, avoids most of that work. It is an array of `m` bits, initially all zero, together with `k` different hash functions. To **add** an item, compute its `k` hashes and set those `k` bits to 1. To **test** an item, check whether all `k` of its bits are 1. If any bit is 0 the item is **definitely not present**. If all are 1 it is **probably present**, but other items might have set those same bits by chance, a **false positive**. There are never false negatives.
+
+    With about 10 bits per key and 7 hash functions, the false-positive rate is roughly one percent, for a filter far smaller than the keys themselves. Keeping one filter per SSTable in memory lets a read skip nearly every table that lacks the key, so only about one disk read in a hundred is wasted. The formula for the rate after storing `n` items is `(1 - e^(-kn/m))^k`, and the best `k` is about `(m/n) · ln 2`.
+- heading: B+ tree or LSM tree?
+  body: Neither is better in general. **B+ trees** (PostgreSQL, MySQL InnoDB, SQLite) give predictable fast reads and in-place updates, and suit workloads with many reads and moderate writes. **LSM trees** give very high write throughput and compress well, but reads may touch several files, compaction uses background effort, and performance can fluctuate while it runs. Choosing between them means asking whether the workload is dominated by reads or writes.
+examples:
+- title: Writes, deletes and compaction
+  intro: A tiny LSM tree flushes to SSTables, hides a deleted key with a tombstone, and compacts.
+  code: |
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+
+
+    def new_lsm(limit):
+        """An empty LSM TREE: {"limit": limit, "memtable": {}, "tables": []}. `memtable` is the in-memory write buffer; `tables` are the SSTables on disk, OLDEST FIRST. ValueError('limit must be at least 1') if limit < 1."""
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        return {"limit": limit, "memtable": {}, "tables": []}
+
+
+    def flush(lsm):
+        """Write the memtable out as a new SSTable (its items sorted by key) at the END of lsm["tables"] and empty the memtable. Return the number of entries written (0 and no new table if the memtable was empty)."""
+        mem = lsm["memtable"]
+        if not mem:
+            return 0
+        lsm["tables"].append(sorted(mem.items()))
+        n = len(mem)
+        mem.clear()
+        return n
+
+
+    def put(lsm, key, value):
+        """Write a key: store it in the memtable; if the memtable then holds `limit` or more entries, flush it."""
+        lsm["memtable"][key] = value
+        if len(lsm["memtable"]) >= lsm["limit"]:
+            flush(lsm)
+
+
+    def delete(lsm, key):
+        """Delete a key by writing a TOMBSTONE: put(lsm, key, TOMB). (Old versions of the key still sit in older tables until compaction.)"""
+        put(lsm, key, TOMB)
+
+
+    def get(lsm, key):
+        """The newest value for the key, or None if it was never written or its newest entry is a tombstone. Look in the memtable first, then the tables from NEWEST to OLDEST (use table_get); the first entry found decides."""
+        if key in lsm["memtable"]:
+            v = lsm["memtable"][key]
+            return None if v == TOMB else v
+        for table in reversed(lsm["tables"]):
+            v = table_get(table, key)
+            if v is not None:
+                return None if v == TOMB else v
+        return None
+
+
+    def compact(lsm, count):
+        """Merge the `count` OLDEST tables into one table (use merge_tables, newer tables overriding older ones) and drop its tombstones, which is safe because the merge includes the oldest table so nothing older can resurface. Replace those tables by the merged one (omit it if it is empty).
+        ValueError('bad count') if count < 2 or count > number of tables. Return how many entries disappeared: total entries before minus entries in the merged table."""
+        tables = lsm["tables"]
+        if count < 2 or count > len(tables):
+            raise ValueError("bad count")
+        before = sum(len(t) for t in tables[:count])
+        merged = tables[0]
+        for t in tables[1:count]:
+            merged = merge_tables(merged, t)
+        merged = drop_tombstones(merged)
+        tables[:count] = [merged] if merged else []
+        return before - len(merged)
+
+
+    def maybe_compact(lsm, trigger):
+        """If there are at least `trigger` tables, compact(lsm, trigger) once and return True; otherwise do nothing and return False."""
+        if len(lsm["tables"]) >= trigger:
+            compact(lsm, trigger)
+            return True
+        return False
+
+
+    def scan(lsm, lo, hi):
+        """All live (key, value) pairs with lo <= key <= hi, sorted by key, as a read would see them: newer sources override older ones (memtable newest, then tables from newest to oldest) and keys whose newest entry is a tombstone are left out."""
+        view = {}
+        for table in lsm["tables"]:
+            for k, v in table:
+                if lo <= k <= hi:
+                    view[k] = v
+        for k, v in lsm["memtable"].items():
+            if lo <= k <= hi:
+                view[k] = v
+        return sorted((k, v) for k, v in view.items() if v != TOMB)
+
+    db = new_lsm(3)
+    for i in range(7):
+        put(db, "user%d" % (i % 4), "v%d" % i)
+    delete(db, "user1")
+    print("tables on disk:", len(db["tables"]), "memtable:", db["memtable"])
+    print("user0 =", get(db, "user0"), "user1 =", get(db, "user1"))
+    print("scan:", scan(db, "user0", "user9"))
+    flush(db)
+    print("tables before compaction:", [len(t) for t in db["tables"]])
+    removed = compact(db, len(db["tables"]))
+    print("entries removed by compaction:", removed, "tables now:", [len(t) for t in db["tables"]])
+  output: |
+    tables on disk: 2 memtable: {'user2': 'v6', 'user1': '<deleted>'}
+    user0 = v4 user1 = None
+    scan: [('user0', 'v4'), ('user2', 'v6'), ('user3', 'v3')]
+    tables before compaction: [3, 3, 2]
+    entries removed by compaction: 5 tables now: [3]
+  lines:
+  - line: 125
+    note: Three keys fill the memtable, so tables are flushed along the way.
+  - line: 126
+    note: A tombstone hides user1.
+  - line: 127
+    note: A scan shows only live entries.
+  - line: 130
+    note: Compaction merges everything and discards old versions and tombstones.
+- title: Bloom filters skip tables
+  intro: Missing keys are rejected by the filters without reading the tables.
+  code: |
+    import math
+
+
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine: FNV-1a over the UTF-8 bytes followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    def new_bloom(m, k):
+        """An empty BLOOM FILTER: {"m": m, "k": k, "bits": [0] * m}. ValueError('bad bloom') if m < 1 or k < 1."""
+        if m < 1 or k < 1:
+            raise ValueError("bad bloom")
+        return {"m": m, "k": k, "bits": [0] * m}
+
+
+    def bloom_positions(bloom, item):
+        """The k bit positions for an item using DOUBLE HASHING: h1 = stable_hash(item), h2 = stable_hash(item + '#2') | 1, and position i (for i = 0 .. k - 1) is (h1 + i * h2) % m."""
+        h1 = stable_hash(item)
+        h2 = stable_hash(item + "#2") | 1
+        return [(h1 + i * h2) % bloom["m"] for i in range(bloom["k"])]
+
+
+    def bloom_add(bloom, item):
+        """Set the item's k bits to 1."""
+        for p in bloom_positions(bloom, item):
+            bloom["bits"][p] = 1
+
+
+    def might_contain(bloom, item):
+        """False means the item is DEFINITELY absent; True means it MAY be present (all k bits are set)."""
+        return all(bloom["bits"][p] for p in bloom_positions(bloom, item))
+
+
+    def false_positive_rate(m, k, n):
+        """The theoretical false-positive probability after n items: (1 - e ** (-k * n / m)) ** k, rounded to 4 decimals."""
+        return round((1 - math.exp(-k * n / m)) ** k, 4)
+
+
+    def optimal_k(m, n):
+        """The best number of hash functions: round((m / n) * ln 2), but at least 1."""
+        return max(1, round(m / n * math.log(2)))
+
+
+    def build_table(pairs, m, k):
+        """An SSTable with a Bloom filter: {"data": the pairs sorted by key, "bloom": a filter (new_bloom(m, k)) holding every key}."""
+        bloom = new_bloom(m, k)
+        for key, value in pairs:
+            bloom_add(bloom, key)
+        return {"data": sorted(pairs), "bloom": bloom}
+
+
+    def lookup(tables, key):
+        """Search a list of tables (OLDEST FIRST) from newest to oldest. A table whose Bloom filter says the key is absent is skipped WITHOUT being read; otherwise it is READ (use table_get). Stop at the first table that has the key. Return (value or None, number of tables actually read).
+        Values equal to TOMB count as found (return TOMB itself; the caller decides what that means)."""
+        reads = 0
+        for table in reversed(tables):
+            if not might_contain(table["bloom"], key):
+                continue
+            reads += 1
+            v = table_get(table["data"], key)
+            if v is not None:
+                return v, reads
+        return None, reads
+
+    def table_get(table, key):
+        for k, v in table:
+            if k == key:
+                return v
+        return None
+
+
+    tables = [build_table([("t%d-%d" % (t, i), i) for i in range(100)], 1000, 7) for t in range(8)]
+    reads = sum(lookup(tables, "absent%d" % i)[1] for i in range(1000))
+    print("1000 lookups of missing keys across 8 tables read", reads, "tables out of", 8000)
+    print("one key from the oldest table reads", lookup(tables, "t0-5")[1], "table(s)")
+    print("theory: false positive rate with 10 bits per key:", false_positive_rate(1000, 7, 100), "best k:", optimal_k(1000, 100))
+  output: |
+    1000 lookups of missing keys across 8 tables read 87 tables out of 8000
+    one key from the oldest table reads 1 table(s)
+    theory: false positive rate with 10 bits per key: 0.0082 best k: 7
+  lines:
+  - line: 83
+    note: Almost every missing key is rejected without a read.
+  - line: 84
+    note: A key in the oldest table needs few reads thanks to the filters.
+  - line: 85
+    note: About one percent false positives.
+playground:
+  prompt: 'A Bloom filter in miniature: change the number of bits.'
+  code: |
+    bits = [0] * 16
+    for item in ['cat', 'dog']:
+        bits[len(item) * 3 % 16] = 1
+        bits[(ord(item[0]) + ord(item[-1])) % 16] = 1
+    print(bits)
+    print('maybe contains cat:', bits[9] == 1)
+exercises:
+- id: sstable
+  title: SSTables and merging
+  difficulty: 4
+  prompt: 'A B+ tree updates pages **in place**, which means random disk writes. A **log-structured merge tree (LSM tree)** turns every write into a cheap sequential one: new data goes into an in-memory sorted buffer, which is later written out as an immutable **SSTable** (*sorted string table*), a file sorted by key. Write the building blocks. `table_get(table, key)`: look up a key in an SSTable (a list of `(key, value)` pairs sorted by key, no repeated keys) using **binary search** (write the loop yourself); return the value (which may be the tombstone marker `TOMB`, given) or `None` if absent. `merge_tables(older, newer)`: merge two sorted tables into one with the **two-pointer** merge-sort technique (do not sort the concatenation); when both have the same key the entry from `newer` **wins**; tombstones are kept like any other value. `drop_tombstones(table)`: a copy without the entries whose value is `TOMB`.'
+  starter: |-
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        pass
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        pass
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        pass
+  tests:
+  - name: binary search
+    code: |
+      t = [(1, "a"), (3, "b"), (5, "c"), (9, "d")]
+      for k, v in t:
+          assert table_get(t, k) == v
+      assert table_get(t, 0) is None and table_get(t, 4) is None and table_get(t, 10) is None
+      assert table_get([], 1) is None and table_get([(2, TOMB)], 2) == TOMB
+      big = [(i * 2, i) for i in range(1000)]
+      assert table_get(big, 998) == 499 and table_get(big, 999) is None
+  - name: merging
+    code: |
+      older = [(1, "old1"), (3, "old3"), (5, "old5")]
+      newer = [(2, "new2"), (3, "new3"), (6, "new6")]
+      assert merge_tables(older, newer) == [(1, "old1"), (2, "new2"), (3, "new3"), (5, "old5"), (6, "new6")]
+      assert merge_tables([], newer) == newer and merge_tables(older, []) == older and merge_tables([], []) == []
+      assert merge_tables([(1, "a")], [(1, TOMB)]) == [(1, TOMB)]
+      assert older == [(1, "old1"), (3, "old3"), (5, "old5")]
+      import random
+      rng = random.Random(1)
+      a = sorted((k, "a") for k in rng.sample(range(100), 30))
+      b = sorted((k, "b") for k in rng.sample(range(100), 30))
+      m = merge_tables(a, b)
+      assert [k for k, v in m] == sorted(set(k for k, v in a) | set(k for k, v in b))
+      assert all(v == "b" for k, v in m if k in dict(b))
+  - name: dropping tombstones
+    code: |
+      t = [(1, "a"), (2, TOMB), (3, "c"), (4, TOMB)]
+      assert drop_tombstones(t) == [(1, "a"), (3, "c")]
+      assert drop_tombstones([]) == [] and drop_tombstones([(1, TOMB)]) == []
+      assert t[1] == (2, TOMB)
+  hints:
+  - For the merge, compare the current keys of both lists; on equality keep the newer entry and advance both.
+  solution: |
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+  explanation: Because SSTables are immutable and sorted, merging them is a fast sequential pass.
+- id: lsm
+  title: The LSM tree
+  difficulty: 5
+  prompt: 'Starter code gives `TOMB`, `table_get`, `merge_tables` and `drop_tombstones`. Write `new_lsm(limit)` returning `{"limit": limit, "memtable": {}, "tables": []}`; `memtable` is the in-memory write buffer, `tables` the SSTables on disk, **oldest first** (`ValueError("limit must be at least 1")` if `limit < 1`). Write `flush(lsm)`: write the memtable out as a new SSTable (its items **sorted by key**) at the **end** of `tables`, empty the memtable and return the number of entries written (0 and no new table if the memtable was empty). Write `put(lsm, key, value)`: store it in the memtable and, if the memtable now holds `limit` or more entries, flush it. Write `delete(lsm, key)`: write a **tombstone**, `put(lsm, key, TOMB)`, because older copies still sit in older tables until compaction. Write `get(lsm, key)`: the newest value, or `None` if the key was never written or its newest entry is a tombstone. Look in the memtable first, then the tables from **newest to oldest**; the first entry found decides.'
+  starter: |-
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+
+
+    def new_lsm(limit):
+        """An empty LSM TREE: {"limit": limit, "memtable": {}, "tables": []}. `memtable` is the in-memory write buffer; `tables` are the SSTables on disk, OLDEST FIRST. ValueError('limit must be at least 1') if limit < 1."""
+        pass
+
+
+    def flush(lsm):
+        """Write the memtable out as a new SSTable (its items sorted by key) at the END of lsm["tables"] and empty the memtable. Return the number of entries written (0 and no new table if the memtable was empty)."""
+        pass
+
+
+    def put(lsm, key, value):
+        """Write a key: store it in the memtable; if the memtable then holds `limit` or more entries, flush it."""
+        pass
+
+
+    def delete(lsm, key):
+        """Delete a key by writing a TOMBSTONE: put(lsm, key, TOMB). (Old versions of the key still sit in older tables until compaction.)"""
+        pass
+
+
+    def get(lsm, key):
+        """The newest value for the key, or None if it was never written or its newest entry is a tombstone. Look in the memtable first, then the tables from NEWEST to OLDEST (use table_get); the first entry found decides."""
+        pass
+  tests:
+  - name: writing and flushing
+    code: |
+      db = new_lsm(3)
+      put(db, "b", 2); put(db, "a", 1)
+      assert db["tables"] == [] and db["memtable"] == {"b": 2, "a": 1}
+      put(db, "c", 3)
+      assert db["memtable"] == {} and db["tables"] == [[("a", 1), ("b", 2), ("c", 3)]]
+      assert flush(db) == 0 and len(db["tables"]) == 1
+      put(db, "z", 26)
+      assert flush(db) == 1 and db["tables"][1] == [("z", 26)]
+      try:
+          new_lsm(0)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "at least 1" in str(e)
+  - name: reading newest first
+    code: |
+      db = new_lsm(2)
+      put(db, "k", "v1"); put(db, "x", 1)
+      put(db, "k", "v2"); put(db, "y", 2)
+      put(db, "k", "v3")
+      assert len(db["tables"]) == 2 and db["memtable"] == {"k": "v3"}
+      assert get(db, "k") == "v3" and get(db, "x") == 1 and get(db, "y") == 2 and get(db, "nope") is None
+      flush(db)
+      assert get(db, "k") == "v3" and db["tables"][2] == [("k", "v3")]
+  - name: deletes are tombstones
+    code: |
+      db = new_lsm(2)
+      put(db, "a", 1); put(db, "b", 2)
+      delete(db, "a")
+      assert get(db, "a") is None and get(db, "b") == 2
+      assert db["tables"] == [[("a", 1), ("b", 2)]] and db["memtable"] == {"a": TOMB}
+      put(db, "c", 3)
+      assert db["tables"][1] == [("a", TOMB), ("c", 3)] and get(db, "a") is None
+      put(db, "a", 99)
+      assert get(db, "a") == 99
+      delete(db, "never-existed")
+      assert get(db, "never-existed") is None
+  - name: many writes
+    code: |
+      import random
+      rng = random.Random(3)
+      db = new_lsm(10)
+      model = {}
+      for i in range(500):
+          k = "key%d" % rng.randrange(40)
+          if rng.random() < 0.25:
+              delete(db, k); model.pop(k, None)
+          else:
+              put(db, k, i); model[k] = i
+      for k in ["key%d" % j for j in range(40)]:
+          assert get(db, k) == model.get(k), k
+      assert len(db["tables"]) >= 40 and all(t == sorted(t) for t in db["tables"])
+  hints:
+  - Test the memtable first, then walk reversed(tables); remember a tombstone found first means 'deleted'.
+  solution: |
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+
+
+    def new_lsm(limit):
+        """An empty LSM TREE: {"limit": limit, "memtable": {}, "tables": []}. `memtable` is the in-memory write buffer; `tables` are the SSTables on disk, OLDEST FIRST. ValueError('limit must be at least 1') if limit < 1."""
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        return {"limit": limit, "memtable": {}, "tables": []}
+
+
+    def flush(lsm):
+        """Write the memtable out as a new SSTable (its items sorted by key) at the END of lsm["tables"] and empty the memtable. Return the number of entries written (0 and no new table if the memtable was empty)."""
+        mem = lsm["memtable"]
+        if not mem:
+            return 0
+        lsm["tables"].append(sorted(mem.items()))
+        n = len(mem)
+        mem.clear()
+        return n
+
+
+    def put(lsm, key, value):
+        """Write a key: store it in the memtable; if the memtable then holds `limit` or more entries, flush it."""
+        lsm["memtable"][key] = value
+        if len(lsm["memtable"]) >= lsm["limit"]:
+            flush(lsm)
+
+
+    def delete(lsm, key):
+        """Delete a key by writing a TOMBSTONE: put(lsm, key, TOMB). (Old versions of the key still sit in older tables until compaction.)"""
+        put(lsm, key, TOMB)
+
+
+    def get(lsm, key):
+        """The newest value for the key, or None if it was never written or its newest entry is a tombstone. Look in the memtable first, then the tables from NEWEST to OLDEST (use table_get); the first entry found decides."""
+        if key in lsm["memtable"]:
+            v = lsm["memtable"][key]
+            return None if v == TOMB else v
+        for table in reversed(lsm["tables"]):
+            v = table_get(table, key)
+            if v is not None:
+                return None if v == TOMB else v
+        return None
+  explanation: LSM trees make writes fast and sequential, at the cost of checking several places on reads.
+- id: compact
+  title: Compaction and scans
+  difficulty: 5
+  prompt: 'Every flush adds an SSTable, so reads must check more and more files and old versions and tombstones pile up. **Compaction** merges tables in the background. Starter code gives the LSM tree so far. Write `compact(lsm, count)`: merge the `count` **oldest** tables into one (with `merge_tables`, newer tables overriding older ones) and **drop its tombstones**; that is safe because the merge includes the oldest table, so no older version can come back. Replace those tables by the merged one (omit it if empty). `ValueError("bad count")` if `count < 2` or `count` is more than the number of tables. Return how many entries disappeared: total entries before minus entries in the merged table. Write `maybe_compact(lsm, trigger)`: if there are at least `trigger` tables, `compact(lsm, trigger)` once and return `True`, otherwise return `False`. Write `scan(lsm, lo, hi)`: all **live** `(key, value)` pairs with `lo <= key <= hi`, sorted, as a read would see them (newer sources override older ones; keys whose newest entry is a tombstone are left out).'
+  starter: |-
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+
+
+    def new_lsm(limit):
+        """An empty LSM TREE: {"limit": limit, "memtable": {}, "tables": []}. `memtable` is the in-memory write buffer; `tables` are the SSTables on disk, OLDEST FIRST. ValueError('limit must be at least 1') if limit < 1."""
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        return {"limit": limit, "memtable": {}, "tables": []}
+
+
+    def flush(lsm):
+        """Write the memtable out as a new SSTable (its items sorted by key) at the END of lsm["tables"] and empty the memtable. Return the number of entries written (0 and no new table if the memtable was empty)."""
+        mem = lsm["memtable"]
+        if not mem:
+            return 0
+        lsm["tables"].append(sorted(mem.items()))
+        n = len(mem)
+        mem.clear()
+        return n
+
+
+    def put(lsm, key, value):
+        """Write a key: store it in the memtable; if the memtable then holds `limit` or more entries, flush it."""
+        lsm["memtable"][key] = value
+        if len(lsm["memtable"]) >= lsm["limit"]:
+            flush(lsm)
+
+
+    def delete(lsm, key):
+        """Delete a key by writing a TOMBSTONE: put(lsm, key, TOMB). (Old versions of the key still sit in older tables until compaction.)"""
+        put(lsm, key, TOMB)
+
+
+    def get(lsm, key):
+        """The newest value for the key, or None if it was never written or its newest entry is a tombstone. Look in the memtable first, then the tables from NEWEST to OLDEST (use table_get); the first entry found decides."""
+        if key in lsm["memtable"]:
+            v = lsm["memtable"][key]
+            return None if v == TOMB else v
+        for table in reversed(lsm["tables"]):
+            v = table_get(table, key)
+            if v is not None:
+                return None if v == TOMB else v
+        return None
+
+
+    def compact(lsm, count):
+        """Merge the `count` OLDEST tables into one table (use merge_tables, newer tables overriding older ones) and drop its tombstones, which is safe because the merge includes the oldest table so nothing older can resurface. Replace those tables by the merged one (omit it if it is empty).
+        ValueError('bad count') if count < 2 or count > number of tables. Return how many entries disappeared: total entries before minus entries in the merged table."""
+        pass
+
+
+    def maybe_compact(lsm, trigger):
+        """If there are at least `trigger` tables, compact(lsm, trigger) once and return True; otherwise do nothing and return False."""
+        pass
+
+
+    def scan(lsm, lo, hi):
+        """All live (key, value) pairs with lo <= key <= hi, sorted by key, as a read would see them: newer sources override older ones (memtable newest, then tables from newest to oldest) and keys whose newest entry is a tombstone are left out."""
+        pass
+  tests:
+  - name: compacting
+    code: |
+      db = new_lsm(2)
+      put(db, "a", 1); put(db, "b", 2)
+      put(db, "a", 10); put(db, "c", 3)
+      delete(db, "b"); put(db, "d", 4)
+      assert db["tables"] == [[("a", 1), ("b", 2)], [("a", 10), ("c", 3)], [("b", TOMB), ("d", 4)]]
+      assert compact(db, 2) == 1 and db["tables"] == [[("a", 10), ("b", 2), ("c", 3)], [("b", TOMB), ("d", 4)]]
+      assert compact(db, 2) == 2
+      assert db["tables"] == [[("a", 10), ("c", 3), ("d", 4)]]
+      assert get(db, "b") is None and get(db, "a") == 10
+  - name: bad counts and empty results
+    code: |
+      db = new_lsm(1)
+      put(db, "x", 1)
+      for c in (0, 1, 2):
+          try:
+              compact(db, c)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad count" in str(e)
+      put(db, "x", 2)
+      delete(db, "x")
+      assert compact(db, 3) == 3 and db["tables"] == []
+      assert get(db, "x") is None
+  - name: automatic compaction
+    code: |
+      db = new_lsm(2)
+      fired = 0
+      for i in range(20):
+          put(db, "k%d" % (i % 6), i)
+          if maybe_compact(db, 4):
+              fired += 1
+      assert fired >= 2 and len(db["tables"]) < 4
+      for j in range(6):
+          last = max(i for i in range(20) if i % 6 == j)
+          assert get(db, "k%d" % j) == last
+      assert maybe_compact(new_lsm(2), 3) is False
+  - name: scanning
+    code: |
+      db = new_lsm(3)
+      for i in range(10):
+          put(db, "k%02d" % i, i)
+      delete(db, "k03"); put(db, "k04", "new")
+      assert scan(db, "k02", "k06") == [("k02", 2), ("k04", "new"), ("k05", 5), ("k06", 6)]
+      assert scan(db, "k07", "k99") == [("k07", 7), ("k08", 8), ("k09", 9)]
+      assert scan(db, "a", "b") == [] and scan(db, "k05", "k01") == []
+      n = len(scan(db, "k00", "k99"))
+      compact(db, len(db["tables"]))
+      assert len(scan(db, "k00", "k99")) == n == 9
+  hints:
+  - Merging oldest to newest means each later table overrides the earlier merged result.
+  solution: |
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+
+
+    def new_lsm(limit):
+        """An empty LSM TREE: {"limit": limit, "memtable": {}, "tables": []}. `memtable` is the in-memory write buffer; `tables` are the SSTables on disk, OLDEST FIRST. ValueError('limit must be at least 1') if limit < 1."""
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        return {"limit": limit, "memtable": {}, "tables": []}
+
+
+    def flush(lsm):
+        """Write the memtable out as a new SSTable (its items sorted by key) at the END of lsm["tables"] and empty the memtable. Return the number of entries written (0 and no new table if the memtable was empty)."""
+        mem = lsm["memtable"]
+        if not mem:
+            return 0
+        lsm["tables"].append(sorted(mem.items()))
+        n = len(mem)
+        mem.clear()
+        return n
+
+
+    def put(lsm, key, value):
+        """Write a key: store it in the memtable; if the memtable then holds `limit` or more entries, flush it."""
+        lsm["memtable"][key] = value
+        if len(lsm["memtable"]) >= lsm["limit"]:
+            flush(lsm)
+
+
+    def delete(lsm, key):
+        """Delete a key by writing a TOMBSTONE: put(lsm, key, TOMB). (Old versions of the key still sit in older tables until compaction.)"""
+        put(lsm, key, TOMB)
+
+
+    def get(lsm, key):
+        """The newest value for the key, or None if it was never written or its newest entry is a tombstone. Look in the memtable first, then the tables from NEWEST to OLDEST (use table_get); the first entry found decides."""
+        if key in lsm["memtable"]:
+            v = lsm["memtable"][key]
+            return None if v == TOMB else v
+        for table in reversed(lsm["tables"]):
+            v = table_get(table, key)
+            if v is not None:
+                return None if v == TOMB else v
+        return None
+
+
+    def compact(lsm, count):
+        """Merge the `count` OLDEST tables into one table (use merge_tables, newer tables overriding older ones) and drop its tombstones, which is safe because the merge includes the oldest table so nothing older can resurface. Replace those tables by the merged one (omit it if it is empty).
+        ValueError('bad count') if count < 2 or count > number of tables. Return how many entries disappeared: total entries before minus entries in the merged table."""
+        tables = lsm["tables"]
+        if count < 2 or count > len(tables):
+            raise ValueError("bad count")
+        before = sum(len(t) for t in tables[:count])
+        merged = tables[0]
+        for t in tables[1:count]:
+            merged = merge_tables(merged, t)
+        merged = drop_tombstones(merged)
+        tables[:count] = [merged] if merged else []
+        return before - len(merged)
+
+
+    def maybe_compact(lsm, trigger):
+        """If there are at least `trigger` tables, compact(lsm, trigger) once and return True; otherwise do nothing and return False."""
+        if len(lsm["tables"]) >= trigger:
+            compact(lsm, trigger)
+            return True
+        return False
+
+
+    def scan(lsm, lo, hi):
+        """All live (key, value) pairs with lo <= key <= hi, sorted by key, as a read would see them: newer sources override older ones (memtable newest, then tables from newest to oldest) and keys whose newest entry is a tombstone are left out."""
+        view = {}
+        for table in lsm["tables"]:
+            for k, v in table:
+                if lo <= k <= hi:
+                    view[k] = v
+        for k, v in lsm["memtable"].items():
+            if lo <= k <= hi:
+                view[k] = v
+        return sorted((k, v) for k, v in view.items() if v != TOMB)
+  explanation: Compaction pays back the work saved on writes, keeping reads fast and reclaiming space.
+- id: bloom
+  title: Bloom filters
+  difficulty: 5
+  prompt: 'Checking every SSTable for a missing key wastes disk reads. A **Bloom filter** is a tiny in-memory structure that answers "is this key in the table?" with either **definitely not** or **maybe**, using far less space than the keys. It is an array of `m` bits and `k` hash functions. Starter code gives `stable_hash`. Write `new_bloom(m, k)` returning `{"m": m, "k": k, "bits": [0] * m}` (`ValueError("bad bloom")` if `m < 1` or `k < 1`). Write `bloom_positions(bloom, item)` using **double hashing**: `h1 = stable_hash(item)`, `h2 = stable_hash(item + ''#2'') | 1`, and position `i` (for `i = 0 .. k - 1`) is `(h1 + i * h2) % m`. Write `bloom_add(bloom, item)` (set those bits) and `might_contain(bloom, item)` (`False` means **definitely absent**, `True` means **maybe present**: all the bits are set). Write `false_positive_rate(m, k, n)`: the theoretical chance of a false alarm after `n` items, `(1 - e ** (-k * n / m)) ** k`, rounded to 4 decimals; and `optimal_k(m, n)`: `round((m / n) * ln 2)`, at least 1.'
+  starter: |-
+    import math
+
+
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine: FNV-1a over the UTF-8 bytes followed by a finishing mix. Returns an int in [0, 2**32)."""
+        pass
+
+
+    def new_bloom(m, k):
+        """An empty BLOOM FILTER: {"m": m, "k": k, "bits": [0] * m}. ValueError('bad bloom') if m < 1 or k < 1."""
+        pass
+
+
+    def bloom_positions(bloom, item):
+        """The k bit positions for an item using DOUBLE HASHING: h1 = stable_hash(item), h2 = stable_hash(item + '#2') | 1, and position i (for i = 0 .. k - 1) is (h1 + i * h2) % m."""
+        pass
+
+
+    def bloom_add(bloom, item):
+        """Set the item's k bits to 1."""
+        pass
+
+
+    def might_contain(bloom, item):
+        """False means the item is DEFINITELY absent; True means it MAY be present (all k bits are set)."""
+        pass
+
+
+    def false_positive_rate(m, k, n):
+        """The theoretical false-positive probability after n items: (1 - e ** (-k * n / m)) ** k, rounded to 4 decimals."""
+        pass
+
+
+    def optimal_k(m, n):
+        """The best number of hash functions: round((m / n) * ln 2), but at least 1."""
+        pass
+  tests:
+  - name: adding and testing
+    code: |
+      b = new_bloom(200, 4)
+      assert b["bits"] == [0] * 200 and b["m"] == 200 and b["k"] == 4
+      pos = bloom_positions(b, "apple")
+      assert len(pos) == 4 and all(0 <= p < 200 for p in pos) and pos == bloom_positions(b, "apple")
+      assert pos != bloom_positions(b, "banana")
+      h1 = stable_hash("apple"); h2 = stable_hash("apple#2") | 1
+      assert pos == [(h1 + i * h2) % 200 for i in range(4)]
+      assert not might_contain(b, "apple")
+      bloom_add(b, "apple")
+      assert might_contain(b, "apple") and sum(b["bits"]) <= 4
+      for bad in ((0, 3), (10, 0)):
+          try:
+              new_bloom(*bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad bloom" in str(e)
+  - name: no false negatives
+    code: |
+      b = new_bloom(1000, 5)
+      words = ["word%d" % i for i in range(100)]
+      for w in words:
+          bloom_add(b, w)
+      assert all(might_contain(b, w) for w in words)
+  - name: false positives are rare
+    code: |
+      b = new_bloom(1000, 7)
+      for i in range(100):
+          bloom_add(b, "in%d" % i)
+      false = sum(1 for i in range(2000) if might_contain(b, "out%d" % i))
+      assert false < 2000 * 0.05, false
+      tiny = new_bloom(8, 2)
+      for i in range(50):
+          bloom_add(tiny, "x%d" % i)
+      assert tiny["bits"] == [1] * 8 and might_contain(tiny, "anything")
+  - name: the formulas
+    code: |
+      assert false_positive_rate(1000, 7, 100) == round((1 - 2.718281828459045 ** (-0.7)) ** 7, 4)
+      assert 0.005 < false_positive_rate(1000, 7, 100) < 0.01
+      assert false_positive_rate(100, 3, 0) == 0.0
+      assert false_positive_rate(100, 1, 10) == 0.0952
+      assert optimal_k(1000, 100) == 7 and optimal_k(10, 100) == 1 and optimal_k(960, 100) == 7
+      assert false_positive_rate(1000, 7, 100) < false_positive_rate(1000, 1, 100)
+  hints:
+  - Compute h1 and h2 once, then loop over i.
+  solution: |
+    import math
+
+
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine: FNV-1a over the UTF-8 bytes followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    def new_bloom(m, k):
+        """An empty BLOOM FILTER: {"m": m, "k": k, "bits": [0] * m}. ValueError('bad bloom') if m < 1 or k < 1."""
+        if m < 1 or k < 1:
+            raise ValueError("bad bloom")
+        return {"m": m, "k": k, "bits": [0] * m}
+
+
+    def bloom_positions(bloom, item):
+        """The k bit positions for an item using DOUBLE HASHING: h1 = stable_hash(item), h2 = stable_hash(item + '#2') | 1, and position i (for i = 0 .. k - 1) is (h1 + i * h2) % m."""
+        h1 = stable_hash(item)
+        h2 = stable_hash(item + "#2") | 1
+        return [(h1 + i * h2) % bloom["m"] for i in range(bloom["k"])]
+
+
+    def bloom_add(bloom, item):
+        """Set the item's k bits to 1."""
+        for p in bloom_positions(bloom, item):
+            bloom["bits"][p] = 1
+
+
+    def might_contain(bloom, item):
+        """False means the item is DEFINITELY absent; True means it MAY be present (all k bits are set)."""
+        return all(bloom["bits"][p] for p in bloom_positions(bloom, item))
+
+
+    def false_positive_rate(m, k, n):
+        """The theoretical false-positive probability after n items: (1 - e ** (-k * n / m)) ** k, rounded to 4 decimals."""
+        return round((1 - math.exp(-k * n / m)) ** k, 4)
+
+
+    def optimal_k(m, n):
+        """The best number of hash functions: round((m / n) * ln 2), but at least 1."""
+        return max(1, round(m / n * math.log(2)))
+  explanation: Ten bits per key give about a one percent false-positive rate, so one disk read in a hundred is wasted.
+- id: runs
+  title: 'Capstone: skipping tables'
+  difficulty: 5
+  prompt: 'Starter code gives `table_get`, `TOMB`, `stable_hash` and the Bloom filter. Combine them as a real LSM tree does. Write `build_table(pairs, m, k)`: a dict `{"data": the pairs sorted by key, "bloom": a filter new_bloom(m, k) containing every key}`. Write `lookup(tables, key)` for a list of such tables **oldest first**: search from **newest to oldest**; a table whose filter says the key is absent is **skipped without being read**; otherwise it is **read** (use `table_get` on its data). Stop at the first table that has the key (a value equal to `TOMB` counts as found; return it unchanged). Return `(value or None, number of tables actually read)`.'
+  starter: |-
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+
+
+    import math
+
+
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine: FNV-1a over the UTF-8 bytes followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    def new_bloom(m, k):
+        """An empty BLOOM FILTER: {"m": m, "k": k, "bits": [0] * m}. ValueError('bad bloom') if m < 1 or k < 1."""
+        if m < 1 or k < 1:
+            raise ValueError("bad bloom")
+        return {"m": m, "k": k, "bits": [0] * m}
+
+
+    def bloom_positions(bloom, item):
+        """The k bit positions for an item using DOUBLE HASHING: h1 = stable_hash(item), h2 = stable_hash(item + '#2') | 1, and position i (for i = 0 .. k - 1) is (h1 + i * h2) % m."""
+        h1 = stable_hash(item)
+        h2 = stable_hash(item + "#2") | 1
+        return [(h1 + i * h2) % bloom["m"] for i in range(bloom["k"])]
+
+
+    def bloom_add(bloom, item):
+        """Set the item's k bits to 1."""
+        for p in bloom_positions(bloom, item):
+            bloom["bits"][p] = 1
+
+
+    def might_contain(bloom, item):
+        """False means the item is DEFINITELY absent; True means it MAY be present (all k bits are set)."""
+        return all(bloom["bits"][p] for p in bloom_positions(bloom, item))
+
+
+    def false_positive_rate(m, k, n):
+        """The theoretical false-positive probability after n items: (1 - e ** (-k * n / m)) ** k, rounded to 4 decimals."""
+        return round((1 - math.exp(-k * n / m)) ** k, 4)
+
+
+    def optimal_k(m, n):
+        """The best number of hash functions: round((m / n) * ln 2), but at least 1."""
+        return max(1, round(m / n * math.log(2)))
+
+
+    def build_table(pairs, m, k):
+        """An SSTable with a Bloom filter: {"data": the pairs sorted by key, "bloom": a filter (new_bloom(m, k)) holding every key}."""
+        pass
+
+
+    def lookup(tables, key):
+        """Search a list of tables (OLDEST FIRST) from newest to oldest. A table whose Bloom filter says the key is absent is skipped WITHOUT being read; otherwise it is READ (use table_get). Stop at the first table that has the key. Return (value or None, number of tables actually read).
+        Values equal to TOMB count as found (return TOMB itself; the caller decides what that means)."""
+        pass
+  tests:
+  - name: finding keys
+    code: |
+      t1 = build_table([("a", 1), ("b", 2)], 64, 3)
+      t2 = build_table([("b", 20), ("c", 3)], 64, 3)
+      assert t1["data"] == [("a", 1), ("b", 2)] and might_contain(t1["bloom"], "a") and might_contain(t2["bloom"], "c")
+      tables = [t1, t2]
+      assert lookup(tables, "c")[0] == 3 and lookup(tables, "b")[0] == 20 and lookup(tables, "a")[0] == 1
+      assert lookup(tables, "b") == (20, 1)
+      assert lookup([], "x") == (None, 0)
+      assert build_table([("z", 1), ("a", 2)], 16, 2)["data"] == [("a", 2), ("z", 1)]
+  - name: tombstones and absent keys
+    code: |
+      old = build_table([("a", 1)], 64, 3)
+      new = build_table([("a", TOMB)], 64, 3)
+      assert lookup([old, new], "a") == (TOMB, 1)
+      assert lookup([old, new], "missing")[0] is None
+  - name: filters save reads
+    code: |
+      tables = [build_table([("t%d-%d" % (t, i), i) for i in range(50)], 600, 5) for t in range(10)]
+      reads = 0
+      for t in range(10):
+          value, r = lookup(tables, "t%d-7" % t)
+          assert value == 7
+          reads += r
+      assert reads <= 10 + 3
+      absent = sum(lookup(tables, "absent%d" % i)[1] for i in range(200))
+      assert absent < 200 * 10 * 0.1, absent
+  - name: no filter protection without bits
+    code: |
+      t = build_table([("a", 1)], 1, 1)
+      assert t["bloom"]["bits"] == [1]
+      many = [build_table([("k%d" % i, i)], 1, 1) for i in range(5)]
+      assert lookup(many, "missing") == (None, 5)
+      assert lookup(many, "k0") == (0, 5)
+  hints:
+  - Ask the filter first; only call table_get when it says maybe.
+  solution: |
+    TOMB = "<deleted>"
+
+
+    def table_get(table, key):
+        """Look up a key in an SSTABLE: a list of (key, value) pairs SORTED by key, with no repeated keys. Use BINARY SEARCH (write the loop yourself). Return the stored value, which may be TOMB, or None if the key is not in the table."""
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            k, v = table[mid]
+            if k == key:
+                return v
+            if k < key:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return None
+
+
+    def merge_tables(older, newer):
+        """Merge two sorted tables into one sorted table with MERGE-SORT style two-pointer logic (do not sort the concatenation). When both tables have the same key the entry from `newer` wins. Tombstones are kept like any other value."""
+        out = []
+        i = j = 0
+        while i < len(older) and j < len(newer):
+            if older[i][0] < newer[j][0]:
+                out.append(older[i])
+                i += 1
+            elif older[i][0] > newer[j][0]:
+                out.append(newer[j])
+                j += 1
+            else:
+                out.append(newer[j])
+                i += 1
+                j += 1
+        out.extend(older[i:])
+        out.extend(newer[j:])
+        return out
+
+
+    def drop_tombstones(table):
+        """A copy of the table without the entries whose value is TOMB."""
+        return [(k, v) for k, v in table if v != TOMB]
+
+
+    import math
+
+
+    def stable_hash(text):
+        """A hash of a string that is the same on every run and every machine: FNV-1a over the UTF-8 bytes followed by a finishing mix. Returns an int in [0, 2**32)."""
+        h = 2166136261
+        for b in text.encode():
+            h ^= b
+            h = (h * 16777619) & 0xFFFFFFFF
+        h ^= h >> 16
+        h = (h * 0x85ebca6b) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xc2b2ae35) & 0xFFFFFFFF
+        h ^= h >> 16
+        return h
+
+
+    def new_bloom(m, k):
+        """An empty BLOOM FILTER: {"m": m, "k": k, "bits": [0] * m}. ValueError('bad bloom') if m < 1 or k < 1."""
+        if m < 1 or k < 1:
+            raise ValueError("bad bloom")
+        return {"m": m, "k": k, "bits": [0] * m}
+
+
+    def bloom_positions(bloom, item):
+        """The k bit positions for an item using DOUBLE HASHING: h1 = stable_hash(item), h2 = stable_hash(item + '#2') | 1, and position i (for i = 0 .. k - 1) is (h1 + i * h2) % m."""
+        h1 = stable_hash(item)
+        h2 = stable_hash(item + "#2") | 1
+        return [(h1 + i * h2) % bloom["m"] for i in range(bloom["k"])]
+
+
+    def bloom_add(bloom, item):
+        """Set the item's k bits to 1."""
+        for p in bloom_positions(bloom, item):
+            bloom["bits"][p] = 1
+
+
+    def might_contain(bloom, item):
+        """False means the item is DEFINITELY absent; True means it MAY be present (all k bits are set)."""
+        return all(bloom["bits"][p] for p in bloom_positions(bloom, item))
+
+
+    def false_positive_rate(m, k, n):
+        """The theoretical false-positive probability after n items: (1 - e ** (-k * n / m)) ** k, rounded to 4 decimals."""
+        return round((1 - math.exp(-k * n / m)) ** k, 4)
+
+
+    def optimal_k(m, n):
+        """The best number of hash functions: round((m / n) * ln 2), but at least 1."""
+        return max(1, round(m / n * math.log(2)))
+
+
+    def build_table(pairs, m, k):
+        """An SSTable with a Bloom filter: {"data": the pairs sorted by key, "bloom": a filter (new_bloom(m, k)) holding every key}."""
+        bloom = new_bloom(m, k)
+        for key, value in pairs:
+            bloom_add(bloom, key)
+        return {"data": sorted(pairs), "bloom": bloom}
+
+
+    def lookup(tables, key):
+        """Search a list of tables (OLDEST FIRST) from newest to oldest. A table whose Bloom filter says the key is absent is skipped WITHOUT being read; otherwise it is READ (use table_get). Stop at the first table that has the key. Return (value or None, number of tables actually read).
+        Values equal to TOMB count as found (return TOMB itself; the caller decides what that means)."""
+        reads = 0
+        for table in reversed(tables):
+            if not might_contain(table["bloom"], key):
+                continue
+            reads += 1
+            v = table_get(table["data"], key)
+            if v is not None:
+                return v, reads
+        return None, reads
+  explanation: Real systems keep one Bloom filter per SSTable in memory, so most missing keys cost no disk reads at all.
+commonMistakes:
+- title: Reading oldest tables first
+  explanation: The newest entry for a key is the real one.
+- title: Dropping a tombstone too early
+  explanation: An older table that still holds the key would bring it back.
+- title: Believing a Bloom filter can say a key is surely present
+  explanation: It only guarantees 'definitely absent'.
+- title: Modifying an SSTable in place
+  explanation: They are immutable; changes go to new tables.
+- title: Never compacting
+  explanation: Reads slow down and space is wasted.
+summary:
+- LSM trees turn writes into memory inserts and sequential flushes.
+- SSTables are immutable sorted files, merged like in merge sort.
+- A delete is a tombstone, removed only during compaction.
+- Reads check the memtable then SSTables from newest to oldest.
+- Bloom filters answer 'definitely not here' to skip tables.
+- LSM trees favour writes, B+ trees favour reads.
+next: u25-query
+quiz:
+- type: mcq
+  question: Why are LSM tree writes fast?
+  options:
+  - They go to memory and are flushed sequentially
+  - They skip the disk forever
+  - They use no memory
+  - They are never saved
+  answer: 0
+  explanation: No random in-place updates.
+- type: mcq
+  question: What does a tombstone do?
+  options:
+  - Marks a key as deleted until compaction removes it
+  - Deletes the table
+  - Compresses data
+  - Encrypts data
+  answer: 0
+  explanation: It hides older versions.
+- type: mcq
+  question: What can a Bloom filter tell you for certain?
+  options:
+  - That a key is definitely absent
+  - That a key is present
+  - How many keys exist
+  - Which table has it
+  answer: 0
+  explanation: No false negatives.
+- type: mcq
+  question: In which order does a read search the tables?
+  options:
+  - Newest to oldest
+  - Oldest to newest
+  - Random
+  - Largest first
+  answer: 0
+  explanation: Newer versions override older ones.
+- type: mcq
+  question: What does compaction do?
+  options:
+  - Merges tables, keeping the newest versions and discarding tombstones
+  - Splits tables
+  - Deletes the memtable
+  - Adds pages
+  answer: 0
+  explanation: It is a sequential merge.
+- type: mcq
+  question: Which workload suits an LSM tree best?
+  options:
+  - Very many writes
+  - Only reads
+  - Tiny data
+  - No data
+  answer: 0
+  explanation: Writes are its strength.
+- type: code
+  question: Write `bits_needed(n, per_key)` returning the number of bits for a Bloom filter holding `n` keys with `per_key` bits each (simply their product).
+  starter: |
+    def bits_needed(n, per_key):
+        pass
+  tests:
+  - name: bits
+    code: |
+      assert bits_needed(100, 10) == 1000 and bits_needed(0, 10) == 0 and bits_needed(7, 3) == 21
+  solution: |
+    def bits_needed(n, per_key):
+        return n * per_key

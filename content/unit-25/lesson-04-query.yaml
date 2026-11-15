@@ -1,0 +1,1460 @@
+id: u25-query
+title: Running Queries
+minutes: 100
+objective: Learn how a database turns a SQL query into rows. You will write streaming operators, three join algorithms, grouping with aggregates, a SQL parser, and a small query engine that executes and explains queries.
+outcomes:
+- Describe the iterator (Volcano) model of query execution
+- Write filter, projection, sort and limit operators
+- Implement nested-loop, hash and sort-merge joins
+- Group rows and compute aggregates
+- Parse a small SQL language
+- Explain a query plan
+sections:
+- heading: From SQL to a plan
+  body: |-
+    **SQL** (Structured Query Language) is *declarative*: you describe *what* you want, such as the names of all customers older than 40, and the database decides *how* to get it. Inside the database a query goes through stages very similar to a compiler. A **parser** turns the text into a tree. A **planner** (or *optimizer*, the next lesson) chooses an efficient strategy. An **executor** runs the chosen **query plan**, which is a tree of **operators**.
+
+    The classic way to run a plan is the **iterator model**, also called the **Volcano model**. Each operator is a small machine that produces rows one at a time on demand: when asked for the next row, it asks the operator below it for rows. The scan at the bottom reads rows from a table; a **filter** passes along only the rows that satisfy a condition (SQL's WHERE); a **projection** keeps only the requested columns (the SELECT list); a **sort** (ORDER BY) must read all its input before it can return the first row; and **limit** stops asking once it has enough. Python generators behave just like this, and because rows flow one at a time, a query can start returning results before it has read the whole table and uses very little memory.
+- heading: Joins
+  body: |-
+    Data is split over several tables to avoid repetition, for example *people* and *orders*, and a **join** puts matching rows back together, for example each order next to the person who placed it. There are three main algorithms. The **nested-loop join** compares every row of one table with every row of the other: simple, but with a million rows each it needs a trillion comparisons. The **hash join** reads one table into a hash table keyed by the join column, then looks up each row of the other table: roughly one step per row, and the usual choice when no index exists. The **sort-merge join** sorts both tables by the join column and then walks through both at once like the merge step of merge sort, which is excellent when the inputs are already sorted, for instance coming from a B+ tree.
+
+    An **outer join** also keeps rows that have no partner, filling the missing columns with **NULL**, SQL's marker for an unknown or absent value. NULL never equals anything, not even another NULL, so rows with NULL keys do not match in an ordinary join.
+- heading: Grouping and aggregates
+  body: 'SQL''s GROUP BY collects rows with the same value in some columns into **groups** and computes an **aggregate** for each group: COUNT, SUM, MIN, MAX or AVG. The usual implementation is a hash table from the group key to running totals, so one pass over the data is enough. Aggregates ignore NULL values, except COUNT(*) which counts rows. A query with aggregates but no GROUP BY has a single group covering the whole table, which exists even when the table is empty (COUNT is 0, the others are NULL).'
+- heading: Putting the engine together
+  body: 'A tiny engine needs just four parts: a **tokenizer** that splits the text into words, numbers, strings and symbols; a **parser** that checks the grammar and produces a structure describing the query; the **operators**; and a function that assembles the operators into a pipeline in the right order. The order matters: filter first to shrink the data early, then sort, then project, then limit. Sorting before projecting lets you order by a column you do not display. SQL''s **EXPLAIN** command prints the plan the database chose, which is the first thing to read when a query is slow.'
+examples:
+- title: Joining, grouping and streaming
+  intro: People and their orders joined with a hash join, grouped per person, plus a lazy limit on an endless table.
+  code: |
+    def scan(table):
+        """The leaf of every query plan: a GENERATOR that yields a COPY (dict(row)) of each row of the table (a list of dicts), one at a time."""
+        for row in table:
+            yield dict(row)
+
+
+    def where(rows, pred):
+        """A FILTER: yield only the rows for which pred(row) is true."""
+        for row in rows:
+            if pred(row):
+                yield row
+
+
+    def project(rows, cols):
+        """A PROJECTION: yield new dicts holding only the named columns, in the order given. ValueError('no such column NAME') if a row lacks a requested column."""
+        for row in rows:
+            out = {}
+            for c in cols:
+                if c not in row:
+                    raise ValueError("no such column " + c)
+                out[c] = row[c]
+            yield out
+
+
+    def limit(rows, n, offset=0):
+        """Skip `offset` rows, then yield at most n rows. It must be LAZY: once n rows have been yielded it stops WITHOUT asking its input for another row (so it works on an endless generator)."""
+        if n <= 0:
+            return
+        skipped = 0
+        given = 0
+        for row in rows:
+            if skipped < offset:
+                skipped += 1
+                continue
+            yield row
+            given += 1
+            if given >= n:
+                return
+
+
+    def order_by(rows, keys):
+        """SORT: `keys` is a list of (column, descending) pairs, most important first. Read ALL the rows, sort them (stable) and yield them. Hint: sort repeatedly, starting from the LAST key, with list.sort(key=..., reverse=...)."""
+        data = list(rows)
+        for col, desc in reversed(keys):
+            data.sort(key=lambda r: r[col], reverse=desc)
+        yield from data
+
+
+    def nested_loop_join(left, right, lcol, rcol):
+        """JOIN by brute force: for every left row compare it with every right row (read `right` into a list once); when left[lcol] == right[rcol] yield the merged row {**left, **right}. A None key never matches anything (as in SQL). Output order: by left row, then right row."""
+        right = list(right)
+        for l in left:
+            for r in right:
+                if l[lcol] is not None and l[lcol] == r[rcol]:
+                    yield {**l, **r}
+
+
+    def hash_join(left, right, lcol, rcol):
+        """HASH JOIN: build a dict from rcol value to the list of right rows (skip rows whose key is None), then for each left row look up its key and yield {**left, **right} for each match. Same output order as the nested-loop join."""
+        table = {}
+        for r in right:
+            if r[rcol] is not None:
+                table.setdefault(r[rcol], []).append(r)
+        for l in left:
+            if l[lcol] is None:
+                continue
+            for r in table.get(l[lcol], []):
+                yield {**l, **r}
+
+
+    def merge_join(left, right, lcol, rcol):
+        """SORT-MERGE JOIN: put both inputs in lists, drop rows whose key is None, sort each by its key column (stable), then walk both with two indexes. When the keys are equal, yield the merged rows for EVERY pairing of the left rows and right rows that share that key
+        (left rows in order, each with all the right rows in order), then move past the whole group. Output is ordered by key."""
+        a = sorted((l for l in left if l[lcol] is not None), key=lambda r: r[lcol])
+        b = sorted((r for r in right if r[rcol] is not None), key=lambda r: r[rcol])
+        i = j = 0
+        while i < len(a) and j < len(b):
+            ka, kb = a[i][lcol], b[j][rcol]
+            if ka < kb:
+                i += 1
+            elif ka > kb:
+                j += 1
+            else:
+                i2 = i
+                while i2 < len(a) and a[i2][lcol] == ka:
+                    i2 += 1
+                j2 = j
+                while j2 < len(b) and b[j2][rcol] == kb:
+                    j2 += 1
+                for l in a[i:i2]:
+                    for r in b[j:j2]:
+                        yield {**l, **r}
+                i, j = i2, j2
+
+
+    def left_join(left, right, lcol, rcol, right_cols):
+        """LEFT OUTER JOIN: like hash_join, but a left row with NO match is still yielded, extended with every name in `right_cols` set to None (a left row with a None key also counts as unmatched). Left rows come in their original order."""
+        table = {}
+        for r in right:
+            if r[rcol] is not None:
+                table.setdefault(r[rcol], []).append(r)
+        for l in left:
+            matches = table.get(l[lcol], []) if l[lcol] is not None else []
+            if not matches:
+                yield {**l, **{c: None for c in right_cols}}
+            for r in matches:
+                yield {**l, **r}
+
+
+    def group_by(rows, keys, aggs):
+        """GROUP BY with aggregates. `keys` is a list of column names; `aggs` a list of (output_name, function, column) with function one of 'count', 'sum', 'min', 'max', 'avg' (ValueError('unknown aggregate NAME') otherwise). Only values that are not None are used: count counts them (the column '*' counts every row),
+        sum/min/max/avg ignore None and give None if there is nothing left; avg is rounded to 2 decimals. Return a list of dicts, one per group, holding the key columns and then the aggregates, sorted by the tuple of key values. With NO keys there is always exactly one group, even for no rows (count 0, the rest None)."""
+        for name, fn, col in aggs:
+            if fn not in ("count", "sum", "min", "max", "avg"):
+                raise ValueError("unknown aggregate " + fn)
+        groups = {}
+        for row in rows:
+            groups.setdefault(tuple(row[k] for k in keys), []).append(row)
+        if not keys and not groups:
+            groups[()] = []
+        out = []
+        for key in sorted(groups):
+            members = groups[key]
+            result = dict(zip(keys, key))
+            for name, fn, col in aggs:
+                if fn == "count" and col == "*":
+                    result[name] = len(members)
+                    continue
+                vals = [r[col] for r in members if r[col] is not None]
+                if fn == "count":
+                    result[name] = len(vals)
+                elif not vals:
+                    result[name] = None
+                elif fn == "sum":
+                    result[name] = sum(vals)
+                elif fn == "min":
+                    result[name] = min(vals)
+                elif fn == "max":
+                    result[name] = max(vals)
+                else:
+                    result[name] = round(sum(vals) / len(vals), 2)
+            out.append(result)
+        return out
+
+    people = [{"pid": 1, "name": "ada"}, {"pid": 2, "name": "alan"}, {"pid": 3, "name": "grace"}]
+    orders = [{"buyer": 2, "item": "pen", "price": 3}, {"buyer": 1, "item": "ink", "price": 9}, {"buyer": 2, "item": "pad", "price": 5}]
+    joined = list(hash_join(people, orders, "pid", "buyer"))
+    print("joined rows:", len(joined))
+    for row in group_by(joined, ["name"], [("orders", "count", "*"), ("spent", "sum", "price")]):
+        print(row)
+    print("no orders:", [r["name"] for r in left_join(people, orders, "pid", "buyer", ["item"]) if r["item"] is None])
+    def numbers():
+        n = 0
+        while True:
+            yield {"n": n}
+            n += 1
+    print("first three squares of an endless table:", [r["n"] ** 2 for r in limit(numbers(), 3)])
+  output: |
+    joined rows: 3
+    {'name': 'ada', 'orders': 1, 'spent': 9}
+    {'name': 'alan', 'orders': 2, 'spent': 8}
+    no orders: ['grace']
+    first three squares of an endless table: [0, 1, 4]
+  lines:
+  - line: 147
+    note: The hash join pairs each order with its buyer.
+  - line: 149
+    note: One summary row per person.
+  - line: 151
+    note: Grace placed no orders, so the left join gives her NULLs.
+  - line: 157
+    note: limit stops the endless generator after three rows.
+- title: A query from text to result
+  intro: The tokens of a query, its result, and the plan from top to bottom.
+  code: |
+    def scan(table):
+        """The leaf of every query plan: a GENERATOR that yields a COPY (dict(row)) of each row of the table (a list of dicts), one at a time."""
+        for row in table:
+            yield dict(row)
+
+
+    def where(rows, pred):
+        """A FILTER: yield only the rows for which pred(row) is true."""
+        for row in rows:
+            if pred(row):
+                yield row
+
+
+    def project(rows, cols):
+        """A PROJECTION: yield new dicts holding only the named columns, in the order given. ValueError('no such column NAME') if a row lacks a requested column."""
+        for row in rows:
+            out = {}
+            for c in cols:
+                if c not in row:
+                    raise ValueError("no such column " + c)
+                out[c] = row[c]
+            yield out
+
+
+    def limit(rows, n, offset=0):
+        """Skip `offset` rows, then yield at most n rows. It must be LAZY: once n rows have been yielded it stops WITHOUT asking its input for another row (so it works on an endless generator)."""
+        if n <= 0:
+            return
+        skipped = 0
+        given = 0
+        for row in rows:
+            if skipped < offset:
+                skipped += 1
+                continue
+            yield row
+            given += 1
+            if given >= n:
+                return
+
+
+    def order_by(rows, keys):
+        """SORT: `keys` is a list of (column, descending) pairs, most important first. Read ALL the rows, sort them (stable) and yield them. Hint: sort repeatedly, starting from the LAST key, with list.sort(key=..., reverse=...)."""
+        data = list(rows)
+        for col, desc in reversed(keys):
+            data.sort(key=lambda r: r[col], reverse=desc)
+        yield from data
+
+
+    import re
+
+    KEYWORDS = ("SELECT", "FROM", "WHERE", "AND", "ORDER", "BY", "ASC", "DESC", "LIMIT")
+
+
+    def tokenize_sql(text):
+        """Split SQL text into a list of tokens: words (letters, digits, underscores, not starting with a digit), whole numbers, strings in single quotes (kept WITH their quotes) and the symbols >= <= != = < > , *. Spaces are skipped. ValueError('unexpected character C') for anything else."""
+        tokens = []
+        pos = 0
+        pattern = re.compile(r"\s+|(>=|<=|!=|=|<|>|,|\*|'[^']*'|\d+|[A-Za-z_][A-Za-z0-9_]*)")
+        while pos < len(text):
+            m = pattern.match(text, pos)
+            if not m:
+                raise ValueError("unexpected character " + text[pos])
+            if m.group(1) is not None:
+                tokens.append(m.group(1))
+            pos = m.end()
+        return tokens
+
+
+    def parse_sql(text):
+        """Parse  SELECT cols FROM table [WHERE cond AND cond ...] [ORDER BY col [ASC|DESC], ...] [LIMIT n]  into {"cols": [...] (or ["*"]), "table": name, "where": [(column, op, value)], "order": [(column, descending)], "limit": n or None}.
+        Keywords are case-insensitive; names are case-sensitive. A condition is column op value with op one of = != < <= > >=, and value an integer or a quoted string (returned without the quotes). Errors are ValueError with the message 'expected X' (X = what was missing, for example 'expected FROM') or 'unexpected extra input'."""
+        toks = tokenize_sql(text)
+        pos = 0
+
+        def peek():
+            return toks[pos] if pos < len(toks) else None
+
+        def is_kw(word):
+            t = peek()
+            return t is not None and t.upper() == word
+
+        def eat_kw(word):
+            nonlocal pos
+            if not is_kw(word):
+                raise ValueError("expected " + word)
+            pos += 1
+
+        def name(what):
+            nonlocal pos
+            t = peek()
+            if t is None or not re.match(r"[A-Za-z_]", t) or t.upper() in KEYWORDS:
+                raise ValueError("expected " + what)
+            pos += 1
+            return t
+
+        eat_kw("SELECT")
+        if peek() == "*":
+            pos += 1
+            cols = ["*"]
+        else:
+            cols = [name("column")]
+            while peek() == ",":
+                pos += 1
+                cols.append(name("column"))
+        eat_kw("FROM")
+        table = name("table name")
+        conds, order, lim = [], [], None
+        if is_kw("WHERE"):
+            pos += 1
+            while True:
+                col = name("column")
+                op = peek()
+                if op not in ("=", "!=", "<", "<=", ">", ">="):
+                    raise ValueError("expected comparison")
+                pos += 1
+                t = peek()
+                if t is None:
+                    raise ValueError("expected value")
+                if t.startswith("'"):
+                    val = t[1:-1]
+                elif t.isdigit():
+                    val = int(t)
+                else:
+                    raise ValueError("expected value")
+                pos += 1
+                conds.append((col, op, val))
+                if is_kw("AND"):
+                    pos += 1
+                else:
+                    break
+        if is_kw("ORDER"):
+            pos += 1
+            eat_kw("BY")
+            while True:
+                col = name("column")
+                desc = False
+                if is_kw("DESC"):
+                    desc = True
+                    pos += 1
+                elif is_kw("ASC"):
+                    pos += 1
+                order.append((col, desc))
+                if peek() == ",":
+                    pos += 1
+                else:
+                    break
+        if is_kw("LIMIT"):
+            pos += 1
+            t = peek()
+            if t is None or not t.isdigit():
+                raise ValueError("expected number")
+            lim = int(t)
+            pos += 1
+        if pos != len(toks):
+            raise ValueError("unexpected extra input")
+        return {"cols": cols, "table": table, "where": conds, "order": order, "limit": lim}
+
+
+    def make_predicate(conds):
+        """Turn a WHERE list of (column, op, value) conditions into a function row -> bool that is true only if ALL conditions hold. Operators: = != < <= > >=. A condition on a NULL (None) value is never true. ValueError('no such column NAME') when the row lacks the column."""
+        def pred(row):
+            for col, op, value in conds:
+                if col not in row:
+                    raise ValueError("no such column " + col)
+                v = row[col]
+                if v is None:
+                    return False
+                ok = {"=": v == value, "!=": v != value, "<": v < value, "<=": v <= value, ">": v > value, ">=": v >= value}[op]
+                if not ok:
+                    return False
+            return True
+        return pred
+
+
+    def execute(sql, db):
+        """Run a query against `db`, a dict from table name to list of row dicts, and return the result as a list of dicts. Build the plan as a pipeline of the operators: scan the table (ValueError('no such table NAME') if missing), then where (with make_predicate) if there is a WHERE,
+        then order_by if there is an ORDER BY, then project unless the columns are ['*'], and finally limit if there is a LIMIT. (Sorting BEFORE projecting lets you order by a column you do not select.)"""
+        q = parse_sql(sql)
+        if q["table"] not in db:
+            raise ValueError("no such table " + q["table"])
+        rows = scan(db[q["table"]])
+        if q["where"]:
+            rows = where(rows, make_predicate(q["where"]))
+        if q["order"]:
+            rows = order_by(rows, q["order"])
+        if q["cols"] != ["*"]:
+            rows = project(rows, q["cols"])
+        if q["limit"] is not None:
+            rows = limit(rows, q["limit"])
+        return list(rows)
+
+
+    def explain(sql):
+        """Describe the plan of a query as a list of strings from the TOP operator down to the scan. Include only the operators that apply: 'Limit N', 'Project a, b', 'Sort a DESC, b ASC' (every key written with ASC or DESC), 'Filter x > 3 AND y = 'z'' (string values in single quotes, integers bare, conditions joined with ' AND '), and always 'Scan TABLE'."""
+        q = parse_sql(sql)
+        plan = []
+        if q["limit"] is not None:
+            plan.append("Limit %d" % q["limit"])
+        if q["cols"] != ["*"]:
+            plan.append("Project " + ", ".join(q["cols"]))
+        if q["order"]:
+            plan.append("Sort " + ", ".join("%s %s" % (c, "DESC" if d else "ASC") for c, d in q["order"]))
+        if q["where"]:
+            plan.append("Filter " + " AND ".join("%s %s %s" % (c, o, repr(v) if isinstance(v, str) else v) for c, o, v in q["where"]))
+        plan.append("Scan " + q["table"])
+        return plan
+
+    db = {"people": [{"name": "ada", "age": 36}, {"name": "alan", "age": 41}, {"name": "grace", "age": 45}, {"name": "edsger", "age": 72}]}
+    sql = "SELECT name FROM people WHERE age > 40 ORDER BY age DESC LIMIT 2"
+    print("query:", sql)
+    print("result:", execute(sql, db))
+    for step in explain(sql):
+        print("plan:", step)
+    print("tokens:", tokenize_sql("SELECT a FROM t WHERE x >= 10"))
+  output: |
+    query: SELECT name FROM people WHERE age > 40 ORDER BY age DESC LIMIT 2
+    result: [{'name': 'edsger'}, {'name': 'grace'}]
+    plan: Limit 2
+    plan: Project name
+    plan: Sort age DESC
+    plan: Filter age > 40
+    plan: Scan people
+    tokens: ['SELECT', 'a', 'FROM', 't', 'WHERE', 'x', '>=', '10']
+  lines:
+  - line: 211
+    note: Only people over 40, oldest first, two of them.
+  - line: 212
+    note: The plan reads from the top operator down to the scan.
+  - line: 214
+    note: Words, symbols and numbers.
+playground:
+  prompt: Change the condition and watch the streaming filter.
+  code: |
+    rows = [{'n': n} for n in range(10)]
+    big = (r for r in rows if r['n'] > 6)
+    first = next(big)
+    print('first big row:', first)
+    print('rest:', list(big))
+exercises:
+- id: ops
+  title: Operators that stream
+  difficulty: 4
+  prompt: 'A database runs a query as a pipeline of **operators**, each pulling rows from the one below it, one row at a time (the **iterator** or **Volcano** model). Python generators are perfect for this. Write `scan(table)`, a generator yielding a **copy** (`dict(row)`) of each row of a list of dicts; `where(rows, pred)`, the **filter**; `project(rows, cols)`, yielding new dicts with only the named columns in the order given (`ValueError("no such column NAME")` if a row lacks one); `limit(rows, n, offset=0)`: skip `offset` rows, then yield at most `n`; it must be **lazy**: once `n` rows have been given it stops **without asking its input for another row**, so it works even on an endless generator; and `order_by(rows, keys)` where `keys` is a list of `(column, descending)` pairs, most important first: read all the rows, sort them and yield them (hint: sort **repeatedly starting from the last key** with `list.sort(key=..., reverse=...)`, because Python''s sort is stable).'
+  starter: |-
+    def scan(table):
+        """The leaf of every query plan: a GENERATOR that yields a COPY (dict(row)) of each row of the table (a list of dicts), one at a time."""
+        pass
+
+
+    def where(rows, pred):
+        """A FILTER: yield only the rows for which pred(row) is true."""
+        pass
+
+
+    def project(rows, cols):
+        """A PROJECTION: yield new dicts holding only the named columns, in the order given. ValueError('no such column NAME') if a row lacks a requested column."""
+        pass
+
+
+    def limit(rows, n, offset=0):
+        """Skip `offset` rows, then yield at most n rows. It must be LAZY: once n rows have been yielded it stops WITHOUT asking its input for another row (so it works on an endless generator)."""
+        pass
+
+
+    def order_by(rows, keys):
+        """SORT: `keys` is a list of (column, descending) pairs, most important first. Read ALL the rows, sort them (stable) and yield them. Hint: sort repeatedly, starting from the LAST key, with list.sort(key=..., reverse=...)."""
+        pass
+  tests:
+  - name: scan, filter, project
+    code: |
+      table = [{"id": 1, "name": "ada", "age": 36}, {"id": 2, "name": "alan", "age": 41}, {"id": 3, "name": "grace", "age": 45}]
+      rows = scan(table)
+      assert iter(rows) is rows
+      r = list(scan(table))
+      assert r == table and r[0] is not table[0]
+      r[0]["name"] = "changed"
+      assert table[0]["name"] == "ada"
+      assert list(where(scan(table), lambda row: row["age"] > 40)) == table[1:]
+      assert list(project(scan(table), ["name", "id"])) == [{"name": "ada", "id": 1}, {"name": "alan", "id": 2}, {"name": "grace", "id": 3}]
+      assert list(project(scan(table), ["name"]))[0].keys() == {"name": 0}.keys()
+      try:
+          list(project(scan(table), ["salary"]))
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no such column salary" in str(e)
+  - name: limit is lazy
+    code: |
+      def counter():
+          n = 0
+          while True:
+              yield {"n": n}
+              n += 1
+      assert list(limit(counter(), 3)) == [{"n": 0}, {"n": 1}, {"n": 2}]
+      assert list(limit(counter(), 2, offset=5)) == [{"n": 5}, {"n": 6}]
+      assert list(limit(counter(), 0)) == []
+      assert list(limit(iter([{"n": 1}]), 5)) == [{"n": 1}]
+      assert list(limit(iter([{"n": 1}, {"n": 2}]), 5, offset=5)) == []
+      pulled = []
+      def watched():
+          for i in range(100):
+              pulled.append(i)
+              yield {"n": i}
+      assert len(list(limit(watched(), 4))) == 4 and pulled == [0, 1, 2, 3]
+  - name: sorting
+    code: |
+      t = [{"d": "x", "n": 3}, {"d": "y", "n": 1}, {"d": "x", "n": 1}, {"d": "y", "n": 3}, {"d": "x", "n": 2}]
+      assert [r["n"] for r in order_by(iter(t), [("n", False)])] == [1, 1, 2, 3, 3]
+      got = list(order_by(iter(t), [("d", False), ("n", True)]))
+      assert [(r["d"], r["n"]) for r in got] == [("x", 3), ("x", 2), ("x", 1), ("y", 3), ("y", 1)]
+      got = list(order_by(iter(t), [("n", True), ("d", False)]))
+      assert [(r["d"], r["n"]) for r in got] == [("x", 3), ("y", 3), ("x", 2), ("x", 1), ("y", 1)]
+      assert list(order_by(iter([]), [("n", False)])) == [] and len(list(order_by(iter(t), []))) == 5
+  - name: a pipeline
+    code: |
+      people = [{"name": n, "age": a} for n, a in (("ada", 36), ("alan", 41), ("grace", 45), ("edsger", 72), ("barbara", 29), ("donald", 85))]
+      plan = limit(project(order_by(where(scan(people), lambda r: r["age"] > 30), [("age", True)]), ["name"]), 3)
+      assert list(plan) == [{"name": "donald"}, {"name": "edsger"}, {"name": "grace"}]
+      assert people[0] == {"name": "ada", "age": 36}
+  hints:
+  - A generator function uses yield; limit can simply return after the n-th row.
+  solution: |
+    def scan(table):
+        """The leaf of every query plan: a GENERATOR that yields a COPY (dict(row)) of each row of the table (a list of dicts), one at a time."""
+        for row in table:
+            yield dict(row)
+
+
+    def where(rows, pred):
+        """A FILTER: yield only the rows for which pred(row) is true."""
+        for row in rows:
+            if pred(row):
+                yield row
+
+
+    def project(rows, cols):
+        """A PROJECTION: yield new dicts holding only the named columns, in the order given. ValueError('no such column NAME') if a row lacks a requested column."""
+        for row in rows:
+            out = {}
+            for c in cols:
+                if c not in row:
+                    raise ValueError("no such column " + c)
+                out[c] = row[c]
+            yield out
+
+
+    def limit(rows, n, offset=0):
+        """Skip `offset` rows, then yield at most n rows. It must be LAZY: once n rows have been yielded it stops WITHOUT asking its input for another row (so it works on an endless generator)."""
+        if n <= 0:
+            return
+        skipped = 0
+        given = 0
+        for row in rows:
+            if skipped < offset:
+                skipped += 1
+                continue
+            yield row
+            given += 1
+            if given >= n:
+                return
+
+
+    def order_by(rows, keys):
+        """SORT: `keys` is a list of (column, descending) pairs, most important first. Read ALL the rows, sort them (stable) and yield them. Hint: sort repeatedly, starting from the LAST key, with list.sort(key=..., reverse=...)."""
+        data = list(rows)
+        for col, desc in reversed(keys):
+            data.sort(key=lambda r: r[col], reverse=desc)
+        yield from data
+  explanation: Streaming operators let a database start answering before it has read everything.
+- id: joins
+  title: Three ways to join
+  difficulty: 5
+  prompt: 'A **join** combines rows of two tables that agree on a column. Rows are dicts; the output row is `{**left, **right}`. A `None` key never matches anything (as in SQL). Write all of these as generators. `nested_loop_join(left, right, lcol, rcol)`: for every left row compare it with every right row (read `right` into a list first). `hash_join(left, right, lcol, rcol)`: build a dict from the right key to the **list** of right rows, then look each left row up; the output order is the same as the nested-loop join. `merge_join(left, right, lcol, rcol)`: **sort-merge join**: put both inputs in lists, drop `None` keys, sort each by its key (stable) and walk both with two indexes; when the keys are equal yield the merged rows for **every pairing** of the left rows and right rows sharing that key, then move past the whole group; the output is ordered by key. Write `left_join(left, right, lcol, rcol, right_cols)`: a **left outer join**: like the hash join, but a left row with no match is still yielded, extended with every name in `right_cols` set to `None` (a left row with a `None` key also counts as unmatched).'
+  starter: |-
+    def nested_loop_join(left, right, lcol, rcol):
+        """JOIN by brute force: for every left row compare it with every right row (read `right` into a list once); when left[lcol] == right[rcol] yield the merged row {**left, **right}. A None key never matches anything (as in SQL). Output order: by left row, then right row."""
+        pass
+
+
+    def hash_join(left, right, lcol, rcol):
+        """HASH JOIN: build a dict from rcol value to the list of right rows (skip rows whose key is None), then for each left row look up its key and yield {**left, **right} for each match. Same output order as the nested-loop join."""
+        pass
+
+
+    def merge_join(left, right, lcol, rcol):
+        """SORT-MERGE JOIN: put both inputs in lists, drop rows whose key is None, sort each by its key column (stable), then walk both with two indexes. When the keys are equal, yield the merged rows for EVERY pairing of the left rows and right rows that share that key
+        (left rows in order, each with all the right rows in order), then move past the whole group. Output is ordered by key."""
+        pass
+
+
+    def left_join(left, right, lcol, rcol, right_cols):
+        """LEFT OUTER JOIN: like hash_join, but a left row with NO match is still yielded, extended with every name in `right_cols` set to None (a left row with a None key also counts as unmatched). Left rows come in their original order."""
+        pass
+  tests:
+  - name: matching rows
+    code: |
+      people = [{"pid": 1, "name": "ada"}, {"pid": 2, "name": "alan"}, {"pid": 3, "name": "grace"}]
+      orders = [{"oid": 10, "buyer": 2, "item": "pen"}, {"oid": 11, "buyer": 1, "item": "ink"}, {"oid": 12, "buyer": 2, "item": "pad"}, {"oid": 13, "buyer": 9, "item": "cup"}]
+      want = [{"pid": 1, "name": "ada", "oid": 11, "buyer": 1, "item": "ink"}, {"pid": 2, "name": "alan", "oid": 10, "buyer": 2, "item": "pen"}, {"pid": 2, "name": "alan", "oid": 12, "buyer": 2, "item": "pad"}]
+      assert list(nested_loop_join(iter(people), iter(orders), "pid", "buyer")) == want
+      assert list(hash_join(iter(people), iter(orders), "pid", "buyer")) == want
+      assert list(merge_join(iter(people), iter(orders), "pid", "buyer")) == want
+      assert list(hash_join(people, [], "pid", "buyer")) == [] and list(merge_join([], orders, "pid", "buyer")) == []
+  - name: nulls and duplicates
+    code: |
+      a = [{"k": 1, "a": "x"}, {"k": None, "a": "y"}, {"k": 1, "a": "z"}, {"k": 2, "a": "w"}]
+      b = [{"k2": 1, "b": 1}, {"k2": None, "b": 2}, {"k2": 1, "b": 3}]
+      want = [{"k": 1, "a": "x", "k2": 1, "b": 1}, {"k": 1, "a": "x", "k2": 1, "b": 3}, {"k": 1, "a": "z", "k2": 1, "b": 1}, {"k": 1, "a": "z", "k2": 1, "b": 3}]
+      for fn in (nested_loop_join, hash_join, merge_join):
+          assert list(fn(a, b, "k", "k2")) == want, fn.__name__
+  - name: the algorithms agree
+    code: |
+      import random
+      rng = random.Random(8)
+      left = [{"x": rng.randrange(20), "l": i} for i in range(60)]
+      right = [{"y": rng.randrange(20), "r": i} for i in range(50)]
+      key = lambda r: (r["l"], r["r"])
+      n = sorted(nested_loop_join(left, right, "x", "y"), key=key)
+      h = sorted(hash_join(left, right, "x", "y"), key=key)
+      m = sorted(merge_join(left, right, "x", "y"), key=key)
+      assert n == h == m and len(n) > 100
+      ms = list(merge_join(left, right, "x", "y"))
+      assert [r["x"] for r in ms] == sorted(r["x"] for r in ms)
+      assert [r["x"] for r in ms] == [r["x"] for r in ms if r["x"] == r["y"]]
+  - name: outer join
+    code: |
+      people = [{"pid": 1, "name": "ada"}, {"pid": 2, "name": "alan"}, {"pid": None, "name": "ghost"}, {"pid": 3, "name": "grace"}]
+      orders = [{"buyer": 2, "item": "pen"}, {"buyer": 2, "item": "pad"}, {"buyer": 3, "item": "cup"}]
+      got = list(left_join(people, orders, "pid", "buyer", ["buyer", "item"]))
+      assert got == [{"pid": 1, "name": "ada", "buyer": None, "item": None}, {"pid": 2, "name": "alan", "buyer": 2, "item": "pen"}, {"pid": 2, "name": "alan", "buyer": 2, "item": "pad"},
+       {"pid": None, "name": "ghost", "buyer": None, "item": None}, {"pid": 3, "name": "grace", "buyer": 3, "item": "cup"}]
+      assert list(left_join([], orders, "pid", "buyer", ["item"])) == []
+      assert list(left_join(people[:1], [], "pid", "buyer", ["item"])) == [{"pid": 1, "name": "ada", "item": None}]
+  hints:
+  - A dict from key to list of rows is the heart of the hash join; the merge join needs a group of equal keys on each side.
+  solution: |
+    def nested_loop_join(left, right, lcol, rcol):
+        """JOIN by brute force: for every left row compare it with every right row (read `right` into a list once); when left[lcol] == right[rcol] yield the merged row {**left, **right}. A None key never matches anything (as in SQL). Output order: by left row, then right row."""
+        right = list(right)
+        for l in left:
+            for r in right:
+                if l[lcol] is not None and l[lcol] == r[rcol]:
+                    yield {**l, **r}
+
+
+    def hash_join(left, right, lcol, rcol):
+        """HASH JOIN: build a dict from rcol value to the list of right rows (skip rows whose key is None), then for each left row look up its key and yield {**left, **right} for each match. Same output order as the nested-loop join."""
+        table = {}
+        for r in right:
+            if r[rcol] is not None:
+                table.setdefault(r[rcol], []).append(r)
+        for l in left:
+            if l[lcol] is None:
+                continue
+            for r in table.get(l[lcol], []):
+                yield {**l, **r}
+
+
+    def merge_join(left, right, lcol, rcol):
+        """SORT-MERGE JOIN: put both inputs in lists, drop rows whose key is None, sort each by its key column (stable), then walk both with two indexes. When the keys are equal, yield the merged rows for EVERY pairing of the left rows and right rows that share that key
+        (left rows in order, each with all the right rows in order), then move past the whole group. Output is ordered by key."""
+        a = sorted((l for l in left if l[lcol] is not None), key=lambda r: r[lcol])
+        b = sorted((r for r in right if r[rcol] is not None), key=lambda r: r[rcol])
+        i = j = 0
+        while i < len(a) and j < len(b):
+            ka, kb = a[i][lcol], b[j][rcol]
+            if ka < kb:
+                i += 1
+            elif ka > kb:
+                j += 1
+            else:
+                i2 = i
+                while i2 < len(a) and a[i2][lcol] == ka:
+                    i2 += 1
+                j2 = j
+                while j2 < len(b) and b[j2][rcol] == kb:
+                    j2 += 1
+                for l in a[i:i2]:
+                    for r in b[j:j2]:
+                        yield {**l, **r}
+                i, j = i2, j2
+
+
+    def left_join(left, right, lcol, rcol, right_cols):
+        """LEFT OUTER JOIN: like hash_join, but a left row with NO match is still yielded, extended with every name in `right_cols` set to None (a left row with a None key also counts as unmatched). Left rows come in their original order."""
+        table = {}
+        for r in right:
+            if r[rcol] is not None:
+                table.setdefault(r[rcol], []).append(r)
+        for l in left:
+            matches = table.get(l[lcol], []) if l[lcol] is not None else []
+            if not matches:
+                yield {**l, **{c: None for c in right_cols}}
+            for r in matches:
+                yield {**l, **r}
+  explanation: Which join algorithm is fastest depends on the sizes and on whether the data is already sorted or indexed.
+- id: groupby
+  title: Grouping and aggregates
+  difficulty: 4
+  prompt: 'Aggregation squeezes many rows into summary rows: *how many orders per customer, what is the average salary per department*. Write `group_by(rows, keys, aggs)`. `keys` is a list of column names; `aggs` is a list of `(output_name, function, column)` where the function is one of `''count''`, `''sum''`, `''min''`, `''max''`, `''avg''` (`ValueError("unknown aggregate NAME")` otherwise). Only values that are **not `None`** are used: `count` counts them (the column `''*''` counts **every** row), `sum`/`min`/`max`/`avg` ignore `None` and give `None` if nothing is left; `avg` is rounded to 2 decimals. Return a list of dicts, one per group, holding the key columns followed by the aggregates, **sorted by the tuple of key values**. With **no keys** there is always exactly one group, even for no rows (count 0, the others `None`).'
+  starter: |-
+    def group_by(rows, keys, aggs):
+        """GROUP BY with aggregates. `keys` is a list of column names; `aggs` a list of (output_name, function, column) with function one of 'count', 'sum', 'min', 'max', 'avg' (ValueError('unknown aggregate NAME') otherwise). Only values that are not None are used: count counts them (the column '*' counts every row),
+        sum/min/max/avg ignore None and give None if there is nothing left; avg is rounded to 2 decimals. Return a list of dicts, one per group, holding the key columns and then the aggregates, sorted by the tuple of key values. With NO keys there is always exactly one group, even for no rows (count 0, the rest None)."""
+        pass
+  tests:
+  - name: one key
+    code: |
+      emp = [{"dept": "eng", "pay": 100}, {"dept": "ops", "pay": 60}, {"dept": "eng", "pay": 120}, {"dept": "ops", "pay": 80}, {"dept": "eng", "pay": 110}]
+      got = group_by(emp, ["dept"], [("n", "count", "*"), ("total", "sum", "pay"), ("top", "max", "pay"), ("low", "min", "pay"), ("mean", "avg", "pay")])
+      assert got == [{"dept": "eng", "n": 3, "total": 330, "top": 120, "low": 100, "mean": 110.0}, {"dept": "ops", "n": 2, "total": 140, "top": 80, "low": 60, "mean": 70.0}]
+      assert group_by([{"a": 1}, {"a": 2}, {"a": 4}], [], [("m", "avg", "a")]) == [{"m": 2.33}]
+  - name: nulls
+    code: |
+      rows = [{"g": "x", "v": 4}, {"g": "x", "v": None}, {"g": "y", "v": None}, {"g": "x", "v": 6}]
+      got = group_by(rows, ["g"], [("rows", "count", "*"), ("vals", "count", "v"), ("s", "sum", "v"), ("a", "avg", "v"), ("lo", "min", "v")])
+      assert got == [{"g": "x", "rows": 3, "vals": 2, "s": 10, "a": 5.0, "lo": 4}, {"g": "y", "rows": 1, "vals": 0, "s": None, "a": None, "lo": None}]
+  - name: several keys and no keys
+    code: |
+      rows = [{"a": 1, "b": "p", "v": 1}, {"a": 2, "b": "p", "v": 2}, {"a": 1, "b": "q", "v": 3}, {"a": 1, "b": "p", "v": 4}]
+      got = group_by(rows, ["a", "b"], [("t", "sum", "v")])
+      assert got == [{"a": 1, "b": "p", "t": 5}, {"a": 1, "b": "q", "t": 3}, {"a": 2, "b": "p", "t": 2}]
+      assert group_by(rows, [], [("n", "count", "*"), ("t", "sum", "v")]) == [{"n": 4, "t": 10}]
+      assert group_by([], [], [("n", "count", "*"), ("t", "sum", "v"), ("m", "max", "v")]) == [{"n": 0, "t": None, "m": None}]
+      assert group_by([], ["a"], [("n", "count", "*")]) == []
+      assert group_by(iter(rows[:1]), ["a"], []) == [{"a": 1}]
+  - name: errors
+    code: |
+      try:
+          group_by([{"a": 1}], ["a"], [("m", "median", "a")])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown aggregate median" in str(e)
+  hints:
+  - Collect the rows of each group in a dict keyed by a tuple, then compute each aggregate from the list.
+  solution: |
+    def group_by(rows, keys, aggs):
+        """GROUP BY with aggregates. `keys` is a list of column names; `aggs` a list of (output_name, function, column) with function one of 'count', 'sum', 'min', 'max', 'avg' (ValueError('unknown aggregate NAME') otherwise). Only values that are not None are used: count counts them (the column '*' counts every row),
+        sum/min/max/avg ignore None and give None if there is nothing left; avg is rounded to 2 decimals. Return a list of dicts, one per group, holding the key columns and then the aggregates, sorted by the tuple of key values. With NO keys there is always exactly one group, even for no rows (count 0, the rest None)."""
+        for name, fn, col in aggs:
+            if fn not in ("count", "sum", "min", "max", "avg"):
+                raise ValueError("unknown aggregate " + fn)
+        groups = {}
+        for row in rows:
+            groups.setdefault(tuple(row[k] for k in keys), []).append(row)
+        if not keys and not groups:
+            groups[()] = []
+        out = []
+        for key in sorted(groups):
+            members = groups[key]
+            result = dict(zip(keys, key))
+            for name, fn, col in aggs:
+                if fn == "count" and col == "*":
+                    result[name] = len(members)
+                    continue
+                vals = [r[col] for r in members if r[col] is not None]
+                if fn == "count":
+                    result[name] = len(vals)
+                elif not vals:
+                    result[name] = None
+                elif fn == "sum":
+                    result[name] = sum(vals)
+                elif fn == "min":
+                    result[name] = min(vals)
+                elif fn == "max":
+                    result[name] = max(vals)
+                else:
+                    result[name] = round(sum(vals) / len(vals), 2)
+            out.append(result)
+        return out
+  explanation: GROUP BY is a hash table of partial results; real engines may use sorting instead when memory is short.
+- id: parser
+  title: Parsing SQL
+  difficulty: 5
+  prompt: 'Before running a query the database must understand it. Write `tokenize_sql(text)`: split into a list of tokens: words (letters, digits, underscores; not starting with a digit), whole numbers, strings in single quotes (**kept with their quotes**) and the symbols `>= <= != = < > , *`; spaces are skipped; `ValueError("unexpected character C")` for anything else. Write `parse_sql(text)` for `SELECT cols FROM table [WHERE cond AND cond ...] [ORDER BY col [ASC|DESC], ...] [LIMIT n]`. It returns `{"cols": [...] (or ["*"]), "table": name, "where": [(column, op, value)], "order": [(column, descending)], "limit": n or None}`. Keywords are **case-insensitive**, names case-sensitive. A condition is `column op value` with `op` one of `= != < <= > >=` and the value an integer or a quoted string (returned **without** the quotes). Errors are `ValueError` with `expected X` (for example `expected FROM`, `expected column`, `expected table name`, `expected comparison`, `expected value`, `expected number`) or `unexpected extra input`. Starter code gives `KEYWORDS` and the `re` import.'
+  starter: |-
+    import re
+
+    KEYWORDS = ("SELECT", "FROM", "WHERE", "AND", "ORDER", "BY", "ASC", "DESC", "LIMIT")
+
+
+    def tokenize_sql(text):
+        """Split SQL text into a list of tokens: words (letters, digits, underscores, not starting with a digit), whole numbers, strings in single quotes (kept WITH their quotes) and the symbols >= <= != = < > , *. Spaces are skipped. ValueError('unexpected character C') for anything else."""
+        pass
+
+
+    def parse_sql(text):
+        """Parse  SELECT cols FROM table [WHERE cond AND cond ...] [ORDER BY col [ASC|DESC], ...] [LIMIT n]  into {"cols": [...] (or ["*"]), "table": name, "where": [(column, op, value)], "order": [(column, descending)], "limit": n or None}.
+        Keywords are case-insensitive; names are case-sensitive. A condition is column op value with op one of = != < <= > >=, and value an integer or a quoted string (returned without the quotes). Errors are ValueError with the message 'expected X' (X = what was missing, for example 'expected FROM') or 'unexpected extra input'."""
+        pass
+  tests:
+  - name: tokens
+    code: |
+      assert tokenize_sql("SELECT a, b FROM t") == ["SELECT", "a", ",", "b", "FROM", "t"]
+      assert tokenize_sql("x>=10 and y!='hi there'") == ["x", ">=", "10", "and", "y", "!=", "'hi there'"]
+      assert tokenize_sql("select * from t where a<5") == ["select", "*", "from", "t", "where", "a", "<", "5"]
+      assert tokenize_sql("") == [] and tokenize_sql("  a_1 ") == ["a_1"]
+      try:
+          tokenize_sql("select a; from t")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unexpected character ;" in str(e)
+  - name: simple queries
+    code: |
+      assert parse_sql("SELECT * FROM people") == {"cols": ["*"], "table": "people", "where": [], "order": [], "limit": None}
+      assert parse_sql("select name, age from people") == {"cols": ["name", "age"], "table": "people", "where": [], "order": [], "limit": None}
+      q = parse_sql("SELECT a FROM t WHERE x > 3 AND y = 'hello world' AND z != 0")
+      assert q["where"] == [("x", ">", 3), ("y", "=", "hello world"), ("z", "!=", 0)]
+      q = parse_sql("SELECT a FROM t ORDER BY a DESC, b, c ASC LIMIT 10")
+      assert q["order"] == [("a", True), ("b", False), ("c", False)] and q["limit"] == 10
+  - name: everything together
+    code: |
+      q = parse_sql("select name from People where Age >= 30 and name != 'bob' order by name desc limit 5")
+      assert q == {"cols": ["name"], "table": "People", "where": [("Age", ">=", 30), ("name", "!=", "bob")], "order": [("name", True)], "limit": 5}
+      assert parse_sql("SELECT a FROM t LIMIT 0")["limit"] == 0
+  - name: errors
+    code: |
+      cases = [("SELECT FROM t", "expected column"), ("SELECT a t", "expected FROM"), ("SELECT a FROM", "expected table name"), ("SELECT a FROM t WHERE", "expected column"),
+       ("SELECT a FROM t WHERE x 5", "expected comparison"), ("SELECT a FROM t WHERE x >", "expected value"), ("SELECT a FROM t WHERE x > y", "expected value"),
+       ("SELECT a FROM t ORDER a", "expected BY"), ("SELECT a FROM t LIMIT x", "expected number"), ("SELECT a FROM t extra", "unexpected extra input"),
+       ("a FROM t", "expected SELECT"), ("SELECT a, FROM t", "expected column"), ("SELECT a FROM t LIMIT", "expected number")]
+      for text, msg in cases:
+          try:
+              parse_sql(text)
+              raise AssertionError("accepted " + text)
+          except ValueError as e:
+              assert msg in str(e), (text, str(e))
+  hints:
+  - Write small helpers peek, eat and name that move a position through the token list.
+  solution: |
+    import re
+
+    KEYWORDS = ("SELECT", "FROM", "WHERE", "AND", "ORDER", "BY", "ASC", "DESC", "LIMIT")
+
+
+    def tokenize_sql(text):
+        """Split SQL text into a list of tokens: words (letters, digits, underscores, not starting with a digit), whole numbers, strings in single quotes (kept WITH their quotes) and the symbols >= <= != = < > , *. Spaces are skipped. ValueError('unexpected character C') for anything else."""
+        tokens = []
+        pos = 0
+        pattern = re.compile(r"\s+|(>=|<=|!=|=|<|>|,|\*|'[^']*'|\d+|[A-Za-z_][A-Za-z0-9_]*)")
+        while pos < len(text):
+            m = pattern.match(text, pos)
+            if not m:
+                raise ValueError("unexpected character " + text[pos])
+            if m.group(1) is not None:
+                tokens.append(m.group(1))
+            pos = m.end()
+        return tokens
+
+
+    def parse_sql(text):
+        """Parse  SELECT cols FROM table [WHERE cond AND cond ...] [ORDER BY col [ASC|DESC], ...] [LIMIT n]  into {"cols": [...] (or ["*"]), "table": name, "where": [(column, op, value)], "order": [(column, descending)], "limit": n or None}.
+        Keywords are case-insensitive; names are case-sensitive. A condition is column op value with op one of = != < <= > >=, and value an integer or a quoted string (returned without the quotes). Errors are ValueError with the message 'expected X' (X = what was missing, for example 'expected FROM') or 'unexpected extra input'."""
+        toks = tokenize_sql(text)
+        pos = 0
+
+        def peek():
+            return toks[pos] if pos < len(toks) else None
+
+        def is_kw(word):
+            t = peek()
+            return t is not None and t.upper() == word
+
+        def eat_kw(word):
+            nonlocal pos
+            if not is_kw(word):
+                raise ValueError("expected " + word)
+            pos += 1
+
+        def name(what):
+            nonlocal pos
+            t = peek()
+            if t is None or not re.match(r"[A-Za-z_]", t) or t.upper() in KEYWORDS:
+                raise ValueError("expected " + what)
+            pos += 1
+            return t
+
+        eat_kw("SELECT")
+        if peek() == "*":
+            pos += 1
+            cols = ["*"]
+        else:
+            cols = [name("column")]
+            while peek() == ",":
+                pos += 1
+                cols.append(name("column"))
+        eat_kw("FROM")
+        table = name("table name")
+        conds, order, lim = [], [], None
+        if is_kw("WHERE"):
+            pos += 1
+            while True:
+                col = name("column")
+                op = peek()
+                if op not in ("=", "!=", "<", "<=", ">", ">="):
+                    raise ValueError("expected comparison")
+                pos += 1
+                t = peek()
+                if t is None:
+                    raise ValueError("expected value")
+                if t.startswith("'"):
+                    val = t[1:-1]
+                elif t.isdigit():
+                    val = int(t)
+                else:
+                    raise ValueError("expected value")
+                pos += 1
+                conds.append((col, op, val))
+                if is_kw("AND"):
+                    pos += 1
+                else:
+                    break
+        if is_kw("ORDER"):
+            pos += 1
+            eat_kw("BY")
+            while True:
+                col = name("column")
+                desc = False
+                if is_kw("DESC"):
+                    desc = True
+                    pos += 1
+                elif is_kw("ASC"):
+                    pos += 1
+                order.append((col, desc))
+                if peek() == ",":
+                    pos += 1
+                else:
+                    break
+        if is_kw("LIMIT"):
+            pos += 1
+            t = peek()
+            if t is None or not t.isdigit():
+                raise ValueError("expected number")
+            lim = int(t)
+            pos += 1
+        if pos != len(toks):
+            raise ValueError("unexpected extra input")
+        return {"cols": cols, "table": table, "where": conds, "order": order, "limit": lim}
+  explanation: A parser turns text into a tree the engine can run; every real database contains one.
+- id: exec
+  title: 'Capstone: a query engine'
+  difficulty: 5
+  prompt: 'Starter code gives the operators (`scan`, `where`, `project`, `limit`, `order_by`) and `parse_sql`. Write `make_predicate(conds)`: turn a WHERE list of `(column, op, value)` into a function `row -> bool` that is true only if **all** conditions hold (operators `= != < <= > >=`; a condition on a `None` value is never true; `ValueError("no such column NAME")` when the row lacks the column). Write `execute(sql, db)`, where `db` is a dict from table name to list of row dicts: parse the query, then build the **pipeline**: `scan` (`ValueError("no such table NAME")` if missing), `where` if there is a WHERE, `order_by` if there is an ORDER BY, `project` unless the columns are `[''*'']`, and finally `limit` if there is a LIMIT. Sorting **before** projecting lets you order by a column you do not select. Return the result as a list. Write `explain(sql)`: the plan as a list of strings from the **top** operator down: `''Limit N''`, `''Project a, b''`, `''Sort a DESC, b ASC''` (every key with ASC or DESC), `''Filter x > 3 AND y = ''z''''` (string values in single quotes, integers bare, joined with `'' AND ''`), and always `''Scan TABLE''`; include only the operators that apply.'
+  starter: |-
+    def scan(table):
+        """The leaf of every query plan: a GENERATOR that yields a COPY (dict(row)) of each row of the table (a list of dicts), one at a time."""
+        for row in table:
+            yield dict(row)
+
+
+    def where(rows, pred):
+        """A FILTER: yield only the rows for which pred(row) is true."""
+        for row in rows:
+            if pred(row):
+                yield row
+
+
+    def project(rows, cols):
+        """A PROJECTION: yield new dicts holding only the named columns, in the order given. ValueError('no such column NAME') if a row lacks a requested column."""
+        for row in rows:
+            out = {}
+            for c in cols:
+                if c not in row:
+                    raise ValueError("no such column " + c)
+                out[c] = row[c]
+            yield out
+
+
+    def limit(rows, n, offset=0):
+        """Skip `offset` rows, then yield at most n rows. It must be LAZY: once n rows have been yielded it stops WITHOUT asking its input for another row (so it works on an endless generator)."""
+        if n <= 0:
+            return
+        skipped = 0
+        given = 0
+        for row in rows:
+            if skipped < offset:
+                skipped += 1
+                continue
+            yield row
+            given += 1
+            if given >= n:
+                return
+
+
+    def order_by(rows, keys):
+        """SORT: `keys` is a list of (column, descending) pairs, most important first. Read ALL the rows, sort them (stable) and yield them. Hint: sort repeatedly, starting from the LAST key, with list.sort(key=..., reverse=...)."""
+        data = list(rows)
+        for col, desc in reversed(keys):
+            data.sort(key=lambda r: r[col], reverse=desc)
+        yield from data
+
+
+    import re
+
+    KEYWORDS = ("SELECT", "FROM", "WHERE", "AND", "ORDER", "BY", "ASC", "DESC", "LIMIT")
+
+
+    def tokenize_sql(text):
+        """Split SQL text into a list of tokens: words (letters, digits, underscores, not starting with a digit), whole numbers, strings in single quotes (kept WITH their quotes) and the symbols >= <= != = < > , *. Spaces are skipped. ValueError('unexpected character C') for anything else."""
+        tokens = []
+        pos = 0
+        pattern = re.compile(r"\s+|(>=|<=|!=|=|<|>|,|\*|'[^']*'|\d+|[A-Za-z_][A-Za-z0-9_]*)")
+        while pos < len(text):
+            m = pattern.match(text, pos)
+            if not m:
+                raise ValueError("unexpected character " + text[pos])
+            if m.group(1) is not None:
+                tokens.append(m.group(1))
+            pos = m.end()
+        return tokens
+
+
+    def parse_sql(text):
+        """Parse  SELECT cols FROM table [WHERE cond AND cond ...] [ORDER BY col [ASC|DESC], ...] [LIMIT n]  into {"cols": [...] (or ["*"]), "table": name, "where": [(column, op, value)], "order": [(column, descending)], "limit": n or None}.
+        Keywords are case-insensitive; names are case-sensitive. A condition is column op value with op one of = != < <= > >=, and value an integer or a quoted string (returned without the quotes). Errors are ValueError with the message 'expected X' (X = what was missing, for example 'expected FROM') or 'unexpected extra input'."""
+        toks = tokenize_sql(text)
+        pos = 0
+
+        def peek():
+            return toks[pos] if pos < len(toks) else None
+
+        def is_kw(word):
+            t = peek()
+            return t is not None and t.upper() == word
+
+        def eat_kw(word):
+            nonlocal pos
+            if not is_kw(word):
+                raise ValueError("expected " + word)
+            pos += 1
+
+        def name(what):
+            nonlocal pos
+            t = peek()
+            if t is None or not re.match(r"[A-Za-z_]", t) or t.upper() in KEYWORDS:
+                raise ValueError("expected " + what)
+            pos += 1
+            return t
+
+        eat_kw("SELECT")
+        if peek() == "*":
+            pos += 1
+            cols = ["*"]
+        else:
+            cols = [name("column")]
+            while peek() == ",":
+                pos += 1
+                cols.append(name("column"))
+        eat_kw("FROM")
+        table = name("table name")
+        conds, order, lim = [], [], None
+        if is_kw("WHERE"):
+            pos += 1
+            while True:
+                col = name("column")
+                op = peek()
+                if op not in ("=", "!=", "<", "<=", ">", ">="):
+                    raise ValueError("expected comparison")
+                pos += 1
+                t = peek()
+                if t is None:
+                    raise ValueError("expected value")
+                if t.startswith("'"):
+                    val = t[1:-1]
+                elif t.isdigit():
+                    val = int(t)
+                else:
+                    raise ValueError("expected value")
+                pos += 1
+                conds.append((col, op, val))
+                if is_kw("AND"):
+                    pos += 1
+                else:
+                    break
+        if is_kw("ORDER"):
+            pos += 1
+            eat_kw("BY")
+            while True:
+                col = name("column")
+                desc = False
+                if is_kw("DESC"):
+                    desc = True
+                    pos += 1
+                elif is_kw("ASC"):
+                    pos += 1
+                order.append((col, desc))
+                if peek() == ",":
+                    pos += 1
+                else:
+                    break
+        if is_kw("LIMIT"):
+            pos += 1
+            t = peek()
+            if t is None or not t.isdigit():
+                raise ValueError("expected number")
+            lim = int(t)
+            pos += 1
+        if pos != len(toks):
+            raise ValueError("unexpected extra input")
+        return {"cols": cols, "table": table, "where": conds, "order": order, "limit": lim}
+
+
+    def make_predicate(conds):
+        """Turn a WHERE list of (column, op, value) conditions into a function row -> bool that is true only if ALL conditions hold. Operators: = != < <= > >=. A condition on a NULL (None) value is never true. ValueError('no such column NAME') when the row lacks the column."""
+        pass
+
+
+    def execute(sql, db):
+        """Run a query against `db`, a dict from table name to list of row dicts, and return the result as a list of dicts. Build the plan as a pipeline of the operators: scan the table (ValueError('no such table NAME') if missing), then where (with make_predicate) if there is a WHERE,
+        then order_by if there is an ORDER BY, then project unless the columns are ['*'], and finally limit if there is a LIMIT. (Sorting BEFORE projecting lets you order by a column you do not select.)"""
+        pass
+
+
+    def explain(sql):
+        """Describe the plan of a query as a list of strings from the TOP operator down to the scan. Include only the operators that apply: 'Limit N', 'Project a, b', 'Sort a DESC, b ASC' (every key written with ASC or DESC), 'Filter x > 3 AND y = 'z'' (string values in single quotes, integers bare, conditions joined with ' AND '), and always 'Scan TABLE'."""
+        pass
+  tests:
+  - name: selecting
+    code: |
+      db = {"people": [{"id": 1, "name": "ada", "age": 36}, {"id": 2, "name": "alan", "age": 41}, {"id": 3, "name": "grace", "age": 45}, {"id": 4, "name": "edsger", "age": None}]}
+      assert execute("SELECT * FROM people", db) == db["people"]
+      assert execute("SELECT name FROM people WHERE age > 40", db) == [{"name": "alan"}, {"name": "grace"}]
+      assert execute("select name, id from people where age >= 36 and age < 45", db) == [{"name": "ada", "id": 1}, {"name": "alan", "id": 2}]
+      assert execute("SELECT id FROM people WHERE name = 'grace'", db) == [{"id": 3}]
+      assert execute("SELECT id FROM people WHERE age != 41", db) == [{"id": 1}, {"id": 3}]
+      assert db["people"][0] == {"id": 1, "name": "ada", "age": 36}
+  - name: order and limit
+    code: |
+      db = {"t": [{"a": 3, "b": "x"}, {"a": 1, "b": "y"}, {"a": 2, "b": "z"}, {"a": 5, "b": "w"}]}
+      assert execute("SELECT a FROM t ORDER BY a DESC LIMIT 2", db) == [{"a": 5}, {"a": 3}]
+      assert execute("SELECT b FROM t ORDER BY a", db) == [{"b": "y"}, {"b": "z"}, {"b": "x"}, {"b": "w"}]
+      assert execute("SELECT a FROM t WHERE a > 1 ORDER BY b LIMIT 2", db) == [{"a": 5}, {"a": 3}]
+      assert execute("SELECT * FROM t LIMIT 0", db) == []
+  - name: predicates
+    code: |
+      p = make_predicate([("a", ">", 1), ("b", "=", "x")])
+      assert p({"a": 2, "b": "x"}) is True and p({"a": 1, "b": "x"}) is False and p({"a": 2, "b": "y"}) is False
+      assert p({"a": None, "b": "x"}) is False
+      assert make_predicate([])({"anything": 1}) is True
+      try:
+          p({"a": 5})
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no such column b" in str(e)
+  - name: errors
+    code: |
+      db = {"t": [{"a": 1}]}
+      for sql, msg in (("SELECT a FROM nope", "no such table nope"), ("SELECT zzz FROM t", "no such column zzz"), ("SELECT a FROM t WHERE q = 1", "no such column q"), ("SELECT a FROM", "expected table name")):
+          try:
+              execute(sql, db)
+              raise AssertionError("accepted " + sql)
+          except ValueError as e:
+              assert msg in str(e), (sql, str(e))
+  - name: explaining
+    code: |
+      assert explain("SELECT * FROM t") == ["Scan t"]
+      assert explain("SELECT a, b FROM t WHERE x > 3 AND y = 'z' ORDER BY a DESC, b LIMIT 5") == ["Limit 5", "Project a, b", "Sort a DESC, b ASC", "Filter x > 3 AND y = 'z'", "Scan t"]
+      assert explain("select a from t limit 1") == ["Limit 1", "Project a", "Scan t"]
+      assert explain("select * from t where n != 0") == ["Filter n != 0", "Scan t"]
+  hints:
+  - 'Wrap the rows one operator at a time: rows = where(rows, ...), then rows = order_by(rows, ...), and so on.'
+  solution: |
+    def scan(table):
+        """The leaf of every query plan: a GENERATOR that yields a COPY (dict(row)) of each row of the table (a list of dicts), one at a time."""
+        for row in table:
+            yield dict(row)
+
+
+    def where(rows, pred):
+        """A FILTER: yield only the rows for which pred(row) is true."""
+        for row in rows:
+            if pred(row):
+                yield row
+
+
+    def project(rows, cols):
+        """A PROJECTION: yield new dicts holding only the named columns, in the order given. ValueError('no such column NAME') if a row lacks a requested column."""
+        for row in rows:
+            out = {}
+            for c in cols:
+                if c not in row:
+                    raise ValueError("no such column " + c)
+                out[c] = row[c]
+            yield out
+
+
+    def limit(rows, n, offset=0):
+        """Skip `offset` rows, then yield at most n rows. It must be LAZY: once n rows have been yielded it stops WITHOUT asking its input for another row (so it works on an endless generator)."""
+        if n <= 0:
+            return
+        skipped = 0
+        given = 0
+        for row in rows:
+            if skipped < offset:
+                skipped += 1
+                continue
+            yield row
+            given += 1
+            if given >= n:
+                return
+
+
+    def order_by(rows, keys):
+        """SORT: `keys` is a list of (column, descending) pairs, most important first. Read ALL the rows, sort them (stable) and yield them. Hint: sort repeatedly, starting from the LAST key, with list.sort(key=..., reverse=...)."""
+        data = list(rows)
+        for col, desc in reversed(keys):
+            data.sort(key=lambda r: r[col], reverse=desc)
+        yield from data
+
+
+    import re
+
+    KEYWORDS = ("SELECT", "FROM", "WHERE", "AND", "ORDER", "BY", "ASC", "DESC", "LIMIT")
+
+
+    def tokenize_sql(text):
+        """Split SQL text into a list of tokens: words (letters, digits, underscores, not starting with a digit), whole numbers, strings in single quotes (kept WITH their quotes) and the symbols >= <= != = < > , *. Spaces are skipped. ValueError('unexpected character C') for anything else."""
+        tokens = []
+        pos = 0
+        pattern = re.compile(r"\s+|(>=|<=|!=|=|<|>|,|\*|'[^']*'|\d+|[A-Za-z_][A-Za-z0-9_]*)")
+        while pos < len(text):
+            m = pattern.match(text, pos)
+            if not m:
+                raise ValueError("unexpected character " + text[pos])
+            if m.group(1) is not None:
+                tokens.append(m.group(1))
+            pos = m.end()
+        return tokens
+
+
+    def parse_sql(text):
+        """Parse  SELECT cols FROM table [WHERE cond AND cond ...] [ORDER BY col [ASC|DESC], ...] [LIMIT n]  into {"cols": [...] (or ["*"]), "table": name, "where": [(column, op, value)], "order": [(column, descending)], "limit": n or None}.
+        Keywords are case-insensitive; names are case-sensitive. A condition is column op value with op one of = != < <= > >=, and value an integer or a quoted string (returned without the quotes). Errors are ValueError with the message 'expected X' (X = what was missing, for example 'expected FROM') or 'unexpected extra input'."""
+        toks = tokenize_sql(text)
+        pos = 0
+
+        def peek():
+            return toks[pos] if pos < len(toks) else None
+
+        def is_kw(word):
+            t = peek()
+            return t is not None and t.upper() == word
+
+        def eat_kw(word):
+            nonlocal pos
+            if not is_kw(word):
+                raise ValueError("expected " + word)
+            pos += 1
+
+        def name(what):
+            nonlocal pos
+            t = peek()
+            if t is None or not re.match(r"[A-Za-z_]", t) or t.upper() in KEYWORDS:
+                raise ValueError("expected " + what)
+            pos += 1
+            return t
+
+        eat_kw("SELECT")
+        if peek() == "*":
+            pos += 1
+            cols = ["*"]
+        else:
+            cols = [name("column")]
+            while peek() == ",":
+                pos += 1
+                cols.append(name("column"))
+        eat_kw("FROM")
+        table = name("table name")
+        conds, order, lim = [], [], None
+        if is_kw("WHERE"):
+            pos += 1
+            while True:
+                col = name("column")
+                op = peek()
+                if op not in ("=", "!=", "<", "<=", ">", ">="):
+                    raise ValueError("expected comparison")
+                pos += 1
+                t = peek()
+                if t is None:
+                    raise ValueError("expected value")
+                if t.startswith("'"):
+                    val = t[1:-1]
+                elif t.isdigit():
+                    val = int(t)
+                else:
+                    raise ValueError("expected value")
+                pos += 1
+                conds.append((col, op, val))
+                if is_kw("AND"):
+                    pos += 1
+                else:
+                    break
+        if is_kw("ORDER"):
+            pos += 1
+            eat_kw("BY")
+            while True:
+                col = name("column")
+                desc = False
+                if is_kw("DESC"):
+                    desc = True
+                    pos += 1
+                elif is_kw("ASC"):
+                    pos += 1
+                order.append((col, desc))
+                if peek() == ",":
+                    pos += 1
+                else:
+                    break
+        if is_kw("LIMIT"):
+            pos += 1
+            t = peek()
+            if t is None or not t.isdigit():
+                raise ValueError("expected number")
+            lim = int(t)
+            pos += 1
+        if pos != len(toks):
+            raise ValueError("unexpected extra input")
+        return {"cols": cols, "table": table, "where": conds, "order": order, "limit": lim}
+
+
+    def make_predicate(conds):
+        """Turn a WHERE list of (column, op, value) conditions into a function row -> bool that is true only if ALL conditions hold. Operators: = != < <= > >=. A condition on a NULL (None) value is never true. ValueError('no such column NAME') when the row lacks the column."""
+        def pred(row):
+            for col, op, value in conds:
+                if col not in row:
+                    raise ValueError("no such column " + col)
+                v = row[col]
+                if v is None:
+                    return False
+                ok = {"=": v == value, "!=": v != value, "<": v < value, "<=": v <= value, ">": v > value, ">=": v >= value}[op]
+                if not ok:
+                    return False
+            return True
+        return pred
+
+
+    def execute(sql, db):
+        """Run a query against `db`, a dict from table name to list of row dicts, and return the result as a list of dicts. Build the plan as a pipeline of the operators: scan the table (ValueError('no such table NAME') if missing), then where (with make_predicate) if there is a WHERE,
+        then order_by if there is an ORDER BY, then project unless the columns are ['*'], and finally limit if there is a LIMIT. (Sorting BEFORE projecting lets you order by a column you do not select.)"""
+        q = parse_sql(sql)
+        if q["table"] not in db:
+            raise ValueError("no such table " + q["table"])
+        rows = scan(db[q["table"]])
+        if q["where"]:
+            rows = where(rows, make_predicate(q["where"]))
+        if q["order"]:
+            rows = order_by(rows, q["order"])
+        if q["cols"] != ["*"]:
+            rows = project(rows, q["cols"])
+        if q["limit"] is not None:
+            rows = limit(rows, q["limit"])
+        return list(rows)
+
+
+    def explain(sql):
+        """Describe the plan of a query as a list of strings from the TOP operator down to the scan. Include only the operators that apply: 'Limit N', 'Project a, b', 'Sort a DESC, b ASC' (every key written with ASC or DESC), 'Filter x > 3 AND y = 'z'' (string values in single quotes, integers bare, conditions joined with ' AND '), and always 'Scan TABLE'."""
+        q = parse_sql(sql)
+        plan = []
+        if q["limit"] is not None:
+            plan.append("Limit %d" % q["limit"])
+        if q["cols"] != ["*"]:
+            plan.append("Project " + ", ".join(q["cols"]))
+        if q["order"]:
+            plan.append("Sort " + ", ".join("%s %s" % (c, "DESC" if d else "ASC") for c, d in q["order"]))
+        if q["where"]:
+            plan.append("Filter " + " AND ".join("%s %s %s" % (c, o, repr(v) if isinstance(v, str) else v) for c, o, v in q["where"]))
+        plan.append("Scan " + q["table"])
+        return plan
+  explanation: The same pipeline, with smarter choices of operators, is how every SQL database runs your query.
+commonMistakes:
+- title: Joining with a nested loop on big tables
+  explanation: The cost multiplies; use a hash or merge join.
+- title: Expecting NULL to equal NULL
+  explanation: A comparison with NULL is never true, so such rows do not join.
+- title: Projecting before sorting
+  explanation: You could not order by a column you removed.
+- title: Reading the whole input in limit
+  explanation: Stop pulling rows as soon as you have enough.
+- title: Counting NULLs with COUNT(column)
+  explanation: It skips them; only COUNT(*) counts every row.
+summary:
+- A query is parsed, planned and executed as a tree of operators.
+- In the iterator model each operator pulls rows from below one at a time.
+- Joins can be nested-loop, hash or sort-merge.
+- GROUP BY keeps running totals per group and aggregates ignore NULL.
+- 'Order matters: filter, sort, project, limit.'
+- EXPLAIN shows the plan the database chose.
+next: u25-optimizer
+quiz:
+- type: mcq
+  question: What does the iterator model mean?
+  options:
+  - Each operator produces one row at a time when asked
+  - Each operator reads the whole table
+  - Operators run on different machines
+  - Only one operator exists
+  answer: 0
+  explanation: Rows flow through the pipeline on demand.
+- type: mcq
+  question: Why is a hash join usually faster than a nested loop join?
+  options:
+  - It looks each row up instead of comparing with every row
+  - It uses less memory always
+  - It sorts the data
+  - It ignores keys
+  answer: 0
+  explanation: Roughly one step per row.
+- type: mcq
+  question: What happens to NULL keys in an ordinary join?
+  options:
+  - They match nothing
+  - They match each other
+  - They match zero
+  - They cause an error
+  answer: 0
+  explanation: NULL is never equal to anything.
+- type: mcq
+  question: Which operator must read all its input before returning a row?
+  options:
+  - Sort
+  - Filter
+  - Limit
+  - Scan
+  answer: 0
+  explanation: The first sorted row could be the last input row.
+- type: mcq
+  question: What does COUNT(*) count?
+  options:
+  - Every row in the group
+  - Only non-NULL values
+  - Only distinct values
+  - Only columns
+  answer: 0
+  explanation: COUNT(column) skips NULLs, COUNT(*) does not.
+- type: mcq
+  question: Why project after sorting?
+  options:
+  - So you can sort by a column you do not select
+  - It is faster always
+  - SQL forbids otherwise
+  - Projection needs sorted rows
+  answer: 0
+  explanation: The sort key may be dropped by the projection.
+- type: code
+  question: Write `count_matches(rows, column, value)` returning how many of the dict rows have `row[column] == value`.
+  starter: |
+    def count_matches(rows, column, value):
+        pass
+  tests:
+  - name: count
+    code: |
+      rows = [{"a": 1}, {"a": 2}, {"a": 1}, {"a": None}]
+      assert count_matches(rows, "a", 1) == 2 and count_matches(rows, "a", 9) == 0 and count_matches([], "a", 1) == 0 and count_matches(rows, "a", None) == 1
+  solution: |
+    def count_matches(rows, column, value):
+        return sum(1 for r in rows if r[column] == value)

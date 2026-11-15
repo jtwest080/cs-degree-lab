@@ -1,0 +1,2182 @@
+id: u25-btree
+title: B+ Trees and Indexes
+minutes: 90
+objective: Learn the data structure that makes databases fast. You will search a B+ tree, insert keys and split nodes, scan ranges through linked leaves, validate the tree, bulk-load an index and build a real index on a table.
+outcomes:
+- Explain why a table needs an index
+- Search a B+ tree page by page
+- Insert keys and split nodes to stay balanced
+- Run range scans through linked leaves
+- Bulk-load a tree from sorted data
+- Build a non-unique index
+sections:
+- heading: Why an index?
+  body: |-
+    Suppose a table has ten million rows and you ask for the one with a particular email address. Without help the database must read every page of the heap file: a **full table scan**, millions of reads. An **index** is a second structure, kept beside the table, that maps a column's values to the places where those rows are stored, like the index at the back of a book. With an index the same question needs only a handful of page reads.
+
+    The index of almost every database is a **B+ tree** (the B is thought to stand for Bayer, its inventor, or for "balanced"). It is a close cousin of the binary search trees you met earlier, but each node is a whole **page** holding hundreds of sorted keys, not just one. Wide nodes keep the tree extremely shallow, and because each node is read from disk in one go, the width costs almost nothing.
+- heading: The shape of a B+ tree
+  body: |-
+    A B+ tree has two kinds of node. An **internal** node holds sorted **separator keys** and one more **child** pointer than keys. The child before a separator holds keys smaller than it, the child after holds keys greater or equal. A **leaf** node holds the actual keys together with their values (or record ids) and a pointer to the **next leaf**, so all leaves form one long sorted chain. Every leaf is at the **same depth**, which is what "balanced" means.
+
+    To search, start at the root, do a **binary search** among its keys to choose the child, and repeat until you reach a leaf, where you look for the exact key. The cost is one page read per level, which is the **height** of the tree. The number of children per node is called the **fanout**. With a fanout of 500 a tree of just 4 levels holds 500 to the power 4, roughly 60 billion, keys, and the top levels are small enough to stay in the buffer pool, so a lookup typically costs one or two actual disk reads.
+
+    Because the leaves are chained, a **range scan** (every key between 100 and 200) searches once for the lower bound and then simply walks right along the leaves, reading pages in sorted order. That is why indexes also make ORDER BY cheap.
+- heading: Inserting and splitting
+  body: |-
+    To insert a key, search for the leaf where it belongs and put it there in sorted position. If the leaf now holds more keys than a page can take, it is **split** into two leaves, each about half full, and the first key of the new right leaf is **copied up** as a separator into the parent. That may overflow the parent, which splits in the same way (except the middle separator is **moved** up, not copied). Splits can ripple all the way to the root; when the root splits, a new root is created above it and the whole tree grows **one level taller**. The tree therefore grows from the top, never unbalanced.
+
+    A tree filled by random inserts has leaves between half and full, about 70 percent on average, which wastes space. If the data already exists in sorted order, a **bulk load** builds the tree from the bottom up: fill the leaves completely, then build each level of parents above them. Databases do this when you run CREATE INDEX. Deleting is the mirror image: a node left too empty is merged with a neighbour or borrows keys from one. Many systems simply tolerate underfull pages and rebuild the index occasionally.
+- heading: Indexes in practice
+  body: A **clustered** index stores the rows themselves in the leaves, so the table *is* the tree, sorted by that key (MySQL's InnoDB does this with the primary key). A **secondary** index stores, for each key, the record id or primary key of a row. Several rows may share a value, so a non-unique index keeps a list of ids for each key. Every index speeds up reading but slows down writing, since each insert, update or delete must change every index on the table, and costs disk space. Choosing which columns to index is one of the main skills of working with databases.
+examples:
+- title: Building and searching a tree
+  intro: Seven inserts into a tiny tree with room for three keys per node.
+  code: |
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        node = tree["root"]
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        out = []
+        leaf = leftmost_leaf(tree)
+        while leaf is not None:
+            out.extend(zip(leaf["keys"], leaf["vals"]))
+            leaf = leaf["next"]
+        return out
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        out = []
+        if lo > hi:
+            return out
+        leaf = find_leaf(tree["root"], lo)
+        while leaf is not None:
+            for k, v in zip(leaf["keys"], leaf["vals"]):
+                if k > hi:
+                    return out
+                if k >= lo:
+                    out.append((k, v))
+            leaf = leaf["next"]
+        return out
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            del leaf["keys"][i - 1]
+            del leaf["vals"][i - 1]
+            return True
+        return False
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        leaves = []
+
+        def walk(node, lo, hi, depth):
+            keys = node["keys"]
+            if len(keys) > tree["max"] or any(a >= b for a, b in zip(keys, keys[1:])):
+                return None
+            if any((lo is not None and k < lo) or (hi is not None and k >= hi) for k in keys):
+                return None
+            if node["leaf"]:
+                leaves.append(node)
+                return depth
+            if len(node["children"]) != len(keys) + 1:
+                return None
+            depths = set()
+            for i, child in enumerate(node["children"]):
+                clo = keys[i - 1] if i > 0 else lo
+                chi = keys[i] if i < len(keys) else hi
+                d = walk(child, clo, chi, depth + 1)
+                if d is None:
+                    return None
+                depths.add(d)
+            return depths.pop() if len(depths) == 1 else None
+
+        if walk(tree["root"], None, None, 1) is None:
+            return False
+        for a, b in zip(leaves, leaves[1:]):
+            if a["next"] is not b:
+                return False
+        return leaves[-1]["next"] is None
+
+    tree = new_tree(3)
+    for k in (10, 20, 30, 40, 50, 60, 70):
+        insert(tree, k, "row" + str(k))
+    print("height after 7 inserts:", height(tree), "root separators:", tree["root"]["keys"])
+    print("search 40:", search(tree, 40), "search 45:", search(tree, 45))
+    print("range 25 to 60:", range_scan(tree, 25, 60))
+    print("valid:", is_valid(tree))
+    print("leaf chain:", [leaf_keys for leaf_keys in all_items(tree)][:3], "...")
+  output: |
+    height after 7 inserts: 2 root separators: [30, 50]
+    search 40: row40 search 45: None
+    range 25 to 60: [(30, 'row30'), (40, 'row40'), (50, 'row50'), (60, 'row60')]
+    valid: True
+    leaf chain: [(10, 'row10'), (20, 'row20'), (30, 'row30')] ...
+  lines:
+  - line: 166
+    note: Seven keys with room for three per node need two levels.
+  - line: 167
+    note: Missing keys return None.
+  - line: 168
+    note: One descent, then walk along the leaves.
+  - line: 169
+    note: All invariants hold.
+- title: A hundred thousand keys
+  intro: A wide tree is only three levels tall, and bulk loading packs it fully.
+  code: |
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        node = tree["root"]
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        out = []
+        leaf = leftmost_leaf(tree)
+        while leaf is not None:
+            out.extend(zip(leaf["keys"], leaf["vals"]))
+            leaf = leaf["next"]
+        return out
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        out = []
+        if lo > hi:
+            return out
+        leaf = find_leaf(tree["root"], lo)
+        while leaf is not None:
+            for k, v in zip(leaf["keys"], leaf["vals"]):
+                if k > hi:
+                    return out
+                if k >= lo:
+                    out.append((k, v))
+            leaf = leaf["next"]
+        return out
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            del leaf["keys"][i - 1]
+            del leaf["vals"][i - 1]
+            return True
+        return False
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        leaves = []
+
+        def walk(node, lo, hi, depth):
+            keys = node["keys"]
+            if len(keys) > tree["max"] or any(a >= b for a, b in zip(keys, keys[1:])):
+                return None
+            if any((lo is not None and k < lo) or (hi is not None and k >= hi) for k in keys):
+                return None
+            if node["leaf"]:
+                leaves.append(node)
+                return depth
+            if len(node["children"]) != len(keys) + 1:
+                return None
+            depths = set()
+            for i, child in enumerate(node["children"]):
+                clo = keys[i - 1] if i > 0 else lo
+                chi = keys[i] if i < len(keys) else hi
+                d = walk(child, clo, chi, depth + 1)
+                if d is None:
+                    return None
+                depths.add(d)
+            return depths.pop() if len(depths) == 1 else None
+
+        if walk(tree["root"], None, None, 1) is None:
+            return False
+        for a, b in zip(leaves, leaves[1:]):
+            if a["next"] is not b:
+                return False
+        return leaves[-1]["next"] is None
+
+
+    def min_key(node):
+        """The smallest key in the subtree under `node` (follow the first child down to a leaf and take its first key)."""
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node["keys"][0]
+
+
+    def bulk_load(pairs, max_keys):
+        """Build a tree from a list of (key, value) pairs ALREADY SORTED by key, much faster than inserting one by one. ValueError('keys must be sorted and unique') otherwise (an empty list is fine and gives an empty tree). Fill LEAVES completely, max_keys pairs each (the last may have fewer), linked through `next`.
+        Then build each INTERNAL level from the level below by grouping max_keys + 1 consecutive nodes under one parent, whose keys are min_key of each child except the first; if the last group would hold only ONE child, move the last child of the previous group into it (so it has 2). Repeat until one node remains: the root."""
+        tree = new_tree(max_keys)
+        if not pairs:
+            return tree
+        keys = [k for k, v in pairs]
+        if any(a >= b for a, b in zip(keys, keys[1:])):
+            raise ValueError("keys must be sorted and unique")
+        level = []
+        for i in range(0, len(pairs), max_keys):
+            chunk = pairs[i:i + max_keys]
+            level.append({"leaf": True, "keys": [k for k, v in chunk], "vals": [v for k, v in chunk], "next": None})
+        for a, b in zip(level, level[1:]):
+            a["next"] = b
+        while len(level) > 1:
+            size = max_keys + 1
+            groups = [level[i:i + size] for i in range(0, len(level), size)]
+            if len(groups) > 1 and len(groups[-1]) == 1:
+                groups[-1].insert(0, groups[-2].pop())
+            level = [{"leaf": False, "keys": [min_key(c) for c in g[1:]], "children": g} for g in groups]
+        tree["root"] = level[0]
+        return tree
+
+
+    def tree_stats(tree):
+        """A summary dict: {"height": levels, "nodes": total nodes, "leaves": number of leaves, "keys": total keys stored in leaves, "fill": average leaf fullness = keys / (leaves * max) rounded to 3 decimals}."""
+        nodes = leaves = keys = 0
+        stack = [tree["root"]]
+        while stack:
+            n = stack.pop()
+            nodes += 1
+            if n["leaf"]:
+                leaves += 1
+                keys += len(n["keys"])
+            else:
+                stack.extend(n["children"])
+        return {"height": height(tree), "nodes": nodes, "leaves": leaves, "keys": keys, "fill": round(keys / (leaves * tree["max"]), 3)}
+
+    import random
+    big = bulk_load([(i, i) for i in range(100000)], 100)
+    print("100000 keys, up to 100 per page:", tree_stats(big))
+    print("a lookup reads", height(big), "pages; a full scan would read", tree_stats(big)["leaves"], "pages")
+    keys = list(range(20000))
+    random.Random(1).shuffle(keys)
+    one_by_one = new_tree(100)
+    for k in keys:
+        insert(one_by_one, k, k)
+    print("20000 shuffled inserts, leaf fill:", tree_stats(one_by_one)["fill"])
+    print("same keys bulk loaded, leaf fill:", tree_stats(bulk_load([(i, i) for i in range(20000)], 100))["fill"])
+  output: |
+    100000 keys, up to 100 per page: {'height': 3, 'nodes': 1011, 'leaves': 1000, 'keys': 100000, 'fill': 1.0}
+    a lookup reads 3 pages; a full scan would read 1000 pages
+    20000 shuffled inserts, leaf fill: 0.707
+    same keys bulk loaded, leaf fill: 1.0
+  lines:
+  - line: 212
+    note: A fanout of 100 keeps the tree three levels tall.
+  - line: 213
+    note: A lookup reads 3 pages instead of 1000.
+  - line: 219
+    note: Random inserts leave leaves partly empty.
+  - line: 220
+    note: Bulk loading fills every leaf.
+playground:
+  prompt: Change the fanout and see how many levels you need for a million keys.
+  code: |
+    keys = 1000000
+    fanout = 100
+    levels = 1
+    capacity = fanout
+    while capacity < keys:
+        capacity = capacity * fanout
+        levels = levels + 1
+    print('levels needed:', levels)
+exercises:
+- id: search
+  title: Searching a B+ tree
+  difficulty: 4
+  prompt: 'A **B+ tree** is the index structure behind most databases. Every node is a page holding sorted keys. **Internal** nodes hold separator keys and children (`len(children) == len(keys) + 1`): a search follows the child whose key range contains the key. **Leaves** hold the keys with their values and are chained together through `next` pointers, so a range can be read by walking along the leaves. A node is a dict: a leaf is `{"leaf": True, "keys": [], "vals": [], "next": None}`, an internal node is `{"leaf": False, "keys": [...], "children": [...]}`. Write `new_tree(max_keys)` returning `{"max": max_keys, "root": an empty leaf}` (`ValueError("max_keys must be at least 3")` if `max_keys < 3`). Write `child_index(keys, key)`: a **binary search** returning how many of the sorted `keys` are `<= key` (write the loop yourself, no `bisect`). Write `find_leaf(node, key)`, which walks down to the leaf that would hold the key by following `children[child_index(keys, key)]`; `search(tree, key)`, the value or `None` (values are never `None`); and `height(tree)`, the number of levels (1 for a single leaf).'
+  starter: |-
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        pass
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        pass
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        pass
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        pass
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        pass
+  tests:
+  - name: binary search in a node
+    code: |
+      assert child_index([10, 20, 30], 5) == 0 and child_index([10, 20, 30], 10) == 1
+      assert child_index([10, 20, 30], 25) == 2 and child_index([10, 20, 30], 30) == 3 and child_index([10, 20, 30], 99) == 3
+      assert child_index([], 4) == 0
+      keys = list(range(0, 1000, 2))
+      for k in (-1, 0, 1, 500, 501, 998, 999, 5000):
+          assert child_index(keys, k) == sum(1 for x in keys if x <= k)
+  - name: an empty tree
+    code: |
+      t = new_tree(4)
+      assert t == {"max": 4, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+      assert search(t, 1) is None and height(t) == 1
+      try:
+          new_tree(2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "at least 3" in str(e)
+  - name: searching a built tree
+    code: |
+      l1 = {"leaf": True, "keys": [1, 3], "vals": ["a", "c"], "next": None}
+      l2 = {"leaf": True, "keys": [5, 7], "vals": ["e", "g"], "next": None}
+      l3 = {"leaf": True, "keys": [9, 11, 13], "vals": ["i", "k", "m"], "next": None}
+      l1["next"], l2["next"] = l2, l3
+      root = {"leaf": False, "keys": [5, 9], "children": [l1, l2, l3]}
+      t = {"max": 3, "root": root}
+      assert find_leaf(root, 6) is l2 and find_leaf(root, 5) is l2 and find_leaf(root, 100) is l3 and find_leaf(root, -1) is l1
+      for k, v in (("1", "a"), (3, "c"), (5, "e"), (7, "g"), (9, "i"), (13, "m")):
+          if k != "1":
+              assert search(t, k) == v
+      assert search(t, 4) is None and search(t, 0) is None and search(t, 14) is None
+      assert height(t) == 2
+      two = {"max": 3, "root": {"leaf": False, "keys": [100], "children": [{"leaf": False, "keys": [50], "children": [l1, l2]}, {"leaf": False, "keys": [], "children": [l3]}]}}
+      assert height(two) == 3 and search(two, 150) is None and search(two, 3) == "c"
+  hints:
+  - children[child_index(keys, key)] is always the child to descend into.
+  solution: |
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+  explanation: A B+ tree search reads one page per level, so a few reads find any key among billions.
+- id: insert
+  title: Insertion and splitting
+  difficulty: 5
+  prompt: 'Starter code gives you `new_tree`, `child_index`, `find_leaf`, `search` and `height`. Write `insert(tree, key, value)`: if the key already exists replace its value and return `False`; otherwise return `True`. Descend to the leaf, remembering the path of `(parent, child position)` pairs, and insert the key in sorted position. While a node has **more than** `tree["max"]` keys, **split** it, with `mid = len(keys) // 2`. A **leaf** keeps `keys[:mid]`, and a new right sibling gets `keys[mid:]` (and the matching `vals`; keep the `next` links right: the new leaf takes the old `next`, the old leaf points to the new one); the **separator** pushed up is the **first key of the new right leaf** (it also stays in that leaf). An **internal** node keeps `keys[:mid]` with `children[:mid + 1]`; the separator pushed up is `keys[mid]` (it **leaves** the node), and the new right node gets `keys[mid + 1:]` with `children[mid + 1:]`. Insert the separator into the parent just after the node that split (`parent["keys"].insert(i, sep)` and `parent["children"].insert(i + 1, right)`); that may overflow the parent, so repeat. If the root splits, make a new root with one separator and the two halves.'
+  starter: |-
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        pass
+  tests:
+  - name: no split needed
+    code: |
+      t = new_tree(4)
+      assert insert(t, 5, "five") is True and insert(t, 2, "two") is True and insert(t, 8, "eight") is True
+      assert t["root"]["keys"] == [2, 5, 8] and t["root"]["vals"] == ["two", "five", "eight"]
+      assert insert(t, 5, "FIVE") is False and search(t, 5) == "FIVE" and len(t["root"]["keys"]) == 3
+      assert height(t) == 1
+  - name: a leaf split
+    code: |
+      t = new_tree(3)
+      for k in (10, 20, 30):
+          insert(t, k, str(k))
+      assert height(t) == 1
+      insert(t, 40, "40")
+      root = t["root"]
+      assert not root["leaf"] and root["keys"] == [30]
+      a, b = root["children"]
+      assert a["keys"] == [10, 20] and b["keys"] == [30, 40] and b["vals"] == ["30", "40"]
+      assert a["next"] is b and b["next"] is None
+      for k in (10, 20, 30, 40):
+          assert search(t, k) == str(k)
+      insert(t, 25, "25")
+      assert root["keys"] == [30] and a["keys"] == [10, 20, 25] and b["keys"] == [30, 40]
+  - name: growing taller
+    code: |
+      t = new_tree(3)
+      for k in range(1, 11):
+          insert(t, k, k * k)
+      assert height(t) == 3
+      assert all(search(t, k) == k * k for k in range(1, 11)) and search(t, 11) is None
+      assert t["root"]["keys"] == [7]
+      leaves = []
+      n = t["root"]
+      while not n["leaf"]:
+          n = n["children"][0]
+      while n:
+          leaves.append(n["keys"])
+          n = n["next"]
+      assert leaves == [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]], leaves
+  - name: any order
+    code: |
+      import random
+      keys = list(range(500))
+      for seed in range(4):
+          rng = random.Random(seed)
+          rng.shuffle(keys)
+          t = new_tree(4 + seed)
+          for k in keys:
+              assert insert(t, k, -k) is True
+          assert all(search(t, k) == -k for k in range(500)) and search(t, 500) is None
+          assert height(t) >= 3
+          node = t["root"]
+          while not node["leaf"]:
+              node = node["children"][0]
+          seen = []
+          while node:
+              seen.extend(node["keys"])
+              node = node["next"]
+          assert seen == list(range(500))
+  hints:
+  - Remember the parent and child position as you descend, so a split can be pushed back up the same path.
+  solution: |
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+  explanation: Splits keep a B+ tree balanced without ever rebuilding it.
+- id: range
+  title: Range scans, deletion and validation
+  difficulty: 5
+  prompt: 'Starter code gives you the search functions and `insert`. Write `leftmost_leaf(tree)`, `all_items(tree)` (every `(key, value)` pair in key order, found by walking the `next` links from the leftmost leaf, never by going back up the tree) and `range_scan(tree, lo, hi)`: all pairs with `lo <= key <= hi` in order, descending **once** to the leaf for `lo` and then following `next` links, stopping as soon as a key exceeds `hi` (an empty list if `lo > hi`). Write `delete(tree, key)`, which removes the key from its leaf and returns `True` (`False` if absent); this simple version never merges nodes. Write `is_valid(tree)`, returning `True` or `False`: every node has at most `max` keys; keys in a node are strictly increasing; an internal node has `len(keys) + 1` children; every key in `children[i]` is `>= keys[i - 1]` and `< keys[i]` where those exist; all leaves are at the same depth; and following `next` from the leftmost leaf visits exactly the leaves in left-to-right order and ends with `None`.'
+  starter: |-
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        pass
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        pass
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        pass
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        pass
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        pass
+  tests:
+  - name: walking the leaves
+    code: |
+      t = new_tree(3)
+      import random
+      keys = list(range(0, 100, 2))
+      random.Random(1).shuffle(keys)
+      for k in keys:
+          insert(t, k, k // 2)
+      assert leftmost_leaf(t)["keys"][0] == 0 and leftmost_leaf(t)["leaf"]
+      assert all_items(t) == [(k, k // 2) for k in range(0, 100, 2)]
+      assert all_items(new_tree(3)) == []
+  - name: range queries
+    code: |
+      t = new_tree(4)
+      for k in range(0, 200, 5):
+          insert(t, k, str(k))
+      assert range_scan(t, 12, 33) == [(15, "15"), (20, "20"), (25, "25"), (30, "30")]
+      assert range_scan(t, 15, 30) == [(15, "15"), (20, "20"), (25, "25"), (30, "30")]
+      assert range_scan(t, -10, 4) == [(0, "0")] and range_scan(t, 195, 999) == [(195, "195")]
+      assert range_scan(t, 6, 9) == [] and range_scan(t, 30, 12) == []
+      assert len(range_scan(t, 0, 10 ** 6)) == 40
+      assert range_scan(new_tree(3), 1, 5) == []
+  - name: deleting
+    code: |
+      t = new_tree(3)
+      for k in range(30):
+          insert(t, k, k)
+      assert delete(t, 7) is True and delete(t, 7) is False and delete(t, 100) is False
+      assert search(t, 7) is None and search(t, 8) == 8
+      for k in range(0, 30):
+          delete(t, k)
+      assert all_items(t) == [] and is_valid(t)
+      insert(t, 5, "back")
+      assert search(t, 5) == "back" and range_scan(t, 0, 10) == [(5, "back")]
+  - name: validity
+    code: |
+      import random
+      t = new_tree(4)
+      keys = list(range(300))
+      random.Random(5).shuffle(keys)
+      for k in keys:
+          insert(t, k, k)
+          if k % 50 == 0:
+              assert is_valid(t)
+      for k in keys[:100]:
+          delete(t, k)
+      assert is_valid(t)
+      assert is_valid(new_tree(3))
+      bad = new_tree(3)
+      for k in range(10):
+          insert(bad, k, k)
+      leaf = leftmost_leaf(bad)
+      leaf["keys"][0], leaf["keys"][1] = leaf["keys"][1], leaf["keys"][0]
+      assert is_valid(bad) is False
+      bad2 = new_tree(3)
+      for k in range(10):
+          insert(bad2, k, k)
+      leftmost_leaf(bad2)["next"] = None
+      assert is_valid(bad2) is False
+      bad3 = new_tree(3)
+      for k in range(10):
+          insert(bad3, k, k)
+      leftmost_leaf(bad3)["keys"].append(999)
+      assert is_valid(bad3) is False
+  hints:
+  - After finding the leaf for lo, keep going right through next pointers; stop when a key is above hi.
+  solution: |
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        node = tree["root"]
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        out = []
+        leaf = leftmost_leaf(tree)
+        while leaf is not None:
+            out.extend(zip(leaf["keys"], leaf["vals"]))
+            leaf = leaf["next"]
+        return out
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        out = []
+        if lo > hi:
+            return out
+        leaf = find_leaf(tree["root"], lo)
+        while leaf is not None:
+            for k, v in zip(leaf["keys"], leaf["vals"]):
+                if k > hi:
+                    return out
+                if k >= lo:
+                    out.append((k, v))
+            leaf = leaf["next"]
+        return out
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            del leaf["keys"][i - 1]
+            del leaf["vals"][i - 1]
+            return True
+        return False
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        leaves = []
+
+        def walk(node, lo, hi, depth):
+            keys = node["keys"]
+            if len(keys) > tree["max"] or any(a >= b for a, b in zip(keys, keys[1:])):
+                return None
+            if any((lo is not None and k < lo) or (hi is not None and k >= hi) for k in keys):
+                return None
+            if node["leaf"]:
+                leaves.append(node)
+                return depth
+            if len(node["children"]) != len(keys) + 1:
+                return None
+            depths = set()
+            for i, child in enumerate(node["children"]):
+                clo = keys[i - 1] if i > 0 else lo
+                chi = keys[i] if i < len(keys) else hi
+                d = walk(child, clo, chi, depth + 1)
+                if d is None:
+                    return None
+                depths.add(d)
+            return depths.pop() if len(depths) == 1 else None
+
+        if walk(tree["root"], None, None, 1) is None:
+            return False
+        for a, b in zip(leaves, leaves[1:]):
+            if a["next"] is not b:
+                return False
+        return leaves[-1]["next"] is None
+  explanation: Linked leaves are why B+ trees answer range queries and ORDER BY so well.
+- id: bulk
+  title: Bulk loading and statistics
+  difficulty: 4
+  prompt: Building an index on a big existing table by inserting keys one at a time is slow and leaves half-empty pages. If the data is sorted, a **bulk load** builds the tree **bottom-up**. Starter code gives the earlier functions. Write `min_key(node)` (the smallest key under a node), `bulk_load(pairs, max_keys)` and `tree_stats(tree)`. `bulk_load` takes a list of `(key, value)` pairs **already sorted** by key (`ValueError("keys must be sorted and unique")` otherwise; an empty list gives an empty tree). Fill leaves **completely**, `max_keys` pairs each (the last may have fewer), linked through `next`. Then build each internal level from the level below by grouping `max_keys + 1` consecutive nodes under one parent whose keys are `min_key` of each child **except the first**; if the last group would hold only **one** child, move the last child of the previous group into it so it has two. Repeat until one node remains, the root. `tree_stats(tree)` returns `{"height", "nodes", "leaves", "keys", "fill"}` where `keys` is the total count of keys in leaves and `fill` is `keys / (leaves * max)` rounded to 3 decimals.
+  starter: |-
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        node = tree["root"]
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        out = []
+        leaf = leftmost_leaf(tree)
+        while leaf is not None:
+            out.extend(zip(leaf["keys"], leaf["vals"]))
+            leaf = leaf["next"]
+        return out
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        out = []
+        if lo > hi:
+            return out
+        leaf = find_leaf(tree["root"], lo)
+        while leaf is not None:
+            for k, v in zip(leaf["keys"], leaf["vals"]):
+                if k > hi:
+                    return out
+                if k >= lo:
+                    out.append((k, v))
+            leaf = leaf["next"]
+        return out
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            del leaf["keys"][i - 1]
+            del leaf["vals"][i - 1]
+            return True
+        return False
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        leaves = []
+
+        def walk(node, lo, hi, depth):
+            keys = node["keys"]
+            if len(keys) > tree["max"] or any(a >= b for a, b in zip(keys, keys[1:])):
+                return None
+            if any((lo is not None and k < lo) or (hi is not None and k >= hi) for k in keys):
+                return None
+            if node["leaf"]:
+                leaves.append(node)
+                return depth
+            if len(node["children"]) != len(keys) + 1:
+                return None
+            depths = set()
+            for i, child in enumerate(node["children"]):
+                clo = keys[i - 1] if i > 0 else lo
+                chi = keys[i] if i < len(keys) else hi
+                d = walk(child, clo, chi, depth + 1)
+                if d is None:
+                    return None
+                depths.add(d)
+            return depths.pop() if len(depths) == 1 else None
+
+        if walk(tree["root"], None, None, 1) is None:
+            return False
+        for a, b in zip(leaves, leaves[1:]):
+            if a["next"] is not b:
+                return False
+        return leaves[-1]["next"] is None
+
+
+    def min_key(node):
+        """The smallest key in the subtree under `node` (follow the first child down to a leaf and take its first key)."""
+        pass
+
+
+    def bulk_load(pairs, max_keys):
+        """Build a tree from a list of (key, value) pairs ALREADY SORTED by key, much faster than inserting one by one. ValueError('keys must be sorted and unique') otherwise (an empty list is fine and gives an empty tree). Fill LEAVES completely, max_keys pairs each (the last may have fewer), linked through `next`.
+        Then build each INTERNAL level from the level below by grouping max_keys + 1 consecutive nodes under one parent, whose keys are min_key of each child except the first; if the last group would hold only ONE child, move the last child of the previous group into it (so it has 2). Repeat until one node remains: the root."""
+        pass
+
+
+    def tree_stats(tree):
+        """A summary dict: {"height": levels, "nodes": total nodes, "leaves": number of leaves, "keys": total keys stored in leaves, "fill": average leaf fullness = keys / (leaves * max) rounded to 3 decimals}."""
+        pass
+  tests:
+  - name: a small bulk load
+    code: |
+      pairs = [(i, str(i)) for i in range(1, 11)]
+      t = bulk_load(pairs, 3)
+      assert is_valid(t) and all_items(t) == pairs
+      assert [l for l in [leftmost_leaf(t)["keys"]]] == [[1, 2, 3]]
+      assert min_key(t["root"]) == 1
+      assert t["root"]["keys"] == [4, 7, 10] and height(t) == 2
+  - name: structure
+    code: |
+      t = bulk_load([(i, i) for i in range(1, 17)], 3)
+      assert is_valid(t) and height(t) == 3
+      root = t["root"]
+      assert root["keys"] == [13] and [len(c["children"]) for c in root["children"]] == [4, 2]
+      assert root["children"][0]["keys"] == [4, 7, 10] and root["children"][1]["keys"] == [16]
+      t2 = bulk_load([(i, i) for i in range(1, 6)], 3)
+      assert [len(c["keys"]) for c in [t2["root"]]] == [1] and t2["root"]["keys"] == [4]
+      single = bulk_load([(1, "a")], 3)
+      assert single["root"]["leaf"] and single["root"]["keys"] == [1]
+  - name: validation
+    code: |
+      assert bulk_load([], 4) == new_tree(4)
+      for bad in ([(2, 1), (1, 1)], [(1, 1), (1, 2)]):
+          try:
+              bulk_load(bad, 4)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "sorted and unique" in str(e)
+      try:
+          bulk_load([(1, 1)], 2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "at least 3" in str(e)
+  - name: a big tree and its fill
+    code: |
+      pairs = [(i, i * 2) for i in range(10000)]
+      t = bulk_load(pairs, 50)
+      s = tree_stats(t)
+      assert is_valid(t) and s["keys"] == 10000 and s["leaves"] == 200 and s["height"] == 3 and s["fill"] == 1.0
+      assert all(search(t, k) == 2 * k for k in (0, 1, 4999, 9999)) and search(t, 10000) is None
+      import random
+      u = new_tree(50)
+      keys = list(range(10000))
+      random.Random(2).shuffle(keys)
+      for k in keys:
+          insert(u, k, k)
+      su = tree_stats(u)
+      assert su["keys"] == 10000 and 0.55 < su["fill"] < 0.85 and su["leaves"] > s["leaves"]
+      assert tree_stats(new_tree(3)) == {"height": 1, "nodes": 1, "leaves": 1, "keys": 0, "fill": 0.0}
+  hints:
+  - Group the nodes of each level in chunks of max_keys + 1; use min_key to find each group's separators.
+  solution: |
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        node = tree["root"]
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        out = []
+        leaf = leftmost_leaf(tree)
+        while leaf is not None:
+            out.extend(zip(leaf["keys"], leaf["vals"]))
+            leaf = leaf["next"]
+        return out
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        out = []
+        if lo > hi:
+            return out
+        leaf = find_leaf(tree["root"], lo)
+        while leaf is not None:
+            for k, v in zip(leaf["keys"], leaf["vals"]):
+                if k > hi:
+                    return out
+                if k >= lo:
+                    out.append((k, v))
+            leaf = leaf["next"]
+        return out
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            del leaf["keys"][i - 1]
+            del leaf["vals"][i - 1]
+            return True
+        return False
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        leaves = []
+
+        def walk(node, lo, hi, depth):
+            keys = node["keys"]
+            if len(keys) > tree["max"] or any(a >= b for a, b in zip(keys, keys[1:])):
+                return None
+            if any((lo is not None and k < lo) or (hi is not None and k >= hi) for k in keys):
+                return None
+            if node["leaf"]:
+                leaves.append(node)
+                return depth
+            if len(node["children"]) != len(keys) + 1:
+                return None
+            depths = set()
+            for i, child in enumerate(node["children"]):
+                clo = keys[i - 1] if i > 0 else lo
+                chi = keys[i] if i < len(keys) else hi
+                d = walk(child, clo, chi, depth + 1)
+                if d is None:
+                    return None
+                depths.add(d)
+            return depths.pop() if len(depths) == 1 else None
+
+        if walk(tree["root"], None, None, 1) is None:
+            return False
+        for a, b in zip(leaves, leaves[1:]):
+            if a["next"] is not b:
+                return False
+        return leaves[-1]["next"] is None
+
+
+    def min_key(node):
+        """The smallest key in the subtree under `node` (follow the first child down to a leaf and take its first key)."""
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node["keys"][0]
+
+
+    def bulk_load(pairs, max_keys):
+        """Build a tree from a list of (key, value) pairs ALREADY SORTED by key, much faster than inserting one by one. ValueError('keys must be sorted and unique') otherwise (an empty list is fine and gives an empty tree). Fill LEAVES completely, max_keys pairs each (the last may have fewer), linked through `next`.
+        Then build each INTERNAL level from the level below by grouping max_keys + 1 consecutive nodes under one parent, whose keys are min_key of each child except the first; if the last group would hold only ONE child, move the last child of the previous group into it (so it has 2). Repeat until one node remains: the root."""
+        tree = new_tree(max_keys)
+        if not pairs:
+            return tree
+        keys = [k for k, v in pairs]
+        if any(a >= b for a, b in zip(keys, keys[1:])):
+            raise ValueError("keys must be sorted and unique")
+        level = []
+        for i in range(0, len(pairs), max_keys):
+            chunk = pairs[i:i + max_keys]
+            level.append({"leaf": True, "keys": [k for k, v in chunk], "vals": [v for k, v in chunk], "next": None})
+        for a, b in zip(level, level[1:]):
+            a["next"] = b
+        while len(level) > 1:
+            size = max_keys + 1
+            groups = [level[i:i + size] for i in range(0, len(level), size)]
+            if len(groups) > 1 and len(groups[-1]) == 1:
+                groups[-1].insert(0, groups[-2].pop())
+            level = [{"leaf": False, "keys": [min_key(c) for c in g[1:]], "children": g} for g in groups]
+        tree["root"] = level[0]
+        return tree
+
+
+    def tree_stats(tree):
+        """A summary dict: {"height": levels, "nodes": total nodes, "leaves": number of leaves, "keys": total keys stored in leaves, "fill": average leaf fullness = keys / (leaves * max) rounded to 3 decimals}."""
+        nodes = leaves = keys = 0
+        stack = [tree["root"]]
+        while stack:
+            n = stack.pop()
+            nodes += 1
+            if n["leaf"]:
+                leaves += 1
+                keys += len(n["keys"])
+            else:
+                stack.extend(n["children"])
+        return {"height": height(tree), "nodes": nodes, "leaves": leaves, "keys": keys, "fill": round(keys / (leaves * tree["max"]), 3)}
+  explanation: Bulk loading builds a perfectly packed index in a single pass over sorted data.
+- id: index
+  title: 'Capstone: an index on a table'
+  difficulty: 5
+  prompt: 'Starter code gives the whole B+ tree, including `bulk_load` and `tree_stats`. Build a **non-unique index** on one column of a table. `rows` is a list of dicts; the **record id** of a row is its position in the list. Write `build_index(rows, column, max_keys)`: create `new_tree(max_keys)` and, for each row in order, store `value -> list of record ids` (append to the existing list if the value is already in the tree, otherwise insert a new one-element list). Write `index_find(index, value)`: the sorted list of record ids whose column equals `value` (empty if none). Write `index_range(index, lo, hi)`: the record ids of rows with `lo <= column <= hi`, ordered by column value and then by record id. Write `nodes_visited(tree, key)`: how many nodes a search for `key` reads from the root down to a leaf.'
+  starter: |-
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        node = tree["root"]
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        out = []
+        leaf = leftmost_leaf(tree)
+        while leaf is not None:
+            out.extend(zip(leaf["keys"], leaf["vals"]))
+            leaf = leaf["next"]
+        return out
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        out = []
+        if lo > hi:
+            return out
+        leaf = find_leaf(tree["root"], lo)
+        while leaf is not None:
+            for k, v in zip(leaf["keys"], leaf["vals"]):
+                if k > hi:
+                    return out
+                if k >= lo:
+                    out.append((k, v))
+            leaf = leaf["next"]
+        return out
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            del leaf["keys"][i - 1]
+            del leaf["vals"][i - 1]
+            return True
+        return False
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        leaves = []
+
+        def walk(node, lo, hi, depth):
+            keys = node["keys"]
+            if len(keys) > tree["max"] or any(a >= b for a, b in zip(keys, keys[1:])):
+                return None
+            if any((lo is not None and k < lo) or (hi is not None and k >= hi) for k in keys):
+                return None
+            if node["leaf"]:
+                leaves.append(node)
+                return depth
+            if len(node["children"]) != len(keys) + 1:
+                return None
+            depths = set()
+            for i, child in enumerate(node["children"]):
+                clo = keys[i - 1] if i > 0 else lo
+                chi = keys[i] if i < len(keys) else hi
+                d = walk(child, clo, chi, depth + 1)
+                if d is None:
+                    return None
+                depths.add(d)
+            return depths.pop() if len(depths) == 1 else None
+
+        if walk(tree["root"], None, None, 1) is None:
+            return False
+        for a, b in zip(leaves, leaves[1:]):
+            if a["next"] is not b:
+                return False
+        return leaves[-1]["next"] is None
+
+
+    def min_key(node):
+        """The smallest key in the subtree under `node` (follow the first child down to a leaf and take its first key)."""
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node["keys"][0]
+
+
+    def bulk_load(pairs, max_keys):
+        """Build a tree from a list of (key, value) pairs ALREADY SORTED by key, much faster than inserting one by one. ValueError('keys must be sorted and unique') otherwise (an empty list is fine and gives an empty tree). Fill LEAVES completely, max_keys pairs each (the last may have fewer), linked through `next`.
+        Then build each INTERNAL level from the level below by grouping max_keys + 1 consecutive nodes under one parent, whose keys are min_key of each child except the first; if the last group would hold only ONE child, move the last child of the previous group into it (so it has 2). Repeat until one node remains: the root."""
+        tree = new_tree(max_keys)
+        if not pairs:
+            return tree
+        keys = [k for k, v in pairs]
+        if any(a >= b for a, b in zip(keys, keys[1:])):
+            raise ValueError("keys must be sorted and unique")
+        level = []
+        for i in range(0, len(pairs), max_keys):
+            chunk = pairs[i:i + max_keys]
+            level.append({"leaf": True, "keys": [k for k, v in chunk], "vals": [v for k, v in chunk], "next": None})
+        for a, b in zip(level, level[1:]):
+            a["next"] = b
+        while len(level) > 1:
+            size = max_keys + 1
+            groups = [level[i:i + size] for i in range(0, len(level), size)]
+            if len(groups) > 1 and len(groups[-1]) == 1:
+                groups[-1].insert(0, groups[-2].pop())
+            level = [{"leaf": False, "keys": [min_key(c) for c in g[1:]], "children": g} for g in groups]
+        tree["root"] = level[0]
+        return tree
+
+
+    def tree_stats(tree):
+        """A summary dict: {"height": levels, "nodes": total nodes, "leaves": number of leaves, "keys": total keys stored in leaves, "fill": average leaf fullness = keys / (leaves * max) rounded to 3 decimals}."""
+        nodes = leaves = keys = 0
+        stack = [tree["root"]]
+        while stack:
+            n = stack.pop()
+            nodes += 1
+            if n["leaf"]:
+                leaves += 1
+                keys += len(n["keys"])
+            else:
+                stack.extend(n["children"])
+        return {"height": height(tree), "nodes": nodes, "leaves": leaves, "keys": keys, "fill": round(keys / (leaves * tree["max"]), 3)}
+
+
+    def build_index(rows, column, max_keys):
+        """A NON-UNIQUE INDEX on one column of a table. `rows` is a list of dicts; the record id of a row is its position in the list. Create new_tree(max_keys) and for each row, in order, store value -> list of record ids (append to the existing list if the value is already in the tree, otherwise insert a new one-element list)."""
+        pass
+
+
+    def index_find(index, value):
+        """The sorted list of record ids of rows whose column equals `value` (empty if none)."""
+        pass
+
+
+    def index_range(index, lo, hi):
+        """The record ids of rows with lo <= column <= hi, ordered by column value and then by record id."""
+        pass
+
+
+    def nodes_visited(tree, key):
+        """How many nodes a search for `key` reads, from the root down to the leaf (this equals the height of the tree)."""
+        pass
+  tests:
+  - name: finding rows
+    code: |
+      rows = [{"name": "ada", "age": 36}, {"name": "grace", "age": 45}, {"name": "alan", "age": 41}, {"name": "edsger", "age": 36}, {"name": "barbara", "age": 29}]
+      idx = build_index(rows, "age", 4)
+      assert index_find(idx, 36) == [0, 3] and index_find(idx, 45) == [1] and index_find(idx, 99) == []
+      by_name = build_index(rows, "name", 4)
+      assert index_find(by_name, "alan") == [2] and index_find(by_name, "zed") == []
+      assert is_valid(idx) and is_valid(by_name)
+  - name: ranges
+    code: |
+      rows = [{"age": a} for a in (36, 45, 41, 36, 29, 30, 52, 41)]
+      idx = build_index(rows, "age", 3)
+      assert index_range(idx, 30, 41) == [5, 0, 3, 2, 7]
+      assert index_range(idx, 0, 100) == [4, 5, 0, 3, 2, 7, 1, 6]
+      assert index_range(idx, 37, 40) == [] and index_range(idx, 50, 20) == []
+      assert index_range(idx, 52, 52) == [6]
+      assert index_range(build_index([], "age", 3), 0, 9) == []
+  - name: index versus scan
+    code: |
+      import random
+      rng = random.Random(4)
+      rows = [{"id": i, "score": rng.randrange(1000)} for i in range(5000)]
+      idx = build_index(rows, "score", 32)
+      for v in (0, 17, 500, 999):
+          assert index_find(idx, v) == [i for i, r in enumerate(rows) if r["score"] == v]
+      assert index_range(idx, 100, 110) == sorted((i for i, r in enumerate(rows) if 100 <= r["score"] <= 110), key=lambda i: (rows[i]["score"], i))
+      for v in (0, 500):
+          assert nodes_visited(idx, v) == height(idx) <= 3
+      assert nodes_visited(new_tree(3), 1) == 1
+      assert nodes_visited(bulk_load([(i, i) for i in range(1000)], 4), 500) == height(bulk_load([(i, i) for i in range(1000)], 4))
+  - name: an index stays correct as rows are added
+    code: |
+      rows = []
+      idx = build_index(rows, "k", 3)
+      assert index_find(idx, 1) == []
+      rows = [{"k": i % 7} for i in range(100)]
+      idx = build_index(rows, "k", 3)
+      assert all(len(index_find(idx, v)) >= 14 for v in range(7)) and index_find(idx, 7) == []
+      assert sum(len(index_find(idx, v)) for v in range(7)) == 100
+      assert index_range(idx, 2, 3)[:3] == [2, 9, 16]
+  hints:
+  - The tree's values are lists of record ids; search returns the list itself, so you can append to it.
+  solution: |
+    def new_tree(max_keys):
+        """An empty B+TREE whose nodes hold at most `max_keys` keys: {"max": max_keys, "root": a leaf}. A node is a dict. A LEAF is {"leaf": True, "keys": [], "vals": [], "next": None} (next links to the leaf on its right); an INTERNAL node is {"leaf": False, "keys": [...], "children": [...]} with len(children) == len(keys) + 1.
+        ValueError('max_keys must be at least 3') if max_keys < 3."""
+        if max_keys < 3:
+            raise ValueError("max_keys must be at least 3")
+        return {"max": max_keys, "root": {"leaf": True, "keys": [], "vals": [], "next": None}}
+
+
+    def child_index(keys, key):
+        """Binary search in one node: how many of the sorted `keys` are <= key (0 .. len(keys)). Write the loop yourself; do not use the bisect module. In an internal node this is the index of the child to follow."""
+        lo, hi = 0, len(keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if keys[mid] <= key:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+
+    def find_leaf(node, key):
+        """Walk down from `node` to the leaf that would hold `key`, following children[child_index(keys, key)] in every internal node."""
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+        return node
+
+
+    def search(tree, key):
+        """The value stored under `key`, or None if the key is absent (values are never None)."""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            return leaf["vals"][i - 1]
+        return None
+
+
+    def height(tree):
+        """The number of levels: 1 for a tree that is a single leaf."""
+        node, h = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][0]
+            h += 1
+        return h
+
+
+    def insert(tree, key, value):
+        """Add key -> value. If the key exists replace its value and return False; otherwise return True. Put a new key into its leaf in sorted position. While a node has MORE than tree["max"] keys, SPLIT it: with mid = len(keys) // 2,
+        a leaf keeps keys[:mid] and a new right sibling gets keys[mid:] (and the matching vals; fix the `next` links) and the separator pushed up is the first key of the new right leaf; an internal node keeps keys[:mid] with children[:mid + 1], the separator pushed up is keys[mid] (it leaves the node),
+        and the new right node gets keys[mid + 1:] with children[mid + 1:]. Insert the separator into the parent just after the position of the node that split (keys.insert(i, sep) and children.insert(i + 1, right)); if the root splits, make a new root with the single separator and the two halves."""
+        path = []
+        node = tree["root"]
+        while not node["leaf"]:
+            i = child_index(node["keys"], key)
+            path.append((node, i))
+            node = node["children"][i]
+        j = child_index(node["keys"], key)
+        if j > 0 and node["keys"][j - 1] == key:
+            node["vals"][j - 1] = value
+            return False
+        node["keys"].insert(j, key)
+        node["vals"].insert(j, value)
+        while len(node["keys"]) > tree["max"]:
+            mid = len(node["keys"]) // 2
+            if node["leaf"]:
+                right = {"leaf": True, "keys": node["keys"][mid:], "vals": node["vals"][mid:], "next": node["next"]}
+                node["keys"] = node["keys"][:mid]
+                node["vals"] = node["vals"][:mid]
+                node["next"] = right
+                sep = right["keys"][0]
+            else:
+                sep = node["keys"][mid]
+                right = {"leaf": False, "keys": node["keys"][mid + 1:], "children": node["children"][mid + 1:]}
+                node["keys"] = node["keys"][:mid]
+                node["children"] = node["children"][:mid + 1]
+            if not path:
+                tree["root"] = {"leaf": False, "keys": [sep], "children": [node, right]}
+                break
+            parent, i = path.pop()
+            parent["keys"].insert(i, sep)
+            parent["children"].insert(i + 1, right)
+            node = parent
+        return True
+
+
+    def leftmost_leaf(tree):
+        """The first (smallest) leaf of the tree."""
+        node = tree["root"]
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node
+
+
+    def all_items(tree):
+        """Every (key, value) pair in key order, found by walking the chain of leaves with their `next` links from the leftmost leaf (never by going back up the tree)."""
+        out = []
+        leaf = leftmost_leaf(tree)
+        while leaf is not None:
+            out.extend(zip(leaf["keys"], leaf["vals"]))
+            leaf = leaf["next"]
+        return out
+
+
+    def range_scan(tree, lo, hi):
+        """All (key, value) pairs with lo <= key <= hi in key order. Descend ONCE to the leaf for `lo`, then follow the `next` links, stopping as soon as a key exceeds hi. An empty list if lo > hi."""
+        out = []
+        if lo > hi:
+            return out
+        leaf = find_leaf(tree["root"], lo)
+        while leaf is not None:
+            for k, v in zip(leaf["keys"], leaf["vals"]):
+                if k > hi:
+                    return out
+                if k >= lo:
+                    out.append((k, v))
+            leaf = leaf["next"]
+        return out
+
+
+    def delete(tree, key):
+        """Remove a key from its leaf and return True; False if it was absent. (This simple version never merges or rebalances nodes, so leaves may become small or even empty, and the rest of the tree stays valid.)"""
+        leaf = find_leaf(tree["root"], key)
+        i = child_index(leaf["keys"], key)
+        if i > 0 and leaf["keys"][i - 1] == key:
+            del leaf["keys"][i - 1]
+            del leaf["vals"][i - 1]
+            return True
+        return False
+
+
+    def is_valid(tree):
+        """Check the tree's invariants and return True or False: every node has at most tree["max"] keys; keys inside a node are strictly increasing; an internal node has len(keys) + 1 children; every key in children[i] is >= keys[i - 1] and < keys[i] (where those exist);
+        all leaves are at the same depth; and following the `next` links from the leftmost leaf visits exactly the leaves in left-to-right order, ending with None."""
+        leaves = []
+
+        def walk(node, lo, hi, depth):
+            keys = node["keys"]
+            if len(keys) > tree["max"] or any(a >= b for a, b in zip(keys, keys[1:])):
+                return None
+            if any((lo is not None and k < lo) or (hi is not None and k >= hi) for k in keys):
+                return None
+            if node["leaf"]:
+                leaves.append(node)
+                return depth
+            if len(node["children"]) != len(keys) + 1:
+                return None
+            depths = set()
+            for i, child in enumerate(node["children"]):
+                clo = keys[i - 1] if i > 0 else lo
+                chi = keys[i] if i < len(keys) else hi
+                d = walk(child, clo, chi, depth + 1)
+                if d is None:
+                    return None
+                depths.add(d)
+            return depths.pop() if len(depths) == 1 else None
+
+        if walk(tree["root"], None, None, 1) is None:
+            return False
+        for a, b in zip(leaves, leaves[1:]):
+            if a["next"] is not b:
+                return False
+        return leaves[-1]["next"] is None
+
+
+    def min_key(node):
+        """The smallest key in the subtree under `node` (follow the first child down to a leaf and take its first key)."""
+        while not node["leaf"]:
+            node = node["children"][0]
+        return node["keys"][0]
+
+
+    def bulk_load(pairs, max_keys):
+        """Build a tree from a list of (key, value) pairs ALREADY SORTED by key, much faster than inserting one by one. ValueError('keys must be sorted and unique') otherwise (an empty list is fine and gives an empty tree). Fill LEAVES completely, max_keys pairs each (the last may have fewer), linked through `next`.
+        Then build each INTERNAL level from the level below by grouping max_keys + 1 consecutive nodes under one parent, whose keys are min_key of each child except the first; if the last group would hold only ONE child, move the last child of the previous group into it (so it has 2). Repeat until one node remains: the root."""
+        tree = new_tree(max_keys)
+        if not pairs:
+            return tree
+        keys = [k for k, v in pairs]
+        if any(a >= b for a, b in zip(keys, keys[1:])):
+            raise ValueError("keys must be sorted and unique")
+        level = []
+        for i in range(0, len(pairs), max_keys):
+            chunk = pairs[i:i + max_keys]
+            level.append({"leaf": True, "keys": [k for k, v in chunk], "vals": [v for k, v in chunk], "next": None})
+        for a, b in zip(level, level[1:]):
+            a["next"] = b
+        while len(level) > 1:
+            size = max_keys + 1
+            groups = [level[i:i + size] for i in range(0, len(level), size)]
+            if len(groups) > 1 and len(groups[-1]) == 1:
+                groups[-1].insert(0, groups[-2].pop())
+            level = [{"leaf": False, "keys": [min_key(c) for c in g[1:]], "children": g} for g in groups]
+        tree["root"] = level[0]
+        return tree
+
+
+    def tree_stats(tree):
+        """A summary dict: {"height": levels, "nodes": total nodes, "leaves": number of leaves, "keys": total keys stored in leaves, "fill": average leaf fullness = keys / (leaves * max) rounded to 3 decimals}."""
+        nodes = leaves = keys = 0
+        stack = [tree["root"]]
+        while stack:
+            n = stack.pop()
+            nodes += 1
+            if n["leaf"]:
+                leaves += 1
+                keys += len(n["keys"])
+            else:
+                stack.extend(n["children"])
+        return {"height": height(tree), "nodes": nodes, "leaves": leaves, "keys": keys, "fill": round(keys / (leaves * tree["max"]), 3)}
+
+
+    def build_index(rows, column, max_keys):
+        """A NON-UNIQUE INDEX on one column of a table. `rows` is a list of dicts; the record id of a row is its position in the list. Create new_tree(max_keys) and for each row, in order, store value -> list of record ids (append to the existing list if the value is already in the tree, otherwise insert a new one-element list)."""
+        tree = new_tree(max_keys)
+        for rid, row in enumerate(rows):
+            existing = search(tree, row[column])
+            if existing is None:
+                insert(tree, row[column], [rid])
+            else:
+                existing.append(rid)
+        return tree
+
+
+    def index_find(index, value):
+        """The sorted list of record ids of rows whose column equals `value` (empty if none)."""
+        found = search(index, value)
+        return sorted(found) if found else []
+
+
+    def index_range(index, lo, hi):
+        """The record ids of rows with lo <= column <= hi, ordered by column value and then by record id."""
+        out = []
+        for key, rids in range_scan(index, lo, hi):
+            out.extend(sorted(rids))
+        return out
+
+
+    def nodes_visited(tree, key):
+        """How many nodes a search for `key` reads, from the root down to the leaf (this equals the height of the tree)."""
+        node, count = tree["root"], 1
+        while not node["leaf"]:
+            node = node["children"][child_index(node["keys"], key)]
+            count += 1
+        return count
+  explanation: An index trades extra space and slower writes for fast reads.
+commonMistakes:
+- title: Searching leaves one by one
+  explanation: Descend using the separators; only walk leaves for ranges.
+- title: Splitting leaves and internal nodes the same way
+  explanation: A leaf copies its separator up; an internal node moves it up.
+- title: Forgetting the next pointers when splitting a leaf
+  explanation: Range scans would skip or loop.
+- title: Indexing every column
+  explanation: Each index slows writes and costs space.
+- title: Using a tree with tiny nodes
+  explanation: The point of a B-tree is wide nodes that match disk pages.
+summary:
+- An index avoids reading the whole table.
+- A B+ tree has wide sorted nodes and all leaves at the same depth.
+- A search costs one page read per level, and the height stays tiny.
+- Overflowing nodes split, and the tree grows from the root.
+- Linked leaves make range scans and sorting cheap.
+- Bulk loading builds a packed tree from sorted data.
+next: u25-lsm
+quiz:
+- type: mcq
+  question: How many page reads does a B+ tree search need?
+  options:
+  - About one per level of the tree
+  - One per key
+  - One per leaf
+  - A million
+  answer: 0
+  explanation: The height is tiny.
+- type: mcq
+  question: What happens when the root of a B+ tree splits?
+  options:
+  - A new root is created and the tree grows one level
+  - The tree is rebuilt
+  - The root is deleted
+  - Keys are lost
+  answer: 0
+  explanation: Trees grow from the top.
+- type: mcq
+  question: Why are the leaves of a B+ tree linked?
+  options:
+  - To read ranges in order without going back up
+  - To save memory
+  - To balance the tree
+  - To split faster
+  answer: 0
+  explanation: Walk right along the chain.
+- type: mcq
+  question: What is the fanout?
+  options:
+  - The number of children per node
+  - The number of rows
+  - The height
+  - The page size
+  answer: 0
+  explanation: Higher fanout means a shallower tree.
+- type: mcq
+  question: What is a cost of having more indexes?
+  options:
+  - Writes become slower and more space is used
+  - Reads become slower
+  - Rows are lost
+  - Pages shrink
+  answer: 0
+  explanation: Every index is updated on every write.
+- type: mcq
+  question: When is a bulk load possible?
+  options:
+  - When the data is already sorted
+  - Only for empty tables
+  - Never
+  - When keys repeat
+  answer: 0
+  explanation: Sorted input can be packed bottom-up.
+- type: code
+  question: Write `levels_needed(keys, fanout)` returning the smallest number of levels a tree with that fanout needs to hold at least `keys` keys, where `levels` levels hold `fanout ** levels` keys (use 1 level for 1 to `fanout` keys, and 0 levels for 0 keys).
+  starter: |
+    def levels_needed(keys, fanout):
+        pass
+  tests:
+  - name: levels
+    code: |
+      assert levels_needed(0, 10) == 0 and levels_needed(1, 10) == 1 and levels_needed(10, 10) == 1 and levels_needed(11, 10) == 2 and levels_needed(1000, 10) == 3 and levels_needed(1001, 10) == 4
+  solution: |
+    def levels_needed(keys, fanout):
+        if keys == 0:
+            return 0
+        levels = 1
+        capacity = fanout
+        while capacity < keys:
+            capacity *= fanout
+            levels += 1
+        return levels

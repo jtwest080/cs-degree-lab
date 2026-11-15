@@ -1,0 +1,1207 @@
+id: u25-txn
+title: Transactions and Concurrency
+minutes: 100
+objective: Learn how a database lets many users change data at once without corrupting it. You will test schedules for serializability, build a lock manager, detect deadlocks, implement snapshot isolation with versions, and roll back with an undo log.
+outcomes:
+- State the ACID properties
+- Recognise lost updates, dirty reads and other anomalies
+- Decide whether a schedule is serializable
+- Use shared and exclusive locks
+- Detect and prevent deadlocks
+- Explain snapshot isolation and MVCC
+- Roll back with an undo log
+sections:
+- heading: Transactions and ACID
+  body: |-
+    A **transaction** is a group of operations that the database treats as one unit: moving 50 dollars from one account to another means subtracting from one row and adding to another, and the world must never see only half of it. The guarantees are summed up as **ACID**. **Atomicity**: all of the transaction happens or none of it does. **Consistency**: the data always satisfies its rules, such as "the balance is never negative". **Isolation**: transactions running at the same time do not see each other's half-finished work, as if they ran one at a time. **Durability**: once the database says "committed", the change survives a crash (the write-ahead log from the Distributed Systems unit does this).
+
+    Isolation is the hard one. Without it you get **anomalies**. A **dirty read** sees another transaction's change that is later rolled back. A **lost update** happens when two transactions read the same value, both add to it, and the second write erases the first. A **non-repeatable read** sees a value change between two reads in one transaction. A **phantom** is a row that appears between two identical queries. The strongest guarantee, **serializability**, says the outcome must equal some serial execution of the transactions.
+- heading: Schedules and locks
+  body: |-
+    A **schedule** lists the reads and writes of all transactions in the order they happened. Two operations **conflict** when they come from different transactions, touch the same item and at least one writes. If we draw an arrow from transaction A to B whenever A did a conflicting operation first, we get the **precedence graph**. A schedule is **conflict-serializable** exactly when this graph has **no cycle**; a topological order of the graph is an equivalent serial order.
+
+    The classic way to enforce this is **locking**. Before reading an item a transaction takes a **shared lock** (many readers allowed together); before writing, an **exclusive lock** (no one else may hold any lock). If a lock cannot be granted the transaction waits. **Two-phase locking (2PL)** says a transaction may not take any new lock after releasing one; every schedule it produces is serializable. In practice databases use **strict 2PL**, holding all locks until the transaction commits or aborts, so no one sees uncommitted data.
+- heading: Deadlocks
+  body: |-
+    Waiting for locks can go wrong: T1 holds x and wants y while T2 holds y and wants x. Both wait forever, a **deadlock**. A database can **detect** deadlocks by maintaining a **wait-for graph**, with an arrow from each waiting transaction to the one holding the lock it needs. A cycle in the graph is a deadlock. The remedy is to abort one transaction in the cycle, the **victim**, usually the youngest or the one that has done the least work, which releases its locks and lets the others proceed; the application then simply retries it.
+
+    Alternatively a database can **prevent** deadlocks using timestamps. With **wait-die** an older transaction may wait for a younger one, but a younger one that would wait for an older one is aborted ("dies"). With **wound-wait** an older transaction aborts ("wounds") a younger lock holder, while a younger one waits. Either way waits can only go in one direction of age, so cycles are impossible.
+- heading: Snapshots, versions and rollback
+  body: |-
+    Locking makes readers and writers block each other. **Multi-version concurrency control (MVCC)** keeps **several versions** of each row, each stamped with the time its writer committed. A transaction takes a **snapshot** when it starts and reads, for every row, the newest version committed before the snapshot, so it never waits for writers and never sees partial changes. Writers create new versions instead of overwriting. This is **snapshot isolation**, the default in PostgreSQL, Oracle and many others. Two transactions that change the *same* row conflict: with **first-committer-wins** the second one is aborted. Snapshot isolation is not fully serializable: **write skew** can occur when two transactions read overlapping data and write *different* rows, for example two doctors who each see that two are on call and both go off call, leaving no one. Stricter modes (serializable snapshot isolation) detect this.
+
+    Finally, **atomicity** needs **rollback**. A simple technique records an **undo log**: before changing a value, save the old one. To roll back, replay the log backwards. A **savepoint** marks a position in the log so only part of the work is undone.
+examples:
+- title: Schedules, locks and deadlocks
+  intro: A lost update is not serializable, locks say no to a second writer, and a three-way wait is a deadlock.
+  code: |
+    def conflict_edges(schedule):
+        """A SCHEDULE is a list of (transaction, operation, item) steps in the order they ran, with operation 'R' (read) or 'W' (write), for example [('T1', 'R', 'x'), ('T2', 'W', 'x')]. Two steps CONFLICT if they belong to different transactions, touch the same item and at least one is a write.
+        Return the SET of pairs (a, b) meaning 'a had a conflicting step BEFORE a step of b'. ValueError('bad operation OP') if an operation is not 'R' or 'W'."""
+        for t, op, x in schedule:
+            if op not in ("R", "W"):
+                raise ValueError("bad operation " + str(op))
+        edges = set()
+        for i, (t1, op1, x1) in enumerate(schedule):
+            for t2, op2, x2 in schedule[i + 1:]:
+                if t1 != t2 and x1 == x2 and "W" in (op1, op2):
+                    edges.add((t1, t2))
+        return edges
+
+
+    def serial_order(schedule):
+        """If the schedule is CONFLICT-SERIALIZABLE return an equivalent serial order of its transactions: a topological order of the graph whose edges are conflict_edges, always taking the smallest transaction name that is ready first. Return None if the graph has a cycle (no equivalent serial order exists)."""
+        edges = conflict_edges(schedule)
+        nodes = sorted({t for t, op, x in schedule})
+        incoming = {n: set() for n in nodes}
+        for a, b in edges:
+            incoming[b].add(a)
+        order = []
+        remaining = set(nodes)
+        while remaining:
+            ready = sorted(n for n in remaining if not (incoming[n] & remaining))
+            if not ready:
+                return None
+            order.append(ready[0])
+            remaining.discard(ready[0])
+        return order
+
+
+    def is_conflict_serializable(schedule):
+        """True if the schedule is equivalent to some serial schedule (its precedence graph has no cycle)."""
+        return serial_order(schedule) is not None
+
+
+    def is_serial(schedule):
+        """True if the transactions run one after another with no interleaving: each transaction's steps form ONE unbroken block."""
+        seen = set()
+        last = None
+        for t, op, x in schedule:
+            if t != last:
+                if t in seen:
+                    return False
+                seen.add(t)
+                last = t
+        return True
+
+
+    def new_lock_table():
+        """An empty LOCK TABLE: {"items": {}}. Each locked item maps to {"mode": 'S' or 'X', "holders": set of transactions}."""
+        return {"items": {}}
+
+
+    def acquire(table, txn, item, mode):
+        """Ask for a SHARED ('S', for reading) or EXCLUSIVE ('X', for writing) lock; ValueError('bad mode') for another mode. Return 'granted' or 'blocked' (nothing is changed when blocked; there are no queues). Rules: an unlocked item is granted. A transaction that already holds the item with a lock that is strong enough
+        (it holds X, or it holds S and asks for S) is granted. Several transactions may hold S together. A holder of S asking for X is UPGRADED (mode becomes 'X', granted) only if it is the ONLY holder, otherwise blocked. Every other request is blocked."""
+        if mode not in ("S", "X"):
+            raise ValueError("bad mode")
+        entry = table["items"].get(item)
+        if entry is None:
+            table["items"][item] = {"mode": mode, "holders": {txn}}
+            return "granted"
+        holders = entry["holders"]
+        if txn in holders:
+            if entry["mode"] == "X" or mode == "S":
+                return "granted"
+            if holders == {txn}:
+                entry["mode"] = "X"
+                return "granted"
+            return "blocked"
+        if mode == "S" and entry["mode"] == "S":
+            holders.add(txn)
+            return "granted"
+        return "blocked"
+
+
+    def locks_held(table, txn):
+        """The sorted list of (item, mode) for every lock the transaction holds."""
+        return sorted((item, e["mode"]) for item, e in table["items"].items() if txn in e["holders"])
+
+
+    def release_all(table, txn):
+        """Release every lock held by the transaction (as at COMMIT in STRICT TWO-PHASE LOCKING). Remove items nobody holds any more. Return the sorted list of items it had locked."""
+        freed = []
+        for item in list(table["items"]):
+            e = table["items"][item]
+            if txn in e["holders"]:
+                freed.append(item)
+                e["holders"].discard(txn)
+                if not e["holders"]:
+                    del table["items"][item]
+        return sorted(freed)
+
+
+    def find_deadlock(waits):
+        """`waits` maps each transaction to the collection of transactions it is WAITING FOR (the WAIT-FOR GRAPH). A DEADLOCK is a cycle. Search with depth-first search, trying transactions in sorted order and the transactions each waits for in sorted order; return the first cycle found as a list of transactions in
+        waiting order (each waits for the next, the last waits for the first), ROTATED so the smallest transaction comes first. Return None if there is no cycle."""
+        color = {}
+        path = []
+
+        def visit(t):
+            color[t] = 1
+            path.append(t)
+            for u in sorted(waits.get(t, ())):
+                if color.get(u) == 1:
+                    cycle = path[path.index(u):]
+                    k = cycle.index(min(cycle))
+                    return cycle[k:] + cycle[:k]
+                if color.get(u) is None:
+                    found = visit(u)
+                    if found:
+                        return found
+            path.pop()
+            color[t] = 2
+            return None
+
+        for t in sorted(waits):
+            if color.get(t) is None:
+                found = visit(t)
+                if found:
+                    return found
+        return None
+
+
+    def choose_victim(cycle, start_times):
+        """Pick the transaction of the cycle to ABORT: the YOUNGEST, that is the one with the largest start time (start_times maps transaction to its start time); on a tie take the larger transaction name."""
+        return max(cycle, key=lambda t: (start_times[t], t))
+
+
+    def resolve(waits, start_times):
+        """Break all deadlocks: while find_deadlock finds a cycle, choose a victim, record it, and remove it from the graph (as a waiter and from everybody's wait sets). Do not change the input. Return the list of victims in the order chosen."""
+        graph = {t: set(ws) for t, ws in waits.items()}
+        victims = []
+        while True:
+            cycle = find_deadlock(graph)
+            if cycle is None:
+                return victims
+            v = choose_victim(cycle, start_times)
+            victims.append(v)
+            graph.pop(v, None)
+            for t in graph:
+                graph[t].discard(v)
+
+
+    def wait_die(requester_ts, holder_ts):
+        """DEADLOCK PREVENTION, WAIT-DIE: a transaction asking for a lock held by another may WAIT only if it is OLDER (smaller timestamp); a younger one DIES (is aborted). Return 'wait' or 'die'."""
+        return "wait" if requester_ts < holder_ts else "die"
+
+
+    def wound_wait(requester_ts, holder_ts):
+        """WOUND-WAIT: an OLDER requester WOUNDS (aborts) the younger holder and takes the lock; a younger requester WAITS. Return 'wound' or 'wait'."""
+        return "wound" if requester_ts < holder_ts else "wait"
+
+    lost_update = [("T1", "R", "x"), ("T2", "R", "x"), ("T1", "W", "x"), ("T2", "W", "x")]
+    fine = [("T1", "R", "x"), ("T1", "W", "x"), ("T2", "R", "x"), ("T2", "W", "x")]
+    print("lost update serializable?", is_conflict_serializable(lost_update))
+    print("one after another serializable?", is_conflict_serializable(fine), "order:", serial_order(fine))
+    table = new_lock_table()
+    print("T1 reads x:", acquire(table, "T1", "x", "S"), "| T2 reads x:", acquire(table, "T2", "x", "S"), "| T2 writes x:", acquire(table, "T2", "x", "X"))
+    waits = {"T1": {"T2"}, "T2": {"T3"}, "T3": {"T1"}}
+    cycle = find_deadlock(waits)
+    print("deadlock cycle:", cycle, "victim:", choose_victim(cycle, {"T1": 1, "T2": 2, "T3": 3}))
+  output: |
+    lost update serializable? False
+    one after another serializable? True order: ['T1', 'T2']
+    T1 reads x: granted | T2 reads x: granted | T2 writes x: blocked
+    deadlock cycle: ['T1', 'T2', 'T3'] victim: T3
+  lines:
+  - line: 158
+    note: Reading, then both writing, forms a cycle.
+  - line: 159
+    note: No cycle, so a serial order exists.
+  - line: 161
+    note: Readers share; a writer is blocked.
+  - line: 164
+    note: T3 is the youngest, so it becomes the victim.
+- title: Snapshots and rollback
+  intro: A reader keeps seeing its old snapshot, a second writer loses the race, and a savepoint undoes part of a transaction.
+  code: |
+    def new_store():
+        """A MULTI-VERSION store: {"versions": {}, "clock": 0, "txns": {}, "next_id": 1}. versions maps a key to a list of (commit_time, value) in commit order."""
+        return {"versions": {}, "clock": 0, "txns": {}, "next_id": 1}
+
+
+    def begin(store):
+        """Start a transaction: its id is next_id (then add 1) and it remembers a SNAPSHOT of the current clock: store["txns"][id] = {"snapshot": clock, "writes": {}, "state": "active"}. Return the id."""
+        tid = store["next_id"]
+        store["next_id"] += 1
+        store["txns"][tid] = {"snapshot": store["clock"], "writes": {}, "state": "active"}
+        return tid
+
+
+    def _active(store, tid):
+        t = store["txns"].get(tid)
+        if t is None or t["state"] != "active":
+            raise ValueError("transaction not active")
+        return t
+
+
+    def read(store, tid, key):
+        """What the transaction sees for a key: its own buffered write if it made one; otherwise the value of the NEWEST version committed at a time <= its snapshot; None if there is none. ValueError('transaction not active') for an unknown, committed or aborted transaction."""
+        t = _active(store, tid)
+        if key in t["writes"]:
+            return t["writes"][key]
+        value = None
+        for ts, v in store["versions"].get(key, []):
+            if ts <= t["snapshot"]:
+                value = v
+        return value
+
+
+    def write(store, tid, key, value):
+        """Buffer a write in the transaction (nothing is visible to others until commit). Same error as read for an inactive transaction."""
+        _active(store, tid)["writes"][key] = value
+
+
+    def commit(store, tid):
+        """SNAPSHOT ISOLATION with FIRST-COMMITTER-WINS. If any key the transaction wrote has a version committed AFTER its snapshot (a concurrent transaction got there first), set its state to 'aborted' and return False. Otherwise, if it wrote anything, add 1 to the clock and append (clock, value) for each written key,
+        set the state to 'committed' and return True. (A transaction with no writes commits without changing the clock.) ValueError('transaction not active') if it is not active."""
+        t = _active(store, tid)
+        for key in t["writes"]:
+            versions = store["versions"].get(key, [])
+            if versions and versions[-1][0] > t["snapshot"]:
+                t["state"] = "aborted"
+                return False
+        if t["writes"]:
+            store["clock"] += 1
+            for key, value in t["writes"].items():
+                store["versions"].setdefault(key, []).append((store["clock"], value))
+        t["state"] = "committed"
+        return True
+
+
+    def abort(store, tid):
+        """Abort an active transaction: state 'aborted', its buffered writes are discarded."""
+        t = _active(store, tid)
+        t["state"] = "aborted"
+        t["writes"] = {}
+
+
+    def new_db():
+        """A database that updates IN PLACE and keeps an UNDO LOG so a transaction can be rolled back: {"data": {}, "txns": {}, "next_id": 1}."""
+        return {"data": {}, "txns": {}, "next_id": 1}
+
+
+    def begin_db(db):
+        """Start a transaction with the next id (then add 1): db["txns"][id] = {"undo": [], "state": "active"}. Return the id."""
+        tid = db["next_id"]
+        db["next_id"] += 1
+        db["txns"][tid] = {"undo": [], "state": "active"}
+        return tid
+
+
+    def _active_db(db, tid):
+        t = db["txns"].get(tid)
+        if t is None or t["state"] != "active":
+            raise ValueError("transaction not active")
+        return t
+
+
+    def get_db(db, tid, key):
+        """The current value of a key (None if absent). It sees every change, even uncommitted ones by other transactions (a DIRTY READ: there is no isolation here). ValueError('transaction not active') if the transaction is not active."""
+        _active_db(db, tid)
+        return db["data"].get(key)
+
+
+    def put_db(db, tid, key, value):
+        """Set a key in place, but FIRST append to the transaction's undo log the tuple (key, existed, old_value), where existed says whether the key was present. ValueError('transaction not active') if not active."""
+        t = _active_db(db, tid)
+        t["undo"].append((key, key in db["data"], db["data"].get(key)))
+        db["data"][key] = value
+
+
+    def delete_db(db, tid, key):
+        """Remove a key, logging undo information like put. Return True if the key existed, False otherwise (nothing is logged then)."""
+        t = _active_db(db, tid)
+        if key not in db["data"]:
+            return False
+        t["undo"].append((key, True, db["data"][key]))
+        del db["data"][key]
+        return True
+
+
+    def savepoint_db(db, tid):
+        """A SAVEPOINT: the current length of the transaction's undo log."""
+        return len(_active_db(db, tid)["undo"])
+
+
+    def rollback_to_db(db, tid, mark):
+        """Undo the changes made after a savepoint: take the undo entries beyond position `mark` in REVERSE order, restore each key (put the old value back, or delete the key if it did not exist), and cut the log back to `mark`. The transaction stays active."""
+        t = _active_db(db, tid)
+        while len(t["undo"]) > mark:
+            key, existed, old = t["undo"].pop()
+            if existed:
+                db["data"][key] = old
+            else:
+                db["data"].pop(key, None)
+
+
+    def commit_db(db, tid):
+        """Make the transaction permanent: state 'committed' and an empty undo log."""
+        t = _active_db(db, tid)
+        t["state"] = "committed"
+        t["undo"] = []
+
+
+    def abort_db(db, tid):
+        """Roll the transaction back completely (rollback_to 0) and set its state to 'aborted'."""
+        rollback_to_db(db, tid, 0)
+        db["txns"][tid]["state"] = "aborted"
+
+    store = new_store()
+    setup = begin(store)
+    write(store, setup, "balance", 100)
+    commit(store, setup)
+    reader = begin(store)
+    writer = begin(store)
+    write(store, writer, "balance", 150)
+    print("writer commits:", commit(store, writer))
+    print("the old reader still sees:", read(store, reader, "balance"))
+    print("a new reader sees:", read(store, begin(store), "balance"))
+    a, b = begin(store), begin(store)
+    write(store, a, "balance", 1)
+    write(store, b, "balance", 2)
+    print("two writers on one key, first commits:", commit(store, a), "second commits:", commit(store, b))
+    db = new_db()
+    t = begin_db(db)
+    put_db(db, t, "x", 1)
+    mark = savepoint_db(db, t)
+    put_db(db, t, "x", 2)
+    put_db(db, t, "y", 3)
+    rollback_to_db(db, t, mark)
+    print("after rollback to the savepoint:", db["data"])
+    abort_db(db, t)
+    print("after abort:", db["data"])
+  output: |
+    writer commits: True
+    the old reader still sees: 100
+    a new reader sees: 150
+    two writers on one key, first commits: True second commits: False
+    after rollback to the savepoint: {'x': 1}
+    after abort: {}
+  lines:
+  - line: 140
+    note: The first writer commits.
+  - line: 141
+    note: The reader keeps its snapshot.
+  - line: 146
+    note: First committer wins, the second is aborted.
+  - line: 154
+    note: Only the work after the savepoint is undone.
+  - line: 156
+    note: Abort undoes everything.
+playground:
+  prompt: Two transactions both add 10 to a balance of 100; see the lost update.
+  code: |
+    balance = 100
+    t1_read = balance
+    t2_read = balance
+    balance = t1_read + 10
+    balance = t2_read + 10
+    print('balance after two +10 updates:', balance)
+exercises:
+- id: sched
+  title: Schedules and serializability
+  difficulty: 5
+  prompt: 'A database runs many **transactions** at once, interleaving their steps, and the result must be the same as if they had run one at a time (**serializability**). A **schedule** is a list of `(transaction, operation, item)` steps in the order they ran, with operation `''R''` (read) or `''W''` (write), for example `[(''T1'', ''R'', ''x''), (''T2'', ''W'', ''x'')]`. Two steps **conflict** if they belong to different transactions, touch the same item and at least one is a write. Write `conflict_edges(schedule)`: the **set** of pairs `(a, b)` meaning *a has a conflicting step before a step of b* (`ValueError("bad operation OP")` if an operation is not `''R''` or `''W''`). Write `serial_order(schedule)`: if the schedule is **conflict-serializable** return an equivalent serial order of its transactions: a topological order of the graph formed by those edges, always taking the **smallest** transaction name that is ready first; return `None` if the graph has a **cycle**. Write `is_conflict_serializable(schedule)` and `is_serial(schedule)` (each transaction''s steps form one unbroken block).'
+  starter: |-
+    def conflict_edges(schedule):
+        """A SCHEDULE is a list of (transaction, operation, item) steps in the order they ran, with operation 'R' (read) or 'W' (write), for example [('T1', 'R', 'x'), ('T2', 'W', 'x')]. Two steps CONFLICT if they belong to different transactions, touch the same item and at least one is a write.
+        Return the SET of pairs (a, b) meaning 'a had a conflicting step BEFORE a step of b'. ValueError('bad operation OP') if an operation is not 'R' or 'W'."""
+        pass
+
+
+    def serial_order(schedule):
+        """If the schedule is CONFLICT-SERIALIZABLE return an equivalent serial order of its transactions: a topological order of the graph whose edges are conflict_edges, always taking the smallest transaction name that is ready first. Return None if the graph has a cycle (no equivalent serial order exists)."""
+        pass
+
+
+    def is_conflict_serializable(schedule):
+        """True if the schedule is equivalent to some serial schedule (its precedence graph has no cycle)."""
+        pass
+
+
+    def is_serial(schedule):
+        """True if the transactions run one after another with no interleaving: each transaction's steps form ONE unbroken block."""
+        pass
+  tests:
+  - name: conflicts
+    code: |
+      s = [("T1", "R", "x"), ("T2", "W", "x"), ("T1", "W", "y"), ("T3", "R", "y"), ("T3", "R", "x")]
+      assert conflict_edges(s) == {("T1", "T2"), ("T1", "T3"), ("T2", "T3")}
+      assert conflict_edges([("T1", "R", "x"), ("T2", "R", "x")]) == set()
+      assert conflict_edges([("T1", "W", "x"), ("T1", "W", "x")]) == set() and conflict_edges([]) == set()
+      assert conflict_edges([("T1", "R", "x"), ("T2", "W", "x"), ("T1", "R", "x")]) == {("T1", "T2"), ("T2", "T1")}
+      try:
+          conflict_edges([("T1", "X", "x")])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad operation X" in str(e)
+  - name: serial orders
+    code: |
+      s = [("T1", "R", "x"), ("T2", "W", "x"), ("T1", "W", "y"), ("T3", "R", "y"), ("T3", "R", "x")]
+      assert serial_order(s) == ["T1", "T2", "T3"] and is_conflict_serializable(s)
+      s2 = [("T2", "W", "x"), ("T1", "W", "y"), ("T3", "R", "z")]
+      assert serial_order(s2) == ["T1", "T2", "T3"]
+      s3 = [("T2", "W", "x"), ("T1", "W", "x")]
+      assert serial_order(s3) == ["T2", "T1"]
+      assert serial_order([]) == []
+  - name: cycles
+    code: |
+      lost = [("T1", "R", "x"), ("T2", "R", "x"), ("T1", "W", "x"), ("T2", "W", "x")]
+      assert serial_order(lost) is None and not is_conflict_serializable(lost)
+      dirty = [("T1", "W", "x"), ("T2", "R", "x"), ("T2", "W", "y"), ("T1", "R", "y")]
+      assert is_conflict_serializable(dirty) is False
+      tri = [("T1", "W", "a"), ("T2", "W", "a"), ("T2", "W", "b"), ("T3", "W", "b"), ("T3", "W", "c"), ("T1", "W", "c")]
+      assert serial_order(tri) == ["T1", "T2", "T3"] or serial_order(tri) is None
+      assert is_conflict_serializable([("T1", "R", "x"), ("T2", "W", "x"), ("T1", "R", "y")]) is True
+  - name: serial schedules
+    code: |
+      assert is_serial([("T1", "R", "x"), ("T1", "W", "x"), ("T2", "R", "x")]) is True
+      assert is_serial([("T1", "R", "x"), ("T2", "W", "x"), ("T1", "W", "x")]) is False
+      assert is_serial([]) is True and is_serial([("T1", "R", "x")]) is True
+      assert is_serial([("T1", "R", "x"), ("T2", "R", "x"), ("T3", "R", "x")]) is True
+  hints:
+  - For serial_order repeatedly choose the smallest transaction with no unprocessed predecessor.
+  solution: |
+    def conflict_edges(schedule):
+        """A SCHEDULE is a list of (transaction, operation, item) steps in the order they ran, with operation 'R' (read) or 'W' (write), for example [('T1', 'R', 'x'), ('T2', 'W', 'x')]. Two steps CONFLICT if they belong to different transactions, touch the same item and at least one is a write.
+        Return the SET of pairs (a, b) meaning 'a had a conflicting step BEFORE a step of b'. ValueError('bad operation OP') if an operation is not 'R' or 'W'."""
+        for t, op, x in schedule:
+            if op not in ("R", "W"):
+                raise ValueError("bad operation " + str(op))
+        edges = set()
+        for i, (t1, op1, x1) in enumerate(schedule):
+            for t2, op2, x2 in schedule[i + 1:]:
+                if t1 != t2 and x1 == x2 and "W" in (op1, op2):
+                    edges.add((t1, t2))
+        return edges
+
+
+    def serial_order(schedule):
+        """If the schedule is CONFLICT-SERIALIZABLE return an equivalent serial order of its transactions: a topological order of the graph whose edges are conflict_edges, always taking the smallest transaction name that is ready first. Return None if the graph has a cycle (no equivalent serial order exists)."""
+        edges = conflict_edges(schedule)
+        nodes = sorted({t for t, op, x in schedule})
+        incoming = {n: set() for n in nodes}
+        for a, b in edges:
+            incoming[b].add(a)
+        order = []
+        remaining = set(nodes)
+        while remaining:
+            ready = sorted(n for n in remaining if not (incoming[n] & remaining))
+            if not ready:
+                return None
+            order.append(ready[0])
+            remaining.discard(ready[0])
+        return order
+
+
+    def is_conflict_serializable(schedule):
+        """True if the schedule is equivalent to some serial schedule (its precedence graph has no cycle)."""
+        return serial_order(schedule) is not None
+
+
+    def is_serial(schedule):
+        """True if the transactions run one after another with no interleaving: each transaction's steps form ONE unbroken block."""
+        seen = set()
+        last = None
+        for t, op, x in schedule:
+            if t != last:
+                if t in seen:
+                    return False
+                seen.add(t)
+                last = t
+        return True
+  explanation: Serializability is the gold standard for correctness; the other lessons' techniques are ways to guarantee it.
+- id: locks
+  title: Locks
+  difficulty: 4
+  prompt: 'The most common way to get serializability is **locking**. A **shared lock** (`''S''`) lets a transaction read and may be held by several transactions at once; an **exclusive lock** (`''X''`) lets one transaction write and excludes everyone else. With **strict two-phase locking** a transaction keeps all its locks until it commits, which prevents the anomalies of interleaving. Write `new_lock_table()` returning `{"items": {}}`; each locked item maps to `{"mode": ''S'' or ''X'', "holders": set of transactions}`. Write `acquire(table, txn, item, mode)` (`ValueError("bad mode")` for another mode) returning `''granted''` or `''blocked''`, changing nothing when blocked (there are no queues). Rules: an unlocked item is granted; a transaction that already holds a lock that is **strong enough** (it holds `X`, or it holds `S` and asks for `S`) is granted; several transactions may hold `S` together; a holder of `S` asking for `X` is **upgraded** (the mode becomes `''X''`, granted) only if it is the **only** holder, otherwise blocked; every other request is blocked. Write `locks_held(table, txn)`: the sorted list of `(item, mode)` the transaction holds. Write `release_all(table, txn)`: release every lock of the transaction, remove items nobody holds any more, and return the sorted list of items it had locked.'
+  starter: |-
+    def new_lock_table():
+        """An empty LOCK TABLE: {"items": {}}. Each locked item maps to {"mode": 'S' or 'X', "holders": set of transactions}."""
+        pass
+
+
+    def acquire(table, txn, item, mode):
+        """Ask for a SHARED ('S', for reading) or EXCLUSIVE ('X', for writing) lock; ValueError('bad mode') for another mode. Return 'granted' or 'blocked' (nothing is changed when blocked; there are no queues). Rules: an unlocked item is granted. A transaction that already holds the item with a lock that is strong enough
+        (it holds X, or it holds S and asks for S) is granted. Several transactions may hold S together. A holder of S asking for X is UPGRADED (mode becomes 'X', granted) only if it is the ONLY holder, otherwise blocked. Every other request is blocked."""
+        pass
+
+
+    def locks_held(table, txn):
+        """The sorted list of (item, mode) for every lock the transaction holds."""
+        pass
+
+
+    def release_all(table, txn):
+        """Release every lock held by the transaction (as at COMMIT in STRICT TWO-PHASE LOCKING). Remove items nobody holds any more. Return the sorted list of items it had locked."""
+        pass
+  tests:
+  - name: compatibility
+    code: |
+      t = new_lock_table()
+      assert t == {"items": {}}
+      assert acquire(t, "T1", "x", "S") == "granted" and acquire(t, "T2", "x", "S") == "granted"
+      assert acquire(t, "T3", "x", "X") == "blocked"
+      assert t["items"]["x"] == {"mode": "S", "holders": {"T1", "T2"}}
+      assert acquire(t, "T1", "y", "X") == "granted"
+      assert acquire(t, "T2", "y", "S") == "blocked" and acquire(t, "T2", "y", "X") == "blocked"
+      assert t["items"]["y"]["holders"] == {"T1"}
+      try:
+          acquire(t, "T1", "z", "U")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad mode" in str(e)
+  - name: re-requests and upgrades
+    code: |
+      t = new_lock_table()
+      assert acquire(t, "T1", "x", "X") == "granted" and acquire(t, "T1", "x", "S") == "granted" and acquire(t, "T1", "x", "X") == "granted"
+      assert t["items"]["x"]["mode"] == "X"
+      assert acquire(t, "T1", "y", "S") == "granted" and acquire(t, "T1", "y", "S") == "granted"
+      assert acquire(t, "T1", "y", "X") == "granted" and t["items"]["y"]["mode"] == "X"
+      assert acquire(t, "T1", "z", "S") == "granted" and acquire(t, "T2", "z", "S") == "granted"
+      assert acquire(t, "T1", "z", "X") == "blocked" and t["items"]["z"]["mode"] == "S"
+  - name: holdings and release
+    code: |
+      t = new_lock_table()
+      for item, mode in (("b", "S"), ("a", "X"), ("c", "S")):
+          acquire(t, "T1", item, mode)
+      acquire(t, "T2", "c", "S")
+      assert locks_held(t, "T1") == [("a", "X"), ("b", "S"), ("c", "S")] and locks_held(t, "T2") == [("c", "S")] and locks_held(t, "T3") == []
+      assert release_all(t, "T1") == ["a", "b", "c"]
+      assert "a" not in t["items"] and "b" not in t["items"] and t["items"]["c"]["holders"] == {"T2"}
+      assert release_all(t, "T1") == []
+      assert acquire(t, "T3", "a", "X") == "granted"
+      assert acquire(t, "T3", "c", "X") == "blocked"
+      release_all(t, "T2")
+      assert acquire(t, "T3", "c", "X") == "granted"
+  hints:
+  - 'Check the cases in order: unlocked, already held, shared with shared, upgrade, everything else blocked.'
+  solution: |
+    def new_lock_table():
+        """An empty LOCK TABLE: {"items": {}}. Each locked item maps to {"mode": 'S' or 'X', "holders": set of transactions}."""
+        return {"items": {}}
+
+
+    def acquire(table, txn, item, mode):
+        """Ask for a SHARED ('S', for reading) or EXCLUSIVE ('X', for writing) lock; ValueError('bad mode') for another mode. Return 'granted' or 'blocked' (nothing is changed when blocked; there are no queues). Rules: an unlocked item is granted. A transaction that already holds the item with a lock that is strong enough
+        (it holds X, or it holds S and asks for S) is granted. Several transactions may hold S together. A holder of S asking for X is UPGRADED (mode becomes 'X', granted) only if it is the ONLY holder, otherwise blocked. Every other request is blocked."""
+        if mode not in ("S", "X"):
+            raise ValueError("bad mode")
+        entry = table["items"].get(item)
+        if entry is None:
+            table["items"][item] = {"mode": mode, "holders": {txn}}
+            return "granted"
+        holders = entry["holders"]
+        if txn in holders:
+            if entry["mode"] == "X" or mode == "S":
+                return "granted"
+            if holders == {txn}:
+                entry["mode"] = "X"
+                return "granted"
+            return "blocked"
+        if mode == "S" and entry["mode"] == "S":
+            holders.add(txn)
+            return "granted"
+        return "blocked"
+
+
+    def locks_held(table, txn):
+        """The sorted list of (item, mode) for every lock the transaction holds."""
+        return sorted((item, e["mode"]) for item, e in table["items"].items() if txn in e["holders"])
+
+
+    def release_all(table, txn):
+        """Release every lock held by the transaction (as at COMMIT in STRICT TWO-PHASE LOCKING). Remove items nobody holds any more. Return the sorted list of items it had locked."""
+        freed = []
+        for item in list(table["items"]):
+            e = table["items"][item]
+            if txn in e["holders"]:
+                freed.append(item)
+                e["holders"].discard(txn)
+                if not e["holders"]:
+                    del table["items"][item]
+        return sorted(freed)
+  explanation: Locks give correctness at the price of waiting, and waiting can lead to deadlock.
+- id: deadlock
+  title: Deadlocks
+  difficulty: 5
+  prompt: 'If T1 waits for a lock held by T2 while T2 waits for a lock held by T1, neither can ever continue: a **deadlock**. Databases keep a **wait-for graph**: `waits` maps each transaction to the collection of transactions it is **waiting for**; a deadlock is a **cycle**. Write `find_deadlock(waits)`: search with **depth-first search**, trying transactions in sorted order and, for each, the transactions it waits for in sorted order; return the first cycle found as a list in waiting order (each waits for the next, the last waits for the first), **rotated so the smallest transaction comes first**; `None` if there is no cycle. Write `choose_victim(cycle, start_times)`: the transaction to **abort**, the **youngest** (largest start time; on a tie the larger name). Write `resolve(waits, start_times)`: while a deadlock exists, choose a victim, record it, and remove it from the graph (as a waiter and from everybody''s wait sets); do not change the input; return the list of victims in order. Write the two **prevention** rules by timestamp (smaller means older): `wait_die(requester_ts, holder_ts)` returns `''wait''` if the requester is older, else `''die''`; `wound_wait(requester_ts, holder_ts)` returns `''wound''` if the requester is older, else `''wait''`.'
+  starter: |-
+    def find_deadlock(waits):
+        """`waits` maps each transaction to the collection of transactions it is WAITING FOR (the WAIT-FOR GRAPH). A DEADLOCK is a cycle. Search with depth-first search, trying transactions in sorted order and the transactions each waits for in sorted order; return the first cycle found as a list of transactions in
+        waiting order (each waits for the next, the last waits for the first), ROTATED so the smallest transaction comes first. Return None if there is no cycle."""
+        pass
+
+
+    def choose_victim(cycle, start_times):
+        """Pick the transaction of the cycle to ABORT: the YOUNGEST, that is the one with the largest start time (start_times maps transaction to its start time); on a tie take the larger transaction name."""
+        pass
+
+
+    def resolve(waits, start_times):
+        """Break all deadlocks: while find_deadlock finds a cycle, choose a victim, record it, and remove it from the graph (as a waiter and from everybody's wait sets). Do not change the input. Return the list of victims in the order chosen."""
+        pass
+
+
+    def wait_die(requester_ts, holder_ts):
+        """DEADLOCK PREVENTION, WAIT-DIE: a transaction asking for a lock held by another may WAIT only if it is OLDER (smaller timestamp); a younger one DIES (is aborted). Return 'wait' or 'die'."""
+        pass
+
+
+    def wound_wait(requester_ts, holder_ts):
+        """WOUND-WAIT: an OLDER requester WOUNDS (aborts) the younger holder and takes the lock; a younger requester WAITS. Return 'wound' or 'wait'."""
+        pass
+  tests:
+  - name: finding cycles
+    code: |
+      assert find_deadlock({}) is None and find_deadlock({"T1": []}) is None
+      assert find_deadlock({"T1": ["T2"], "T2": ["T1"]}) == ["T1", "T2"]
+      assert find_deadlock({"T2": {"T3"}, "T3": {"T1"}, "T1": {"T2"}}) == ["T1", "T2", "T3"]
+      assert find_deadlock({"T1": ["T2"], "T2": ["T3"], "T3": []}) is None
+      assert find_deadlock({"T1": ["T2"], "T2": ["T3"], "T3": ["T2"]}) == ["T2", "T3"]
+      assert find_deadlock({"T1": ["T1"]}) == ["T1"]
+      assert find_deadlock({"A": ["B", "C"], "B": [], "C": ["A"]}) == ["A", "C"]
+  - name: victims
+    code: |
+      cyc = ["T1", "T2", "T3"]
+      assert choose_victim(cyc, {"T1": 5, "T2": 9, "T3": 7}) == "T2"
+      assert choose_victim(cyc, {"T1": 5, "T2": 5, "T3": 5}) == "T3"
+      assert choose_victim(["T4"], {"T4": 1}) == "T4"
+  - name: breaking deadlocks
+    code: |
+      waits = {"T1": {"T2"}, "T2": {"T1"}, "T3": {"T4"}, "T4": {"T5"}, "T5": {"T3"}, "T6": {"T1"}}
+      start = {"T1": 1, "T2": 2, "T3": 3, "T4": 9, "T5": 4, "T6": 6}
+      victims = resolve(waits, start)
+      assert victims == ["T2", "T4"]
+      assert waits["T1"] == {"T2"}
+      assert resolve({"T1": ["T2"], "T2": []}, {"T1": 1, "T2": 2}) == []
+      assert resolve({}, {}) == []
+      assert resolve({"A": ["B"], "B": ["A"]}, {"A": 2, "B": 1}) == ["A"]
+  - name: prevention rules
+    code: |
+      assert wait_die(1, 5) == "wait" and wait_die(5, 1) == "die" and wait_die(3, 3) == "die"
+      assert wound_wait(1, 5) == "wound" and wound_wait(5, 1) == "wait" and wound_wait(3, 3) == "wait"
+  hints:
+  - 'Depth-first search: keep the current path; reaching a node that is already on the path means you found a cycle.'
+  solution: |
+    def find_deadlock(waits):
+        """`waits` maps each transaction to the collection of transactions it is WAITING FOR (the WAIT-FOR GRAPH). A DEADLOCK is a cycle. Search with depth-first search, trying transactions in sorted order and the transactions each waits for in sorted order; return the first cycle found as a list of transactions in
+        waiting order (each waits for the next, the last waits for the first), ROTATED so the smallest transaction comes first. Return None if there is no cycle."""
+        color = {}
+        path = []
+
+        def visit(t):
+            color[t] = 1
+            path.append(t)
+            for u in sorted(waits.get(t, ())):
+                if color.get(u) == 1:
+                    cycle = path[path.index(u):]
+                    k = cycle.index(min(cycle))
+                    return cycle[k:] + cycle[:k]
+                if color.get(u) is None:
+                    found = visit(u)
+                    if found:
+                        return found
+            path.pop()
+            color[t] = 2
+            return None
+
+        for t in sorted(waits):
+            if color.get(t) is None:
+                found = visit(t)
+                if found:
+                    return found
+        return None
+
+
+    def choose_victim(cycle, start_times):
+        """Pick the transaction of the cycle to ABORT: the YOUNGEST, that is the one with the largest start time (start_times maps transaction to its start time); on a tie take the larger transaction name."""
+        return max(cycle, key=lambda t: (start_times[t], t))
+
+
+    def resolve(waits, start_times):
+        """Break all deadlocks: while find_deadlock finds a cycle, choose a victim, record it, and remove it from the graph (as a waiter and from everybody's wait sets). Do not change the input. Return the list of victims in the order chosen."""
+        graph = {t: set(ws) for t, ws in waits.items()}
+        victims = []
+        while True:
+            cycle = find_deadlock(graph)
+            if cycle is None:
+                return victims
+            v = choose_victim(cycle, start_times)
+            victims.append(v)
+            graph.pop(v, None)
+            for t in graph:
+                graph[t].discard(v)
+
+
+    def wait_die(requester_ts, holder_ts):
+        """DEADLOCK PREVENTION, WAIT-DIE: a transaction asking for a lock held by another may WAIT only if it is OLDER (smaller timestamp); a younger one DIES (is aborted). Return 'wait' or 'die'."""
+        return "wait" if requester_ts < holder_ts else "die"
+
+
+    def wound_wait(requester_ts, holder_ts):
+        """WOUND-WAIT: an OLDER requester WOUNDS (aborts) the younger holder and takes the lock; a younger requester WAITS. Return 'wound' or 'wait'."""
+        return "wound" if requester_ts < holder_ts else "wait"
+  explanation: Databases either detect deadlocks and abort a victim, or prevent them with timestamp rules.
+- id: mvcc
+  title: Snapshots and MVCC
+  difficulty: 5
+  prompt: 'Locks make readers wait for writers. **Multi-version concurrency control (MVCC)** avoids that by keeping **several versions** of every value, so a reader just looks at an older one. Under **snapshot isolation** each transaction sees the database as it was when it started. Write `new_store()` returning `{"versions": {}, "clock": 0, "txns": {}, "next_id": 1}` (`versions` maps a key to a list of `(commit_time, value)` in commit order). Write `begin(store)`: its id is `next_id` (then add 1) and it remembers a **snapshot** of the clock: `store["txns"][id] = {"snapshot": clock, "writes": {}, "state": "active"}`; return the id. Write `read(store, tid, key)`: the transaction''s own buffered write if it made one, otherwise the value of the **newest version committed at a time `<=` its snapshot**, or `None`. Write `write(store, tid, key, value)`: buffer the write in the transaction. All three raise `ValueError("transaction not active")` for an unknown, committed or aborted transaction (the helper `_active` is yours to write too if you wish). Write `commit(store, tid)` with **first-committer-wins**: if any key it wrote has a version committed **after** its snapshot, set its state to `''aborted''` and return `False`; otherwise, if it wrote anything, add 1 to the clock and append `(clock, value)` for each written key, set the state to `''committed''` and return `True` (a transaction with no writes commits without changing the clock). Write `abort(store, tid)`: state `''aborted''`, buffered writes discarded.'
+  starter: |-
+    def new_store():
+        """A MULTI-VERSION store: {"versions": {}, "clock": 0, "txns": {}, "next_id": 1}. versions maps a key to a list of (commit_time, value) in commit order."""
+        pass
+
+
+    def begin(store):
+        """Start a transaction: its id is next_id (then add 1) and it remembers a SNAPSHOT of the current clock: store["txns"][id] = {"snapshot": clock, "writes": {}, "state": "active"}. Return the id."""
+        pass
+
+
+    def _active(store, tid):
+        pass
+
+
+    def read(store, tid, key):
+        """What the transaction sees for a key: its own buffered write if it made one; otherwise the value of the NEWEST version committed at a time <= its snapshot; None if there is none. ValueError('transaction not active') for an unknown, committed or aborted transaction."""
+        pass
+
+
+    def write(store, tid, key, value):
+        """Buffer a write in the transaction (nothing is visible to others until commit). Same error as read for an inactive transaction."""
+        pass
+
+
+    def commit(store, tid):
+        """SNAPSHOT ISOLATION with FIRST-COMMITTER-WINS. If any key the transaction wrote has a version committed AFTER its snapshot (a concurrent transaction got there first), set its state to 'aborted' and return False. Otherwise, if it wrote anything, add 1 to the clock and append (clock, value) for each written key,
+        set the state to 'committed' and return True. (A transaction with no writes commits without changing the clock.) ValueError('transaction not active') if it is not active."""
+        pass
+
+
+    def abort(store, tid):
+        """Abort an active transaction: state 'aborted', its buffered writes are discarded."""
+        pass
+  tests:
+  - name: snapshots
+    code: |
+      s = new_store()
+      t1 = begin(s)
+      write(s, t1, "x", 10)
+      assert read(s, t1, "x") == 10
+      t2 = begin(s)
+      assert read(s, t2, "x") is None
+      assert commit(s, t1) is True and s["clock"] == 1 and s["versions"]["x"] == [(1, 10)]
+      assert read(s, t2, "x") is None
+      t3 = begin(s)
+      assert read(s, t3, "x") == 10 and t3 == 3
+      assert s["txns"][t3] == {"snapshot": 1, "writes": {}, "state": "active"}
+      assert commit(s, t2) is True and s["clock"] == 1
+  - name: readers do not block
+    code: |
+      s = new_store()
+      t = begin(s); write(s, t, "a", 1); commit(s, t)
+      reader = begin(s)
+      w = begin(s); write(s, w, "a", 2); assert commit(s, w) is True
+      assert read(s, reader, "a") == 1
+      fresh = begin(s)
+      assert read(s, fresh, "a") == 2
+      assert s["versions"]["a"] == [(1, 1), (2, 2)]
+      assert commit(s, reader) is True
+  - name: first committer wins
+    code: |
+      s = new_store()
+      t = begin(s); write(s, t, "bal", 100); commit(s, t)
+      a, b = begin(s), begin(s)
+      write(s, a, "bal", read(s, a, "bal") + 10)
+      write(s, b, "bal", read(s, b, "bal") + 20)
+      assert commit(s, a) is True
+      assert commit(s, b) is False and s["txns"][b]["state"] == "aborted"
+      assert s["versions"]["bal"] == [(1, 100), (2, 110)]
+      try:
+          read(s, b, "bal")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "transaction not active" in str(e)
+      c = begin(s); write(s, c, "bal", 5)
+      abort(s, c)
+      assert s["txns"][c]["state"] == "aborted" and s["versions"]["bal"][-1] == (2, 110)
+      try:
+          commit(s, c)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "not active" in str(e)
+  - name: write skew is allowed
+    code: |
+      s = new_store()
+      t = begin(s); write(s, t, "alice", "on-call"); write(s, t, "bob", "on-call"); commit(s, t)
+      a, b = begin(s), begin(s)
+      assert read(s, a, "alice") == "on-call" and read(s, a, "bob") == "on-call"
+      assert read(s, b, "alice") == "on-call" and read(s, b, "bob") == "on-call"
+      write(s, a, "alice", "off")
+      write(s, b, "bob", "off")
+      assert commit(s, a) is True and commit(s, b) is True
+      check = begin(s)
+      assert read(s, check, "alice") == "off" and read(s, check, "bob") == "off"
+      try:
+          write(s, 99, "x", 1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "not active" in str(e)
+  hints:
+  - Find the newest version with commit time <= snapshot by scanning the list; versions are stored in commit order.
+  solution: |
+    def new_store():
+        """A MULTI-VERSION store: {"versions": {}, "clock": 0, "txns": {}, "next_id": 1}. versions maps a key to a list of (commit_time, value) in commit order."""
+        return {"versions": {}, "clock": 0, "txns": {}, "next_id": 1}
+
+
+    def begin(store):
+        """Start a transaction: its id is next_id (then add 1) and it remembers a SNAPSHOT of the current clock: store["txns"][id] = {"snapshot": clock, "writes": {}, "state": "active"}. Return the id."""
+        tid = store["next_id"]
+        store["next_id"] += 1
+        store["txns"][tid] = {"snapshot": store["clock"], "writes": {}, "state": "active"}
+        return tid
+
+
+    def _active(store, tid):
+        t = store["txns"].get(tid)
+        if t is None or t["state"] != "active":
+            raise ValueError("transaction not active")
+        return t
+
+
+    def read(store, tid, key):
+        """What the transaction sees for a key: its own buffered write if it made one; otherwise the value of the NEWEST version committed at a time <= its snapshot; None if there is none. ValueError('transaction not active') for an unknown, committed or aborted transaction."""
+        t = _active(store, tid)
+        if key in t["writes"]:
+            return t["writes"][key]
+        value = None
+        for ts, v in store["versions"].get(key, []):
+            if ts <= t["snapshot"]:
+                value = v
+        return value
+
+
+    def write(store, tid, key, value):
+        """Buffer a write in the transaction (nothing is visible to others until commit). Same error as read for an inactive transaction."""
+        _active(store, tid)["writes"][key] = value
+
+
+    def commit(store, tid):
+        """SNAPSHOT ISOLATION with FIRST-COMMITTER-WINS. If any key the transaction wrote has a version committed AFTER its snapshot (a concurrent transaction got there first), set its state to 'aborted' and return False. Otherwise, if it wrote anything, add 1 to the clock and append (clock, value) for each written key,
+        set the state to 'committed' and return True. (A transaction with no writes commits without changing the clock.) ValueError('transaction not active') if it is not active."""
+        t = _active(store, tid)
+        for key in t["writes"]:
+            versions = store["versions"].get(key, [])
+            if versions and versions[-1][0] > t["snapshot"]:
+                t["state"] = "aborted"
+                return False
+        if t["writes"]:
+            store["clock"] += 1
+            for key, value in t["writes"].items():
+                store["versions"].setdefault(key, []).append((store["clock"], value))
+        t["state"] = "committed"
+        return True
+
+
+    def abort(store, tid):
+        """Abort an active transaction: state 'aborted', its buffered writes are discarded."""
+        t = _active(store, tid)
+        t["state"] = "aborted"
+        t["writes"] = {}
+  explanation: Snapshot isolation lets reads proceed without locks, which is why PostgreSQL, Oracle and many others use MVCC.
+- id: undo
+  title: 'Capstone: rollback with an undo log'
+  difficulty: 5
+  prompt: 'Real databases must be able to **roll back** a transaction. A simple method is the **undo log**: before changing a value, remember its old value. Write `new_db()` returning `{"data": {}, "txns": {}, "next_id": 1}`. Write `begin(db)`: the next id (then add 1), with `db["txns"][id] = {"undo": [], "state": "active"}`; return the id. All other functions raise `ValueError("transaction not active")` for an unknown, committed or aborted transaction. Write `get(db, tid, key)`: the current value, or `None`; it sees every change, even **uncommitted** ones by other transactions (a **dirty read**; there is no isolation here). Write `put(db, tid, key, value)`: **first** append to the transaction''s undo log the tuple `(key, existed, old_value)` (`existed` says whether the key was present), then set the key in place. Write `delete(db, tid, key)`: remove the key, logging the same way, and return `True` if it existed; if it did not, return `False` and log nothing. Write `savepoint(db, tid)`: the current length of the undo log. Write `rollback_to(db, tid, mark)`: take the undo entries beyond position `mark` in **reverse** order, restore each key (put the old value back, or delete the key if it did not exist) and cut the log back to `mark`; the transaction stays active. Write `commit(db, tid)` (state `''committed''`, undo log emptied) and `abort(db, tid)`: roll back completely and set the state to `''aborted''`.'
+  starter: |-
+    def new_db():
+        """A database that updates IN PLACE and keeps an UNDO LOG so a transaction can be rolled back: {"data": {}, "txns": {}, "next_id": 1}."""
+        pass
+
+
+    def begin(db):
+        """Start a transaction with the next id (then add 1): db["txns"][id] = {"undo": [], "state": "active"}. Return the id."""
+        pass
+
+
+    def _active(db, tid):
+        pass
+
+
+    def get(db, tid, key):
+        """The current value of a key (None if absent). It sees every change, even uncommitted ones by other transactions (a DIRTY READ: there is no isolation here). ValueError('transaction not active') if the transaction is not active."""
+        pass
+
+
+    def put(db, tid, key, value):
+        """Set a key in place, but FIRST append to the transaction's undo log the tuple (key, existed, old_value), where existed says whether the key was present. ValueError('transaction not active') if not active."""
+        pass
+
+
+    def delete(db, tid, key):
+        """Remove a key, logging undo information like put. Return True if the key existed, False otherwise (nothing is logged then)."""
+        pass
+
+
+    def savepoint(db, tid):
+        """A SAVEPOINT: the current length of the transaction's undo log."""
+        pass
+
+
+    def rollback_to(db, tid, mark):
+        """Undo the changes made after a savepoint: take the undo entries beyond position `mark` in REVERSE order, restore each key (put the old value back, or delete the key if it did not exist), and cut the log back to `mark`. The transaction stays active."""
+        pass
+
+
+    def commit(db, tid):
+        """Make the transaction permanent: state 'committed' and an empty undo log."""
+        pass
+
+
+    def abort(db, tid):
+        """Roll the transaction back completely (rollback_to 0) and set its state to 'aborted'."""
+        pass
+  tests:
+  - name: changing and committing
+    code: |
+      db = new_db()
+      t = begin(db)
+      assert t == 1 and db["txns"][1] == {"undo": [], "state": "active"}
+      put(db, t, "a", 1); put(db, t, "b", 2); put(db, t, "a", 3)
+      assert db["data"] == {"a": 3, "b": 2} and get(db, t, "a") == 3 and get(db, t, "zzz") is None
+      assert db["txns"][t]["undo"] == [("a", False, None), ("b", False, None), ("a", True, 1)]
+      commit(db, t)
+      assert db["data"] == {"a": 3, "b": 2} and db["txns"][t] == {"undo": [], "state": "committed"}
+      try:
+          put(db, t, "c", 1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "transaction not active" in str(e)
+  - name: aborting
+    code: |
+      db = new_db()
+      t1 = begin(db); put(db, t1, "x", "old"); put(db, t1, "y", 5); commit(db, t1)
+      t2 = begin(db)
+      put(db, t2, "x", "new"); put(db, t2, "z", 1); delete(db, t2, "y"); put(db, t2, "x", "newer")
+      assert db["data"] == {"x": "newer", "z": 1}
+      abort(db, t2)
+      assert db["data"] == {"x": "old", "y": 5} and db["txns"][t2]["state"] == "aborted"
+      for call in (lambda: get(db, t2, "x"), lambda: abort(db, t2), lambda: commit(db, t2), lambda: get(db, 99, "x")):
+          try:
+              call()
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "not active" in str(e)
+  - name: deleting
+    code: |
+      db = new_db()
+      t = begin(db)
+      assert delete(db, t, "nope") is False and db["txns"][t]["undo"] == []
+      put(db, t, "k", 1)
+      assert delete(db, t, "k") is True and "k" not in db["data"]
+      assert delete(db, t, "k") is False
+      assert db["txns"][t]["undo"] == [("k", False, None), ("k", True, 1)]
+      abort(db, t)
+      assert db["data"] == {}
+  - name: savepoints
+    code: |
+      db = new_db()
+      t = begin(db)
+      put(db, t, "a", 1)
+      sp = savepoint(db, t)
+      assert sp == 1
+      put(db, t, "a", 2); put(db, t, "b", 9); delete(db, t, "a")
+      rollback_to(db, t, sp)
+      assert db["data"] == {"a": 1} and len(db["txns"][t]["undo"]) == 1 and db["txns"][t]["state"] == "active"
+      put(db, t, "c", 3)
+      commit(db, t)
+      assert db["data"] == {"a": 1, "c": 3}
+  - name: dirty reads
+    code: |
+      db = new_db()
+      t1, t2 = begin(db), begin(db)
+      put(db, t1, "balance", 500)
+      assert get(db, t2, "balance") == 500
+      abort(db, t1)
+      assert get(db, t2, "balance") is None
+      t3 = begin(db); put(db, t3, "n", 1); commit(db, t3)
+      t4 = begin(db); put(db, t4, "n", 2)
+      abort(db, t4)
+      assert get(db, t2, "n") == 1
+  hints:
+  - Always log first, then change; rolling back replays the log backwards.
+  solution: |
+    def new_db():
+        """A database that updates IN PLACE and keeps an UNDO LOG so a transaction can be rolled back: {"data": {}, "txns": {}, "next_id": 1}."""
+        return {"data": {}, "txns": {}, "next_id": 1}
+
+
+    def begin(db):
+        """Start a transaction with the next id (then add 1): db["txns"][id] = {"undo": [], "state": "active"}. Return the id."""
+        tid = db["next_id"]
+        db["next_id"] += 1
+        db["txns"][tid] = {"undo": [], "state": "active"}
+        return tid
+
+
+    def _active(db, tid):
+        t = db["txns"].get(tid)
+        if t is None or t["state"] != "active":
+            raise ValueError("transaction not active")
+        return t
+
+
+    def get(db, tid, key):
+        """The current value of a key (None if absent). It sees every change, even uncommitted ones by other transactions (a DIRTY READ: there is no isolation here). ValueError('transaction not active') if the transaction is not active."""
+        _active(db, tid)
+        return db["data"].get(key)
+
+
+    def put(db, tid, key, value):
+        """Set a key in place, but FIRST append to the transaction's undo log the tuple (key, existed, old_value), where existed says whether the key was present. ValueError('transaction not active') if not active."""
+        t = _active(db, tid)
+        t["undo"].append((key, key in db["data"], db["data"].get(key)))
+        db["data"][key] = value
+
+
+    def delete(db, tid, key):
+        """Remove a key, logging undo information like put. Return True if the key existed, False otherwise (nothing is logged then)."""
+        t = _active(db, tid)
+        if key not in db["data"]:
+            return False
+        t["undo"].append((key, True, db["data"][key]))
+        del db["data"][key]
+        return True
+
+
+    def savepoint(db, tid):
+        """A SAVEPOINT: the current length of the transaction's undo log."""
+        return len(_active(db, tid)["undo"])
+
+
+    def rollback_to(db, tid, mark):
+        """Undo the changes made after a savepoint: take the undo entries beyond position `mark` in REVERSE order, restore each key (put the old value back, or delete the key if it did not exist), and cut the log back to `mark`. The transaction stays active."""
+        t = _active(db, tid)
+        while len(t["undo"]) > mark:
+            key, existed, old = t["undo"].pop()
+            if existed:
+                db["data"][key] = old
+            else:
+                db["data"].pop(key, None)
+
+
+    def commit(db, tid):
+        """Make the transaction permanent: state 'committed' and an empty undo log."""
+        t = _active(db, tid)
+        t["state"] = "committed"
+        t["undo"] = []
+
+
+    def abort(db, tid):
+        """Roll the transaction back completely (rollback_to 0) and set its state to 'aborted'."""
+        rollback_to(db, tid, 0)
+        db["txns"][tid]["state"] = "aborted"
+  explanation: Rolling back by replaying an undo log backwards is how a database cancels half-finished work.
+commonMistakes:
+- title: Releasing locks before commit
+  explanation: Others could read data that is later rolled back.
+- title: Believing snapshot isolation is fully serializable
+  explanation: Write skew can still happen.
+- title: Aborting the transaction that has done the most work
+  explanation: Pick the cheapest victim, usually the youngest.
+- title: Not retrying an aborted transaction
+  explanation: Deadlock and conflict aborts are normal; the application must retry.
+- title: Rolling back by replaying the undo log forwards
+  explanation: Undo entries must be applied in reverse order.
+summary:
+- Transactions are atomic, consistent, isolated and durable.
+- Anomalies include dirty reads, lost updates and phantoms.
+- A schedule is conflict-serializable if its precedence graph has no cycle.
+- Strict two-phase locking gives serializability by holding locks to commit.
+- Deadlocks are cycles in the wait-for graph; abort a victim or use wait-die / wound-wait.
+- MVCC gives each transaction a snapshot so readers never block; undo logs roll back.
+next: u25-design
+quiz:
+- type: mcq
+  question: What does the I in ACID stand for?
+  options:
+  - Isolation
+  - Integrity
+  - Indexing
+  - Inheritance
+  answer: 0
+  explanation: Concurrent transactions must not interfere.
+- type: mcq
+  question: When is a schedule conflict-serializable?
+  options:
+  - When its precedence graph has no cycle
+  - When it is short
+  - When it uses locks
+  - When all operations are reads
+  answer: 0
+  explanation: A cycle means no equivalent serial order.
+- type: mcq
+  question: What is a deadlock?
+  options:
+  - Transactions waiting for each other in a cycle
+  - A crashed disk
+  - A slow query
+  - A full table
+  answer: 0
+  explanation: Nobody can proceed.
+- type: mcq
+  question: What does a reader see under snapshot isolation?
+  options:
+  - The data as of the moment its transaction started
+  - The newest uncommitted data
+  - Nothing
+  - Only its own writes
+  answer: 0
+  explanation: Plus its own writes.
+- type: mcq
+  question: What is write skew?
+  options:
+  - Two transactions write different rows after reading overlapping data, breaking a rule
+  - A disk failure
+  - A lost message
+  - A slow write
+  answer: 0
+  explanation: Snapshot isolation allows it.
+- type: mcq
+  question: Why replay an undo log backwards?
+  options:
+  - The latest change must be undone first
+  - It is faster
+  - Logs are stored backwards
+  - To save space
+  answer: 0
+  explanation: Each entry restores the state before that change.
+- type: code
+  question: Write `has_cycle(edges)` for a list of directed edges `(a, b)` returning True if the graph has a cycle. Use any method.
+  starter: |
+    def has_cycle(edges):
+        pass
+  tests:
+  - name: cycle
+    code: |
+      assert has_cycle([("a", "b"), ("b", "c"), ("c", "a")]) is True and has_cycle([("a", "b"), ("b", "c")]) is False and has_cycle([]) is False and has_cycle([("x", "x")]) is True and has_cycle([("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")]) is False
+  solution: |
+    def has_cycle(edges):
+        graph = {}
+        for a, b in edges:
+            graph.setdefault(a, []).append(b)
+            graph.setdefault(b, [])
+        state = {}
+        def visit(n):
+            state[n] = 1
+            for m in graph[n]:
+                if state.get(m) == 1:
+                    return True
+                if m not in state and visit(m):
+                    return True
+            state[n] = 2
+            return False
+        return any(n not in state and visit(n) for n in graph)

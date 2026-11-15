@@ -30,8 +30,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 22 | Advanced Algorithms (Version 2) | ✅ Complete (Phase 22) | 7 | 35 | Algorithm Lab (max flow, SCC, KMP, convex hull, SAT solver, vertex cover approximation, Held-Karp TSP, reservoir sampling, segment tree, inversions) |
 | 23 | Compilers (Version 2) | ✅ Complete (Phase 23) | 7 | 35 | Mini Compiler (tokenizer, precedence parser, name checker, three-address code, optimizer, bytecode, assembler, virtual machine) |
 | 24 | Distributed Systems (Version 2) | ✅ Complete (Phase 24) | 7 | 35 | Mini Key-Value Cluster (hash ring, replicas, quorums, read repair, rebalancing, anti-entropy) |
+| 25 | Database Internals (Version 2) | ✅ Complete (Phase 25) | 7 | 35 | Mini Database (typed tables, keys, indexes, planner, SELECT/UPDATE/DELETE, transactions with rollback) |
 
-Totals: 202 lessons, 963 practice exercises, 202 lesson quizzes (1212 multiple-choice questions + 202 coding questions), 24 unit projects, 1918 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers and 24 Distributed Systems done, plus a timed Exams page; database internals next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 209 lessons, 998 practice exercises, 209 lesson quizzes (1254 multiple-choice questions + 209 coding questions), 25 unit projects, 1995 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers and 24 Distributed Systems and 25 Database Internals done, plus a timed Exams page; electives next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -567,9 +568,25 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Unit 25 can assume:** everything through Unit 24. Database internals can use logs and write-ahead logging, hashing and partitioning, quorums, and transactions (two-phase commit) freely.
 
+## Unit 25: Database Internals (Version 2) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 25.1 Pages, Rows and the Buffer Pool | `u25-storage` | slotted pages, row encoding with NULL bitmaps, buffer pool, LRU/FIFO/CLOCK, heap files |
+| 25.2 B+ Trees and Indexes | `u25-btree` | search, insertion and splitting, range scans, deletion, validation, bulk loading, non-unique indexes |
+| 25.3 LSM Trees and Bloom Filters | `u25-lsm` | memtable, SSTables, tombstones, compaction, scans, Bloom filters |
+| 25.4 Running Queries | `u25-query` | iterator operators, three join algorithms, GROUP BY, SQL parser, query engine, EXPLAIN |
+| 25.5 The Query Optimizer | `u25-optimizer` | statistics and selectivity, cost model, histograms, join ordering, filter push-down |
+| 25.6 Transactions and Concurrency | `u25-txn` | serializability, locks, deadlocks, snapshot isolation (MVCC), undo logs |
+| 25.7 Relational Design and Normalization | `u25-design` | functional dependencies, closure, keys, BCNF/3NF, decomposition, minimal cover, dependencies in data |
+
+**Project: Mini Database.** Learners write `new_database`, `get_table`, `create_table`, `create_index`, `check_values`, `insert`, `plan`, `explain`, `find_rids`, `select`, `update`, `delete`, `begin`, `commit` and `rollback` (helpers for matching rows and searching sorted indexes are given). 12 checklist items, 12 tests.
+
+**Unit 26 can assume:** everything through Unit 25. Later electives can use indexes, transactions, query processing and design theory freely.
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems and the timed exams page are done; next deeper core course (database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals and the timed exams page are done; next electives (graphics, HCI), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -602,3 +619,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 22 (2026-11-15):** Version 2 continues. Complete Unit 22 Advanced Algorithms (7 lessons, 35 exercises, 7 quizzes, Algorithm Lab project, 78 glossary terms). No framework changes; all Python.
 - **Phase 23 (2026-11-15):** Version 2 continues. Complete Unit 23 Compilers (7 lessons, 35 exercises, 7 quizzes, Mini Compiler project, 63 glossary terms). No framework changes; all Python.
 - **Phase 24 (2026-11-15):** Version 2 continues. Complete Unit 24 Distributed Systems (7 lessons, 35 exercises, 7 quizzes, Mini Key-Value Cluster project, 72 glossary terms). No framework changes; all Python.
+- **Phase 25 (2026-11-15):** Version 2 continues. Complete Unit 25 Database Internals (7 lessons, 35 exercises, 7 quizzes, Mini Database project, 77 glossary terms). No framework changes; all Python.

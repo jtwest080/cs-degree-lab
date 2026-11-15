@@ -1,0 +1,1093 @@
+id: u25-design
+title: Relational Design and Normalization
+minutes: 90
+objective: Learn the theory behind well-designed tables. You will compute attribute closures and candidate keys, check Boyce-Codd and third normal forms, decompose relations, find minimal covers, and test decompositions on real data.
+outcomes:
+- Explain redundancy and the anomalies it causes
+- Compute the closure of attributes under functional dependencies
+- Find candidate keys
+- Check BCNF and 3NF
+- Decompose a relation losslessly
+- Find dependencies in data
+sections:
+- heading: Why normalize?
+  body: |-
+    Suppose one big table lists every order with the customer's name, address and city repeated on each row. The same fact, *ada lives in Oslo*, is stored many times. This causes three **anomalies**. When she moves, you must change every row, and if you miss one the data contradicts itself (the **update anomaly**). You cannot record a new customer until she orders something (the **insertion anomaly**). Deleting her last order erases the only record of where she lives (the **deletion anomaly**).
+
+    **Normalization** is the process of splitting tables so that each fact is stored exactly once. The mathematical tool is the **functional dependency**, a rule about the data written `X -> Y` and read "X determines Y": whenever two rows have the same X they must have the same Y. For example `customer -> city`, since one customer has one city, and `zip -> city`. Dependencies come from the meaning of the data, so a designer must state them; a computer cannot discover what is *intended*, only what happens to hold in the rows it sees.
+- heading: Closure, keys and normal forms
+  body: |-
+    From a set of dependencies we can derive others. The **closure** of a set of attributes `X`, written X⁺, is every attribute it determines directly or through a chain of dependencies. To compute it start with X and repeatedly add the right-hand side of any dependency whose left-hand side is already inside, until nothing changes. A **superkey** is a set whose closure is *all* the attributes, so it identifies every row. A **candidate key** is a *minimal* superkey, one where removing any attribute breaks the property. An attribute that belongs to some candidate key is **prime**.
+
+    A **normal form** is a quality standard for a table. **Boyce-Codd normal form (BCNF)** says that whenever `X -> Y` holds and Y is not already part of X, X must be a superkey. In other words, only keys may determine other things, which rules out the redundancy above. **Third normal form (3NF)** is slightly weaker: the right-hand side may also be a prime attribute. 3NF can always be reached without losing anything, while BCNF sometimes cannot. (First and second normal forms are earlier, weaker standards that BCNF and 3NF include.)
+- heading: Decomposition
+  body: |-
+    To fix a table that violates BCNF because of `X -> Y`, **decompose** it: one table with X and everything X determines, and one with X and all the remaining attributes. Repeat until every table is in BCNF. A good decomposition must be **lossless**: joining the pieces back together gives *exactly* the original rows. A bad split invents rows that never existed, such as pairing every student with every teacher of a common course. A simple test for two pieces: the attributes they share must determine all of one piece. Ideally the decomposition also **preserves dependencies**, so each rule can be enforced inside a single table without joins.
+
+    Before decomposing, designers usually simplify the dependencies into a **minimal cover**: single attributes on the right, no extra attributes on the left, and no dependency that others already imply. Finally, real systems sometimes **denormalize** on purpose, keeping a duplicate fact to avoid an expensive join, trading some redundancy for speed. That is a deliberate decision, made after the design is clean.
+examples:
+- title: Keys and normal forms
+  intro: A chain of dependencies, its single key, and a table that is 3NF but not BCNF.
+  code: |
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    from itertools import combinations
+
+
+    def candidate_keys(attrs, fds):
+        """All CANDIDATE KEYS of a relation: the MINIMAL sets of attributes that determine everything (a superkey with no smaller superkey inside it). Try the subsets of the sorted attributes in order of size (itertools.combinations), keep a subset if it is a superkey and does not contain a key already found.
+        Return the keys as strings, ordered by size and then alphabetically."""
+        letters = sorted(set(attrs))
+        keys = []
+        for size in range(1, len(letters) + 1):
+            for combo in combinations(letters, size):
+                key = "".join(combo)
+                if is_superkey(letters, key, fds) and not any(set(k) <= set(key) for k in keys):
+                    keys.append(key)
+        return keys
+
+
+    def prime_attributes(attrs, fds):
+        """The attributes that belong to at least one candidate key, as a sorted string."""
+        return "".join(sorted(set("".join(candidate_keys(attrs, fds)))))
+
+
+    def subsets(attrs):
+        """All non-empty subsets of the attributes as strings of sorted letters, ordered by size and then alphabetically."""
+        letters = sorted(set(attrs))
+        return ["".join(c) for size in range(1, len(letters) + 1) for c in combinations(letters, size)]
+
+
+    def bcnf_violations(attrs, fds):
+        """The attribute sets X (as strings, in the order of `subsets`) that determine something NEW inside the relation without being a superkey: closure(X) restricted to the relation's attributes is bigger than X but is not all the attributes."""
+        whole = set(attrs)
+        bad = []
+        for x in subsets(attrs):
+            c = set(closure(x, fds)) & whole
+            if c != set(x) and c != whole:
+                bad.append(x)
+        return bad
+
+
+    def is_bcnf(attrs, fds):
+        """BOYCE-CODD NORMAL FORM: every non-trivial dependency starts from a superkey, i.e. there are no violations."""
+        return not bcnf_violations(attrs, fds)
+
+
+    def is_3nf(attrs, fds):
+        """THIRD NORMAL FORM: for every X that determines something new but is not a superkey, every NEW attribute it determines (inside the relation) must be PRIME (part of some candidate key)."""
+        whole = set(attrs)
+        prime = set(prime_attributes(attrs, fds))
+        for x in bcnf_violations(attrs, fds):
+            new = (set(closure(x, fds)) & whole) - set(x)
+            if not new <= prime:
+                return False
+        return True
+
+
+    def bcnf_decompose(attrs, fds):
+        """Split a relation into BCNF relations. If there are no violations return [attrs] (sorted letters). Otherwise take the FIRST violation X (the first in bcnf_violations) and split into R1 = the closure of X restricted to the relation, and R2 = (the other attributes) plus X; decompose both recursively.
+        Return the final relations as sorted-letter strings, without duplicates and without any relation that is contained in another, sorted alphabetically."""
+        attrs = "".join(sorted(set(attrs)))
+        bad = bcnf_violations(attrs, fds)
+        if not bad:
+            return [attrs]
+        x = bad[0]
+        r1 = "".join(sorted(set(closure(x, fds)) & set(attrs)))
+        r2 = "".join(sorted((set(attrs) - set(r1)) | set(x)))
+        parts = set(bcnf_decompose(r1, fds)) | set(bcnf_decompose(r2, fds))
+        parts = [p for p in parts if not any(p != q and set(p) <= set(q) for q in parts)]
+        return sorted(parts)
+
+    fds = [("A", "B"), ("B", "C")]
+    print("closure of A:", closure("A", fds), "| closure of B:", closure("B", fds))
+    print("candidate keys of ABC:", candidate_keys("ABC", fds), "| BCNF?", is_bcnf("ABC", fds))
+    print("split into:", bcnf_decompose("ABC", fds))
+    fds2 = [("AB", "C"), ("C", "B")]
+    print("keys of ABC with AB->C and C->B:", candidate_keys("ABC", fds2), "| 3NF?", is_3nf("ABC", fds2), "| BCNF?", is_bcnf("ABC", fds2))
+  output: |
+    closure of A: ABC | closure of B: BC
+    candidate keys of ABC: ['A'] | BCNF? False
+    split into: ['AB', 'BC']
+    keys of ABC with AB->C and C->B: ['AB', 'AC'] | 3NF? True | BCNF? False
+  lines:
+  - line: 94
+    note: A determines B, and B determines C, so A determines everything.
+  - line: 95
+    note: The only key is A, but B -> C breaks BCNF.
+  - line: 96
+    note: The decomposition AB and BC is in BCNF.
+  - line: 98
+    note: AB and AC are both keys, so every attribute is prime and the table is in 3NF but not BCNF.
+- title: Dependencies in real rows
+  intro: Finding dependencies in an orders table and testing whether splitting it loses information.
+  code: |
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    def minimal_cover(fds):
+        """A MINIMAL COVER: a simpler list of dependencies with the same meaning. (1) split every right-hand side into single attributes and drop trivial ones (the attribute is already in the lhs); remove duplicates and sort. (2) For each dependency try to remove EXTRANEOUS attributes from its lhs, going through the lhs letters in alphabetical order:
+        a letter can go if the rhs is still in the closure of the smaller lhs (under the whole current list). (3) Remove each REDUNDANT dependency (one implied by the others), checking them in order. Return the sorted list of (lhs, rhs) with single-letter rhs."""
+        g = sorted({("".join(sorted(set(l))), a) for l, r in fds for a in set(r) if a not in l})
+        for i in range(len(g)):
+            l, a = g[i]
+            for b in sorted(l):
+                if len(l) > 1 and b in l:
+                    smaller = l.replace(b, "")
+                    if a in closure(smaller, g):
+                        l = smaller
+            g[i] = (l, a)
+        g = sorted(set(g))
+        i = 0
+        while i < len(g):
+            l, a = g[i]
+            rest = g[:i] + g[i + 1:]
+            if a in closure(l, rest):
+                g = rest
+            else:
+                i += 1
+        return g
+
+
+    def lossless_binary(r1, r2, fds):
+        """Is splitting a relation into the two relations r1 and r2 LOSSLESS (joining them back gives exactly the original)? True if the shared attributes determine all of r1 or all of r2 (use closure)."""
+        cl = set(closure("".join(set(r1) & set(r2)), fds))
+        return set(r1) <= cl or set(r2) <= cl
+
+
+    def preserves_dependencies(parts, fds):
+        """Does a decomposition PRESERVE the dependencies (can each one still be checked inside a single relation)? For every (lhs, rhs): start with z = set(lhs); repeat until nothing changes: for each part, add (closure(z intersect part) intersect part) to z. The dependency is preserved if rhs is inside z in the end. True if all are preserved."""
+        for lhs, rhs in fds:
+            z = set(lhs)
+            changed = True
+            while changed:
+                changed = False
+                for part in parts:
+                    new = set(closure("".join(z & set(part)), fds)) & set(part)
+                    if not new <= z:
+                        z |= new
+                        changed = True
+            if not set(rhs) <= z:
+                return False
+        return True
+
+
+    from itertools import combinations
+
+
+    def fd_holds(rows, lhs, rhs):
+        """Does the functional dependency lhs -> rhs hold in the DATA? `rows` is a list of dicts, lhs and rhs are lists of column names. It holds if no two rows agree on all the lhs columns but differ on some rhs column."""
+        seen = {}
+        for row in rows:
+            key = tuple(row[c] for c in lhs)
+            val = tuple(row[c] for c in rhs)
+            if seen.setdefault(key, val) != val:
+                return False
+        return True
+
+
+    def discover_fds(rows, columns, max_lhs=2):
+        """Find the dependencies that hold in the data. For each rhs column and each lhs size from 1 to max_lhs, try every combination of OTHER columns (itertools.combinations over the columns in the given order) and keep (lhs tuple, rhs column) if fd_holds, but skip an lhs that contains the lhs of a dependency already found for the same rhs (only MINIMAL ones).
+        Return the list sorted by (size of lhs, lhs, rhs)."""
+        found = []
+        for rhs in columns:
+            others = [c for c in columns if c != rhs]
+            mine = []
+            for size in range(1, max_lhs + 1):
+                for lhs in combinations(others, size):
+                    if any(set(m) <= set(lhs) for m in mine):
+                        continue
+                    if fd_holds(rows, list(lhs), [rhs]):
+                        mine.append(lhs)
+                        found.append((lhs, rhs))
+        return sorted(found, key=lambda f: (len(f[0]), f[0], f[1]))
+
+
+    def project_rows(rows, cols):
+        """The DISTINCT combinations of the given columns, as tuples in the order of `cols`, sorted by repr."""
+        return sorted({tuple(r[c] for c in cols) for r in rows}, key=repr)
+
+
+    def join_back(parts):
+        """NATURAL-JOIN a list of (columns, tuples) pieces: start with the rows of the first piece as dicts; for each next piece, combine every row so far with every tuple of the piece whose values AGREE on the shared columns (merge the dicts). Return the distinct result rows as a list of dicts sorted by repr(sorted(row.items()))."""
+        rows = [dict(zip(parts[0][0], t)) for t in parts[0][1]]
+        for cols, tuples in parts[1:]:
+            merged = []
+            for r in rows:
+                for t in tuples:
+                    d = dict(zip(cols, t))
+                    if all(r[c] == d[c] for c in cols if c in r):
+                        merged.append({**r, **d})
+            rows = merged
+        unique = {repr(sorted(r.items())): r for r in rows}
+        return [unique[k] for k in sorted(unique)]
+
+
+    def is_lossless(rows, parts):
+        """Split the table into the column groups in `parts` (a list of lists of columns), project every group with project_rows, join them back with join_back and return True if the result is exactly the set of original rows."""
+        pieces = [(cols, project_rows(rows, cols)) for cols in parts]
+        back = join_back(pieces)
+        return {repr(sorted(r.items())) for r in back} == {repr(sorted(r.items())) for r in rows}
+
+    orders = [
+        {"order": 1, "customer": "ada", "city": "Oslo", "item": "pen"},
+        {"order": 2, "customer": "ada", "city": "Oslo", "item": "ink"},
+        {"order": 3, "customer": "bob", "city": "Rome", "item": "pen"},
+        {"order": 4, "customer": "cy", "city": "Oslo", "item": "pad"},
+    ]
+    print("dependencies found:", discover_fds(orders, ["order", "customer", "city", "item"], max_lhs=1))
+    print("lossless to split into customer+city and order+customer+item:", is_lossless(orders, [["customer", "city"], ["order", "customer", "item"]]))
+    print("lossless to split into customer+city and city+item:", is_lossless(orders, [["customer", "city"], ["city", "item"]]))
+    print("minimal cover:", minimal_cover([("A", "BC"), ("B", "C"), ("A", "B"), ("AB", "C")]))
+  output: |
+    dependencies found: [(('customer',), 'city'), (('order',), 'city'), (('order',), 'customer'), (('order',), 'item')]
+    lossless to split into customer+city and order+customer+item: True
+    lossless to split into customer+city and city+item: False
+    minimal cover: [('A', 'B'), ('B', 'C')]
+  lines:
+  - line: 135
+    note: order determines everything; customer determines city.
+  - line: 136
+    note: Splitting off customer and city is lossless.
+  - line: 137
+    note: Joining on city invents rows, so this split loses information.
+  - line: 138
+    note: Redundant dependencies are removed.
+playground:
+  prompt: Add rows that break the rule that a customer has one city.
+  code: |
+    rows = [('ada', 'Oslo'), ('ada', 'Oslo'), ('bob', 'Rome')]
+    cities = {}
+    for customer, city in rows:
+        cities.setdefault(customer, set()).add(city)
+    print(cities)
+    print('customer -> city holds:', all(len(c) == 1 for c in cities.values()))
+exercises:
+- id: closure
+  title: Functional dependencies
+  difficulty: 4
+  prompt: 'Good database design means storing each fact once. A **functional dependency (FD)** `X -> Y` says that whenever two rows agree on `X` they must agree on `Y`: for example `zip_code -> city`. Here attributes are single letters, a set of attributes is a string like `''AB''`, and a list of FDs is `[(''A'', ''BC''), (''C'', ''D'')]` meaning *A determines B and C, and C determines D*. Write `closure(attrs, fds)`: the **closure** of a set of attributes is everything they determine; start with the attributes and keep adding the right side of every FD whose left side is already inside, until nothing changes. Return it as a string of the letters in **sorted** order. Write `implies(fds, lhs, rhs)`: `True` if every letter of `rhs` is in the closure of `lhs`. Write `is_superkey(attrs, key, fds)`: `True` if `key` determines **all** the attributes of the relation `attrs`.'
+  starter: |-
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        pass
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        pass
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        pass
+  tests:
+  - name: closures
+    code: |
+      fds = [("A", "B"), ("B", "C")]
+      assert closure("A", fds) == "ABC" and closure("B", fds) == "BC" and closure("C", fds) == "C" and closure("", fds) == ""
+      assert closure("CA", fds) == "ABC" and closure("AA", fds) == "ABC"
+      assert closure("AB", [("AB", "C"), ("C", "D"), ("D", "A")]) == "ABCD"
+      assert closure("C", [("AB", "C"), ("C", "D"), ("D", "A")]) == "ACD"
+      assert closure("X", []) == "X"
+  - name: what is implied
+    code: |
+      fds = [("A", "BC"), ("C", "D")]
+      assert implies(fds, "A", "D") and implies(fds, "A", "BD") and not implies(fds, "B", "C") and implies(fds, "C", "") and implies(fds, "A", "A")
+      assert not implies([], "A", "B")
+  - name: superkeys
+    code: |
+      fds = [("A", "BC"), ("C", "D")]
+      assert is_superkey("ABCD", "A", fds) and is_superkey("ABCD", "AB", fds)
+      assert not is_superkey("ABCD", "C", fds) and not is_superkey("ABCD", "BD", fds)
+      assert is_superkey("ABCDE", "AE", fds + [("E", "E")]) and not is_superkey("ABCDE", "A", fds)
+      assert is_superkey("A", "A", [])
+  hints:
+  - Loop until a whole pass over the dependencies adds nothing new.
+  solution: |
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+  explanation: 'Closure is the basic tool of design theory: everything else, keys, normal forms, decompositions, is computed from it.'
+- id: keys
+  title: Candidate keys
+  difficulty: 4
+  prompt: 'A **candidate key** is a **minimal** set of attributes that determines everything in the relation: a superkey with no smaller superkey inside it. The starter has `closure`, `implies` and `is_superkey`. Write `candidate_keys(attrs, fds)`: try the subsets of the sorted attributes in order of size (`itertools.combinations`), keep a subset if it is a superkey **and** does not contain a key already found; return the keys as strings ordered by size and then alphabetically. Write `prime_attributes(attrs, fds)`: the attributes that belong to **at least one** candidate key, as a sorted string.'
+  starter: |-
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    from itertools import combinations
+
+
+    def candidate_keys(attrs, fds):
+        """All CANDIDATE KEYS of a relation: the MINIMAL sets of attributes that determine everything (a superkey with no smaller superkey inside it). Try the subsets of the sorted attributes in order of size (itertools.combinations), keep a subset if it is a superkey and does not contain a key already found.
+        Return the keys as strings, ordered by size and then alphabetically."""
+        pass
+
+
+    def prime_attributes(attrs, fds):
+        """The attributes that belong to at least one candidate key, as a sorted string."""
+        pass
+  tests:
+  - name: one key
+    code: |
+      assert candidate_keys("ABC", [("A", "B"), ("B", "C")]) == ["A"]
+      assert candidate_keys("ABCD", [("A", "BCD")]) == ["A"]
+      assert candidate_keys("AB", []) == ["AB"]
+      assert candidate_keys("A", []) == ["A"]
+      assert candidate_keys("ABC", [("AB", "C")]) == ["AB"]
+  - name: several keys
+    code: |
+      fds = [("AB", "C"), ("C", "D"), ("D", "A")]
+      assert candidate_keys("ABCD", fds) == ["AB", "BC", "BD"]
+      assert candidate_keys("AB", [("A", "B"), ("B", "A")]) == ["A", "B"]
+      assert candidate_keys("ABC", [("A", "B"), ("B", "A")]) == ["AC", "BC"]
+  - name: prime attributes
+    code: |
+      fds = [("AB", "C"), ("C", "D"), ("D", "A")]
+      assert prime_attributes("ABCD", fds) == "ABCD"
+      assert prime_attributes("ABC", [("A", "B"), ("B", "C")]) == "A"
+      assert prime_attributes("ABCDE", [("A", "BC"), ("C", "D")]) == "AE"
+      assert prime_attributes("AB", []) == "AB"
+  hints:
+  - Check subsets by increasing size so that the first superkeys found are automatically minimal.
+  solution: |
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    from itertools import combinations
+
+
+    def candidate_keys(attrs, fds):
+        """All CANDIDATE KEYS of a relation: the MINIMAL sets of attributes that determine everything (a superkey with no smaller superkey inside it). Try the subsets of the sorted attributes in order of size (itertools.combinations), keep a subset if it is a superkey and does not contain a key already found.
+        Return the keys as strings, ordered by size and then alphabetically."""
+        letters = sorted(set(attrs))
+        keys = []
+        for size in range(1, len(letters) + 1):
+            for combo in combinations(letters, size):
+                key = "".join(combo)
+                if is_superkey(letters, key, fds) and not any(set(k) <= set(key) for k in keys):
+                    keys.append(key)
+        return keys
+
+
+    def prime_attributes(attrs, fds):
+        """The attributes that belong to at least one candidate key, as a sorted string."""
+        return "".join(sorted(set("".join(candidate_keys(attrs, fds)))))
+  explanation: Every table should have a key; finding them from the dependencies is a mechanical process.
+- id: normal
+  title: Normal forms and decomposition
+  difficulty: 5
+  prompt: 'A table with redundancy suffers **anomalies**: change one copy of a fact and forget another (update anomaly), or be unable to record a fact without another (insertion anomaly). **Normalization** removes redundancy by splitting tables. The starter has the closure and key functions. Write `subsets(attrs)`: all non-empty subsets as sorted-letter strings, ordered by size and then alphabetically. Write `bcnf_violations(attrs, fds)`: the sets `X` (strings, in the order of `subsets`) that determine something **new inside the relation** without being a superkey: `closure(X)` restricted to the relation''s attributes is bigger than `X` but is **not** all the attributes. Write `is_bcnf(attrs, fds)`: **Boyce-Codd normal form** means there are no violations. Write `is_3nf(attrs, fds)`: **third normal form** is a little weaker: for every violating `X`, every **new** attribute it determines (inside the relation) must be **prime** (part of some candidate key). Write `bcnf_decompose(attrs, fds)`: if there are no violations return `[attrs]` (sorted letters); otherwise take the **first** violation `X` and split into `R1` = the closure of `X` restricted to the relation, and `R2` = the other attributes plus `X`; decompose both recursively; return the final relations as sorted-letter strings, without duplicates and **without any relation contained in another**, sorted alphabetically.'
+  starter: |-
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    from itertools import combinations
+
+
+    def candidate_keys(attrs, fds):
+        """All CANDIDATE KEYS of a relation: the MINIMAL sets of attributes that determine everything (a superkey with no smaller superkey inside it). Try the subsets of the sorted attributes in order of size (itertools.combinations), keep a subset if it is a superkey and does not contain a key already found.
+        Return the keys as strings, ordered by size and then alphabetically."""
+        letters = sorted(set(attrs))
+        keys = []
+        for size in range(1, len(letters) + 1):
+            for combo in combinations(letters, size):
+                key = "".join(combo)
+                if is_superkey(letters, key, fds) and not any(set(k) <= set(key) for k in keys):
+                    keys.append(key)
+        return keys
+
+
+    def prime_attributes(attrs, fds):
+        """The attributes that belong to at least one candidate key, as a sorted string."""
+        return "".join(sorted(set("".join(candidate_keys(attrs, fds)))))
+
+
+    def subsets(attrs):
+        """All non-empty subsets of the attributes as strings of sorted letters, ordered by size and then alphabetically."""
+        pass
+
+
+    def bcnf_violations(attrs, fds):
+        """The attribute sets X (as strings, in the order of `subsets`) that determine something NEW inside the relation without being a superkey: closure(X) restricted to the relation's attributes is bigger than X but is not all the attributes."""
+        pass
+
+
+    def is_bcnf(attrs, fds):
+        """BOYCE-CODD NORMAL FORM: every non-trivial dependency starts from a superkey, i.e. there are no violations."""
+        pass
+
+
+    def is_3nf(attrs, fds):
+        """THIRD NORMAL FORM: for every X that determines something new but is not a superkey, every NEW attribute it determines (inside the relation) must be PRIME (part of some candidate key)."""
+        pass
+
+
+    def bcnf_decompose(attrs, fds):
+        """Split a relation into BCNF relations. If there are no violations return [attrs] (sorted letters). Otherwise take the FIRST violation X (the first in bcnf_violations) and split into R1 = the closure of X restricted to the relation, and R2 = (the other attributes) plus X; decompose both recursively.
+        Return the final relations as sorted-letter strings, without duplicates and without any relation that is contained in another, sorted alphabetically."""
+        pass
+  tests:
+  - name: subsets and violations
+    code: |
+      assert subsets("CAB") == ["A", "B", "C", "AB", "AC", "BC", "ABC"] and subsets("") == []
+      assert bcnf_violations("ABC", [("B", "C")]) == ["B"]
+      assert bcnf_violations("ABC", [("A", "BC")]) == []
+      assert bcnf_violations("ABC", [("AB", "C"), ("C", "B")]) == ["C"]
+      v = bcnf_violations("ABCD", [("A", "B"), ("C", "D")])
+      assert v[:2] == ["A", "C"] and "AC" not in v and "BC" in v
+  - name: BCNF and 3NF
+    code: |
+      assert is_bcnf("ABC", [("A", "BC")]) and not is_bcnf("ABC", [("B", "C")])
+      assert is_bcnf("AB", []) and is_3nf("AB", [])
+      fds = [("AB", "C"), ("C", "B")]
+      assert not is_bcnf("ABC", fds) and is_3nf("ABC", fds)
+      assert not is_3nf("ABC", [("B", "C")])
+      assert is_3nf("ABC", [("A", "B"), ("A", "C")])
+      assert not is_3nf("ABCD", [("A", "B"), ("B", "C"), ("C", "D")])
+  - name: decomposing
+    code: |
+      assert bcnf_decompose("ABC", [("A", "BC")]) == ["ABC"]
+      assert bcnf_decompose("ABC", [("B", "C")]) == ["AB", "BC"]
+      assert bcnf_decompose("ABCD", [("A", "B"), ("B", "C"), ("C", "D")]) == ["AB", "BC", "CD"]
+      parts = bcnf_decompose("ABCD", [("A", "B"), ("C", "D")])
+      assert parts == ["AB", "AC", "CD"]
+      assert all(is_bcnf(p, [("A", "B"), ("C", "D")]) for p in parts)
+      for p in bcnf_decompose("ABCDE", [("A", "B"), ("BC", "D"), ("D", "E")]):
+          assert is_bcnf(p, [("A", "B"), ("BC", "D"), ("D", "E")])
+  hints:
+  - Closure of X inside the relation is set(closure(X, fds)) & set(attrs); use it for the split and the check.
+  solution: |
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    from itertools import combinations
+
+
+    def candidate_keys(attrs, fds):
+        """All CANDIDATE KEYS of a relation: the MINIMAL sets of attributes that determine everything (a superkey with no smaller superkey inside it). Try the subsets of the sorted attributes in order of size (itertools.combinations), keep a subset if it is a superkey and does not contain a key already found.
+        Return the keys as strings, ordered by size and then alphabetically."""
+        letters = sorted(set(attrs))
+        keys = []
+        for size in range(1, len(letters) + 1):
+            for combo in combinations(letters, size):
+                key = "".join(combo)
+                if is_superkey(letters, key, fds) and not any(set(k) <= set(key) for k in keys):
+                    keys.append(key)
+        return keys
+
+
+    def prime_attributes(attrs, fds):
+        """The attributes that belong to at least one candidate key, as a sorted string."""
+        return "".join(sorted(set("".join(candidate_keys(attrs, fds)))))
+
+
+    def subsets(attrs):
+        """All non-empty subsets of the attributes as strings of sorted letters, ordered by size and then alphabetically."""
+        letters = sorted(set(attrs))
+        return ["".join(c) for size in range(1, len(letters) + 1) for c in combinations(letters, size)]
+
+
+    def bcnf_violations(attrs, fds):
+        """The attribute sets X (as strings, in the order of `subsets`) that determine something NEW inside the relation without being a superkey: closure(X) restricted to the relation's attributes is bigger than X but is not all the attributes."""
+        whole = set(attrs)
+        bad = []
+        for x in subsets(attrs):
+            c = set(closure(x, fds)) & whole
+            if c != set(x) and c != whole:
+                bad.append(x)
+        return bad
+
+
+    def is_bcnf(attrs, fds):
+        """BOYCE-CODD NORMAL FORM: every non-trivial dependency starts from a superkey, i.e. there are no violations."""
+        return not bcnf_violations(attrs, fds)
+
+
+    def is_3nf(attrs, fds):
+        """THIRD NORMAL FORM: for every X that determines something new but is not a superkey, every NEW attribute it determines (inside the relation) must be PRIME (part of some candidate key)."""
+        whole = set(attrs)
+        prime = set(prime_attributes(attrs, fds))
+        for x in bcnf_violations(attrs, fds):
+            new = (set(closure(x, fds)) & whole) - set(x)
+            if not new <= prime:
+                return False
+        return True
+
+
+    def bcnf_decompose(attrs, fds):
+        """Split a relation into BCNF relations. If there are no violations return [attrs] (sorted letters). Otherwise take the FIRST violation X (the first in bcnf_violations) and split into R1 = the closure of X restricted to the relation, and R2 = (the other attributes) plus X; decompose both recursively.
+        Return the final relations as sorted-letter strings, without duplicates and without any relation that is contained in another, sorted alphabetically."""
+        attrs = "".join(sorted(set(attrs)))
+        bad = bcnf_violations(attrs, fds)
+        if not bad:
+            return [attrs]
+        x = bad[0]
+        r1 = "".join(sorted(set(closure(x, fds)) & set(attrs)))
+        r2 = "".join(sorted((set(attrs) - set(r1)) | set(x)))
+        parts = set(bcnf_decompose(r1, fds)) | set(bcnf_decompose(r2, fds))
+        parts = [p for p in parts if not any(p != q and set(p) <= set(q) for q in parts)]
+        return sorted(parts)
+  explanation: BCNF removes redundancy completely, at the price of sometimes losing the ability to check a dependency within one table.
+- id: cover
+  title: Covers and good decompositions
+  difficulty: 5
+  prompt: 'A decomposition must be **lossless** (joining the pieces gives back exactly the original rows, no more) and ideally **dependency preserving**. The starter has the closure functions. Write `minimal_cover(fds)`: a simpler list of FDs with the same meaning. **(1)** Split every right side into single attributes, drop trivial ones (the attribute is already in the left side), remove duplicates and sort. **(2)** For each FD, try to remove **extraneous** attributes from its left side, going through the left-side letters in alphabetical order: a letter can go if the right side is still in the closure of the smaller left side (computed under the whole current list). **(3)** Remove each **redundant** FD (one implied by the others), checking them in order. Return the sorted list of `(lhs, rhs)` with single-letter `rhs`. Write `lossless_binary(r1, r2, fds)`: splitting a relation into two relations is lossless if the **shared** attributes determine all of `r1` or all of `r2` (use closure). Write `preserves_dependencies(parts, fds)`: for every `(lhs, rhs)` start with `z = set(lhs)` and repeat until nothing changes: for each part add `closure(z & part) & part` to `z`; the FD is preserved if `rhs` ends up inside `z`; return `True` if **all** are preserved.'
+  starter: |-
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    def minimal_cover(fds):
+        """A MINIMAL COVER: a simpler list of dependencies with the same meaning. (1) split every right-hand side into single attributes and drop trivial ones (the attribute is already in the lhs); remove duplicates and sort. (2) For each dependency try to remove EXTRANEOUS attributes from its lhs, going through the lhs letters in alphabetical order:
+        a letter can go if the rhs is still in the closure of the smaller lhs (under the whole current list). (3) Remove each REDUNDANT dependency (one implied by the others), checking them in order. Return the sorted list of (lhs, rhs) with single-letter rhs."""
+        pass
+
+
+    def lossless_binary(r1, r2, fds):
+        """Is splitting a relation into the two relations r1 and r2 LOSSLESS (joining them back gives exactly the original)? True if the shared attributes determine all of r1 or all of r2 (use closure)."""
+        pass
+
+
+    def preserves_dependencies(parts, fds):
+        """Does a decomposition PRESERVE the dependencies (can each one still be checked inside a single relation)? For every (lhs, rhs): start with z = set(lhs); repeat until nothing changes: for each part, add (closure(z intersect part) intersect part) to z. The dependency is preserved if rhs is inside z in the end. True if all are preserved."""
+        pass
+  tests:
+  - name: minimal cover
+    code: |
+      assert minimal_cover([("A", "BC"), ("B", "C"), ("A", "B"), ("AB", "C")]) == [("A", "B"), ("B", "C")]
+      assert minimal_cover([("A", "B"), ("A", "B")]) == [("A", "B")]
+      assert minimal_cover([("AB", "A")]) == []
+      assert minimal_cover([("AB", "C"), ("A", "B")]) == [("A", "B"), ("A", "C")]
+      assert minimal_cover([]) == []
+      assert minimal_cover([("A", "B"), ("B", "C"), ("A", "C")]) == [("A", "B"), ("B", "C")]
+  - name: lossless splits
+    code: |
+      fds = [("B", "C")]
+      assert lossless_binary("AB", "BC", fds) is True
+      assert lossless_binary("AC", "BC", fds) is False
+      assert lossless_binary("AB", "BC", []) is False
+      assert lossless_binary("ABC", "AB", []) is True
+      assert lossless_binary("AB", "CD", [("A", "B"), ("C", "D")]) is False
+      assert lossless_binary("AB", "AC", [("A", "B")]) is True
+  - name: preserving dependencies
+    code: |
+      fds = [("A", "B"), ("B", "C")]
+      assert preserves_dependencies(["AB", "BC"], fds) is True
+      assert preserves_dependencies(["AB", "AC"], fds) is False
+      assert preserves_dependencies(["AC", "BC"], fds) is False
+      fds2 = [("AB", "C"), ("C", "B")]
+      assert preserves_dependencies(["AC", "BC"], fds2) is False
+      assert preserves_dependencies(["ABC"], fds2) is True
+      assert preserves_dependencies([], []) is True
+  hints:
+  - For the redundancy test, remove the FD, then ask whether its rhs is still in the closure of its lhs.
+  solution: |
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    def minimal_cover(fds):
+        """A MINIMAL COVER: a simpler list of dependencies with the same meaning. (1) split every right-hand side into single attributes and drop trivial ones (the attribute is already in the lhs); remove duplicates and sort. (2) For each dependency try to remove EXTRANEOUS attributes from its lhs, going through the lhs letters in alphabetical order:
+        a letter can go if the rhs is still in the closure of the smaller lhs (under the whole current list). (3) Remove each REDUNDANT dependency (one implied by the others), checking them in order. Return the sorted list of (lhs, rhs) with single-letter rhs."""
+        g = sorted({("".join(sorted(set(l))), a) for l, r in fds for a in set(r) if a not in l})
+        for i in range(len(g)):
+            l, a = g[i]
+            for b in sorted(l):
+                if len(l) > 1 and b in l:
+                    smaller = l.replace(b, "")
+                    if a in closure(smaller, g):
+                        l = smaller
+            g[i] = (l, a)
+        g = sorted(set(g))
+        i = 0
+        while i < len(g):
+            l, a = g[i]
+            rest = g[:i] + g[i + 1:]
+            if a in closure(l, rest):
+                g = rest
+            else:
+                i += 1
+        return g
+
+
+    def lossless_binary(r1, r2, fds):
+        """Is splitting a relation into the two relations r1 and r2 LOSSLESS (joining them back gives exactly the original)? True if the shared attributes determine all of r1 or all of r2 (use closure)."""
+        cl = set(closure("".join(set(r1) & set(r2)), fds))
+        return set(r1) <= cl or set(r2) <= cl
+
+
+    def preserves_dependencies(parts, fds):
+        """Does a decomposition PRESERVE the dependencies (can each one still be checked inside a single relation)? For every (lhs, rhs): start with z = set(lhs); repeat until nothing changes: for each part, add (closure(z intersect part) intersect part) to z. The dependency is preserved if rhs is inside z in the end. True if all are preserved."""
+        for lhs, rhs in fds:
+            z = set(lhs)
+            changed = True
+            while changed:
+                changed = False
+                for part in parts:
+                    new = set(closure("".join(z & set(part)), fds)) & set(part)
+                    if not new <= z:
+                        z |= new
+                        changed = True
+            if not set(rhs) <= z:
+                return False
+        return True
+  explanation: A good design is lossless and, whenever possible, dependency preserving; 3NF can always achieve both.
+- id: data
+  title: 'Capstone: dependencies in data'
+  difficulty: 5
+  prompt: 'Now work with real **rows** (dicts). Write `fd_holds(rows, lhs, rhs)`: does the dependency hold in the data? `lhs` and `rhs` are lists of column names; it holds if no two rows agree on all `lhs` columns but differ on some `rhs` column. Write `discover_fds(rows, columns, max_lhs=2)`: for each `rhs` column in order, and each left-side size from 1 to `max_lhs`, try every combination of the **other** columns (`itertools.combinations`, in the given column order) and keep `(lhs tuple, rhs column)` if `fd_holds`, but **skip** a left side that contains the left side of a dependency already found for the same `rhs` (only minimal ones); return the list sorted by `(size of lhs, lhs, rhs)`. Write `project_rows(rows, cols)`: the **distinct** combinations of the columns as tuples in the order of `cols`, sorted by `repr`. Write `join_back(parts)` for a list of `(columns, tuples)` pieces: natural-join them: start with the rows of the first piece as dicts, then for each next piece combine every row so far with every tuple of the piece that **agrees on the shared columns** (merge the dicts); return the **distinct** result rows as dicts sorted by `repr(sorted(row.items()))`. Write `is_lossless(rows, parts)`: project every group of columns in `parts`, join them back, and return `True` if the result is **exactly** the set of original rows.'
+  starter: |-
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    from itertools import combinations
+
+
+    def fd_holds(rows, lhs, rhs):
+        """Does the functional dependency lhs -> rhs hold in the DATA? `rows` is a list of dicts, lhs and rhs are lists of column names. It holds if no two rows agree on all the lhs columns but differ on some rhs column."""
+        pass
+
+
+    def discover_fds(rows, columns, max_lhs=2):
+        """Find the dependencies that hold in the data. For each rhs column and each lhs size from 1 to max_lhs, try every combination of OTHER columns (itertools.combinations over the columns in the given order) and keep (lhs tuple, rhs column) if fd_holds, but skip an lhs that contains the lhs of a dependency already found for the same rhs (only MINIMAL ones).
+        Return the list sorted by (size of lhs, lhs, rhs)."""
+        pass
+
+
+    def project_rows(rows, cols):
+        """The DISTINCT combinations of the given columns, as tuples in the order of `cols`, sorted by repr."""
+        pass
+
+
+    def join_back(parts):
+        """NATURAL-JOIN a list of (columns, tuples) pieces: start with the rows of the first piece as dicts; for each next piece, combine every row so far with every tuple of the piece whose values AGREE on the shared columns (merge the dicts). Return the distinct result rows as a list of dicts sorted by repr(sorted(row.items()))."""
+        pass
+
+
+    def is_lossless(rows, parts):
+        """Split the table into the column groups in `parts` (a list of lists of columns), project every group with project_rows, join them back with join_back and return True if the result is exactly the set of original rows."""
+        pass
+  tests:
+  - name: checking a dependency
+    code: |
+      rows = [{"zip": "10001", "city": "NYC", "name": "a"}, {"zip": "10001", "city": "NYC", "name": "b"}, {"zip": "02139", "city": "Cambridge", "name": "c"}]
+      assert fd_holds(rows, ["zip"], ["city"]) is True
+      assert fd_holds(rows, ["city"], ["zip"]) is True
+      assert fd_holds(rows, ["zip"], ["name"]) is False
+      assert fd_holds(rows, ["zip", "name"], ["city"]) is True
+      assert fd_holds([], ["a"], ["b"]) is True
+      assert fd_holds(rows, [], ["city"]) is False
+  - name: discovering
+    code: |
+      rows = [{"id": 1, "zip": "z1", "city": "c1", "name": "a"}, {"id": 2, "zip": "z1", "city": "c1", "name": "b"}, {"id": 3, "zip": "z2", "city": "c2", "name": "b"}, {"id": 4, "zip": "z3", "city": "c1", "name": "a"}]
+      got = discover_fds(rows, ["id", "zip", "city", "name"])
+      assert (("id",), "zip") in got and (("id",), "city") in got and (("id",), "name") in got
+      assert (("zip",), "city") in got and (("city",), "zip") not in got
+      assert (("zip", "name"), "city") not in got
+      assert got == sorted(got, key=lambda f: (len(f[0]), f[0], f[1]))
+      assert discover_fds([], ["a", "b"]) == [(("a",), "b"), (("b",), "a")]
+      assert discover_fds(rows, ["id", "zip"], max_lhs=1) == [(("id",), "zip")]
+  - name: projecting and joining
+    code: |
+      rows = [{"a": 1, "b": "x", "c": 10}, {"a": 2, "b": "x", "c": 10}, {"a": 3, "b": "y", "c": 20}]
+      assert project_rows(rows, ["b", "c"]) == [("x", 10), ("y", 20)] and project_rows(rows, ["c", "b"]) == [(10, "x"), (20, "y")]
+      assert project_rows(rows, ["a"]) == [(1,), (2,), (3,)] and project_rows([], ["a"]) == []
+      back = join_back([(["a", "b"], project_rows(rows, ["a", "b"])), (["b", "c"], project_rows(rows, ["b", "c"]))])
+      assert back == sorted(rows, key=lambda r: repr(sorted(r.items())))
+      assert join_back([(["a"], [(1,), (2,)])]) == [{"a": 1}, {"a": 2}]
+  - name: lossless and lossy
+    code: |
+      rows = [{"a": 1, "b": "x", "c": 10}, {"a": 2, "b": "x", "c": 10}, {"a": 3, "b": "y", "c": 20}]
+      assert is_lossless(rows, [["a", "b"], ["b", "c"]]) is True
+      assert is_lossless(rows, [["a", "b", "c"]]) is True
+      lossy = [{"s": "ann", "c": "db", "t": "x"}, {"s": "ann", "c": "os", "t": "y"}, {"s": "bob", "c": "db", "t": "y"}]
+      assert is_lossless(lossy, [["s", "c"], ["c", "t"]]) is False
+      assert is_lossless(lossy, [["s", "c"], ["s", "t"]]) is False
+      assert is_lossless(lossy, [["s", "c", "t"]]) is True
+      assert is_lossless([], [["a"], ["b"]]) is True or is_lossless([], [["a"], ["b"]]) is False
+  hints:
+  - fd_holds can use a dict from lhs values to the first rhs values seen.
+  solution: |
+    def closure(attrs, fds):
+        """The CLOSURE of a set of attributes: everything they determine. Attributes are single letters; `attrs` is a string like 'AB'; `fds` is a list of FUNCTIONAL DEPENDENCIES (lhs, rhs) of strings like ('A', 'BC') meaning 'A determines B and C'. Start with the attributes and keep adding the rhs of every dependency whose lhs is already inside, until nothing changes.
+        Return the result as a string of the letters in sorted order."""
+        result = set(attrs)
+        changed = True
+        while changed:
+            changed = False
+            for lhs, rhs in fds:
+                if set(lhs) <= result and not set(rhs) <= result:
+                    result |= set(rhs)
+                    changed = True
+        return "".join(sorted(result))
+
+
+    def implies(fds, lhs, rhs):
+        """True if the dependencies imply that lhs determines rhs (every letter of rhs is in the closure of lhs)."""
+        return set(rhs) <= set(closure(lhs, fds))
+
+
+    def is_superkey(attrs, key, fds):
+        """True if `key` determines ALL the attributes of the relation `attrs`."""
+        return set(attrs) <= set(closure(key, fds))
+
+
+    from itertools import combinations
+
+
+    def fd_holds(rows, lhs, rhs):
+        """Does the functional dependency lhs -> rhs hold in the DATA? `rows` is a list of dicts, lhs and rhs are lists of column names. It holds if no two rows agree on all the lhs columns but differ on some rhs column."""
+        seen = {}
+        for row in rows:
+            key = tuple(row[c] for c in lhs)
+            val = tuple(row[c] for c in rhs)
+            if seen.setdefault(key, val) != val:
+                return False
+        return True
+
+
+    def discover_fds(rows, columns, max_lhs=2):
+        """Find the dependencies that hold in the data. For each rhs column and each lhs size from 1 to max_lhs, try every combination of OTHER columns (itertools.combinations over the columns in the given order) and keep (lhs tuple, rhs column) if fd_holds, but skip an lhs that contains the lhs of a dependency already found for the same rhs (only MINIMAL ones).
+        Return the list sorted by (size of lhs, lhs, rhs)."""
+        found = []
+        for rhs in columns:
+            others = [c for c in columns if c != rhs]
+            mine = []
+            for size in range(1, max_lhs + 1):
+                for lhs in combinations(others, size):
+                    if any(set(m) <= set(lhs) for m in mine):
+                        continue
+                    if fd_holds(rows, list(lhs), [rhs]):
+                        mine.append(lhs)
+                        found.append((lhs, rhs))
+        return sorted(found, key=lambda f: (len(f[0]), f[0], f[1]))
+
+
+    def project_rows(rows, cols):
+        """The DISTINCT combinations of the given columns, as tuples in the order of `cols`, sorted by repr."""
+        return sorted({tuple(r[c] for c in cols) for r in rows}, key=repr)
+
+
+    def join_back(parts):
+        """NATURAL-JOIN a list of (columns, tuples) pieces: start with the rows of the first piece as dicts; for each next piece, combine every row so far with every tuple of the piece whose values AGREE on the shared columns (merge the dicts). Return the distinct result rows as a list of dicts sorted by repr(sorted(row.items()))."""
+        rows = [dict(zip(parts[0][0], t)) for t in parts[0][1]]
+        for cols, tuples in parts[1:]:
+            merged = []
+            for r in rows:
+                for t in tuples:
+                    d = dict(zip(cols, t))
+                    if all(r[c] == d[c] for c in cols if c in r):
+                        merged.append({**r, **d})
+            rows = merged
+        unique = {repr(sorted(r.items())): r for r in rows}
+        return [unique[k] for k in sorted(unique)]
+
+
+    def is_lossless(rows, parts):
+        """Split the table into the column groups in `parts` (a list of lists of columns), project every group with project_rows, join them back with join_back and return True if the result is exactly the set of original rows."""
+        pieces = [(cols, project_rows(rows, cols)) for cols in parts]
+        back = join_back(pieces)
+        return {repr(sorted(r.items())) for r in back} == {repr(sorted(r.items())) for r in rows}
+  explanation: 'A decomposition can be tested on real data: if the join gives extra rows, information was lost.'
+commonMistakes:
+- title: Deriving dependencies from the sample data alone
+  explanation: A rule that holds in today's rows may not hold tomorrow; dependencies come from the meaning.
+- title: Treating a candidate key as any superkey
+  explanation: A candidate key must be minimal.
+- title: Splitting a table with no shared attribute
+  explanation: The join would be a cross product and invent rows.
+- title: Normalizing without thinking about queries
+  explanation: Heavily split tables need many joins; sometimes denormalize on purpose.
+- title: Forgetting that BCNF can lose dependencies
+  explanation: Check preservation, or settle for 3NF.
+summary:
+- Redundancy causes update, insertion and deletion anomalies.
+- A functional dependency X -> Y means X determines Y.
+- The closure of a set of attributes is everything it determines.
+- A candidate key is a minimal set that determines every attribute.
+- 'BCNF: only keys determine other attributes; 3NF also allows prime attributes.'
+- A decomposition must be lossless and, if possible, preserve dependencies.
+next: u25-project
+quiz:
+- type: mcq
+  question: What does the functional dependency A -> B say?
+  options:
+  - Rows with the same A must have the same B
+  - B determines A
+  - A and B are equal
+  - A is a key of every table
+  answer: 0
+  explanation: A determines B.
+- type: mcq
+  question: What is a candidate key?
+  options:
+  - A minimal set of attributes that determines all attributes
+  - Any set of columns
+  - The first column
+  - A foreign key
+  answer: 0
+  explanation: Minimal and a superkey.
+- type: mcq
+  question: What does BCNF require?
+  options:
+  - Every non-trivial dependency starts from a superkey
+  - Every table has one column
+  - No keys
+  - Only prime attributes
+  answer: 0
+  explanation: Only keys determine other attributes.
+- type: mcq
+  question: What is a lossless decomposition?
+  options:
+  - Joining the pieces gives back exactly the original rows
+  - The pieces are smaller
+  - No attribute is dropped
+  - The pieces are sorted
+  answer: 0
+  explanation: No rows are lost or invented.
+- type: mcq
+  question: Why might a designer denormalize?
+  options:
+  - To avoid costly joins for speed
+  - To remove keys
+  - To add anomalies
+  - To save names
+  answer: 0
+  explanation: A deliberate trade-off.
+- type: mcq
+  question: What is an update anomaly?
+  options:
+  - Changing one copy of a fact but forgetting another
+  - A failed disk
+  - A slow update
+  - A lost key
+  answer: 0
+  explanation: The data then contradicts itself.
+- type: code
+  question: Write `determines(rows, a, b)` returning True if in the list of dict rows the value of column `a` always determines the value of column `b` (no two rows have equal `a` but different `b`).
+  starter: |
+    def determines(rows, a, b):
+        pass
+  tests:
+  - name: determines
+    code: |
+      rows = [{"a": 1, "b": "x"}, {"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
+      assert determines(rows, "a", "b") is True and determines([{"a": 1, "b": 1}, {"a": 1, "b": 2}], "a", "b") is False and determines([], "a", "b") is True and determines(rows, "b", "a") is True
+  solution: |
+    def determines(rows, a, b):
+        seen = {}
+        for r in rows:
+            if seen.setdefault(r[a], r[b]) != r[b]:
+                return False
+        return True
