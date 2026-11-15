@@ -1,0 +1,2872 @@
+id: u23-pratt
+title: Syntax Trees and Expression Parsing
+minutes: 95
+objective: 'Learn the most useful data structure in compilers: the abstract syntax tree. You will write a compact and powerful parser for arithmetic with correct precedence and associativity, evaluate and print trees, simplify and differentiate them symbolically, and compile a tree into a fast function.'
+outcomes:
+- Explain what an abstract syntax tree is
+- Write a Pratt (precedence climbing) parser
+- Evaluate, print and convert trees to postfix
+- Simplify and differentiate expressions symbolically
+- Explain interpreting versus compiling
+sections:
+- heading: Abstract syntax trees
+  body: |-
+    A parse tree from the grammar lesson records every rule used, including boring intermediate ones such as `Term -> Factor`. Compilers usually throw that detail away and build an **abstract syntax tree** (AST): a tree with only the meaningful structure. For `1 + 2 * 3` the AST has a `+` node whose children are `1` and a `*` node, which in turn has children `2` and `3`. Parentheses vanish, because the *shape* of the tree already says what groups with what. In our code each node is a tuple that starts with a tag: `("num", 3)`, `("var", "x")`, `("binop", "+", left, right)`.
+
+    Why trees? Because almost everything a compiler does is a **recursive walk** over the tree: evaluate it, print it, check its types, simplify it, translate it into machine code. A program is data, and once it is a tree you can process it with ordinary code. This idea, **code as data**, is the heart of languages such as Lisp, and of every tool that analyses or transforms programs: formatters, linters, refactoring tools, even your editor's syntax highlighting.
+- heading: Precedence climbing (Pratt parsing)
+  body: |-
+    The grammar-based parser from the last lesson needs a separate rule for every precedence level, which gets long. **Pratt parsing**, also called **precedence climbing**, gives each operator a number (its **binding power** or **precedence**) and parses any expression with one short loop. The function `parse_expr(min_prec)` reads a **prefix item** (a number, a name, a parenthesised expression or a unary minus), and then loops: look at the next operator; if its precedence is lower than `min_prec`, stop and return what we have; otherwise consume it, parse its right-hand side with a suitable `min_prec`, and combine.
+
+    The magic is in that suitable minimum. For a **left-associative** operator such as `-`, ask for operators strictly *tighter* (`prec + 1`) on the right, so `8 - 3 - 2` becomes `(8 - 3) - 2`: the second minus is not absorbed on the right. For a **right-associative** operator such as `^` use `prec` itself, so `2 ^ 3 ^ 2` becomes `2 ^ (3 ^ 2)`. **Unary minus** is a prefix item whose operand is parsed with its own precedence (25): tighter than `*` (so `-a * b` is `(-a) * b`) but looser than `^` (so `-2 ^ 2` is `-(2 ^ 2)`, which mathematicians agree is -4). A name followed by `(` is a **function call** whose arguments are separated by commas. The whole parser is about 40 lines, and adding a new operator means adding one line to a table. Production parsers for JavaScript, Rust and many other languages use this technique for expressions.
+- heading: 'Working with trees: print, simplify, differentiate, compile'
+  body: |-
+    With an AST in hand, each job is a recursive function with one case per node kind. **Evaluating** walks the tree, evaluating children and then combining them. **Pretty printing** goes the other way, and the interesting part is adding *only the necessary parentheses*: put them around a child if it binds looser than its parent, with special care for equal precedence, where associativity decides which side needs them. A good test of both the printer and the parser is the **round trip**: parse the printed text and you should get the same tree back. **Postfix** (reverse Polish) notation lists operands before operators and needs no parentheses at all: `(1 + 2) * 3` becomes `1 2 + 3 *`. Stack machines, which you will meet shortly, execute it directly.
+
+    Trees can also be *rewritten*. **Simplification** applies algebra rules bottom-up (anything times 1 is itself, anything times 0 is 0, two numbers fold into one) repeatedly until nothing changes. **Symbolic differentiation** applies the rules from calculus (sum, product, quotient and chain rules) node by node, producing a tree for the derivative; simplification then tidies it. The numerical derivatives of the calculus unit approximate; this one is exact.
+
+    Finally, **interpreting** means walking the tree afresh every time you evaluate it. **Compiling** means doing the walk *once*, producing something faster to run. The simplest form turns each node into a Python **closure** (a function that remembers the closures built for its children), so later calls just call functions instead of inspecting tuples. Real compilers go much further, producing machine instructions, but the principle is the same: pay for the analysis once and run many times.
+examples:
+- title: Parse, evaluate, print, differentiate
+  intro: The whole toolkit on a few expressions, including a syntax error.
+  code: |
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def precedence_of(ast):
+        """How tightly a node binds: 10, 20 or 30 for binary operators, 25 for unary minus, 100 for everything else (numbers, names, calls)."""
+        if ast[0] == "binop":
+            return BINARY[ast[1]][0]
+        if ast[0] == "unary":
+            return UNARY_PRECEDENCE
+        return 100
+
+
+    def to_string(ast):
+        """Write the AST back as text with the FEWEST parentheses that still parse to the same tree. Binary operators are written with a space
+        on each side ('a + b'); calls as 'f(a, b)'; unary minus as '-x'. A left operand needs parentheses if it binds looser than the operator, or equally
+        tight for a right-associative operator (^), or is a unary minus under ^ (since -x^2 means -(x^2)). A right operand needs them if it binds looser,
+        or equally tight for a left-associative operator. A unary minus needs them around an operand that binds looser than 25 or is itself a unary minus."""
+        kind = ast[0]
+        if kind == "num":
+            return str(ast[1])
+        if kind == "var":
+            return ast[1]
+        if kind == "call":
+            return "%s(%s)" % (ast[1], ", ".join(to_string(a) for a in ast[2]))
+        if kind == "unary":
+            inner = to_string(ast[2])
+            if precedence_of(ast[2]) < UNARY_PRECEDENCE or ast[2][0] == "unary":
+                inner = "(" + inner + ")"
+            return "-" + inner
+        op, left, right = ast[1], ast[2], ast[3]
+        prec, assoc = BINARY[op]
+        ls, rs = to_string(left), to_string(right)
+        lp, rp = precedence_of(left), precedence_of(right)
+        if lp < prec or (lp == prec and assoc == "right") or (left[0] == "unary" and op == "^"):
+            ls = "(" + ls + ")"
+        if rp < prec or (rp == prec and assoc == "left"):
+            rs = "(" + rs + ")"
+        return "%s %s %s" % (ls, op, rs)
+
+
+    def to_rpn(ast):
+        """The expression in reverse Polish (postfix) order as a list of strings: operands first, then the operator. Numbers and names are written as
+        text, binary operators as themselves, unary minus as 'neg', and a call as 'name/argument-count' after its arguments. '1 + 2 * 3' gives
+        ['1', '2', '3', '*', '+']."""
+        kind = ast[0]
+        if kind == "num":
+            return [str(ast[1])]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "unary":
+            return to_rpn(ast[2]) + ["neg"]
+        if kind == "binop":
+            return to_rpn(ast[2]) + to_rpn(ast[3]) + [ast[1]]
+        out = []
+        for a in ast[2]:
+            out += to_rpn(a)
+        return out + ["%s/%d" % (ast[1], len(ast[2]))]
+
+
+    def free_variables(ast):
+        """The sorted list of distinct variable names used in the AST (function names are not variables)."""
+        kind = ast[0]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "num":
+            return []
+        names = set()
+        children = ast[2:] if kind in ("unary", "binop") else ast[2]
+        for child in children:
+            names.update(free_variables(child))
+        return sorted(names)
+
+
+    def simplify_once(ast):
+        """One bottom-up pass of simplification: first simplify the children, then apply to the node: fold an operation on two numbers (except
+        division by zero or a power that is not a real number, which stay as they are); x + 0, 0 + x, x - 0, x * 1, 1 * x, x / 1, x ^ 1 become x;
+        x * 0 and 0 * x become 0; x ^ 0 becomes 1; unary minus of a number becomes a negative number, and minus minus x becomes x."""
+        kind = ast[0]
+        if kind in ("num", "var"):
+            return ast
+        if kind == "call":
+            return ("call", ast[1], [simplify_once(a) for a in ast[2]])
+        if kind == "unary":
+            inner = simplify_once(ast[2])
+            if inner[0] == "num":
+                return ("num", -inner[1])
+            if inner[0] == "unary":
+                return inner[2]
+            return ("unary", "-", inner)
+        op = ast[1]
+        a, b = simplify_once(ast[2]), simplify_once(ast[3])
+        if a[0] == "num" and b[0] == "num":
+            try:
+                return ("num", evaluate(("binop", op, a, b)))
+            except ValueError:
+                return ("binop", op, a, b)
+        zero = lambda n: n[0] == "num" and n[1] == 0
+        one = lambda n: n[0] == "num" and n[1] == 1
+        if op == "+" and zero(a):
+            return b
+        if op in "+-" and zero(b):
+            return a
+        if op == "*" and (zero(a) or zero(b)):
+            return ("num", 0)
+        if op == "*" and one(a):
+            return b
+        if op in "*/" and one(b):
+            return a
+        if op == "^" and one(b):
+            return a
+        if op == "^" and zero(b):
+            return ("num", 1)
+        return ("binop", op, a, b)
+
+
+    def simplify(ast):
+        """Apply simplify_once repeatedly until the tree stops changing."""
+        while True:
+            new = simplify_once(ast)
+            if new == ast:
+                return ast
+            ast = new
+
+
+    def differentiate(ast, var):
+        """The symbolic derivative of the AST with respect to the variable `var`, as an AST (not simplified): constants give 0; the variable
+        gives 1 and other variables 0; sums, differences and unary minus act term by term; products use the product rule (u v)' = u' v + u v';
+        quotients (u / v)' = (u' v - u v') / v ^ 2; a power u ^ n with n free of var gives n * u ^ (n - 1) * u'; a power a ^ v with the base free of var
+        gives a ^ v * ln(a) * v'; a general u ^ v gives u ^ v * (v' * ln(u) + v * u' / u); and calls sin, cos, exp, ln and sqrt use the chain rule
+        (sin u)' = cos(u) u', (cos u)' = -sin(u) u', (exp u)' = exp(u) u', (ln u)' = u' / u, (sqrt u)' = u' / (2 * sqrt(u)). ValueError for other functions."""
+        kind = ast[0]
+        num = lambda v: ("num", v)
+        if kind == "num":
+            return num(0)
+        if kind == "var":
+            return num(1 if ast[1] == var else 0)
+        if kind == "unary":
+            return ("unary", "-", differentiate(ast[2], var))
+        if kind == "call":
+            name, args = ast[1], ast[2]
+            if len(args) != 1 or name not in ("sin", "cos", "exp", "ln", "sqrt"):
+                raise ValueError("cannot differentiate %s" % name)
+            u = args[0]
+            du = differentiate(u, var)
+            if name == "sin":
+                return ("binop", "*", ("call", "cos", [u]), du)
+            if name == "cos":
+                return ("binop", "*", ("unary", "-", ("call", "sin", [u])), du)
+            if name == "exp":
+                return ("binop", "*", ("call", "exp", [u]), du)
+            if name == "ln":
+                return ("binop", "/", du, u)
+            return ("binop", "/", du, ("binop", "*", num(2), ("call", "sqrt", [u])))
+        op, u, v = ast[1], ast[2], ast[3]
+        du, dv = differentiate(u, var), differentiate(v, var)
+        if op in "+-":
+            return ("binop", op, du, dv)
+        if op == "*":
+            return ("binop", "+", ("binop", "*", du, v), ("binop", "*", u, dv))
+        if op == "/":
+            top = ("binop", "-", ("binop", "*", du, v), ("binop", "*", u, dv))
+            return ("binop", "/", top, ("binop", "^", v, num(2)))
+        if var not in free_variables(v):
+            power = ("binop", "^", u, ("binop", "-", v, num(1)))
+            return ("binop", "*", ("binop", "*", v, power), du)
+        if var not in free_variables(u):
+            return ("binop", "*", ("binop", "*", ast, ("call", "ln", [u])), dv)
+        inner = ("binop", "+", ("binop", "*", dv, ("call", "ln", [u])), ("binop", "/", ("binop", "*", v, du), u))
+        return ("binop", "*", ast, inner)
+
+
+    def derivative_text(text, var):
+        """Parse the expression, differentiate it with respect to var, simplify, and write it back with to_string."""
+        return to_string(simplify(differentiate(parse(text), var)))
+
+    ast = parse("1 + 2 * 3 ^ 2")
+    print("tree:", ast)
+    print("value:", evaluate(ast))
+    print("written back:", to_string(parse("(a + b) * (c - (d - e))")))
+    print("postfix:", to_rpn(parse("(1 + 2) * 3")))
+    print("-2 ^ 2 =", evaluate(parse("-2 ^ 2")), " (the unary minus binds looser than ^)")
+    print("d/dx of x ^ 3 + 2 * x:", derivative_text("x ^ 3 + 2 * x", "x"))
+    print("d/dx of sin(x) * x:", derivative_text("sin(x) * x", "x"))
+    try:
+        parse("(1 + 2")
+    except ValueError as error:
+        print("error:", error)
+  output: |
+    tree: ('binop', '+', ('num', 1), ('binop', '*', ('num', 2), ('binop', '^', ('num', 3), ('num', 2))))
+    value: 19
+    written back: (a + b) * (c - (d - e))
+    postfix: ['1', '2', '+', '3', '*']
+    -2 ^ 2 = -4  (the unary minus binds looser than ^)
+    d/dx of x ^ 3 + 2 * x: 3 * x ^ 2 + 2
+    d/dx of sin(x) * x: cos(x) * x + sin(x)
+    error: expected ) at position 6
+  lines:
+  - line: 339
+    note: 'Nested tuples: the shape shows the grouping.'
+  - line: 343
+    note: Mathematicians agree on -4.
+  - line: 344
+    note: An exact symbolic derivative.
+- title: Compiling a tree
+  intro: The same expression run by walking the tree and by a compiled closure, and substitution.
+  code: |
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def free_variables(ast):
+        """The sorted list of distinct variable names used in the AST (function names are not variables)."""
+        kind = ast[0]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "num":
+            return []
+        names = set()
+        children = ast[2:] if kind in ("unary", "binop") else ast[2]
+        for child in children:
+            names.update(free_variables(child))
+        return sorted(names)
+
+
+
+
+    def substitute(ast, name, replacement):
+        """A new AST in which every occurrence of the variable `name` is replaced by the AST `replacement`."""
+        kind = ast[0]
+        if kind == "var":
+            return replacement if ast[1] == name else ast
+        if kind == "num":
+            return ast
+        if kind == "unary":
+            return ("unary", "-", substitute(ast[2], name, replacement))
+        if kind == "binop":
+            return ("binop", ast[1], substitute(ast[2], name, replacement), substitute(ast[3], name, replacement))
+        return ("call", ast[1], [substitute(a, name, replacement) for a in ast[2]])
+
+
+    def tree_depth(ast):
+        """The number of levels in the tree: a number or variable has depth 1; an operator or call has one more than its deepest child
+        (a call with no arguments has depth 1)."""
+        kind = ast[0]
+        if kind in ("num", "var"):
+            return 1
+        children = ast[2:] if kind in ("unary", "binop") else ast[2]
+        return 1 + max((tree_depth(c) for c in children), default=0)
+
+
+    def compile_ast(ast):
+        """Turn the AST into a Python function f(env) that computes the same value as evaluate(ast, env), by building nested closures ONCE
+        instead of walking the tree on every call (the idea behind a compiler). Errors must behave like evaluate: raise ValueError when the function
+        is CALLED (undefined variable, division by zero, unknown function...), not when it is built. You may reuse evaluate for the rare error cases."""
+        kind = ast[0]
+        if kind == "num":
+            value = ast[1]
+            return lambda env: value
+        if kind == "var":
+            name = ast[1]
+
+            def lookup(env):
+                if name not in env:
+                    raise ValueError("undefined variable %s" % name)
+                return env[name]
+            return lookup
+        if kind == "unary":
+            inner = compile_ast(ast[2])
+            return lambda env: -inner(env)
+        if kind == "binop":
+            op = ast[1]
+            left, right = compile_ast(ast[2]), compile_ast(ast[3])
+            if op == "+":
+                return lambda env: left(env) + right(env)
+            if op == "-":
+                return lambda env: left(env) - right(env)
+            if op == "*":
+                return lambda env: left(env) * right(env)
+            return lambda env: evaluate(("binop", op, ("num", left(env)), ("num", right(env))))
+        args = [compile_ast(a) for a in ast[2]]
+        name = ast[1]
+        return lambda env: evaluate(("call", name, [("num", f(env)) for f in args]))
+
+    import time
+    tree = parse("x * x + 3 * x - 7 / (x + 1)")
+    slow = lambda env: evaluate(tree, env)
+    fast = compile_ast(tree)
+    print("same answer:", slow({"x": 4}) == fast({"x": 4}), round(fast({"x": 4}), 3))
+    start = time.perf_counter()
+    for i in range(20000):
+        slow({"x": i})
+    t_slow = time.perf_counter() - start
+    start = time.perf_counter()
+    for i in range(20000):
+        fast({"x": i})
+    t_fast = time.perf_counter() - start
+    print("compiled version at least as fast:", t_fast <= t_slow * 1.5)
+    print("substituting x = y + 1 gives depth", tree_depth(substitute(tree, "x", parse("y + 1"))), "instead of", tree_depth(tree))
+  output: |
+    same answer: True 26.6
+    compiled version at least as fast: True
+    substituting x = y + 1 gives depth 5 instead of 4
+  lines:
+  - line: 243
+    note: Interpreting and compiling agree.
+  - line: 253
+    note: Substitution rewrites the tree.
+playground:
+  prompt: Write a nested tuple for 2 * (3 + 4) by hand.
+  code: |
+    tree = ('binop', '*', ('num', 2), ('binop', '+', ('num', 3), ('num', 4)))
+    print(tree)
+exercises:
+- id: pratt
+  title: A Pratt parser
+  difficulty: 5
+  prompt: 'The starter has `tokenize_expr` (tokens are `(kind, text, position)` with kinds `NUM`, `ID`, `OP`, `LPAREN`, `RPAREN`, `COMMA`) and the table `BINARY` of `(precedence, associativity)`. Write `parse(text)` returning an **abstract syntax tree** (AST) of tuples: `("num", value)` (an `int`, or a `float` if the text has a decimal point), `("var", name)`, `("unary", "-", operand)`, `("binop", op, left, right)` and `("call", name, [args])`. Use **precedence climbing**: `parse_expr(min_prec)` parses a prefix item, then keeps taking binary operators whose precedence is at least `min_prec`; the right side is parsed with `prec + 1` for a left-associative operator and `prec` for a right-associative one (`^`). The prefix item is a number; a name (a call if `(` follows, with comma-separated arguments, possibly none); a parenthesised expression; or unary minus, whose operand is `parse_expr(UNARY_PRECEDENCE)` (25), so `-2^2` means `-(2^2)` but `-a*b` means `(-a)*b`. Raise `ValueError` containing `at position N` for every syntax error (`N` is `len(text)` at the end of input), including leftover tokens.'
+  starter: |-
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        pass
+  tests:
+  - name: precedence and associativity
+    code: |
+      assert parse("1 + 2 * 3") == ("binop", "+", ("num", 1), ("binop", "*", ("num", 2), ("num", 3)))
+      assert parse("(1 + 2) * 3") == ("binop", "*", ("binop", "+", ("num", 1), ("num", 2)), ("num", 3))
+      assert parse("8 - 3 - 2") == ("binop", "-", ("binop", "-", ("num", 8), ("num", 3)), ("num", 2))
+      assert parse("2 ^ 3 ^ 2") == ("binop", "^", ("num", 2), ("binop", "^", ("num", 3), ("num", 2)))
+      assert parse("12 / 4 / 3") == ("binop", "/", ("binop", "/", ("num", 12), ("num", 4)), ("num", 3))
+      assert parse("x") == ("var", "x") and parse("  7  ") == ("num", 7) and parse("2.5") == ("num", 2.5)
+  - name: unary minus and calls
+    code: |
+      assert parse("-2 ^ 2") == ("unary", "-", ("binop", "^", ("num", 2), ("num", 2)))
+      assert parse("-a * b") == ("binop", "*", ("unary", "-", ("var", "a")), ("var", "b"))
+      assert parse("2 * -3") == ("binop", "*", ("num", 2), ("unary", "-", ("num", 3)))
+      assert parse("--x") == ("unary", "-", ("unary", "-", ("var", "x")))
+      assert parse("f()") == ("call", "f", [])
+      assert parse("max(1, x + 2, 3)") == ("call", "max", [("num", 1), ("binop", "+", ("var", "x"), ("num", 2)), ("num", 3)])
+      assert parse("sqrt(x) + 1") == ("binop", "+", ("call", "sqrt", [("var", "x")]), ("num", 1))
+      assert parse("2 ^ -1") == ("binop", "^", ("num", 2), ("unary", "-", ("num", 1)))
+  - name: syntax errors
+    code: |
+      cases = [("1 +", "3"), ("(1 + 2", "6"), ("1 2", "2"), (")", "0"), ("1 + * 2", "4"), ("f(1,", "4"), ("f(1 2)", "4"), ("", "0"), ("2 $ 3", "2"), ("()", "1")]
+      for text, where in cases:
+          try:
+              parse(text)
+              raise AssertionError("accepted %r" % text)
+          except ValueError as e:
+              assert "at position " + where in str(e), (text, str(e))
+  hints:
+  - 'After parsing a prefix item, loop: look at the next operator and compare its precedence with min_prec.'
+  solution: |
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+  explanation: One small loop handles every precedence level and both associativities.
+- id: evaluate
+  title: Evaluating a tree
+  difficulty: 3
+  prompt: 'The starter has the parser. Write `evaluate(ast, env=None)`: compute the value of an AST. `env` maps variable names to numbers. `/` is true division. Raise `ValueError` for an undefined variable (message `undefined variable NAME`), division by zero (also `0 ^ negative`), an unknown function, a bad call (the function raises `TypeError` or `ValueError`, such as `sqrt` of a negative number or wrong argument count) and a power whose result is a complex number. The functions are in the dictionary `FUNCTIONS` (`sqrt`, `abs`, `max`, `min`, `sin`, `cos`, `exp`, `ln`).'
+  starter: |-
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        pass
+  tests:
+  - name: arithmetic
+    code: |
+      assert evaluate(parse("1 + 2 * 3")) == 7
+      assert evaluate(parse("(1 + 2) * 3")) == 9
+      assert evaluate(parse("2 ^ 3 ^ 2")) == 512
+      assert evaluate(parse("-2 ^ 2")) == -4
+      assert evaluate(parse("7 / 2")) == 3.5
+      assert evaluate(parse("10 - 4 - 3")) == 3
+      assert evaluate(parse("x * x + 1"), {"x": 5}) == 26
+      assert evaluate(parse("2 ^ -1")) == 0.5
+      assert abs(evaluate(parse("sqrt(16) + max(1, 5, 3) + abs(-2)")) - 11) < 1e-12
+      assert abs(evaluate(parse("sin(0) + cos(0) + exp(0) + ln(1)")) - 2) < 1e-12
+  - name: errors
+    code: |
+      for text, env in (("x + 1", {}), ("1 / 0", {}), ("1 / (x - x)", {"x": 3}), ("foo(1)", {}), ("sqrt(-1)", {}), ("abs(1, 2)", {}), ("(-8) ^ 0.5", {}), ("0 ^ -1", {})):
+          try:
+              evaluate(parse(text), env)
+              raise AssertionError("accepted " + text)
+          except ValueError:
+              pass
+      try:
+          evaluate(parse("y"), {"x": 1})
+      except ValueError as e:
+          assert "undefined variable y" in str(e)
+      assert evaluate(("num", 5), None) == 5
+  - name: the environment is not changed
+    code: |
+      env = {"a": 2}
+      evaluate(parse("a * 3"), env)
+      assert env == {"a": 2}
+      assert evaluate(parse("a"), env) == 2
+  hints:
+  - Evaluate the children first, then combine; check for dangerous cases before dividing.
+  solution: |
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+  explanation: Evaluating a tree is a short recursive function with one case per node kind.
+- id: printing
+  title: Printing and postfix
+  difficulty: 4
+  prompt: 'The starter has the parser and `evaluate`. Write `precedence_of(ast)` (10, 20 or 30 for binary operators from `BINARY`, 25 for unary minus, 100 for everything else) and `to_string(ast)`: write the AST back as text with the **fewest parentheses** that still parse to the same tree. Binary operators have a space on each side (`a + b`), calls look like `f(a, b)`, unary minus is `-x`. A **left** operand needs parentheses if it binds looser than the operator, or equally tight when the operator is right-associative (`^`), or is a unary minus under `^`. A **right** operand needs them if it binds looser, or equally tight when the operator is left-associative. A unary minus needs parentheses around an operand that binds looser than 25 or is itself a unary minus. Write `to_rpn(ast)`: the expression in **reverse Polish** (postfix) order as a list of strings: operands first then the operator; numbers and names as text, binary operators as themselves, unary minus as `"neg"`, and a call as `"name/count"` after its arguments (`1 + 2 * 3` gives `[''1'', ''2'', ''3'', ''*'', ''+'']`).'
+  starter: |-
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def precedence_of(ast):
+        """How tightly a node binds: 10, 20 or 30 for binary operators, 25 for unary minus, 100 for everything else (numbers, names, calls)."""
+        pass
+
+
+    def to_string(ast):
+        """Write the AST back as text with the FEWEST parentheses that still parse to the same tree. Binary operators are written with a space
+        on each side ('a + b'); calls as 'f(a, b)'; unary minus as '-x'. A left operand needs parentheses if it binds looser than the operator, or equally
+        tight for a right-associative operator (^), or is a unary minus under ^ (since -x^2 means -(x^2)). A right operand needs them if it binds looser,
+        or equally tight for a left-associative operator. A unary minus needs them around an operand that binds looser than 25 or is itself a unary minus."""
+        pass
+
+
+    def to_rpn(ast):
+        """The expression in reverse Polish (postfix) order as a list of strings: operands first, then the operator. Numbers and names are written as
+        text, binary operators as themselves, unary minus as 'neg', and a call as 'name/argument-count' after its arguments. '1 + 2 * 3' gives
+        ['1', '2', '3', '*', '+']."""
+        pass
+  tests:
+  - name: minimal parentheses
+    code: |
+      assert to_string(parse("((a)) + (b * c)")) == "a + b * c"
+      assert to_string(parse("(a + b) * c")) == "(a + b) * c"
+      assert to_string(parse("a - (b - c)")) == "a - (b - c)"
+      assert to_string(parse("(a - b) - c")) == "a - b - c"
+      assert to_string(parse("2 ^ 3 ^ 2")) == "2 ^ 3 ^ 2"
+      assert to_string(parse("(2 ^ 3) ^ 2")) == "(2 ^ 3) ^ 2"
+      assert to_string(parse("-(a + b)")) == "-(a + b)"
+      assert to_string(parse("(-a) ^ 2")) == "(-a) ^ 2"
+      assert to_string(parse("-a ^ 2")) == "-a ^ 2"
+      assert to_string(parse("--x")) == "-(-x)"
+      assert to_string(parse("f(1+2,  x)")) == "f(1 + 2, x)"
+      assert to_string(parse("a / (b * c)")) == "a / (b * c)"
+      assert to_string(parse("a * -b")) == "a * -b"
+      assert to_string(parse("2.5")) == "2.5"
+  - name: round trip
+    code: |
+      for text in ["1 + 2 * 3", "(1 + 2) * (3 - 4)", "a - b - c - d", "a - (b - (c - d))", "2 ^ 3 ^ 4", "(2 ^ 3) ^ 4", "-x ^ 2 + (-x) ^ 2", "f(g(x), 1 / (1 + y))", "--a * -b", "a / b / c * d", "1 / (2 / 3)"]:
+          tree = parse(text)
+          assert parse(to_string(tree)) == tree, text
+          assert to_string(parse(to_string(tree))) == to_string(tree)
+  - name: postfix
+    code: |
+      assert to_rpn(parse("1 + 2 * 3")) == ["1", "2", "3", "*", "+"]
+      assert to_rpn(parse("(1 + 2) * 3")) == ["1", "2", "+", "3", "*"]
+      assert to_rpn(parse("-x + 1")) == ["x", "neg", "1", "+"]
+      assert to_rpn(parse("max(a, 2 * b)")) == ["a", "2", "b", "*", "max/2"]
+      assert to_rpn(parse("f()")) == ["f/0"]
+      assert to_rpn(parse("2 ^ 3 ^ 2")) == ["2", "3", "2", "^", "^"]
+      assert precedence_of(parse("a + b")) == 10 and precedence_of(parse("a * b")) == 20 and precedence_of(parse("a ^ b")) == 30
+      assert precedence_of(parse("-a")) == 25 and precedence_of(parse("a")) == 100 and precedence_of(parse("f(a)")) == 100
+  hints:
+  - Compare precedence numbers; for equal precedence the associativity decides which side needs parentheses.
+  solution: |
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def precedence_of(ast):
+        """How tightly a node binds: 10, 20 or 30 for binary operators, 25 for unary minus, 100 for everything else (numbers, names, calls)."""
+        if ast[0] == "binop":
+            return BINARY[ast[1]][0]
+        if ast[0] == "unary":
+            return UNARY_PRECEDENCE
+        return 100
+
+
+    def to_string(ast):
+        """Write the AST back as text with the FEWEST parentheses that still parse to the same tree. Binary operators are written with a space
+        on each side ('a + b'); calls as 'f(a, b)'; unary minus as '-x'. A left operand needs parentheses if it binds looser than the operator, or equally
+        tight for a right-associative operator (^), or is a unary minus under ^ (since -x^2 means -(x^2)). A right operand needs them if it binds looser,
+        or equally tight for a left-associative operator. A unary minus needs them around an operand that binds looser than 25 or is itself a unary minus."""
+        kind = ast[0]
+        if kind == "num":
+            return str(ast[1])
+        if kind == "var":
+            return ast[1]
+        if kind == "call":
+            return "%s(%s)" % (ast[1], ", ".join(to_string(a) for a in ast[2]))
+        if kind == "unary":
+            inner = to_string(ast[2])
+            if precedence_of(ast[2]) < UNARY_PRECEDENCE or ast[2][0] == "unary":
+                inner = "(" + inner + ")"
+            return "-" + inner
+        op, left, right = ast[1], ast[2], ast[3]
+        prec, assoc = BINARY[op]
+        ls, rs = to_string(left), to_string(right)
+        lp, rp = precedence_of(left), precedence_of(right)
+        if lp < prec or (lp == prec and assoc == "right") or (left[0] == "unary" and op == "^"):
+            ls = "(" + ls + ")"
+        if rp < prec or (rp == prec and assoc == "left"):
+            rs = "(" + rs + ")"
+        return "%s %s %s" % (ls, op, rs)
+
+
+    def to_rpn(ast):
+        """The expression in reverse Polish (postfix) order as a list of strings: operands first, then the operator. Numbers and names are written as
+        text, binary operators as themselves, unary minus as 'neg', and a call as 'name/argument-count' after its arguments. '1 + 2 * 3' gives
+        ['1', '2', '3', '*', '+']."""
+        kind = ast[0]
+        if kind == "num":
+            return [str(ast[1])]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "unary":
+            return to_rpn(ast[2]) + ["neg"]
+        if kind == "binop":
+            return to_rpn(ast[2]) + to_rpn(ast[3]) + [ast[1]]
+        out = []
+        for a in ast[2]:
+            out += to_rpn(a)
+        return out + ["%s/%d" % (ast[1], len(ast[2]))]
+  explanation: A printer that adds only necessary parentheses proves the parser and the tree agree.
+- id: symbolic
+  title: Simplifying and differentiating
+  difficulty: 5
+  prompt: 'The starter has everything so far. Write `free_variables(ast)` (the sorted distinct variable names; function names are not variables). Write `simplify_once(ast)`: a bottom-up pass that first simplifies the children and then at the node: folds an operation on two numbers (use `evaluate`; leave division by zero or a non-real power unchanged); `x + 0`, `0 + x`, `x - 0`, `x * 1`, `1 * x`, `x / 1` and `x ^ 1` become `x`; `x * 0` and `0 * x` become `0`; `x ^ 0` becomes `1`; unary minus of a number becomes a negative number; and `-(-x)` becomes `x`. Write `simplify(ast)`: repeat `simplify_once` until nothing changes. Write `differentiate(ast, var)`, the **symbolic derivative** you met in calculus: constants give 0; the variable gives 1 (other variables 0); sums, differences and unary minus act term by term; products `(u v)'' = u'' v + u v''`; quotients `(u / v)'' = (u'' v - u v'') / v^2`; `u ^ n` with `n` free of `var` gives `n * u^(n - 1) * u''`; `a ^ v` with the base free of `var` gives `a^v * ln(a) * v''`; general `u ^ v` gives `u^v * (v'' * ln(u) + v * u'' / u)`; calls use the chain rule: `sin u` gives `cos(u) * u''`, `cos u` gives `-sin(u) * u''`, `exp u` gives `exp(u) * u''`, `ln u` gives `u'' / u`, `sqrt u` gives `u'' / (2 * sqrt(u))`; any other function is a `ValueError`. Finally `derivative_text(text, var)`: parse, differentiate, simplify and write back with `to_string`.'
+  starter: |-
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def precedence_of(ast):
+        """How tightly a node binds: 10, 20 or 30 for binary operators, 25 for unary minus, 100 for everything else (numbers, names, calls)."""
+        if ast[0] == "binop":
+            return BINARY[ast[1]][0]
+        if ast[0] == "unary":
+            return UNARY_PRECEDENCE
+        return 100
+
+
+    def to_string(ast):
+        """Write the AST back as text with the FEWEST parentheses that still parse to the same tree. Binary operators are written with a space
+        on each side ('a + b'); calls as 'f(a, b)'; unary minus as '-x'. A left operand needs parentheses if it binds looser than the operator, or equally
+        tight for a right-associative operator (^), or is a unary minus under ^ (since -x^2 means -(x^2)). A right operand needs them if it binds looser,
+        or equally tight for a left-associative operator. A unary minus needs them around an operand that binds looser than 25 or is itself a unary minus."""
+        kind = ast[0]
+        if kind == "num":
+            return str(ast[1])
+        if kind == "var":
+            return ast[1]
+        if kind == "call":
+            return "%s(%s)" % (ast[1], ", ".join(to_string(a) for a in ast[2]))
+        if kind == "unary":
+            inner = to_string(ast[2])
+            if precedence_of(ast[2]) < UNARY_PRECEDENCE or ast[2][0] == "unary":
+                inner = "(" + inner + ")"
+            return "-" + inner
+        op, left, right = ast[1], ast[2], ast[3]
+        prec, assoc = BINARY[op]
+        ls, rs = to_string(left), to_string(right)
+        lp, rp = precedence_of(left), precedence_of(right)
+        if lp < prec or (lp == prec and assoc == "right") or (left[0] == "unary" and op == "^"):
+            ls = "(" + ls + ")"
+        if rp < prec or (rp == prec and assoc == "left"):
+            rs = "(" + rs + ")"
+        return "%s %s %s" % (ls, op, rs)
+
+
+    def to_rpn(ast):
+        """The expression in reverse Polish (postfix) order as a list of strings: operands first, then the operator. Numbers and names are written as
+        text, binary operators as themselves, unary minus as 'neg', and a call as 'name/argument-count' after its arguments. '1 + 2 * 3' gives
+        ['1', '2', '3', '*', '+']."""
+        kind = ast[0]
+        if kind == "num":
+            return [str(ast[1])]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "unary":
+            return to_rpn(ast[2]) + ["neg"]
+        if kind == "binop":
+            return to_rpn(ast[2]) + to_rpn(ast[3]) + [ast[1]]
+        out = []
+        for a in ast[2]:
+            out += to_rpn(a)
+        return out + ["%s/%d" % (ast[1], len(ast[2]))]
+
+
+    def free_variables(ast):
+        """The sorted list of distinct variable names used in the AST (function names are not variables)."""
+        pass
+
+
+    def simplify_once(ast):
+        """One bottom-up pass of simplification: first simplify the children, then apply to the node: fold an operation on two numbers (except
+        division by zero or a power that is not a real number, which stay as they are); x + 0, 0 + x, x - 0, x * 1, 1 * x, x / 1, x ^ 1 become x;
+        x * 0 and 0 * x become 0; x ^ 0 becomes 1; unary minus of a number becomes a negative number, and minus minus x becomes x."""
+        pass
+
+
+    def simplify(ast):
+        """Apply simplify_once repeatedly until the tree stops changing."""
+        pass
+
+
+    def differentiate(ast, var):
+        """The symbolic derivative of the AST with respect to the variable `var`, as an AST (not simplified): constants give 0; the variable
+        gives 1 and other variables 0; sums, differences and unary minus act term by term; products use the product rule (u v)' = u' v + u v';
+        quotients (u / v)' = (u' v - u v') / v ^ 2; a power u ^ n with n free of var gives n * u ^ (n - 1) * u'; a power a ^ v with the base free of var
+        gives a ^ v * ln(a) * v'; a general u ^ v gives u ^ v * (v' * ln(u) + v * u' / u); and calls sin, cos, exp, ln and sqrt use the chain rule
+        (sin u)' = cos(u) u', (cos u)' = -sin(u) u', (exp u)' = exp(u) u', (ln u)' = u' / u, (sqrt u)' = u' / (2 * sqrt(u)). ValueError for other functions."""
+        pass
+
+
+    def derivative_text(text, var):
+        """Parse the expression, differentiate it with respect to var, simplify, and write it back with to_string."""
+        pass
+  tests:
+  - name: simplifying
+    code: |
+      def s(text):
+          return to_string(simplify(parse(text)))
+      assert s("2 + 3 * 4") == "14"
+      assert s("x * 1 + 0") == "x"
+      assert s("0 * x + y") == "y"
+      assert s("x ^ 1 + x ^ 0") == "x + 1"
+      assert s("-(-x)") == "x"
+      assert s("(x + 0) * (1 * y)") == "x * y"
+      assert s("1 / 0") == "1 / 0"
+      assert s("2 * (3 + 4) * x") == "14 * x"
+      assert s("x - 0 - 0") == "x"
+      assert free_variables(parse("x * y + f(x, z) - 3")) == ["x", "y", "z"]
+      assert free_variables(parse("sqrt(4)")) == []
+  - name: exact derivatives
+    code: |
+      assert derivative_text("x ^ 2", "x") == "2 * x"
+      assert derivative_text("5", "x") == "0"
+      assert derivative_text("x * x", "x") == "x + x"
+      assert derivative_text("3 * x", "x") == "3"
+      assert derivative_text("y", "x") == "0"
+      assert derivative_text("x + 7", "x") == "1"
+      assert derivative_text("x ^ 3", "x") == "3 * x ^ 2"
+      assert derivative_text("sin(x)", "x") == "cos(x)"
+      assert derivative_text("exp(x)", "x") == "exp(x)"
+      assert derivative_text("ln(x)", "x") == "1 / x"
+      try:
+          derivative_text("max(x, 1)", "x")
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  - name: numerically correct
+    code: |
+      import math
+      def numeric(text, x, h=1e-6):
+          f = lambda v: evaluate(parse(text), {"x": v})
+          return (f(x + h) - f(x - h)) / (2 * h)
+      for text in ["x ^ 3 - 2 * x + 5", "sin(x) * x", "x / (x ^ 2 + 1)", "exp(2 * x)", "ln(x ^ 2 + 1)", "sqrt(x + 4)", "2 ^ x", "x ^ x", "(x + 1) ^ 3 / (x - 2)", "cos(x ^ 2)"]:
+          for point in (0.5, 1.5, 3.0):
+              exact = evaluate(simplify(differentiate(parse(text), "x")), {"x": point})
+              assert abs(exact - numeric(text, point)) < 1e-4 * max(1, abs(exact)), (text, point, exact, numeric(text, point))
+      tree = parse("x * x + 1")
+      before = tree
+      differentiate(tree, "x")
+      assert tree == before
+  hints:
+  - Build the derivative tree exactly as the rules say, then let simplify clean it up.
+  solution: |
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def precedence_of(ast):
+        """How tightly a node binds: 10, 20 or 30 for binary operators, 25 for unary minus, 100 for everything else (numbers, names, calls)."""
+        if ast[0] == "binop":
+            return BINARY[ast[1]][0]
+        if ast[0] == "unary":
+            return UNARY_PRECEDENCE
+        return 100
+
+
+    def to_string(ast):
+        """Write the AST back as text with the FEWEST parentheses that still parse to the same tree. Binary operators are written with a space
+        on each side ('a + b'); calls as 'f(a, b)'; unary minus as '-x'. A left operand needs parentheses if it binds looser than the operator, or equally
+        tight for a right-associative operator (^), or is a unary minus under ^ (since -x^2 means -(x^2)). A right operand needs them if it binds looser,
+        or equally tight for a left-associative operator. A unary minus needs them around an operand that binds looser than 25 or is itself a unary minus."""
+        kind = ast[0]
+        if kind == "num":
+            return str(ast[1])
+        if kind == "var":
+            return ast[1]
+        if kind == "call":
+            return "%s(%s)" % (ast[1], ", ".join(to_string(a) for a in ast[2]))
+        if kind == "unary":
+            inner = to_string(ast[2])
+            if precedence_of(ast[2]) < UNARY_PRECEDENCE or ast[2][0] == "unary":
+                inner = "(" + inner + ")"
+            return "-" + inner
+        op, left, right = ast[1], ast[2], ast[3]
+        prec, assoc = BINARY[op]
+        ls, rs = to_string(left), to_string(right)
+        lp, rp = precedence_of(left), precedence_of(right)
+        if lp < prec or (lp == prec and assoc == "right") or (left[0] == "unary" and op == "^"):
+            ls = "(" + ls + ")"
+        if rp < prec or (rp == prec and assoc == "left"):
+            rs = "(" + rs + ")"
+        return "%s %s %s" % (ls, op, rs)
+
+
+    def to_rpn(ast):
+        """The expression in reverse Polish (postfix) order as a list of strings: operands first, then the operator. Numbers and names are written as
+        text, binary operators as themselves, unary minus as 'neg', and a call as 'name/argument-count' after its arguments. '1 + 2 * 3' gives
+        ['1', '2', '3', '*', '+']."""
+        kind = ast[0]
+        if kind == "num":
+            return [str(ast[1])]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "unary":
+            return to_rpn(ast[2]) + ["neg"]
+        if kind == "binop":
+            return to_rpn(ast[2]) + to_rpn(ast[3]) + [ast[1]]
+        out = []
+        for a in ast[2]:
+            out += to_rpn(a)
+        return out + ["%s/%d" % (ast[1], len(ast[2]))]
+
+
+    def free_variables(ast):
+        """The sorted list of distinct variable names used in the AST (function names are not variables)."""
+        kind = ast[0]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "num":
+            return []
+        names = set()
+        children = ast[2:] if kind in ("unary", "binop") else ast[2]
+        for child in children:
+            names.update(free_variables(child))
+        return sorted(names)
+
+
+    def simplify_once(ast):
+        """One bottom-up pass of simplification: first simplify the children, then apply to the node: fold an operation on two numbers (except
+        division by zero or a power that is not a real number, which stay as they are); x + 0, 0 + x, x - 0, x * 1, 1 * x, x / 1, x ^ 1 become x;
+        x * 0 and 0 * x become 0; x ^ 0 becomes 1; unary minus of a number becomes a negative number, and minus minus x becomes x."""
+        kind = ast[0]
+        if kind in ("num", "var"):
+            return ast
+        if kind == "call":
+            return ("call", ast[1], [simplify_once(a) for a in ast[2]])
+        if kind == "unary":
+            inner = simplify_once(ast[2])
+            if inner[0] == "num":
+                return ("num", -inner[1])
+            if inner[0] == "unary":
+                return inner[2]
+            return ("unary", "-", inner)
+        op = ast[1]
+        a, b = simplify_once(ast[2]), simplify_once(ast[3])
+        if a[0] == "num" and b[0] == "num":
+            try:
+                return ("num", evaluate(("binop", op, a, b)))
+            except ValueError:
+                return ("binop", op, a, b)
+        zero = lambda n: n[0] == "num" and n[1] == 0
+        one = lambda n: n[0] == "num" and n[1] == 1
+        if op == "+" and zero(a):
+            return b
+        if op in "+-" and zero(b):
+            return a
+        if op == "*" and (zero(a) or zero(b)):
+            return ("num", 0)
+        if op == "*" and one(a):
+            return b
+        if op in "*/" and one(b):
+            return a
+        if op == "^" and one(b):
+            return a
+        if op == "^" and zero(b):
+            return ("num", 1)
+        return ("binop", op, a, b)
+
+
+    def simplify(ast):
+        """Apply simplify_once repeatedly until the tree stops changing."""
+        while True:
+            new = simplify_once(ast)
+            if new == ast:
+                return ast
+            ast = new
+
+
+    def differentiate(ast, var):
+        """The symbolic derivative of the AST with respect to the variable `var`, as an AST (not simplified): constants give 0; the variable
+        gives 1 and other variables 0; sums, differences and unary minus act term by term; products use the product rule (u v)' = u' v + u v';
+        quotients (u / v)' = (u' v - u v') / v ^ 2; a power u ^ n with n free of var gives n * u ^ (n - 1) * u'; a power a ^ v with the base free of var
+        gives a ^ v * ln(a) * v'; a general u ^ v gives u ^ v * (v' * ln(u) + v * u' / u); and calls sin, cos, exp, ln and sqrt use the chain rule
+        (sin u)' = cos(u) u', (cos u)' = -sin(u) u', (exp u)' = exp(u) u', (ln u)' = u' / u, (sqrt u)' = u' / (2 * sqrt(u)). ValueError for other functions."""
+        kind = ast[0]
+        num = lambda v: ("num", v)
+        if kind == "num":
+            return num(0)
+        if kind == "var":
+            return num(1 if ast[1] == var else 0)
+        if kind == "unary":
+            return ("unary", "-", differentiate(ast[2], var))
+        if kind == "call":
+            name, args = ast[1], ast[2]
+            if len(args) != 1 or name not in ("sin", "cos", "exp", "ln", "sqrt"):
+                raise ValueError("cannot differentiate %s" % name)
+            u = args[0]
+            du = differentiate(u, var)
+            if name == "sin":
+                return ("binop", "*", ("call", "cos", [u]), du)
+            if name == "cos":
+                return ("binop", "*", ("unary", "-", ("call", "sin", [u])), du)
+            if name == "exp":
+                return ("binop", "*", ("call", "exp", [u]), du)
+            if name == "ln":
+                return ("binop", "/", du, u)
+            return ("binop", "/", du, ("binop", "*", num(2), ("call", "sqrt", [u])))
+        op, u, v = ast[1], ast[2], ast[3]
+        du, dv = differentiate(u, var), differentiate(v, var)
+        if op in "+-":
+            return ("binop", op, du, dv)
+        if op == "*":
+            return ("binop", "+", ("binop", "*", du, v), ("binop", "*", u, dv))
+        if op == "/":
+            top = ("binop", "-", ("binop", "*", du, v), ("binop", "*", u, dv))
+            return ("binop", "/", top, ("binop", "^", v, num(2)))
+        if var not in free_variables(v):
+            power = ("binop", "^", u, ("binop", "-", v, num(1)))
+            return ("binop", "*", ("binop", "*", v, power), du)
+        if var not in free_variables(u):
+            return ("binop", "*", ("binop", "*", ast, ("call", "ln", [u])), dv)
+        inner = ("binop", "+", ("binop", "*", dv, ("call", "ln", [u])), ("binop", "/", ("binop", "*", v, du), u))
+        return ("binop", "*", ast, inner)
+
+
+    def derivative_text(text, var):
+        """Parse the expression, differentiate it with respect to var, simplify, and write it back with to_string."""
+        return to_string(simplify(differentiate(parse(text), var)))
+  explanation: Differentiation is mechanical rewriting of a tree, which is why computers are good at it.
+- id: compile
+  title: 'Capstone: compiling a tree into a function'
+  difficulty: 5
+  prompt: 'The starter has the parser, `evaluate` and the helpers. Write `substitute(ast, name, replacement)` (a new AST with every occurrence of the variable `name` replaced by the AST `replacement`), `tree_depth(ast)` (a number or variable has depth 1; an operator or call has one more than its deepest child; a call with no arguments has depth 1) and `compile_ast(ast)`: return a Python function `f(env)` that computes the same value as `evaluate(ast, env)` but by building **nested closures once** instead of walking the tree on every call. This is the idea behind a compiler: do the structural work ahead of time. Errors must behave like `evaluate`: raise `ValueError` when the function is **called**, not when it is built. You may reuse `evaluate` for the rarer cases (`/`, `^` and calls).'
+  starter: |-
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def free_variables(ast):
+        """The sorted list of distinct variable names used in the AST (function names are not variables)."""
+        kind = ast[0]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "num":
+            return []
+        names = set()
+        children = ast[2:] if kind in ("unary", "binop") else ast[2]
+        for child in children:
+            names.update(free_variables(child))
+        return sorted(names)
+
+
+
+
+    def substitute(ast, name, replacement):
+        """A new AST in which every occurrence of the variable `name` is replaced by the AST `replacement`."""
+        pass
+
+
+    def tree_depth(ast):
+        """The number of levels in the tree: a number or variable has depth 1; an operator or call has one more than its deepest child
+        (a call with no arguments has depth 1)."""
+        pass
+
+
+    def compile_ast(ast):
+        """Turn the AST into a Python function f(env) that computes the same value as evaluate(ast, env), by building nested closures ONCE
+        instead of walking the tree on every call (the idea behind a compiler). Errors must behave like evaluate: raise ValueError when the function
+        is CALLED (undefined variable, division by zero, unknown function...), not when it is built. You may reuse evaluate for the rare error cases."""
+        pass
+  tests:
+  - name: substituting
+    code: |
+      ast = parse("x * x + y")
+      assert substitute(ast, "x", ("num", 3)) == parse("3 * 3 + y")
+      assert substitute(ast, "z", ("num", 3)) == ast
+      assert substitute(parse("f(x, 2) - x"), "x", parse("a + 1")) == ("binop", "-", ("call", "f", [parse("a + 1"), ("num", 2)]), parse("a + 1"))
+      assert evaluate(substitute(parse("x ^ 2"), "x", parse("1 + 2"))) == 9
+      assert ast == parse("x * x + y")
+  - name: depth
+    code: |
+      assert tree_depth(parse("1")) == 1 and tree_depth(parse("x")) == 1
+      assert tree_depth(parse("1 + 2")) == 2 and tree_depth(parse("1 + 2 * 3")) == 3
+      assert tree_depth(parse("-x")) == 2 and tree_depth(parse("f()")) == 1
+      assert tree_depth(parse("f(1, g(x, 2))")) == 3
+      assert tree_depth(parse("((1 + 2) + 3) + 4")) == 4
+  - name: compiled functions agree with evaluate
+    code: |
+      import random
+      rng = random.Random(3)
+      for text in ["x * x + y", "(x + 1) / (y + 2)", "2 ^ x - y ^ 2", "max(x, y) - min(x, y)", "-x * -y + sqrt(x * x)", "sin(x) ^ 2 + cos(x) ^ 2", "f(1)" if False else "abs(x - y)"]:
+          f = compile_ast(parse(text))
+          for _ in range(20):
+              env = {"x": rng.randrange(1, 9), "y": rng.randrange(1, 9)}
+              assert abs(f(env) - evaluate(parse(text), env)) < 1e-12, (text, env)
+  - name: errors happen at call time
+    code: |
+      g = compile_ast(parse("1 / x"))
+      assert g({"x": 4}) == 0.25
+      for env in ({"x": 0}, {}):
+          try:
+              g(env)
+              raise AssertionError("accepted")
+          except ValueError:
+              pass
+      h = compile_ast(parse("unknown(1)"))
+      try:
+          h({})
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+      assert compile_ast(parse("7"))({}) == 7
+  hints:
+  - A closure remembers the child functions it was built from, so each call only combines their results.
+  solution: |
+    import math
+
+    BINARY = {"+": (10, "left"), "-": (10, "left"), "*": (20, "left"), "/": (20, "left"), "^": (30, "right")}
+    UNARY_PRECEDENCE = 25
+    FUNCTIONS = {"sqrt": math.sqrt, "abs": abs, "max": max, "min": min, "sin": math.sin, "cos": math.cos, "exp": math.exp, "ln": math.log}
+
+
+    def tokenize_expr(text):
+        """Split an expression into (kind, text, position) tokens: NUM (digits, optionally with one decimal point), ID (letters, digits and
+        underscores, not starting with a digit), OP (one of + - * / ^), LPAREN, RPAREN and COMMA. Spaces are skipped.
+        ValueError containing the position for any other character."""
+        tokens = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+            elif ch.isdigit():
+                j = i
+                while j < len(text) and text[j].isdigit():
+                    j += 1
+                if j + 1 < len(text) and text[j] == "." and text[j + 1].isdigit():
+                    j += 1
+                    while j < len(text) and text[j].isdigit():
+                        j += 1
+                tokens.append(("NUM", text[i:j], i))
+                i = j
+            elif ch.isalpha() or ch == "_":
+                j = i
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+                tokens.append(("ID", text[i:j], i))
+                i = j
+            elif ch in "+-*/^":
+                tokens.append(("OP", ch, i))
+                i += 1
+            elif ch in "(),":
+                tokens.append(({"(": "LPAREN", ")": "RPAREN", ",": "COMMA"}[ch], ch, i))
+                i += 1
+            else:
+                raise ValueError("unexpected character %r at position %d" % (ch, i))
+        return tokens
+
+
+    def parse(text):
+        """Pratt (precedence climbing) parser. Return an abstract syntax tree (AST) made of tuples:
+        ("num", value) with int or float value, ("var", name), ("unary", "-", operand), ("binop", op, left, right) and ("call", name, [args]).
+        Rules: + and - bind weakest (10) and group left to right; * and / (20) also left to right; ^ (30) groups RIGHT to left; unary minus (25) binds
+        tighter than * but looser than ^, so -2^2 means -(2^2). Parentheses group. A name followed by ( is a call with comma-separated arguments.
+        Use the table BINARY. Core idea: parse_expr(min_prec) parses a prefix item, then keeps taking operators whose precedence is at least
+        min_prec; the right side is parsed with prec + 1 for left-associative operators and prec for right-associative ones.
+        ValueError with 'at position N' (N is len(text) at the end of input) for any syntax error, including leftover tokens."""
+        tokens = tokenize_expr(text)
+        pos = 0
+
+        def peek():
+            return tokens[pos] if pos < len(tokens) else None
+
+        def take():
+            nonlocal pos
+            token = peek()
+            pos += 1
+            return token
+
+        def where(token):
+            return token[2] if token else len(text)
+
+        def parse_expr(min_prec):
+            left = parse_prefix()
+            while True:
+                token = peek()
+                if token is None or token[0] != "OP" or token[1] not in BINARY:
+                    return left
+                prec, assoc = BINARY[token[1]]
+                if prec < min_prec:
+                    return left
+                take()
+                right = parse_expr(prec + 1 if assoc == "left" else prec)
+                left = ("binop", token[1], left, right)
+
+        def parse_prefix():
+            token = take()
+            if token is None:
+                raise ValueError("unexpected end of input at position %d" % len(text))
+            kind, value, p = token
+            if kind == "NUM":
+                return ("num", float(value) if "." in value else int(value))
+            if kind == "ID":
+                nxt = peek()
+                if nxt is None or nxt[0] != "LPAREN":
+                    return ("var", value)
+                take()
+                args = []
+                if peek() is not None and peek()[0] == "RPAREN":
+                    take()
+                    return ("call", value, args)
+                while True:
+                    args.append(parse_expr(0))
+                    closer = take()
+                    if closer is not None and closer[0] == "RPAREN":
+                        return ("call", value, args)
+                    if closer is None or closer[0] != "COMMA":
+                        raise ValueError("expected , or ) at position %d" % where(closer))
+            if kind == "LPAREN":
+                inner = parse_expr(0)
+                closer = take()
+                if closer is None or closer[0] != "RPAREN":
+                    raise ValueError("expected ) at position %d" % where(closer))
+                return inner
+            if kind == "OP" and value == "-":
+                return ("unary", "-", parse_expr(UNARY_PRECEDENCE))
+            raise ValueError("unexpected %s at position %d" % (value, p))
+
+        tree = parse_expr(0)
+        if pos < len(tokens):
+            raise ValueError("unexpected %s at position %d" % (tokens[pos][1], tokens[pos][2]))
+        return tree
+
+
+    def evaluate(ast, env=None):
+        """Compute the value of an AST. `env` maps variable names to numbers. `/` is true division. ValueError for an undefined variable
+        ('undefined variable NAME'), division by zero, an unknown function, a call with the wrong number of arguments or an argument outside
+        a function's domain (such as sqrt of a negative number), and a power that would not be a real number."""
+        env = env or {}
+        kind = ast[0]
+        if kind == "num":
+            return ast[1]
+        if kind == "var":
+            if ast[1] not in env:
+                raise ValueError("undefined variable %s" % ast[1])
+            return env[ast[1]]
+        if kind == "unary":
+            return -evaluate(ast[2], env)
+        if kind == "binop":
+            op = ast[1]
+            a = evaluate(ast[2], env)
+            b = evaluate(ast[3], env)
+            if op == "+":
+                return a + b
+            if op == "-":
+                return a - b
+            if op == "*":
+                return a * b
+            if op == "/":
+                if b == 0:
+                    raise ValueError("division by zero")
+                return a / b
+            try:
+                result = a ** b
+            except ZeroDivisionError:
+                raise ValueError("division by zero")
+            if isinstance(result, complex):
+                raise ValueError("power is not a real number")
+            return result
+        if kind == "call":
+            name, args = ast[1], [evaluate(a, env) for a in ast[2]]
+            if name not in FUNCTIONS:
+                raise ValueError("unknown function %s" % name)
+            try:
+                return FUNCTIONS[name](*args)
+            except (TypeError, ValueError) as error:
+                raise ValueError("bad call to %s: %s" % (name, error))
+        raise ValueError("unknown node %r" % (kind,))
+
+
+    def free_variables(ast):
+        """The sorted list of distinct variable names used in the AST (function names are not variables)."""
+        kind = ast[0]
+        if kind == "var":
+            return [ast[1]]
+        if kind == "num":
+            return []
+        names = set()
+        children = ast[2:] if kind in ("unary", "binop") else ast[2]
+        for child in children:
+            names.update(free_variables(child))
+        return sorted(names)
+
+
+
+
+    def substitute(ast, name, replacement):
+        """A new AST in which every occurrence of the variable `name` is replaced by the AST `replacement`."""
+        kind = ast[0]
+        if kind == "var":
+            return replacement if ast[1] == name else ast
+        if kind == "num":
+            return ast
+        if kind == "unary":
+            return ("unary", "-", substitute(ast[2], name, replacement))
+        if kind == "binop":
+            return ("binop", ast[1], substitute(ast[2], name, replacement), substitute(ast[3], name, replacement))
+        return ("call", ast[1], [substitute(a, name, replacement) for a in ast[2]])
+
+
+    def tree_depth(ast):
+        """The number of levels in the tree: a number or variable has depth 1; an operator or call has one more than its deepest child
+        (a call with no arguments has depth 1)."""
+        kind = ast[0]
+        if kind in ("num", "var"):
+            return 1
+        children = ast[2:] if kind in ("unary", "binop") else ast[2]
+        return 1 + max((tree_depth(c) for c in children), default=0)
+
+
+    def compile_ast(ast):
+        """Turn the AST into a Python function f(env) that computes the same value as evaluate(ast, env), by building nested closures ONCE
+        instead of walking the tree on every call (the idea behind a compiler). Errors must behave like evaluate: raise ValueError when the function
+        is CALLED (undefined variable, division by zero, unknown function...), not when it is built. You may reuse evaluate for the rare error cases."""
+        kind = ast[0]
+        if kind == "num":
+            value = ast[1]
+            return lambda env: value
+        if kind == "var":
+            name = ast[1]
+
+            def lookup(env):
+                if name not in env:
+                    raise ValueError("undefined variable %s" % name)
+                return env[name]
+            return lookup
+        if kind == "unary":
+            inner = compile_ast(ast[2])
+            return lambda env: -inner(env)
+        if kind == "binop":
+            op = ast[1]
+            left, right = compile_ast(ast[2]), compile_ast(ast[3])
+            if op == "+":
+                return lambda env: left(env) + right(env)
+            if op == "-":
+                return lambda env: left(env) - right(env)
+            if op == "*":
+                return lambda env: left(env) * right(env)
+            return lambda env: evaluate(("binop", op, ("num", left(env)), ("num", right(env))))
+        args = [compile_ast(a) for a in ast[2]]
+        name = ast[1]
+        return lambda env: evaluate(("call", name, [("num", f(env)) for f in args]))
+  explanation: Compiling once and running many times is far faster than interpreting the tree each time.
+commonMistakes:
+- title: Using prec + 1 for a right-associative operator
+  explanation: 2 ^ 3 ^ 2 would then group to the left.
+- title: Parsing the unary operand with min_prec 0
+  explanation: -2 ^ 2 would not bind the way mathematicians expect, and -a * b would swallow the product.
+- title: Adding parentheses everywhere when printing
+  explanation: Compare precedence and associativity to add only the necessary ones.
+- title: Ignoring leftover tokens after the expression
+  explanation: After the top-level parse the input must be exhausted.
+- title: Raising errors when building a compiled function
+  explanation: Runtime errors such as division by zero belong to the call.
+summary:
+- An AST keeps only the meaningful structure of a program.
+- Precedence climbing parses expressions with one loop and a precedence table.
+- Left-associative operators ask for tighter operators on the right; right-associative ones do not.
+- Evaluate, print, simplify and differentiate are recursive walks over the tree.
+- Compiling a tree into closures does the structural work once.
+next: u23-semantics
+quiz:
+- type: mcq
+  question: What does an AST leave out compared with a parse tree?
+  options:
+  - Grammar bookkeeping such as parentheses and chain rules
+  - The operators
+  - The numbers
+  - The root
+  answer: 0
+  explanation: Only the meaningful structure remains.
+- type: mcq
+  question: For 8 - 3 - 2 the tree should group as...
+  options:
+  - (8 - 3) - 2
+  - 8 - (3 - 2)
+  - 8 - 3 and 2 separately
+  - it is ambiguous
+  answer: 0
+  explanation: Subtraction is left-associative.
+- type: mcq
+  question: Why is -2 ^ 2 equal to -4?
+  options:
+  - Unary minus binds looser than ^
+  - Unary minus is ignored
+  - ^ is left-associative
+  - 2 ^ 2 is negative
+  answer: 0
+  explanation: It is -(2 ^ 2).
+- type: mcq
+  question: Reverse Polish notation...
+  options:
+  - needs no parentheses
+  - needs more parentheses
+  - lists operators first
+  - uses only one operator
+  answer: 0
+  explanation: Order alone determines the grouping.
+- type: mcq
+  question: Simplification stops when...
+  options:
+  - a pass changes nothing
+  - the tree is empty
+  - a number appears
+  - an error occurs
+  answer: 0
+  explanation: It repeats until a fixed point.
+- type: mcq
+  question: What does compiling to closures save?
+  options:
+  - Re-walking the tree on every evaluation
+  - Memory for tokens
+  - Parsing time
+  - Syntax errors
+  answer: 0
+  explanation: The structural work is done once.
+- type: code
+  question: 'Write `count_ops(ast)` that returns how many `"binop"` and `"unary"` nodes the AST contains. Nodes are tuples: `("num", v)`, `("var", name)`, `("unary", "-", operand)`, `("binop", op, left, right)`, and `("call", name, [args])`.'
+  starter: |
+    def count_ops(ast):
+        pass
+  tests:
+  - name: count
+    code: |
+      n = ("num", 1)
+      x = ("var", "x")
+      assert count_ops(n) == 0 and count_ops(x) == 0
+      assert count_ops(("binop", "+", n, x)) == 1
+      assert count_ops(("unary", "-", ("binop", "*", n, x))) == 2
+      assert count_ops(("call", "f", [("binop", "+", n, n), ("unary", "-", x)])) == 2
+      assert count_ops(("call", "f", [])) == 0
+  solution: |
+    def count_ops(ast):
+        kind = ast[0]
+        if kind == 'binop':
+            return 1 + count_ops(ast[2]) + count_ops(ast[3])
+        if kind == 'unary':
+            return 1 + count_ops(ast[2])
+        if kind == 'call':
+            return sum(count_ops(a) for a in ast[2])
+        return 0

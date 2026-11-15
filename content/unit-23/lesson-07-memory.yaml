@@ -1,0 +1,1149 @@
+id: u23-memory
+title: Memory Management and Garbage Collection
+minutes: 95
+objective: Learn how programs get and give back memory. You will build a heap-as-graph model, then write a mark-and-sweep collector, reference counting (and see why cycles defeat it), a memory allocator with fragmentation, and Cheney's copying collector.
+outcomes:
+- Explain the stack, the heap and why memory must be reclaimed
+- Write a mark-and-sweep collector
+- Explain reference counting and its cycle problem
+- Write an allocator with first-fit, best-fit and coalescing
+- Explain copying and generational collection
+sections:
+- heading: The stack, the heap and manual memory
+  body: |-
+    Programs keep data in two places. The **stack** holds the local variables of each running function; memory is claimed when a function is called and released automatically when it returns, so it is fast and tidy, but a value cannot outlive the function that made it. The **heap** holds data whose lifetime is not tied to one function: lists that grow, objects handed from place to place. Someone must decide when heap memory is no longer needed and can be reused.
+
+    In languages such as C that someone is **you**: you call `malloc` to get memory and `free` to give it back. It is fast and gives total control, and it is also the source of some of the most famous bugs and security holes in history. Forget to free and you have a **memory leak**: the program slowly eats all the memory. Free too early and you have a **dangling pointer**: code that still uses memory which now belongs to something else. Free twice and the allocator's records are corrupted. Languages such as Python, Java and JavaScript remove this burden with **automatic memory management**, also called **garbage collection** (GC). (Rust takes a third route: its compiler checks ownership rules so that memory is freed at the right moment without a collector running.)
+- heading: 'Finding garbage: reachability and reference counting'
+  body: |-
+    How can a collector know that an object will never be used again? It cannot read the future, so it uses a safe approximation: an object is garbage if **no code can ever reach it**. Picture memory as a **graph**: each object is a node, each reference is an edge. The **roots** are the references held directly by running code (local variables, globals). An object is **live** if it is reachable from a root, and every unreachable object is garbage. This definition ignores whether the program *would* actually use a live object; that is undecidable, a cousin of the halting problem.
+
+    **Tracing** collectors compute reachability directly. **Mark-and-sweep** has two phases: **mark** follows references from the roots (a graph search, with a visited set so cycles end) and flags everything it reaches; **sweep** walks the whole heap and frees whatever is not flagged. It handles cycles perfectly, but it typically must pause the program while it runs (a **stop-the-world** pause) and its sweep touches all memory, live or dead.
+
+    **Reference counting** takes the opposite approach. Each object stores a count of the references pointing at it. When the count drops to zero, the object is freed immediately, which in turn lowers the counts of the objects it pointed to, possibly freeing them too (a **cascade**). It is simple, predictable, and reclaims memory right away, and CPython uses it. Its weakness is **cycles**: if A points to B and B points to A, each keeps the other's count at one forever, even if the rest of the program has long forgotten both. Such objects **leak**. Real systems add a backup tracing collector for cycles (CPython has one, in the `gc` module) or offer **weak references**, which do not count.
+- heading: Allocation, fragmentation and copying
+  body: |-
+    Whoever frees memory also needs an **allocator** that finds space for new requests. A simple one keeps a list of free blocks. **First fit** takes the first block that is big enough; **best fit** takes the smallest sufficient one, hoping to preserve large blocks. A request usually leaves a remainder, which becomes a new free block; and when a block is freed it is **coalesced** (merged) with free neighbours, so free space does not shatter into useless crumbs. Even so, after many allocations and frees the free space is scattered in small pieces: this is **fragmentation**. A request for 50 cells can fail even though 70 are free, because no single piece is large enough.
+
+    A **copying collector** attacks fragmentation and cost together. Memory is split into two halves. Allocation just bumps a pointer forward in the active half (very fast). When it fills, the collector copies every **live** object into the empty half, packed together, then swaps the halves. **Cheney's algorithm** does this with a queue and no recursion: copy the roots, then scan the copied objects in order; whenever a scanned object points to something not yet copied, copy that too and update the pointer. A **forwarding** table (or a marker left in the old copy) ensures each object is moved once. The result is perfectly compact memory, and the time spent is proportional to the *live* data, not the garbage. The price is that half the memory is idle at any moment.
+
+    Finally, observation shows that **most objects die young**: temporary values vanish quickly, while a few survive for a long time. **Generational** collectors exploit this: new objects go in a small "young" area that is collected often and cheaply with a copying collector, and the survivors are promoted to an "old" area collected rarely. Java's and JavaScript's collectors work this way. Garbage collection is therefore not one algorithm but a family, a nice meeting of graphs (reachability), data structures (free lists) and engineering trade-offs (pauses, throughput, memory overhead).
+examples:
+- title: Tracing versus counting
+  intro: A heap with garbage, including a cycle, collected by two strategies.
+  code: |
+    def reachable(heap, roots):
+        """The heap is a dict from object id to the list of object ids it points to; roots is a list of ids held by variables (it may repeat ids). Return the sorted list of ids
+        reachable from the roots by following references (cycles are fine). ValueError('dangling reference ID') if a root or a reference names an id that is not a key of the heap."""
+        seen = set()
+        stack = list(roots)
+        while stack:
+            obj = stack.pop()
+            if obj not in heap:
+                raise ValueError("dangling reference %s" % (obj,))
+            if obj in seen:
+                continue
+            seen.add(obj)
+            stack.extend(heap[obj])
+        return sorted(seen)
+
+
+    def garbage(heap, roots):
+        """Sorted ids that are in the heap but not reachable from the roots."""
+        live = set(reachable(heap, roots))
+        return sorted(o for o in heap if o not in live)
+
+
+    def mark_sweep(heap, roots):
+        """Mark-and-sweep collection. MARK everything reachable from the roots, then SWEEP away the rest. Return (new_heap, freed): new_heap is a NEW dict holding only the surviving objects
+        (same ids, same reference lists), freed is the sorted list of removed ids. The input is not changed."""
+        live = set(reachable(heap, roots))
+        new_heap = {o: list(refs) for o, refs in heap.items() if o in live}
+        freed = sorted(o for o in heap if o not in live)
+        return new_heap, freed
+
+
+    def heap_stats(heap, roots):
+        """A dict {"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}."""
+        total = len(heap)
+        live = len(reachable(heap, roots))
+        g = total - live
+        return {"objects": total, "live": live, "garbage": g, "garbage_percent": round(100 * g / total, 1) if total else 0.0}
+
+
+    def refcounts(heap, roots):
+        """A dict for EVERY object id in the heap giving its reference count: how many times it appears in other objects' reference lists (every entry counts, including duplicates
+        and an object pointing to itself) plus how many times it appears in `roots`."""
+        counts = {o: 0 for o in heap}
+        for refs in heap.values():
+            for r in refs:
+                counts[r] += 1
+        for r in roots:
+            counts[r] += 1
+        return counts
+
+
+    def ref_count_collect(heap, roots):
+        """Reference-counting collection: free every object whose count is 0; freeing an object removes its outgoing references, which lowers its children's counts and may free
+        them too (a cascade). Return (new_heap, freed): the surviving objects as a new dict (same reference lists) and the sorted list of freed ids. Input is unchanged."""
+        counts = refcounts(heap, roots)
+        queue = sorted(o for o, c in counts.items() if c == 0)
+        freed = set()
+        while queue:
+            obj = queue.pop()
+            if obj in freed:
+                continue
+            freed.add(obj)
+            for child in heap[obj]:
+                counts[child] -= 1
+                if counts[child] == 0:
+                    queue.append(child)
+        new_heap = {o: list(refs) for o, refs in heap.items() if o not in freed}
+        return new_heap, sorted(freed)
+
+
+    def leaked_by_refcount(heap, roots):
+        """Sorted ids that are garbage (unreachable from the roots) but are NOT freed by reference counting: objects kept alive only by cycles."""
+        _, freed = ref_count_collect(heap, roots)
+        return sorted(set(garbage(heap, roots)) - set(freed))
+
+    heap = {0: [1, 2], 1: [3], 2: [], 3: [1], 4: [5], 5: [4], 6: [7], 7: []}
+    roots = [0]
+    print("stats:", heap_stats(heap, roots))
+    print("reachable:", reachable(heap, roots))
+    new_heap, freed = mark_sweep(heap, roots)
+    print("mark-sweep frees:", freed)
+    rc_heap, rc_freed = ref_count_collect(heap, roots)
+    print("reference counting frees:", rc_freed)
+    print("leaked by reference counting:", leaked_by_refcount(heap, roots))
+  output: |
+    stats: {'objects': 8, 'live': 4, 'garbage': 4, 'garbage_percent': 50.0}
+    reachable: [0, 1, 2, 3]
+    mark-sweep frees: [4, 5, 6, 7]
+    reference counting frees: [6, 7]
+    leaked by reference counting: [4, 5]
+  lines:
+  - line: 78
+    note: Half of the eight objects are unreachable.
+  - line: 84
+    note: Reference counting cannot free a cycle.
+- title: Fragmentation and copying
+  intro: A first-fit and best-fit allocator that runs out of room, and Cheney copying.
+  code: |
+    def new_memory(size):
+        """A memory of `size` cells: {"size": size, "blocks": [(start, length, name or None), ...]} where None marks a free block. It starts as one free block."""
+        return {"size": size, "blocks": [(0, size, None)]}
+
+
+    def malloc(mem, name, length, strategy="first"):
+        """Allocate `length` cells for `name` and return the start address. Choose a free block that is large enough: strategy "first" takes the lowest-address one; "best" takes the
+        smallest sufficient one (ties: lowest address). The allocation goes at the START of the chosen block and any remainder stays as a free block right after it. ValueError('bad size')
+        if length <= 0, ValueError('duplicate name NAME') if the name is already allocated, ValueError('out of memory') if no free block fits. Modifies `mem`."""
+        if length <= 0:
+            raise ValueError("bad size")
+        if any(b[2] == name for b in mem["blocks"]):
+            raise ValueError("duplicate name " + name)
+        candidates = [i for i, b in enumerate(mem["blocks"]) if b[2] is None and b[1] >= length]
+        if not candidates:
+            raise ValueError("out of memory")
+        if strategy == "best":
+            pick = min(candidates, key=lambda i: (mem["blocks"][i][1], mem["blocks"][i][0]))
+        else:
+            pick = candidates[0]
+        start, size, _ = mem["blocks"][pick]
+        pieces = [(start, length, name)]
+        if size > length:
+            pieces.append((start + length, size - length, None))
+        mem["blocks"][pick:pick + 1] = pieces
+        return start
+
+
+    def free(mem, name):
+        """Release the block owned by `name` and COALESCE: merge it with a free block just before it and/or just after it so the free space stays in as few pieces as possible.
+        ValueError('unknown name NAME') if nothing is allocated under that name. Modifies `mem`."""
+        blocks = mem["blocks"]
+        index = next((i for i, b in enumerate(blocks) if b[2] == name), None)
+        if index is None:
+            raise ValueError("unknown name " + name)
+        start, size, _ = blocks[index]
+        blocks[index] = (start, size, None)
+        if index + 1 < len(blocks) and blocks[index + 1][2] is None:
+            nxt = blocks.pop(index + 1)
+            blocks[index] = (start, size + nxt[1], None)
+        if index > 0 and blocks[index - 1][2] is None:
+            prev = blocks[index - 1]
+            cur = blocks.pop(index)
+            blocks[index - 1] = (prev[0], prev[1] + cur[1], None)
+
+
+    def fragmentation(mem):
+        """How scattered the free space is: 1 - (largest free block / total free cells), rounded to 3 decimals; 0.0 when there is no free space or only one free block."""
+        free_sizes = [b[1] for b in mem["blocks"] if b[2] is None]
+        if not free_sizes:
+            return 0.0
+        return round(1 - max(free_sizes) / sum(free_sizes), 3)
+
+
+    def copy_collect(heap, roots):
+        """Cheney's copying collector. Copy the reachable objects into a fresh 'to-space' numbered 0, 1, 2, ... in the order they are copied: first copy each root's object in order of
+        `roots` (an object already copied is not copied again), then SCAN the copied objects in order of their new id: for each reference in a scanned object, copy the target if it has not been copied
+        yet (in the order the references appear), and rewrite the reference to the new id. Return (new_heap, new_roots, forwarding): new_heap maps each new id to its list of new ids, new_roots is the
+        root list in new ids (same order and repeats as `roots`), and forwarding maps old ids to new ids. ValueError('dangling reference ID') for an id not in the heap."""
+        forwarding = {}
+        order = []
+
+        def copy(old):
+            if old not in heap:
+                raise ValueError("dangling reference %s" % (old,))
+            if old not in forwarding:
+                forwarding[old] = len(order)
+                order.append(old)
+            return forwarding[old]
+
+        new_roots = [copy(r) for r in roots]
+        new_heap = {}
+        scan = 0
+        while scan < len(order):
+            new_heap[scan] = [copy(child) for child in heap[order[scan]]]
+            scan += 1
+        return new_heap, new_roots, forwarding
+
+
+    def cheney_order(heap, roots):
+        """The list of OLD ids in the order Cheney's algorithm copies them (the same order used for the new ids)."""
+        _, _, forwarding = copy_collect(heap, roots)
+        return sorted(forwarding, key=lambda old: forwarding[old])
+
+    mem = new_memory(100)
+    for name, size in (("A", 10), ("B", 20), ("C", 10), ("D", 8), ("E", 10)):
+        malloc(mem, name, size)
+    free(mem, "B")
+    free(mem, "D")
+    print("free blocks:", [(b[0], b[1]) for b in mem["blocks"] if b[2] is None])
+    print("fragmentation:", fragmentation(mem))
+    def copy_of(m):
+        return {"size": m["size"], "blocks": list(m["blocks"])}
+    print("first fit places a 6-cell request at", malloc(copy_of(mem), "F", 6))
+    print("best fit places it at", malloc(copy_of(mem), "F", 6, "best"))
+    print("a 50-cell request:", end=" ")
+    try:
+        malloc(mem, "big", 50)
+    except ValueError as error:
+        print(error, "(despite", sum(b[1] for b in mem["blocks"] if b[2] is None), "free cells)")
+    heap = {10: [20, 30], 20: [10], 30: [], 40: [10], 50: [60], 60: []}
+    new_heap, new_roots, forwarding = copy_collect(heap, [10])
+    print("copied:", new_heap, "from old ids", cheney_order(heap, [10]))
+  output: |
+    free blocks: [(10, 20), (40, 8), (58, 42)]
+    fragmentation: 0.4
+    first fit places a 6-cell request at 10
+    best fit places it at 40
+    a 50-cell request: out of memory (despite 70 free cells)
+    copied: {0: [1, 2], 1: [0], 2: []} from old ids [10, 20, 30]
+  lines:
+  - line: 91
+    note: Scattered free space.
+  - line: 94
+    note: First fit takes the first big-enough hole.
+  - line: 95
+    note: Best fit takes the smallest big-enough hole.
+  - line: 103
+    note: Live objects end up in 0, 1, 2 with no gaps.
+playground:
+  prompt: Draw a heap as a dict, then list which objects can be reached from a root by hand.
+  code: |
+    heap = {0: [1], 1: [2], 2: [], 3: [3]}
+    roots = [0]
+    seen = set()
+    stack = list(roots)
+    while stack:
+        obj = stack.pop()
+        if obj not in seen:
+            seen.add(obj)
+            stack.extend(heap[obj])
+    print(sorted(seen))
+exercises:
+- id: marksweep
+  title: Mark and sweep
+  difficulty: 4
+  prompt: 'A **heap** here is a dict from object id to the list of ids that object points to; `roots` is a list of ids held directly by variables (it may repeat). Write `reachable(heap, roots)`, the sorted list of ids reachable from the roots by following references (cycles are fine; raise `ValueError("dangling reference ID")` if a root or reference names an id that is not in the heap). Write `garbage(heap, roots)` (sorted ids in the heap that are not reachable). Write `mark_sweep(heap, roots)`: **mark** everything reachable, **sweep** away the rest, returning `(new_heap, freed)` where `new_heap` is a **new** dict of the survivors (same ids, same reference lists) and `freed` is the sorted list of removed ids; the input is not changed. Write `heap_stats(heap, roots)`: a dict `{"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}`.'
+  starter: |-
+    def reachable(heap, roots):
+        """The heap is a dict from object id to the list of object ids it points to; roots is a list of ids held by variables (it may repeat ids). Return the sorted list of ids
+        reachable from the roots by following references (cycles are fine). ValueError('dangling reference ID') if a root or a reference names an id that is not a key of the heap."""
+        pass
+
+
+    def garbage(heap, roots):
+        """Sorted ids that are in the heap but not reachable from the roots."""
+        pass
+
+
+    def mark_sweep(heap, roots):
+        """Mark-and-sweep collection. MARK everything reachable from the roots, then SWEEP away the rest. Return (new_heap, freed): new_heap is a NEW dict holding only the surviving objects
+        (same ids, same reference lists), freed is the sorted list of removed ids. The input is not changed."""
+        pass
+
+
+    def heap_stats(heap, roots):
+        """A dict {"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}."""
+        pass
+  tests:
+  - name: reachability
+    code: |
+      heap = {0: [1, 2], 1: [3], 2: [], 3: [1], 4: [5], 5: [4], 6: []}
+      assert reachable(heap, [0]) == [0, 1, 2, 3]
+      assert reachable(heap, [4]) == [4, 5]
+      assert reachable(heap, [0, 6, 0]) == [0, 1, 2, 3, 6]
+      assert reachable(heap, []) == []
+      assert garbage(heap, [0]) == [4, 5, 6]
+      assert garbage(heap, [0, 4, 6]) == []
+      assert reachable({0: [0]}, [0]) == [0]
+      for bad_heap, bad_roots in (({0: [9]}, [0]), ({0: []}, [3])):
+          try:
+              reachable(bad_heap, bad_roots)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "dangling reference" in str(e)
+  - name: sweeping
+    code: |
+      heap = {0: [1, 2], 1: [3], 2: [], 3: [1], 4: [5], 5: [4], 6: []}
+      new, freed = mark_sweep(heap, [0])
+      assert new == {0: [1, 2], 1: [3], 2: [], 3: [1]} and freed == [4, 5, 6]
+      assert len(heap) == 7
+      new["0"] = 1
+      assert "0" not in heap
+      new, freed = mark_sweep(heap, [])
+      assert new == {} and freed == [0, 1, 2, 3, 4, 5, 6]
+      new, freed = mark_sweep({}, [])
+      assert new == {} and freed == []
+      new, freed = mark_sweep({0: [1], 1: []}, [0])
+      assert freed == [] and new == {0: [1], 1: []}
+      copy_of = {0: [1], 1: []}
+      new, _ = mark_sweep(copy_of, [0])
+      new[0].append(7)
+      assert copy_of[0] == [1]
+  - name: statistics
+    code: |
+      heap = {0: [1, 2], 1: [3], 2: [], 3: [1], 4: [5], 5: [4], 6: []}
+      assert heap_stats(heap, [0]) == {"objects": 7, "live": 4, "garbage": 3, "garbage_percent": 42.9}
+      assert heap_stats(heap, [0, 4, 6]) == {"objects": 7, "live": 7, "garbage": 0, "garbage_percent": 0.0}
+      assert heap_stats({}, []) == {"objects": 0, "live": 0, "garbage": 0, "garbage_percent": 0.0}
+      assert heap_stats({0: []}, []) == {"objects": 1, "live": 0, "garbage": 1, "garbage_percent": 100.0}
+  hints:
+  - Follow references from the roots with a stack; remember the ones you have already seen so cycles end.
+  solution: |
+    def reachable(heap, roots):
+        """The heap is a dict from object id to the list of object ids it points to; roots is a list of ids held by variables (it may repeat ids). Return the sorted list of ids
+        reachable from the roots by following references (cycles are fine). ValueError('dangling reference ID') if a root or a reference names an id that is not a key of the heap."""
+        seen = set()
+        stack = list(roots)
+        while stack:
+            obj = stack.pop()
+            if obj not in heap:
+                raise ValueError("dangling reference %s" % (obj,))
+            if obj in seen:
+                continue
+            seen.add(obj)
+            stack.extend(heap[obj])
+        return sorted(seen)
+
+
+    def garbage(heap, roots):
+        """Sorted ids that are in the heap but not reachable from the roots."""
+        live = set(reachable(heap, roots))
+        return sorted(o for o in heap if o not in live)
+
+
+    def mark_sweep(heap, roots):
+        """Mark-and-sweep collection. MARK everything reachable from the roots, then SWEEP away the rest. Return (new_heap, freed): new_heap is a NEW dict holding only the surviving objects
+        (same ids, same reference lists), freed is the sorted list of removed ids. The input is not changed."""
+        live = set(reachable(heap, roots))
+        new_heap = {o: list(refs) for o, refs in heap.items() if o in live}
+        freed = sorted(o for o in heap if o not in live)
+        return new_heap, freed
+
+
+    def heap_stats(heap, roots):
+        """A dict {"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}."""
+        total = len(heap)
+        live = len(reachable(heap, roots))
+        g = total - live
+        return {"objects": total, "live": live, "garbage": g, "garbage_percent": round(100 * g / total, 1) if total else 0.0}
+  explanation: Mark-and-sweep treats memory as a graph and keeps whatever the program can still reach.
+- id: refcount
+  title: Reference counting and its blind spot
+  difficulty: 5
+  prompt: 'The starter has the tracing tools from the last exercise. **Reference counting** frees an object as soon as nothing refers to it. Write `refcounts(heap, roots)`, a dict for **every** object giving how many times it appears in other objects'' reference lists (every entry counts, including duplicates and an object pointing to itself) plus how many times it appears in `roots`. Write `ref_count_collect(heap, roots)`: free every object whose count is 0; freeing an object removes its outgoing references, which lowers its children''s counts and may free them too (a **cascade**). Return `(new_heap, freed)`: the surviving objects as a new dict (same reference lists) and the sorted list of freed ids; the input is unchanged. Write `leaked_by_refcount(heap, roots)`: sorted ids that are garbage (unreachable from the roots) but are **not** freed by reference counting, objects kept alive only by cycles.'
+  starter: |-
+    def reachable(heap, roots):
+        """The heap is a dict from object id to the list of object ids it points to; roots is a list of ids held by variables (it may repeat ids). Return the sorted list of ids
+        reachable from the roots by following references (cycles are fine). ValueError('dangling reference ID') if a root or a reference names an id that is not a key of the heap."""
+        seen = set()
+        stack = list(roots)
+        while stack:
+            obj = stack.pop()
+            if obj not in heap:
+                raise ValueError("dangling reference %s" % (obj,))
+            if obj in seen:
+                continue
+            seen.add(obj)
+            stack.extend(heap[obj])
+        return sorted(seen)
+
+
+    def garbage(heap, roots):
+        """Sorted ids that are in the heap but not reachable from the roots."""
+        live = set(reachable(heap, roots))
+        return sorted(o for o in heap if o not in live)
+
+
+    def mark_sweep(heap, roots):
+        """Mark-and-sweep collection. MARK everything reachable from the roots, then SWEEP away the rest. Return (new_heap, freed): new_heap is a NEW dict holding only the surviving objects
+        (same ids, same reference lists), freed is the sorted list of removed ids. The input is not changed."""
+        live = set(reachable(heap, roots))
+        new_heap = {o: list(refs) for o, refs in heap.items() if o in live}
+        freed = sorted(o for o in heap if o not in live)
+        return new_heap, freed
+
+
+    def heap_stats(heap, roots):
+        """A dict {"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}."""
+        total = len(heap)
+        live = len(reachable(heap, roots))
+        g = total - live
+        return {"objects": total, "live": live, "garbage": g, "garbage_percent": round(100 * g / total, 1) if total else 0.0}
+
+
+    def refcounts(heap, roots):
+        """A dict for EVERY object id in the heap giving its reference count: how many times it appears in other objects' reference lists (every entry counts, including duplicates
+        and an object pointing to itself) plus how many times it appears in `roots`."""
+        pass
+
+
+    def ref_count_collect(heap, roots):
+        """Reference-counting collection: free every object whose count is 0; freeing an object removes its outgoing references, which lowers its children's counts and may free
+        them too (a cascade). Return (new_heap, freed): the surviving objects as a new dict (same reference lists) and the sorted list of freed ids. Input is unchanged."""
+        pass
+
+
+    def leaked_by_refcount(heap, roots):
+        """Sorted ids that are garbage (unreachable from the roots) but are NOT freed by reference counting: objects kept alive only by cycles."""
+        pass
+  tests:
+  - name: counting
+    code: |
+      heap = {0: [1, 2], 1: [3], 2: [3], 3: []}
+      assert refcounts(heap, []) == {0: 0, 1: 1, 2: 1, 3: 2}
+      assert refcounts(heap, [0, 0]) == {0: 2, 1: 1, 2: 1, 3: 2}
+      assert refcounts({0: [1, 1], 1: []}, []) == {0: 0, 1: 2}
+      assert refcounts({0: [0]}, []) == {0: 1}
+      assert refcounts({}, []) == {}
+  - name: cascading frees
+    code: |
+      chain = {0: [1], 1: [2], 2: []}
+      new, freed = ref_count_collect(chain, [])
+      assert new == {} and freed == [0, 1, 2]
+      new, freed = ref_count_collect(chain, [0])
+      assert new == chain and freed == []
+      new, freed = ref_count_collect(chain, [1])
+      assert new == {1: [2], 2: []} and freed == [0]
+      diamond = {0: [1, 2], 1: [3], 2: [3], 3: []}
+      new, freed = ref_count_collect(diamond, [])
+      assert freed == [0, 1, 2, 3] and new == {}
+      new, freed = ref_count_collect({0: [1, 1], 1: []}, [])
+      assert freed == [0, 1]
+      assert ref_count_collect({}, []) == ({}, [])
+      before = {0: [1], 1: []}
+      ref_count_collect(before, [])
+      assert before == {0: [1], 1: []}
+  - name: cycles leak
+    code: |
+      cyc = {0: [1], 1: [0], 2: []}
+      new, freed = ref_count_collect(cyc, [])
+      assert freed == [2] and new == {0: [1], 1: [0]}
+      assert leaked_by_refcount(cyc, []) == [0, 1]
+      assert leaked_by_refcount(cyc, [0]) == []
+      assert leaked_by_refcount({0: [0]}, []) == [0]
+      assert leaked_by_refcount({0: [1], 1: []}, []) == []
+      tail = {0: [1], 1: [0, 2], 2: []}
+      assert leaked_by_refcount(tail, []) == [0, 1, 2]
+      assert ref_count_collect(tail, [])[1] == []
+  hints:
+  - Count references first, then free zero-count objects and repeat as children's counts drop.
+  solution: |
+    def reachable(heap, roots):
+        """The heap is a dict from object id to the list of object ids it points to; roots is a list of ids held by variables (it may repeat ids). Return the sorted list of ids
+        reachable from the roots by following references (cycles are fine). ValueError('dangling reference ID') if a root or a reference names an id that is not a key of the heap."""
+        seen = set()
+        stack = list(roots)
+        while stack:
+            obj = stack.pop()
+            if obj not in heap:
+                raise ValueError("dangling reference %s" % (obj,))
+            if obj in seen:
+                continue
+            seen.add(obj)
+            stack.extend(heap[obj])
+        return sorted(seen)
+
+
+    def garbage(heap, roots):
+        """Sorted ids that are in the heap but not reachable from the roots."""
+        live = set(reachable(heap, roots))
+        return sorted(o for o in heap if o not in live)
+
+
+    def mark_sweep(heap, roots):
+        """Mark-and-sweep collection. MARK everything reachable from the roots, then SWEEP away the rest. Return (new_heap, freed): new_heap is a NEW dict holding only the surviving objects
+        (same ids, same reference lists), freed is the sorted list of removed ids. The input is not changed."""
+        live = set(reachable(heap, roots))
+        new_heap = {o: list(refs) for o, refs in heap.items() if o in live}
+        freed = sorted(o for o in heap if o not in live)
+        return new_heap, freed
+
+
+    def heap_stats(heap, roots):
+        """A dict {"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}."""
+        total = len(heap)
+        live = len(reachable(heap, roots))
+        g = total - live
+        return {"objects": total, "live": live, "garbage": g, "garbage_percent": round(100 * g / total, 1) if total else 0.0}
+
+
+    def refcounts(heap, roots):
+        """A dict for EVERY object id in the heap giving its reference count: how many times it appears in other objects' reference lists (every entry counts, including duplicates
+        and an object pointing to itself) plus how many times it appears in `roots`."""
+        counts = {o: 0 for o in heap}
+        for refs in heap.values():
+            for r in refs:
+                counts[r] += 1
+        for r in roots:
+            counts[r] += 1
+        return counts
+
+
+    def ref_count_collect(heap, roots):
+        """Reference-counting collection: free every object whose count is 0; freeing an object removes its outgoing references, which lowers its children's counts and may free
+        them too (a cascade). Return (new_heap, freed): the surviving objects as a new dict (same reference lists) and the sorted list of freed ids. Input is unchanged."""
+        counts = refcounts(heap, roots)
+        queue = sorted(o for o, c in counts.items() if c == 0)
+        freed = set()
+        while queue:
+            obj = queue.pop()
+            if obj in freed:
+                continue
+            freed.add(obj)
+            for child in heap[obj]:
+                counts[child] -= 1
+                if counts[child] == 0:
+                    queue.append(child)
+        new_heap = {o: list(refs) for o, refs in heap.items() if o not in freed}
+        return new_heap, sorted(freed)
+
+
+    def leaked_by_refcount(heap, roots):
+        """Sorted ids that are garbage (unreachable from the roots) but are NOT freed by reference counting: objects kept alive only by cycles."""
+        _, freed = ref_count_collect(heap, roots)
+        return sorted(set(garbage(heap, roots)) - set(freed))
+  explanation: Reference counting is simple and immediate, but cycles keep each other alive forever.
+- id: allocator
+  title: A memory allocator
+  difficulty: 5
+  prompt: 'A memory is `{"size": N, "blocks": [(start, length, name or None), ...]}` where `None` marks a free block, kept sorted by address. Write `new_memory(size)` (one free block covering everything), and `malloc(mem, name, length, strategy="first")`, which allocates `length` cells for `name` and returns the start address. Choose a free block that is large enough: strategy `"first"` takes the lowest-address one, `"best"` takes the **smallest** sufficient one (ties: lowest address). The allocation goes at the **start** of the chosen block and any remainder stays as a free block right after it. Raise `ValueError("bad size")` if `length <= 0`, `ValueError("duplicate name NAME")` if the name is already allocated and `ValueError("out of memory")` if no free block fits. Write `free(mem, name)`: release the block and **coalesce**, merging it with a free block just before and/or just after it so free space stays in as few pieces as possible; `ValueError("unknown name NAME")` if the name is not allocated. Both modify `mem`. Write `fragmentation(mem)`: `1 - largest_free_block / total_free_cells` rounded to 3 decimals; `0.0` when there is no free space.'
+  starter: |-
+    def new_memory(size):
+        """A memory of `size` cells: {"size": size, "blocks": [(start, length, name or None), ...]} where None marks a free block. It starts as one free block."""
+        pass
+
+
+    def malloc(mem, name, length, strategy="first"):
+        """Allocate `length` cells for `name` and return the start address. Choose a free block that is large enough: strategy "first" takes the lowest-address one; "best" takes the
+        smallest sufficient one (ties: lowest address). The allocation goes at the START of the chosen block and any remainder stays as a free block right after it. ValueError('bad size')
+        if length <= 0, ValueError('duplicate name NAME') if the name is already allocated, ValueError('out of memory') if no free block fits. Modifies `mem`."""
+        pass
+
+
+    def free(mem, name):
+        """Release the block owned by `name` and COALESCE: merge it with a free block just before it and/or just after it so the free space stays in as few pieces as possible.
+        ValueError('unknown name NAME') if nothing is allocated under that name. Modifies `mem`."""
+        pass
+
+
+    def fragmentation(mem):
+        """How scattered the free space is: 1 - (largest free block / total free cells), rounded to 3 decimals; 0.0 when there is no free space or only one free block."""
+        pass
+  tests:
+  - name: allocating
+    code: |
+      mem = new_memory(100)
+      assert mem == {"size": 100, "blocks": [(0, 100, None)]}
+      assert malloc(mem, "A", 10) == 0 and malloc(mem, "B", 20) == 10 and malloc(mem, "C", 10) == 30
+      assert mem["blocks"] == [(0, 10, "A"), (10, 20, "B"), (30, 10, "C"), (40, 60, None)]
+      assert malloc(mem, "D", 60) == 40
+      assert mem["blocks"][-1] == (40, 60, "D")
+      for bad, msg in ((lambda: malloc(mem, "E", 1), "out of memory"), (lambda: malloc(mem, "A", 1), "duplicate name A"), (lambda: malloc(mem, "F", 0), "bad size"), (lambda: malloc(mem, "F", -3), "bad size")):
+          try:
+              bad()
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: freeing and coalescing
+    code: |
+      mem = new_memory(100)
+      for name, size in (("A", 10), ("B", 20), ("C", 10)):
+          malloc(mem, name, size)
+      free(mem, "B")
+      assert mem["blocks"] == [(0, 10, "A"), (10, 20, None), (30, 10, "C"), (40, 60, None)]
+      free(mem, "C")
+      assert mem["blocks"] == [(0, 10, "A"), (10, 90, None)]
+      free(mem, "A")
+      assert mem["blocks"] == [(0, 100, None)]
+      mem = new_memory(30)
+      for name in "XYZ":
+          malloc(mem, name, 10)
+      free(mem, "X")
+      free(mem, "Z")
+      assert mem["blocks"] == [(0, 10, None), (10, 10, "Y"), (20, 10, None)]
+      free(mem, "Y")
+      assert mem["blocks"] == [(0, 30, None)]
+      try:
+          free(mem, "X")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown name X" in str(e)
+  - name: first fit versus best fit
+    code: |
+      def setup():
+          mem = new_memory(100)
+          for name, size in (("A", 10), ("B", 20), ("C", 10), ("D", 8), ("E", 10)):
+              malloc(mem, name, size)
+          free(mem, "B")
+          free(mem, "D")
+          return mem
+      mem = setup()
+      assert mem["blocks"] == [(0, 10, "A"), (10, 20, None), (30, 10, "C"), (40, 8, None), (48, 10, "E"), (58, 42, None)]
+      assert malloc(mem, "F", 6) == 10
+      assert mem["blocks"][1:3] == [(10, 6, "F"), (16, 14, None)]
+      mem = setup()
+      assert malloc(mem, "F", 6, "best") == 40
+      assert mem["blocks"][3:5] == [(40, 6, "F"), (46, 2, None)]
+      mem = setup()
+      assert malloc(mem, "G", 20, "best") == 10 and mem["blocks"][1] == (10, 20, "G")
+      mem = setup()
+      assert malloc(mem, "H", 30, "first") == 58
+      mem = setup()
+      assert malloc(mem, "H", 25, "best") == 58
+  - name: fragmentation
+    code: |
+      mem = new_memory(100)
+      assert fragmentation(mem) == 0.0
+      for name, size in (("A", 10), ("B", 20), ("C", 10), ("D", 8), ("E", 10)):
+          malloc(mem, name, size)
+      free(mem, "B")
+      free(mem, "D")
+      assert fragmentation(mem) == round(1 - 42 / 70, 3) == 0.4
+      malloc(mem, "big", 42)
+      assert fragmentation(mem) == round(1 - 20 / 28, 3)
+      full = new_memory(5)
+      malloc(full, "x", 5)
+      assert fragmentation(full) == 0.0
+  hints:
+  - Find candidate free blocks, choose by strategy, split the chosen block; when freeing, merge with free neighbours.
+  solution: |
+    def new_memory(size):
+        """A memory of `size` cells: {"size": size, "blocks": [(start, length, name or None), ...]} where None marks a free block. It starts as one free block."""
+        return {"size": size, "blocks": [(0, size, None)]}
+
+
+    def malloc(mem, name, length, strategy="first"):
+        """Allocate `length` cells for `name` and return the start address. Choose a free block that is large enough: strategy "first" takes the lowest-address one; "best" takes the
+        smallest sufficient one (ties: lowest address). The allocation goes at the START of the chosen block and any remainder stays as a free block right after it. ValueError('bad size')
+        if length <= 0, ValueError('duplicate name NAME') if the name is already allocated, ValueError('out of memory') if no free block fits. Modifies `mem`."""
+        if length <= 0:
+            raise ValueError("bad size")
+        if any(b[2] == name for b in mem["blocks"]):
+            raise ValueError("duplicate name " + name)
+        candidates = [i for i, b in enumerate(mem["blocks"]) if b[2] is None and b[1] >= length]
+        if not candidates:
+            raise ValueError("out of memory")
+        if strategy == "best":
+            pick = min(candidates, key=lambda i: (mem["blocks"][i][1], mem["blocks"][i][0]))
+        else:
+            pick = candidates[0]
+        start, size, _ = mem["blocks"][pick]
+        pieces = [(start, length, name)]
+        if size > length:
+            pieces.append((start + length, size - length, None))
+        mem["blocks"][pick:pick + 1] = pieces
+        return start
+
+
+    def free(mem, name):
+        """Release the block owned by `name` and COALESCE: merge it with a free block just before it and/or just after it so the free space stays in as few pieces as possible.
+        ValueError('unknown name NAME') if nothing is allocated under that name. Modifies `mem`."""
+        blocks = mem["blocks"]
+        index = next((i for i, b in enumerate(blocks) if b[2] == name), None)
+        if index is None:
+            raise ValueError("unknown name " + name)
+        start, size, _ = blocks[index]
+        blocks[index] = (start, size, None)
+        if index + 1 < len(blocks) and blocks[index + 1][2] is None:
+            nxt = blocks.pop(index + 1)
+            blocks[index] = (start, size + nxt[1], None)
+        if index > 0 and blocks[index - 1][2] is None:
+            prev = blocks[index - 1]
+            cur = blocks.pop(index)
+            blocks[index - 1] = (prev[0], prev[1] + cur[1], None)
+
+
+    def fragmentation(mem):
+        """How scattered the free space is: 1 - (largest free block / total free cells), rounded to 3 decimals; 0.0 when there is no free space or only one free block."""
+        free_sizes = [b[1] for b in mem["blocks"] if b[2] is None]
+        if not free_sizes:
+            return 0.0
+        return round(1 - max(free_sizes) / sum(free_sizes), 3)
+  explanation: 'Allocators trade speed against fragmentation: free memory scattered in small pieces cannot satisfy a big request.'
+- id: copying
+  title: A copying collector
+  difficulty: 5
+  prompt: 'A **copying collector** moves live objects into a fresh area, which both removes garbage and **compacts** memory. Write `copy_collect(heap, roots)` using **Cheney''s algorithm**. Copy the reachable objects into a new "to-space" numbered `0, 1, 2, ...` in copy order: first copy each root''s object in order of `roots` (an object already copied is not copied again), then **scan** the copied objects in order of their new id; for each reference in a scanned object, copy the target if it has not been copied yet (in the order the references appear) and rewrite the reference to the new id. Return `(new_heap, new_roots, forwarding)`: `new_heap` maps each new id to its list of new ids, `new_roots` is the root list in new ids (same order, same repeats), and `forwarding` maps old ids to new ids. Raise `ValueError("dangling reference ID")` for an id not in the heap. Write `cheney_order(heap, roots)`, the list of **old** ids in the order they were copied.'
+  starter: |-
+    def copy_collect(heap, roots):
+        """Cheney's copying collector. Copy the reachable objects into a fresh 'to-space' numbered 0, 1, 2, ... in the order they are copied: first copy each root's object in order of
+        `roots` (an object already copied is not copied again), then SCAN the copied objects in order of their new id: for each reference in a scanned object, copy the target if it has not been copied
+        yet (in the order the references appear), and rewrite the reference to the new id. Return (new_heap, new_roots, forwarding): new_heap maps each new id to its list of new ids, new_roots is the
+        root list in new ids (same order and repeats as `roots`), and forwarding maps old ids to new ids. ValueError('dangling reference ID') for an id not in the heap."""
+        pass
+
+
+    def cheney_order(heap, roots):
+        """The list of OLD ids in the order Cheney's algorithm copies them (the same order used for the new ids)."""
+        pass
+  tests:
+  - name: a simple copy
+    code: |
+      heap = {5: [7, 9], 7: [5], 9: [], 3: [9]}
+      new_heap, new_roots, fwd = copy_collect(heap, [5])
+      assert new_heap == {0: [1, 2], 1: [0], 2: []} and new_roots == [0] and fwd == {5: 0, 7: 1, 9: 2}
+      assert 3 not in fwd
+      assert heap == {5: [7, 9], 7: [5], 9: [], 3: [9]}
+      assert cheney_order(heap, [5]) == [5, 7, 9]
+  - name: order of copying
+    code: |
+      heap = {5: [7, 9], 7: [5], 9: [], 3: [9]}
+      new_heap, new_roots, fwd = copy_collect(heap, [9, 5, 9])
+      assert new_roots == [0, 1, 0]
+      assert fwd == {9: 0, 5: 1, 7: 2} and new_heap == {0: [], 1: [2, 0], 2: [1]}
+      assert cheney_order(heap, [9, 5, 9]) == [9, 5, 7]
+      chain = {0: [1], 1: [2], 2: [3], 3: []}
+      assert copy_collect(chain, [0])[0] == {0: [1], 1: [2], 2: [3], 3: []}
+      tree = {10: [20, 30], 20: [40, 50], 30: [60], 40: [], 50: [], 60: []}
+      assert cheney_order(tree, [10]) == [10, 20, 30, 40, 50, 60]
+  - name: compaction and sharing
+    code: |
+      heap = {i * 10: [] for i in range(1, 8)}
+      heap[10] = [30, 30, 50]
+      new_heap, new_roots, fwd = copy_collect(heap, [10])
+      assert new_heap == {0: [1, 1, 2], 1: [], 2: []} and len(new_heap) == 3
+      assert sorted(new_heap) == list(range(3))
+      new_heap, new_roots, fwd = copy_collect({0: [0]}, [0])
+      assert new_heap == {0: [0]} and fwd == {0: 0}
+      assert copy_collect({}, []) == ({}, [], {})
+      assert copy_collect({0: [1], 1: []}, []) == ({}, [], {})
+  - name: dangling references
+    code: |
+      for h, r in (({0: [4]}, [0]), ({0: []}, [2])):
+          try:
+              copy_collect(h, r)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "dangling reference" in str(e)
+  hints:
+  - 'Use a list as the to-space queue: the scan position walks along it while new objects are appended.'
+  solution: |
+    def copy_collect(heap, roots):
+        """Cheney's copying collector. Copy the reachable objects into a fresh 'to-space' numbered 0, 1, 2, ... in the order they are copied: first copy each root's object in order of
+        `roots` (an object already copied is not copied again), then SCAN the copied objects in order of their new id: for each reference in a scanned object, copy the target if it has not been copied
+        yet (in the order the references appear), and rewrite the reference to the new id. Return (new_heap, new_roots, forwarding): new_heap maps each new id to its list of new ids, new_roots is the
+        root list in new ids (same order and repeats as `roots`), and forwarding maps old ids to new ids. ValueError('dangling reference ID') for an id not in the heap."""
+        forwarding = {}
+        order = []
+
+        def copy(old):
+            if old not in heap:
+                raise ValueError("dangling reference %s" % (old,))
+            if old not in forwarding:
+                forwarding[old] = len(order)
+                order.append(old)
+            return forwarding[old]
+
+        new_roots = [copy(r) for r in roots]
+        new_heap = {}
+        scan = 0
+        while scan < len(order):
+            new_heap[scan] = [copy(child) for child in heap[order[scan]]]
+            scan += 1
+        return new_heap, new_roots, forwarding
+
+
+    def cheney_order(heap, roots):
+        """The list of OLD ids in the order Cheney's algorithm copies them (the same order used for the new ids)."""
+        _, _, forwarding = copy_collect(heap, roots)
+        return sorted(forwarding, key=lambda old: forwarding[old])
+  explanation: Copying collection costs time proportional to the live data only, and leaves memory perfectly compact.
+- id: simulate
+  title: 'Capstone: comparing collectors'
+  difficulty: 5
+  prompt: 'The starter has `mark_sweep`, `garbage`, `refcounts` and `ref_count_collect`. Write `run_ops(ops, mode)`, a simulation of a tiny program under a garbage-collection `mode`. The state is a heap (id to reference list), variables (name to object id) and a counter that gives new objects the ids `0, 1, 2, ...` in order. Operations: `("new", var)` allocates an object and stores it in `var` (rebinding `var` drops the old object from the variables); `("link", a, b)` appends a reference from the object in `a` to the object in `b`; `("unlink", a, b)` removes **one** reference (the first) from `a`''s object to `b`''s object; `("drop", var)` deletes the variable; `("collect",)` runs `mark_sweep` from the variables'' objects. Raise `ValueError("unknown variable X")` for a missing variable and `ValueError("no such link")` when `unlink` finds no reference. Mode `"tracing"`: objects are freed only by `("collect",)`. Mode `"refcount"`: after every operation **except** `collect` run `ref_count_collect` (a cascade) and ignore `("collect",)`. The roots given to the collectors are the variables'' object ids sorted by variable name. Return `{"live": sorted ids still in the heap, "freed": sorted ids freed so far, "garbage": sorted ids in the heap unreachable from the variables, "peak": the largest heap size seen after any operation (before the refcount cleanup of that operation)}`.'
+  starter: |-
+    def reachable(heap, roots):
+        """The heap is a dict from object id to the list of object ids it points to; roots is a list of ids held by variables (it may repeat ids). Return the sorted list of ids
+        reachable from the roots by following references (cycles are fine). ValueError('dangling reference ID') if a root or a reference names an id that is not a key of the heap."""
+        seen = set()
+        stack = list(roots)
+        while stack:
+            obj = stack.pop()
+            if obj not in heap:
+                raise ValueError("dangling reference %s" % (obj,))
+            if obj in seen:
+                continue
+            seen.add(obj)
+            stack.extend(heap[obj])
+        return sorted(seen)
+
+
+    def garbage(heap, roots):
+        """Sorted ids that are in the heap but not reachable from the roots."""
+        live = set(reachable(heap, roots))
+        return sorted(o for o in heap if o not in live)
+
+
+    def mark_sweep(heap, roots):
+        """Mark-and-sweep collection. MARK everything reachable from the roots, then SWEEP away the rest. Return (new_heap, freed): new_heap is a NEW dict holding only the surviving objects
+        (same ids, same reference lists), freed is the sorted list of removed ids. The input is not changed."""
+        live = set(reachable(heap, roots))
+        new_heap = {o: list(refs) for o, refs in heap.items() if o in live}
+        freed = sorted(o for o in heap if o not in live)
+        return new_heap, freed
+
+
+    def heap_stats(heap, roots):
+        """A dict {"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}."""
+        total = len(heap)
+        live = len(reachable(heap, roots))
+        g = total - live
+        return {"objects": total, "live": live, "garbage": g, "garbage_percent": round(100 * g / total, 1) if total else 0.0}
+
+
+    def refcounts(heap, roots):
+        """A dict for EVERY object id in the heap giving its reference count: how many times it appears in other objects' reference lists (every entry counts, including duplicates
+        and an object pointing to itself) plus how many times it appears in `roots`."""
+        counts = {o: 0 for o in heap}
+        for refs in heap.values():
+            for r in refs:
+                counts[r] += 1
+        for r in roots:
+            counts[r] += 1
+        return counts
+
+
+    def ref_count_collect(heap, roots):
+        """Reference-counting collection: free every object whose count is 0; freeing an object removes its outgoing references, which lowers its children's counts and may free
+        them too (a cascade). Return (new_heap, freed): the surviving objects as a new dict (same reference lists) and the sorted list of freed ids. Input is unchanged."""
+        counts = refcounts(heap, roots)
+        queue = sorted(o for o, c in counts.items() if c == 0)
+        freed = set()
+        while queue:
+            obj = queue.pop()
+            if obj in freed:
+                continue
+            freed.add(obj)
+            for child in heap[obj]:
+                counts[child] -= 1
+                if counts[child] == 0:
+                    queue.append(child)
+        new_heap = {o: list(refs) for o, refs in heap.items() if o not in freed}
+        return new_heap, sorted(freed)
+
+
+
+
+    def run_ops(ops, mode):
+        """Simulate a tiny program that allocates objects and keeps them in named variables, under a garbage-collection `mode`. The state: heap (id -> reference list), variables
+        (name -> object id) and a counter that gives new objects the ids 0, 1, 2, ... in order. Operations: ("new", var) allocate an object and store it in var (rebinding var drops its old object from
+        the variables); ("link", a, b) append a reference from the object in a to the object in b; ("unlink", a, b) remove ONE reference (the first) from a's object to b's object; ("drop", var) delete
+        the variable; ("collect",) run mark_sweep from the variables' objects. ValueError('unknown variable X') for a variable that does not exist, ValueError('no such link') when unlink finds no reference.
+        mode 'tracing': objects are only freed by ("collect",). mode 'refcount': after every operation EXCEPT collect run ref_count_collect (which cascades) and ignore ("collect",). The roots passed to
+        the collectors are the variables' object ids sorted by variable name (repeats allowed). Return {"live": sorted ids still in the heap, "freed": sorted ids freed so far,
+        "garbage": sorted ids in the heap that are unreachable from the variables, "peak": the largest heap size seen after any operation}."""
+        pass
+  tests:
+  - name: simple programs
+    code: |
+      ops = [("new", "a"), ("new", "b"), ("link", "a", "b"), ("drop", "b"), ("drop", "a")]
+      res = run_ops(ops, "tracing")
+      assert res == {"live": [0, 1], "freed": [], "garbage": [0, 1], "peak": 2}
+      res = run_ops(ops + [("collect",)], "tracing")
+      assert res == {"live": [], "freed": [0, 1], "garbage": [], "peak": 2}
+      res = run_ops(ops, "refcount")
+      assert res == {"live": [], "freed": [0, 1], "garbage": [], "peak": 2}
+      assert run_ops([], "tracing") == {"live": [], "freed": [], "garbage": [], "peak": 0}
+      res = run_ops([("new", "a"), ("new", "a")], "refcount")
+      assert res["freed"] == [0] and res["live"] == [1]
+      res = run_ops([("new", "a"), ("new", "a")], "tracing")
+      assert res["live"] == [0, 1] and res["garbage"] == [0]
+  - name: cycles
+    code: |
+      ops = [("new", "a"), ("new", "b"), ("link", "a", "b"), ("link", "b", "a"), ("drop", "a"), ("drop", "b")]
+      res = run_ops(ops, "refcount")
+      assert res == {"live": [0, 1], "freed": [], "garbage": [0, 1], "peak": 2}
+      res = run_ops(ops + [("collect",)], "refcount")
+      assert res["garbage"] == [0, 1]
+      res = run_ops(ops + [("collect",)], "tracing")
+      assert res == {"live": [], "freed": [0, 1], "garbage": [], "peak": 2}
+      res = run_ops([("new", "x"), ("link", "x", "x"), ("drop", "x")], "refcount")
+      assert res["garbage"] == [0] and res["freed"] == []
+  - name: unlink and sharing
+    code: |
+      ops = [("new", "a"), ("new", "b"), ("link", "a", "b"), ("unlink", "a", "b"), ("drop", "b")]
+      res = run_ops(ops, "refcount")
+      assert res == {"live": [0], "freed": [1], "garbage": [], "peak": 2}
+      ops = [("new", "a"), ("new", "b"), ("new", "c"), ("link", "a", "c"), ("link", "b", "c"), ("drop", "c"), ("drop", "a")]
+      res = run_ops(ops, "refcount")
+      assert res["live"] == [1, 2] and res["freed"] == [0]
+      res = run_ops(ops + [("drop", "b")], "refcount")
+      assert res["live"] == [] and res["freed"] == [0, 1, 2]
+      res = run_ops([("new", "a"), ("new", "b"), ("link", "a", "b"), ("link", "a", "b"), ("unlink", "a", "b"), ("drop", "b"), ("collect",)], "tracing")
+      assert res["live"] == [0, 1] and res["garbage"] == []
+  - name: peak memory and errors
+    code: |
+      churn = []
+      for i in range(5):
+          churn += [("new", "t")]
+      assert run_ops(churn, "refcount")["peak"] == 2 and run_ops(churn, "refcount")["live"] == [4]
+      assert run_ops(churn, "tracing")["peak"] == 5
+      assert run_ops(churn + [("collect",)], "tracing")["live"] == [4]
+      for bad, msg in ((([("link", "a", "b")]), "unknown variable a"), ([("new", "a"), ("drop", "z")], "unknown variable z"), ([("new", "a"), ("new", "b"), ("unlink", "a", "b")], "no such link")):
+          try:
+              run_ops(bad, "tracing")
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  hints:
+  - Keep the heap, the variables and the freed list as local state, and rebuild the root list from the variables when you collect.
+  solution: |
+    def reachable(heap, roots):
+        """The heap is a dict from object id to the list of object ids it points to; roots is a list of ids held by variables (it may repeat ids). Return the sorted list of ids
+        reachable from the roots by following references (cycles are fine). ValueError('dangling reference ID') if a root or a reference names an id that is not a key of the heap."""
+        seen = set()
+        stack = list(roots)
+        while stack:
+            obj = stack.pop()
+            if obj not in heap:
+                raise ValueError("dangling reference %s" % (obj,))
+            if obj in seen:
+                continue
+            seen.add(obj)
+            stack.extend(heap[obj])
+        return sorted(seen)
+
+
+    def garbage(heap, roots):
+        """Sorted ids that are in the heap but not reachable from the roots."""
+        live = set(reachable(heap, roots))
+        return sorted(o for o in heap if o not in live)
+
+
+    def mark_sweep(heap, roots):
+        """Mark-and-sweep collection. MARK everything reachable from the roots, then SWEEP away the rest. Return (new_heap, freed): new_heap is a NEW dict holding only the surviving objects
+        (same ids, same reference lists), freed is the sorted list of removed ids. The input is not changed."""
+        live = set(reachable(heap, roots))
+        new_heap = {o: list(refs) for o, refs in heap.items() if o in live}
+        freed = sorted(o for o in heap if o not in live)
+        return new_heap, freed
+
+
+    def heap_stats(heap, roots):
+        """A dict {"objects": total, "live": reachable count, "garbage": the rest, "garbage_percent": 100 * garbage / objects rounded to 1 decimal (0.0 for an empty heap)}."""
+        total = len(heap)
+        live = len(reachable(heap, roots))
+        g = total - live
+        return {"objects": total, "live": live, "garbage": g, "garbage_percent": round(100 * g / total, 1) if total else 0.0}
+
+
+    def refcounts(heap, roots):
+        """A dict for EVERY object id in the heap giving its reference count: how many times it appears in other objects' reference lists (every entry counts, including duplicates
+        and an object pointing to itself) plus how many times it appears in `roots`."""
+        counts = {o: 0 for o in heap}
+        for refs in heap.values():
+            for r in refs:
+                counts[r] += 1
+        for r in roots:
+            counts[r] += 1
+        return counts
+
+
+    def ref_count_collect(heap, roots):
+        """Reference-counting collection: free every object whose count is 0; freeing an object removes its outgoing references, which lowers its children's counts and may free
+        them too (a cascade). Return (new_heap, freed): the surviving objects as a new dict (same reference lists) and the sorted list of freed ids. Input is unchanged."""
+        counts = refcounts(heap, roots)
+        queue = sorted(o for o, c in counts.items() if c == 0)
+        freed = set()
+        while queue:
+            obj = queue.pop()
+            if obj in freed:
+                continue
+            freed.add(obj)
+            for child in heap[obj]:
+                counts[child] -= 1
+                if counts[child] == 0:
+                    queue.append(child)
+        new_heap = {o: list(refs) for o, refs in heap.items() if o not in freed}
+        return new_heap, sorted(freed)
+
+
+
+
+    def run_ops(ops, mode):
+        """Simulate a tiny program that allocates objects and keeps them in named variables, under a garbage-collection `mode`. The state: heap (id -> reference list), variables
+        (name -> object id) and a counter that gives new objects the ids 0, 1, 2, ... in order. Operations: ("new", var) allocate an object and store it in var (rebinding var drops its old object from
+        the variables); ("link", a, b) append a reference from the object in a to the object in b; ("unlink", a, b) remove ONE reference (the first) from a's object to b's object; ("drop", var) delete
+        the variable; ("collect",) run mark_sweep from the variables' objects. ValueError('unknown variable X') for a variable that does not exist, ValueError('no such link') when unlink finds no reference.
+        mode 'tracing': objects are only freed by ("collect",). mode 'refcount': after every operation EXCEPT collect run ref_count_collect (which cascades) and ignore ("collect",). The roots passed to
+        the collectors are the variables' object ids sorted by variable name (repeats allowed). Return {"live": sorted ids still in the heap, "freed": sorted ids freed so far,
+        "garbage": sorted ids in the heap that are unreachable from the variables, "peak": the largest heap size seen after any operation}."""
+        heap = {}
+        variables = {}
+        freed = []
+        counter = 0
+        peak = 0
+
+        def roots():
+            return [variables[name] for name in sorted(variables)]
+
+        def need(name):
+            if name not in variables:
+                raise ValueError("unknown variable " + name)
+            return variables[name]
+
+        for op in ops:
+            kind = op[0]
+            if kind == "new":
+                heap[counter] = []
+                variables[op[1]] = counter
+                counter += 1
+            elif kind == "link":
+                a, b = need(op[1]), need(op[2])
+                heap[a].append(b)
+            elif kind == "unlink":
+                a, b = need(op[1]), need(op[2])
+                if b not in heap[a]:
+                    raise ValueError("no such link")
+                heap[a].remove(b)
+            elif kind == "drop":
+                need(op[1])
+                del variables[op[1]]
+            elif kind == "collect" and mode == "tracing":
+                heap, gone = mark_sweep(heap, roots())
+                freed.extend(gone)
+            peak = max(peak, len(heap))
+            if mode == "refcount" and kind != "collect":
+                heap, gone = ref_count_collect(heap, roots())
+                freed.extend(gone)
+        return {"live": sorted(heap), "freed": sorted(freed), "garbage": garbage(heap, roots()), "peak": peak}
+  explanation: Comparing strategies on the same program shows why real runtimes combine them.
+commonMistakes:
+- title: Following references without a visited set
+  explanation: A cycle then loops forever.
+- title: Believing reference counting handles cycles
+  explanation: Two objects pointing at each other keep each other's counts above zero.
+- title: Forgetting to coalesce on free
+  explanation: Free space shatters into pieces too small to use.
+- title: Copying an object twice
+  explanation: Record a forwarding address the first time so shared objects stay shared.
+- title: Mutating the old heap during a collection
+  explanation: Build a new heap; the input may be needed again.
+summary:
+- The stack is automatic; the heap needs a policy for freeing memory.
+- An object is garbage if no root can reach it.
+- Mark-and-sweep traces reachability; it handles cycles.
+- Reference counting is immediate but leaks cycles.
+- Allocators trade off fit strategies and suffer fragmentation.
+- Copying and generational collectors give compact memory and fast allocation.
+next: u23-project
+quiz:
+- type: mcq
+  question: What are the roots of a heap graph?
+  options:
+  - References held directly by running code
+  - The oldest objects
+  - Objects with no references
+  - Free blocks
+  answer: 0
+  explanation: Everything live is reachable from them.
+- type: mcq
+  question: Why can reference counting leak?
+  options:
+  - Cycles keep each other's counts above zero
+  - Counts overflow
+  - It frees too early
+  - It cannot free anything
+  answer: 0
+  explanation: Mutual references never reach zero.
+- type: mcq
+  question: Mark-and-sweep's mark phase is essentially...
+  options:
+  - a graph search from the roots
+  - a sort
+  - a hash lookup
+  - a binary search
+  answer: 0
+  explanation: It marks what is reachable.
+- type: mcq
+  question: What does coalescing do?
+  options:
+  - Merges adjacent free blocks
+  - Copies objects
+  - Counts references
+  - Marks live objects
+  answer: 0
+  explanation: It fights fragmentation.
+- type: mcq
+  question: What is the cost of a copying collector's compact result?
+  options:
+  - Half of memory sits unused at a time
+  - It cannot handle cycles
+  - It needs reference counts
+  - It is slower with more garbage
+  answer: 0
+  explanation: Two semispaces are needed.
+- type: mcq
+  question: The generational hypothesis says...
+  options:
+  - most objects die young
+  - old objects die first
+  - all objects live forever
+  - objects never share
+  answer: 0
+  explanation: So collect the young area often and cheaply.
+- type: code
+  question: Write `count_live(heap, roots)` that returns how many objects are reachable from `roots` in `heap` (a dict from id to a list of ids it references; cycles are possible).
+  starter: |
+    def count_live(heap, roots):
+        pass
+  tests:
+  - name: count
+    code: |
+      heap = {0: [1, 2], 1: [0], 2: [], 3: [3]}
+      assert count_live(heap, [0]) == 3 and count_live(heap, [3]) == 1 and count_live(heap, []) == 0 and count_live(heap, [0, 3]) == 4
+  solution: |
+    def count_live(heap, roots):
+        seen = set()
+        stack = list(roots)
+        while stack:
+            obj = stack.pop()
+            if obj not in seen:
+                seen.add(obj)
+                stack.extend(heap[obj])
+        return len(seen)

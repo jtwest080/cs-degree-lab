@@ -28,8 +28,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 20 | Calculus (Version 2) | ✅ Complete (Phase 19) | 7 | 35 | Calculus Toolkit (derivative, Simpson integration, bisection and Newton roots, RK4 ODE solver, series sine, gradient, backtracking minimizer) |
 | 21 | Probability & Statistics (Version 2) | ✅ Complete (Phase 20) | 8 | 40 | Statistics Toolkit (quantiles, normal curve, Bayes, confidence and bootstrap intervals, permutation and A/B tests, regression) |
 | 22 | Advanced Algorithms (Version 2) | ✅ Complete (Phase 22) | 7 | 35 | Algorithm Lab (max flow, SCC, KMP, convex hull, SAT solver, vertex cover approximation, Held-Karp TSP, reservoir sampling, segment tree, inversions) |
+| 23 | Compilers (Version 2) | ✅ Complete (Phase 23) | 7 | 35 | Mini Compiler (tokenizer, precedence parser, name checker, three-address code, optimizer, bytecode, assembler, virtual machine) |
 
-Totals: 188 lessons, 893 practice exercises, 188 lesson quizzes (1128 multiple-choice questions + 188 coding questions), 22 unit projects, 1783 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics and 22 Advanced Algorithms done, plus a timed Exams page; compilers, distributed systems and database internals next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 195 lessons, 928 practice exercises, 195 lesson quizzes (1170 multiple-choice questions + 195 coding questions), 23 unit projects, 1846 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms and 23 Compilers done, plus a timed Exams page; distributed systems and database internals next). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -533,9 +534,25 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 **Unit 23 can assume:** everything through Unit 22. Deeper core courses (compilers, distributed systems, database internals) can use graph algorithms, tries, hashing, randomization and probability freely.
 
+## Unit 23: Compilers (Version 2) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 23.1 Lexing and Automata | `u23-lexing` | tokens, maximal munch, regular expressions, Thompson NFAs, subset construction, DFA minimization, a scanner |
+| 23.2 Grammars and Parsing | `u23-parsing` | context-free grammars, derivations, FIRST and FOLLOW sets, LL(1) tables, predictive parsing, left recursion |
+| 23.3 Syntax Trees and Expression Parsing | `u23-pratt` | ASTs, Pratt/precedence climbing, evaluation, printing, postfix, simplification, symbolic differentiation, compiling to closures |
+| 23.4 Semantic Analysis | `u23-semantics` | scopes and symbol tables, type checking, all-paths-return, call graphs and recursion, a linter |
+| 23.5 Intermediate Code and Optimization | `u23-optimize` | three-address code, basic blocks and the CFG, constant folding, copy propagation, CSE, liveness and dead code elimination |
+| 23.6 Code Generation and Registers | `u23-codegen` | stack bytecode, assembler, virtual machine, peephole optimization, interference graphs, graph-coloring register allocation |
+| 23.7 Memory Management and Garbage Collection | `u23-memory` | stack and heap, mark-sweep, reference counting and cycles, allocators and fragmentation, Cheney copying, generations |
+
+**Project: Mini Compiler.** Learners write `tokenize`, `parse`, `check_names`, `lower`, `apply_op`, `run_tac`, `split_blocks`, `defs_uses`, `fold_block`, `fold_constants`, `remove_dead_code`, `optimize`, `generate`, `assemble`, `run_vm` and `compile_source` for a tiny language with if/while/print/return. 13 checklist items, 13 tests.
+
+**Unit 24 can assume:** everything through Unit 23. Distributed systems and database internals can use automata, trees, graphs, parsing and memory management freely (a SQL engine can reuse the lexer, parser and optimizer ideas).
+
 ## Plan for remaining units (to refine before each phase)
 
-Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms and the timed exams page are done; next deeper core courses (compilers, distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
+Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers and the timed exams page are done; next deeper core courses (distributed systems, database internals), electives (graphics, HCI), open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
 
 ## Technical notes for later phases
 
@@ -566,3 +583,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms and the ti
 - **Phase 20 (2026-11-14):** Version 2 continues. Complete Unit 21 Probability & Statistics (8 lessons, 40 exercises, 8 quizzes, Statistics Toolkit project, 78 glossary terms). No framework changes; all Python.
 - **Phase 21 (2026-11-15):** Version 2 framework: timed **Exams** page (`#/exams`, `src/components/Exams.jsx`). Quick quiz (15 q), Midterm (30 q) and Final (50 q); questions mixed evenly across chosen units from lesson quiz MCQs; 90 seconds per question with a countdown that auto-submits; no feedback until submit; results with per-unit breakdown, weak-unit drill, answer review and saved attempt history (`exams` in progress state).
 - **Phase 22 (2026-11-15):** Version 2 continues. Complete Unit 22 Advanced Algorithms (7 lessons, 35 exercises, 7 quizzes, Algorithm Lab project, 78 glossary terms). No framework changes; all Python.
+- **Phase 23 (2026-11-15):** Version 2 continues. Complete Unit 23 Compilers (7 lessons, 35 exercises, 7 quizzes, Mini Compiler project, 63 glossary terms). No framework changes; all Python.

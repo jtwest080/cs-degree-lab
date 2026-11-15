@@ -1,0 +1,2569 @@
+id: u23-optimize
+title: Intermediate Code and Optimization
+minutes: 100
+objective: Learn how a compiler turns a tree into a flat, simple, machine-independent language, splits it into basic blocks and a control-flow graph, and then makes the program faster with constant folding, copy propagation, common subexpression elimination and dead code elimination, using the dataflow idea of liveness.
+outcomes:
+- Lower an AST to three-address code
+- Split code into basic blocks and build a control-flow graph
+- Apply constant folding and copy propagation
+- Remove common subexpressions and dead code
+- Explain liveness and fixed-point iteration
+sections:
+- heading: Intermediate representations
+  body: |-
+    A real compiler does not go straight from the tree to machine code. It first translates the tree into an **intermediate representation** (IR): a simple language that is closer to the machine than the source, yet independent of any particular machine. One benefit is reuse: a compiler for many source languages and many processors needs only one IR in the middle, so you write each front end and each back end once instead of every pair. The other benefit is that the IR is a good place to **optimize**.
+
+    A popular IR is **three-address code**. Each instruction does at most one operation and names at most three variables: `t3 = a + b`, `t4 = -t3`, `x = t4`. A big expression becomes a sequence of small steps, each result stored in a fresh **temporary** variable. Control flow turns into **labels**, **jumps** and **conditional jumps**, the same ingredients as assembly language: a `while` loop becomes a label at the top, a test that jumps out if false, the body, a jump back to the top, and a label at the end. There are no trees and no nested scopes any more, just a flat list. That flatness is what makes the program easy to analyse and to run: our little interpreter `run_tac` is a loop with a program counter.
+- heading: Basic blocks and the control-flow graph
+  body: |-
+    Optimizers reason about code that runs in a straight line, so the first step is to cut the instruction list into **basic blocks**: maximal runs with one entrance (the top) and one exit (the bottom). A block starts at the first instruction, at every label (someone may jump here), and right after every jump (the previous block ended). Inside a block nothing can jump in or out, so the compiler can reason about it without worrying about surprises.
+
+    Then connect the blocks into a **control-flow graph** (CFG): there is an edge from block A to block B if control may pass from A to B. The last instruction of a block says where: a `jump` has one successor, a conditional jump has two (the target and the next block), a `ret` has none, and anything else falls through to the next block. A `while` loop shows up as a **cycle** in the graph, and an `if` as a diamond. The CFG also reveals **unreachable code**: blocks that no path from the entry reaches can be deleted outright.
+- heading: Optimizations
+  body: |-
+    **Constant folding** evaluates at compile time anything whose inputs are already known: if `a = 2` and `b = 3`, then `c = a + b` becomes `c = 5`. Be careful with operations that can fail: `1 / 0` must stay in the program, so that the error still happens when (and if) it would have. **Copy propagation** replaces a use of `b` by the original when `b = a`; this makes the copy itself useless. The two work together: after propagating, new constants appear, which enables more folding. The pass must **forget** facts when a variable is overwritten, otherwise it would apply stale knowledge and change the program's meaning. Every optimization has this rule: it must preserve **observable behaviour** (what the program prints and returns).
+
+    **Common subexpression elimination** (CSE) notices that `a + b` is computed twice and reuses the first result. Because addition is commutative, `a + b` and `b + a` are the same computation, and sorting the operands lets us notice it. The saved result is only valid until `a`, `b` or the variable holding the result changes.
+
+    **Dead code elimination** removes instructions whose results are never used. To know what is used, compilers compute **liveness**: a variable is **live** at a point if some path from there *reads* it before *writing* it. Liveness flows **backward**, so it is computed from the end: a block's `live_in` is what it reads before writing, plus whatever remains live afterwards and is not overwritten. With loops, one pass is not enough, so we **iterate to a fixed point**: repeat until no set changes. This pattern, called **dataflow analysis**, underlies many optimizations. Plain liveness is conservative: a variable that is only used to update itself inside a loop (like a counter nobody reads afterwards) counts as live, because the loop does read it; removing such code needs a stronger analysis that starts from the observable instructions and keeps only what they depend on. Dead code removal is often iterated with the others, because every pass creates opportunities for the next: after folding makes a temporary unused, removing it can make *its* inputs unused too.
+
+    You will notice that every optimization here preserves a *contract*: the program prints the same output. A trustworthy compiler tests exactly that, by running the code before and after. Our exercises do too.
+examples:
+- title: A loop in three-address code
+  intro: Lowering a while loop to labels and jumps, and running it.
+  code: |
+    def show(ins):
+        kind = ins[0]
+        if kind == "const": return "%s = %s" % (ins[1], ins[2])
+        if kind == "copy": return "%s = %s" % (ins[1], ins[2])
+        if kind == "neg": return "%s = -%s" % (ins[1], ins[2])
+        if kind == "bin": return "%s = %s %s %s" % (ins[1], ins[3], ins[2], ins[4])
+        if kind == "label": return ins[1] + ":"
+        if kind == "jump": return "goto " + ins[1]
+        if kind == "jumpz": return "if %s == 0 goto %s" % (ins[1], ins[2])
+        return "%s %s" % (kind, ins[1])
+
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def lower_program(stmts):
+        """Lower statements to flat three-address code with labels L1, L2, ... and temporaries t1, t2, ... Statements: ("assign", name, expr), ("print", expr),
+        ("return", expr), ("if", cond, then_list, else_list), ("while", cond, body_list). A while loop is: label top; evaluate cond; jumpz cond end; body; jump top; label end.
+        An if is: evaluate cond; jumpz cond else; then; jump end; label else; else-part; label end."""
+        code = []
+        counters = {"t": 0, "L": 0}
+
+        def tmp():
+            counters["t"] += 1
+            return "t%d" % counters["t"]
+
+        def label():
+            counters["L"] += 1
+            return "L%d" % counters["L"]
+
+        def expr(e):
+            if e[0] == "num":
+                t = tmp()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = expr(e[2])
+                t = tmp()
+                code.append(("neg", t, a))
+                return t
+            a = expr(e[2])
+            b = expr(e[3])
+            t = tmp()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.append(("copy", s[1], expr(s[2])))
+            elif s[0] == "print":
+                code.append(("print", expr(s[1])))
+            elif s[0] == "return":
+                code.append(("ret", expr(s[1])))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                c = expr(s[1])
+                code.append(("jumpz", c, end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                c = expr(s[1])
+                code.append(("jumpz", c, other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+    program = [("assign", "x", ("num", 0)), ("while", ("binop", "<", ("var", "x"), ("num", 3)), [("assign", "x", ("binop", "+", ("var", "x"), ("num", 1)))]), ("print", ("var", "x"))]
+    code = lower_program(program)
+    print("three-address code:")
+    for ins in code:
+        print("   " + show(ins) if ins[0] != "label" else show(ins))
+    print("output:", run_tac(code)["output"])
+  output: |
+    three-address code:
+       t1 = 0
+       x = t1
+    L1:
+       t2 = 3
+       t3 = x < t2
+       if t3 == 0 goto L2
+       t4 = 1
+       t5 = x + t4
+       x = t5
+       goto L1
+    L2:
+       print x
+    output: [3]
+  lines:
+  - line: 172
+    note: The tree becomes a flat list with labels and jumps.
+  - line: 176
+    note: The interpreter runs the flat code.
+- title: Optimizing a program
+  intro: Blocks, constant folding and dead code removal on a short program.
+  code: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def lower_program(stmts):
+        """Lower statements to flat three-address code with labels L1, L2, ... and temporaries t1, t2, ... Statements: ("assign", name, expr), ("print", expr),
+        ("return", expr), ("if", cond, then_list, else_list), ("while", cond, body_list). A while loop is: label top; evaluate cond; jumpz cond end; body; jump top; label end.
+        An if is: evaluate cond; jumpz cond else; then; jump end; label else; else-part; label end."""
+        code = []
+        counters = {"t": 0, "L": 0}
+
+        def tmp():
+            counters["t"] += 1
+            return "t%d" % counters["t"]
+
+        def label():
+            counters["L"] += 1
+            return "L%d" % counters["L"]
+
+        def expr(e):
+            if e[0] == "num":
+                t = tmp()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = expr(e[2])
+                t = tmp()
+                code.append(("neg", t, a))
+                return t
+            a = expr(e[2])
+            b = expr(e[3])
+            t = tmp()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.append(("copy", s[1], expr(s[2])))
+            elif s[0] == "print":
+                code.append(("print", expr(s[1])))
+            elif s[0] == "return":
+                code.append(("ret", expr(s[1])))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                c = expr(s[1])
+                code.append(("jumpz", c, end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                c = expr(s[1])
+                code.append(("jumpz", c, other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+
+    def basic_blocks(code):
+        """Split instructions into basic blocks: straight-line runs entered only at the top and left only at the bottom. A new block starts at the first instruction,
+        at every ("label", ...), and right after every jump, jumpz or ret. Return a list of lists of instructions (empty code gives an empty list)."""
+        blocks = []
+        for i, ins in enumerate(code):
+            starts = i == 0 or ins[0] == "label" or code[i - 1][0] in ("jump", "jumpz", "ret")
+            if starts:
+                blocks.append([])
+            blocks[-1].append(ins)
+        return blocks
+
+
+    def build_cfg(blocks):
+        """The control flow graph: a dict from block index to the sorted list of successor block indexes. Look at the LAST instruction: a jump goes to the block that
+        starts with that label; a jumpz goes to that block or falls through to the next block; ret has no successors; anything else falls through to the next block (if any)."""
+        where = {}
+        for i, block in enumerate(blocks):
+            if block[0][0] == "label":
+                where[block[0][1]] = i
+        cfg = {}
+        for i, block in enumerate(blocks):
+            last = block[-1]
+            out = set()
+            if last[0] == "jump":
+                out.add(where[last[1]])
+            elif last[0] == "jumpz":
+                out.add(where[last[2]])
+                if i + 1 < len(blocks):
+                    out.add(i + 1)
+            elif last[0] != "ret" and i + 1 < len(blocks):
+                out.add(i + 1)
+            cfg[i] = sorted(out)
+        return cfg
+
+
+    def reachable_blocks(cfg):
+        """Sorted list of block indexes reachable from block 0 by following the graph (an empty graph gives [])."""
+        if not cfg:
+            return []
+        seen = {0}
+        stack = [0]
+        while stack:
+            for nxt in cfg[stack.pop()]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return sorted(seen)
+
+
+    def remove_unreachable(code):
+        """Return the instruction list with every unreachable basic block deleted (the others keep their order)."""
+        blocks = basic_blocks(code)
+        keep = reachable_blocks(build_cfg(blocks))
+        return [ins for i in keep for ins in blocks[i]]
+
+
+    def optimize_block(block):
+        """One forward pass over a basic block doing constant folding and copy propagation. Track `consts` (variable -> known number) and `copies` (variable -> the
+        variable it currently equals). For each instruction: first replace each operand that is a copy with its source; then fold a bin or neg whose operands are all known constants into
+        ("const", dest, value) (use apply_op, but leave the bin alone if apply_op raises ValueError, e.g. division by zero); turn ("copy", d, s) into ("const", d, value) when s is a known constant. After
+        defining dest, forget every fact that involved dest (its old constant, copies from it or to it) and then record the new fact about it (const or copy; a copy of itself records nothing).
+        Labels and jumps pass through (jumpz and print and ret get their operands rewritten). Return the new block; the input is not modified."""
+        consts = {}
+        copies = {}
+        out = []
+
+        def forget(name):
+            consts.pop(name, None)
+            copies.pop(name, None)
+            for k in [k for k, v in copies.items() if v == name]:
+                del copies[k]
+
+        def src(name):
+            return copies.get(name, name)
+
+        for ins in block:
+            kind = ins[0]
+            if kind == "const":
+                forget(ins[1])
+                consts[ins[1]] = ins[2]
+                out.append(ins)
+            elif kind == "copy":
+                s = src(ins[2])
+                d = ins[1]
+                forget(d)
+                if s in consts:
+                    consts[d] = consts[s]
+                    out.append(("const", d, consts[s]))
+                else:
+                    if s != d:
+                        copies[d] = s
+                    out.append(("copy", d, s))
+            elif kind == "neg":
+                a = src(ins[2])
+                d = ins[1]
+                forget(d)
+                if a in consts:
+                    consts[d] = -consts[a]
+                    out.append(("const", d, -consts[a]))
+                else:
+                    out.append(("neg", d, a))
+            elif kind == "bin":
+                a, b = src(ins[3]), src(ins[4])
+                d = ins[1]
+                folded = None
+                if a in consts and b in consts:
+                    try:
+                        folded = apply_op(ins[2], consts[a], consts[b])
+                    except ValueError:
+                        folded = None
+                forget(d)
+                if folded is not None:
+                    consts[d] = folded
+                    out.append(("const", d, folded))
+                else:
+                    out.append(("bin", d, ins[2], a, b))
+            elif kind == "jumpz":
+                out.append(("jumpz", src(ins[1]), ins[2]))
+            elif kind in ("print", "ret"):
+                out.append((kind, src(ins[1])))
+            else:
+                out.append(ins)
+        return out
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+
+    COMMUTATIVE = ("+", "*", "==", "!=")
+
+
+    def common_subexpressions(block):
+        """Local common subexpression elimination. Remember, for each computation seen so far, the variable that holds its value: a key ("bin", op, a, b) (for the
+        commutative operators + * == != sort the two operands first) or ("neg", a). When the same computation appears again and its holder still has that value, replace the
+        instruction with ("copy", dest, holder). Whenever a variable is redefined, forget every remembered computation that uses it as an operand or holds its value. A computation whose
+        dest is also one of its own operands (x = x + 1) is never remembered. Return the new block."""
+        seen = {}
+        out = []
+        for ins in block:
+            key = None
+            if ins[0] == "bin":
+                a, b = ins[3], ins[4]
+                if ins[2] in COMMUTATIVE and b < a:
+                    a, b = b, a
+                key = ("bin", ins[2], a, b)
+            elif ins[0] == "neg":
+                key = ("neg", ins[2])
+            if key is not None and key in seen:
+                new = ("copy", ins[1], seen[key])
+            else:
+                new = ins
+            out.append(new)
+            d, _ = defs_uses(new)
+            if d is not None:
+                for k in [k for k, holder in seen.items() if holder == d or d in k[2:]]:
+                    del seen[k]
+                if key is not None and new is ins and d not in key[2:]:
+                    seen[key] = d
+        return out
+
+
+    def eliminate_dead_code(block, live_out):
+        """Backward pass: walk the block from the end with a set of live variables that starts as `live_out`. An instruction that defines a variable which is not live
+        (const, copy, neg or bin) is deleted; otherwise its defined variable leaves the live set and its used variables join it. print, ret, jumpz, label and jump are always kept (the ones with
+        operands add them to the live set). Return the new block in the original order."""
+        live = set(live_out)
+        kept = []
+        for ins in reversed(block):
+            d, uses = defs_uses(ins)
+            if d is not None and d not in live:
+                continue
+            if d is not None:
+                live.discard(d)
+            live.update(uses)
+            kept.append(ins)
+        kept.reverse()
+        return kept
+
+
+    def liveness(blocks, cfg):
+        """Global liveness analysis by iteration. A variable is LIVE at a point if some path from there reads it before writing it. For each block compute
+        use (variables read before any write in the block) and defs (variables written). Then repeat until nothing changes: live_out[b] = union of live_in[s] for successors s, and
+        live_in[b] = use[b] union (live_out[b] minus defs[b]). Return (live_in, live_out), each a list indexed by block holding a SORTED list of names."""
+        use, defs = [], []
+        for block in blocks:
+            u, d = set(), set()
+            for ins in block:
+                defined, used = defs_uses(ins)
+                u.update(v for v in used if v not in d)
+                if defined is not None:
+                    d.add(defined)
+            use.append(u)
+            defs.append(d)
+        live_in = [set() for _ in blocks]
+        live_out = [set() for _ in blocks]
+        changed = True
+        while changed:
+            changed = False
+            for b in reversed(range(len(blocks))):
+                out = set()
+                for s in cfg[b]:
+                    out |= live_in[s]
+                new_in = use[b] | (out - defs[b])
+                if out != live_out[b] or new_in != live_in[b]:
+                    live_out[b], live_in[b] = out, new_in
+                    changed = True
+        return [sorted(s) for s in live_in], [sorted(s) for s in live_out]
+
+
+    def dead_code_elimination(code):
+        """Remove every assignment whose value is never used, across the whole program: repeat { split into blocks, build the cfg, run liveness, apply eliminate_dead_code to each block with
+        its live_out, join the blocks } until the code stops changing (removing one assignment can make another dead). Return the new instruction list."""
+        while True:
+            blocks = basic_blocks(code)
+            if not blocks:
+                return []
+            cfg = build_cfg(blocks)
+            _, live_out = liveness(blocks, cfg)
+            new = []
+            for i, block in enumerate(blocks):
+                new += eliminate_dead_code(block, live_out[i])
+            if new == code:
+                return code
+            code = new
+
+    program = [("assign", "a", ("num", 2)), ("assign", "b", ("binop", "*", ("var", "a"), ("num", 8))), ("assign", "c", ("binop", "+", ("var", "a"), ("var", "b"))),
+               ("assign", "unused", ("binop", "*", ("var", "c"), ("var", "c"))), ("print", ("var", "c"))]
+    code = lower_program(program)
+    blocks = basic_blocks(code)
+    print("blocks:", len(blocks), " cfg:", build_cfg(blocks))
+    folded = optimize_block(blocks[0])
+    print("before:", len(code), "instructions")
+    print("after folding:", len(folded), "instructions")
+    final = dead_code_elimination(folded)
+    print("after dead code removal:", len(final), "instructions")
+    print("same output:", run_tac(code)["output"] == run_tac(final)["output"], run_tac(final)["output"])
+    print("remaining:", [ins[0] + " " + str(ins[1]) for ins in final])
+  output: |
+    blocks: 1  cfg: {0: []}
+    before: 10 instructions
+    after folding: 10 instructions
+    after dead code removal: 2 instructions
+    same output: True [18]
+    remaining: ['const c', 'print c']
+  lines:
+  - line: 212
+    note: Straight-line code is one block.
+  - line: 405
+    note: Constants are computed at compile time.
+  - line: 408
+    note: Unused work is removed.
+playground:
+  prompt: Write three-address code by hand for x = (a + b) * c as a list of tuples and run it.
+  code: |
+    code = [('bin', 't1', '+', 'a', 'b'), ('bin', 'x', '*', 't1', 'c')]
+    env = {'a': 1, 'b': 2, 'c': 3}
+    for ins in code:
+        print(ins)
+exercises:
+- id: lower
+  title: Three-address code
+  difficulty: 4
+  prompt: 'Compilers lower trees into **three-address code**: a flat list of simple instructions, each with at most one operation. Write `lower(ast)` for an expression AST (`num`, `var`, `("unary", "-", e)`, `("binop", op, l, r)`), returning `(code, result_name)`. Every operation gets a fresh temporary `t1`, `t2`, ... numbered from 1 in creation order (operands before the operation, left operand before right). Instructions: `("const", dest, value)`, `("neg", dest, a)` and `("bin", dest, op, a, b)`; a variable needs no instruction because its own name is the result. Then write `apply_op(op, a, b)` (`+ - *`; `/` is true division; `%`; the comparisons `< <= > >= == !=` give `1` or `0`; `ValueError("division by zero")` for `/` or `%` with `b == 0`; `ValueError("unknown operator OP")` otherwise) and `run_tac(code, env=None, limit=10000)`, an interpreter for instruction lists. Besides the three above it handles `("copy", dest, src)`, `("label", name)`, `("jump", name)`, `("jumpz", cond, name)` (jump if the variable is 0), `("print", a)` and `("ret", a)` (stop). It returns `{"env": variables, "output": printed values in order, "returned": the ret value or None}`, starting from a copy of `env`. Raise `ValueError("undefined NAME")` when reading a variable without a value and `ValueError("too many steps")` after `limit` executed instructions.'
+  starter: |-
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        pass
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        pass
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        pass
+  tests:
+  - name: lowering
+    code: |
+      code, r = lower(("binop", "+", ("num", 1), ("binop", "*", ("num", 2), ("num", 3))))
+      assert code == [("const", "t1", 1), ("const", "t2", 2), ("const", "t3", 3), ("bin", "t4", "*", "t2", "t3"), ("bin", "t5", "+", "t1", "t4")] and r == "t5"
+      assert lower(("var", "x")) == ([], "x")
+      code, r = lower(("unary", "-", ("var", "a")))
+      assert code == [("neg", "t1", "a")] and r == "t1"
+      code, r = lower(("binop", "-", ("var", "a"), ("binop", "-", ("var", "b"), ("var", "c"))))
+      assert code == [("bin", "t1", "-", "b", "c"), ("bin", "t2", "-", "a", "t1")] and r == "t2"
+      code, r = lower(("num", 7))
+      assert code == [("const", "t1", 7)] and r == "t1"
+  - name: operators
+    code: |
+      assert apply_op("+", 2, 3) == 5 and apply_op("-", 2, 3) == -1 and apply_op("*", 4, 3) == 12
+      assert apply_op("/", 7, 2) == 3.5 and apply_op("%", 7, 3) == 1
+      assert [apply_op(o, 2, 3) for o in ("<", "<=", ">", ">=", "==", "!=")] == [1, 1, 0, 0, 0, 1]
+      for bad in (("/", 1, 0), ("%", 1, 0)):
+          try:
+              apply_op(*bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "division by zero" in str(e)
+      try:
+          apply_op("^", 1, 2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown operator" in str(e)
+  - name: running straight-line code
+    code: |
+      code, r = lower(("binop", "+", ("var", "x"), ("binop", "*", ("num", 2), ("var", "y"))))
+      result = run_tac(code, {"x": 1, "y": 5})
+      assert result["env"][r] == 11 and result["output"] == [] and result["returned"] is None
+      env = {"x": 1}
+      run_tac([("const", "a", 5)], env)
+      assert env == {"x": 1}
+      res = run_tac([("const", "a", 4), ("neg", "b", "a"), ("copy", "c", "b"), ("print", "c"), ("print", "a"), ("ret", "b"), ("print", "a")])
+      assert res["output"] == [-4, 4] and res["returned"] == -4
+      try:
+          run_tac([("print", "nothing")])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "undefined nothing" in str(e)
+  - name: loops and branches
+    code: |
+      code = [("const", "i", 0), ("const", "one", 1), ("const", "n", 4), ("label", "top"), ("bin", "c", "<", "i", "n"), ("jumpz", "c", "end"), ("print", "i"),
+              ("bin", "i", "+", "i", "one"), ("jump", "top"), ("label", "end"), ("ret", "i")]
+      res = run_tac(code)
+      assert res["output"] == [0, 1, 2, 3] and res["returned"] == 4
+      loop = [("label", "x"), ("jump", "x")]
+      try:
+          run_tac(loop, limit=50)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "too many steps" in str(e)
+      res = run_tac([("const", "z", 0), ("jumpz", "z", "skip"), ("const", "w", 1), ("label", "skip"), ("print", "z")])
+      assert "w" not in res["env"] and res["output"] == [0]
+  hints:
+  - Keep a counter in a list so the inner function can change it.
+  solution: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+  explanation: Three-address code is simple enough to execute, optimize and translate to machine code.
+- id: blocks
+  title: Basic blocks and the control-flow graph
+  difficulty: 5
+  prompt: 'The starter has `lower_program`, `apply_op` and `run_tac`. Write `basic_blocks(code)`: split instructions into **basic blocks**, straight-line runs entered only at the top and left only at the bottom. A new block starts at the first instruction, at every `("label", ...)`, and right after every `jump`, `jumpz` or `ret`. Return a list of lists (empty code gives `[]`). Write `build_cfg(blocks)`, the **control-flow graph** as a dict from block index to the sorted list of successor indexes: look at the **last** instruction; a `jump` goes to the block starting with that label; a `jumpz` goes to that block or falls through to the next one; a `ret` has no successors; anything else falls through to the next block if there is one. Write `reachable_blocks(cfg)` (sorted indexes reachable from block 0; `[]` for an empty graph) and `remove_unreachable(code)` (the instructions with every unreachable block removed, others keeping their order).'
+  starter: |-
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def lower_program(stmts):
+        """Lower statements to flat three-address code with labels L1, L2, ... and temporaries t1, t2, ... Statements: ("assign", name, expr), ("print", expr),
+        ("return", expr), ("if", cond, then_list, else_list), ("while", cond, body_list). A while loop is: label top; evaluate cond; jumpz cond end; body; jump top; label end.
+        An if is: evaluate cond; jumpz cond else; then; jump end; label else; else-part; label end."""
+        code = []
+        counters = {"t": 0, "L": 0}
+
+        def tmp():
+            counters["t"] += 1
+            return "t%d" % counters["t"]
+
+        def label():
+            counters["L"] += 1
+            return "L%d" % counters["L"]
+
+        def expr(e):
+            if e[0] == "num":
+                t = tmp()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = expr(e[2])
+                t = tmp()
+                code.append(("neg", t, a))
+                return t
+            a = expr(e[2])
+            b = expr(e[3])
+            t = tmp()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.append(("copy", s[1], expr(s[2])))
+            elif s[0] == "print":
+                code.append(("print", expr(s[1])))
+            elif s[0] == "return":
+                code.append(("ret", expr(s[1])))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                c = expr(s[1])
+                code.append(("jumpz", c, end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                c = expr(s[1])
+                code.append(("jumpz", c, other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+
+    def basic_blocks(code):
+        """Split instructions into basic blocks: straight-line runs entered only at the top and left only at the bottom. A new block starts at the first instruction,
+        at every ("label", ...), and right after every jump, jumpz or ret. Return a list of lists of instructions (empty code gives an empty list)."""
+        pass
+
+
+    def build_cfg(blocks):
+        """The control flow graph: a dict from block index to the sorted list of successor block indexes. Look at the LAST instruction: a jump goes to the block that
+        starts with that label; a jumpz goes to that block or falls through to the next block; ret has no successors; anything else falls through to the next block (if any)."""
+        pass
+
+
+    def reachable_blocks(cfg):
+        """Sorted list of block indexes reachable from block 0 by following the graph (an empty graph gives [])."""
+        pass
+
+
+    def remove_unreachable(code):
+        """Return the instruction list with every unreachable basic block deleted (the others keep their order)."""
+        pass
+  tests:
+  - name: splitting
+    code: |
+      prog = [("assign", "x", ("num", 0)), ("while", ("binop", "<", ("var", "x"), ("num", 3)), [("assign", "x", ("binop", "+", ("var", "x"), ("num", 1)))]), ("print", ("var", "x"))]
+      code = lower_program(prog)
+      blocks = basic_blocks(code)
+      assert [len(b) for b in blocks] == [2, 4, 4, 2]
+      assert blocks[1][0] == ("label", "L1") and blocks[3][0] == ("label", "L2") and blocks[2][-1] == ("jump", "L1")
+      assert [ins for b in blocks for ins in b] == code
+      assert basic_blocks([]) == []
+      assert basic_blocks([("const", "a", 1), ("print", "a")]) == [[("const", "a", 1), ("print", "a")]]
+      assert len(basic_blocks([("ret", "a"), ("print", "b")])) == 2
+  - name: the graph
+    code: |
+      prog = [("assign", "x", ("num", 0)), ("while", ("binop", "<", ("var", "x"), ("num", 3)), [("assign", "x", ("binop", "+", ("var", "x"), ("num", 1)))]), ("print", ("var", "x"))]
+      cfg = build_cfg(basic_blocks(lower_program(prog)))
+      assert cfg == {0: [1], 1: [2, 3], 2: [1], 3: []}
+      prog = [("assign", "a", ("num", 1)), ("if", ("var", "a"), [("print", ("num", 1))], [("print", ("num", 2))]), ("return", ("var", "a"))]
+      blocks = basic_blocks(lower_program(prog))
+      cfg = build_cfg(blocks)
+      assert len(blocks) == 4 and cfg == {0: [1, 2], 1: [3], 2: [3], 3: []}
+      assert set(cfg) == set(range(len(blocks)))
+      assert build_cfg([[("ret", "a")]]) == {0: []}
+      assert build_cfg([[("const", "a", 1)], [("print", "a")]]) == {0: [1], 1: []}
+  - name: reachability
+    code: |
+      assert reachable_blocks({0: [1], 1: [2, 3], 2: [1], 3: []}) == [0, 1, 2, 3]
+      assert reachable_blocks({0: [2], 1: [2], 2: []}) == [0, 2]
+      assert reachable_blocks({0: [0]}) == [0]
+      assert reachable_blocks({}) == []
+  - name: removing dead blocks
+    code: |
+      code = [("const", "a", 1), ("ret", "a"), ("const", "b", 2), ("print", "b"), ("label", "L"), ("print", "a")]
+      assert remove_unreachable(code) == [("const", "a", 1), ("ret", "a")]
+      prog = [("assign", "x", ("num", 2)), ("return", ("var", "x")), ("print", ("var", "x"))]
+      code = lower_program(prog)
+      cleaned = remove_unreachable(code)
+      assert len(cleaned) < len(code) and run_tac(cleaned)["returned"] == 2
+      code = [("const", "a", 1), ("jump", "end"), ("const", "a", 2), ("label", "end"), ("print", "a")]
+      assert remove_unreachable(code) == [("const", "a", 1), ("jump", "end"), ("label", "end"), ("print", "a")]
+      assert remove_unreachable([]) == []
+  hints:
+  - A basic block starts at the first instruction, at labels, and right after jumps.
+  solution: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def lower_program(stmts):
+        """Lower statements to flat three-address code with labels L1, L2, ... and temporaries t1, t2, ... Statements: ("assign", name, expr), ("print", expr),
+        ("return", expr), ("if", cond, then_list, else_list), ("while", cond, body_list). A while loop is: label top; evaluate cond; jumpz cond end; body; jump top; label end.
+        An if is: evaluate cond; jumpz cond else; then; jump end; label else; else-part; label end."""
+        code = []
+        counters = {"t": 0, "L": 0}
+
+        def tmp():
+            counters["t"] += 1
+            return "t%d" % counters["t"]
+
+        def label():
+            counters["L"] += 1
+            return "L%d" % counters["L"]
+
+        def expr(e):
+            if e[0] == "num":
+                t = tmp()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = expr(e[2])
+                t = tmp()
+                code.append(("neg", t, a))
+                return t
+            a = expr(e[2])
+            b = expr(e[3])
+            t = tmp()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.append(("copy", s[1], expr(s[2])))
+            elif s[0] == "print":
+                code.append(("print", expr(s[1])))
+            elif s[0] == "return":
+                code.append(("ret", expr(s[1])))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                c = expr(s[1])
+                code.append(("jumpz", c, end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                c = expr(s[1])
+                code.append(("jumpz", c, other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+
+    def basic_blocks(code):
+        """Split instructions into basic blocks: straight-line runs entered only at the top and left only at the bottom. A new block starts at the first instruction,
+        at every ("label", ...), and right after every jump, jumpz or ret. Return a list of lists of instructions (empty code gives an empty list)."""
+        blocks = []
+        for i, ins in enumerate(code):
+            starts = i == 0 or ins[0] == "label" or code[i - 1][0] in ("jump", "jumpz", "ret")
+            if starts:
+                blocks.append([])
+            blocks[-1].append(ins)
+        return blocks
+
+
+    def build_cfg(blocks):
+        """The control flow graph: a dict from block index to the sorted list of successor block indexes. Look at the LAST instruction: a jump goes to the block that
+        starts with that label; a jumpz goes to that block or falls through to the next block; ret has no successors; anything else falls through to the next block (if any)."""
+        where = {}
+        for i, block in enumerate(blocks):
+            if block[0][0] == "label":
+                where[block[0][1]] = i
+        cfg = {}
+        for i, block in enumerate(blocks):
+            last = block[-1]
+            out = set()
+            if last[0] == "jump":
+                out.add(where[last[1]])
+            elif last[0] == "jumpz":
+                out.add(where[last[2]])
+                if i + 1 < len(blocks):
+                    out.add(i + 1)
+            elif last[0] != "ret" and i + 1 < len(blocks):
+                out.add(i + 1)
+            cfg[i] = sorted(out)
+        return cfg
+
+
+    def reachable_blocks(cfg):
+        """Sorted list of block indexes reachable from block 0 by following the graph (an empty graph gives [])."""
+        if not cfg:
+            return []
+        seen = {0}
+        stack = [0]
+        while stack:
+            for nxt in cfg[stack.pop()]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return sorted(seen)
+
+
+    def remove_unreachable(code):
+        """Return the instruction list with every unreachable basic block deleted (the others keep their order)."""
+        blocks = basic_blocks(code)
+        keep = reachable_blocks(build_cfg(blocks))
+        return [ins for i in keep for ins in blocks[i]]
+  explanation: A control-flow graph turns a flat instruction list into the shape every global optimization works on.
+- id: fold
+  title: Constant folding and copy propagation
+  difficulty: 5
+  prompt: 'The starter has `apply_op` and `run_tac`. Write `optimize_block(block)`: one forward pass over a **basic block** that does **constant folding** (compute at compile time what is already known) and **copy propagation** (use the original instead of a copy). Keep a dict `consts` (variable to known number) and a dict `copies` (variable to the variable it currently equals). For each instruction: first replace every operand that is a known copy with its source; then fold a `bin` or `neg` whose operands are all known constants into `("const", dest, value)` (use `apply_op`, but leave the `bin` alone if it raises `ValueError`, for example division by zero); turn `("copy", d, s)` into `("const", d, value)` when `s` is a known constant. After defining `dest`, forget every fact that involved it (its old constant, copies from it **and** copies of it) and then record the new fact about it. `jumpz`, `print` and `ret` get their operands rewritten; labels and `jump`s pass through. Return a new block; the input is unchanged.'
+  starter: |-
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def optimize_block(block):
+        """One forward pass over a basic block doing constant folding and copy propagation. Track `consts` (variable -> known number) and `copies` (variable -> the
+        variable it currently equals). For each instruction: first replace each operand that is a copy with its source; then fold a bin or neg whose operands are all known constants into
+        ("const", dest, value) (use apply_op, but leave the bin alone if apply_op raises ValueError, e.g. division by zero); turn ("copy", d, s) into ("const", d, value) when s is a known constant. After
+        defining dest, forget every fact that involved dest (its old constant, copies from it or to it) and then record the new fact about it (const or copy; a copy of itself records nothing).
+        Labels and jumps pass through (jumpz and print and ret get their operands rewritten). Return the new block; the input is not modified."""
+        pass
+  tests:
+  - name: folding
+    code: |
+      block = [("const", "a", 2), ("const", "b", 3), ("bin", "c", "+", "a", "b"), ("bin", "d", "*", "c", "a"), ("print", "d")]
+      assert optimize_block(block) == [("const", "a", 2), ("const", "b", 3), ("const", "c", 5), ("const", "d", 10), ("print", "d")]
+      assert optimize_block([("const", "a", 4), ("neg", "b", "a"), ("print", "b")]) == [("const", "a", 4), ("const", "b", -4), ("print", "b")]
+      assert optimize_block([("const", "a", 1), ("bin", "a", "+", "a", "a"), ("bin", "b", "+", "a", "a")]) == [("const", "a", 1), ("const", "a", 2), ("const", "b", 4)]
+      assert optimize_block([("const", "a", 7), ("copy", "b", "a")]) == [("const", "a", 7), ("const", "b", 7)]
+      assert optimize_block([("const", "a", 3), ("const", "b", 3), ("bin", "c", "<", "a", "b")]) == [("const", "a", 3), ("const", "b", 3), ("const", "c", 0)]
+      block = [("const", "a", 1)]
+      optimize_block(block)
+      assert block == [("const", "a", 1)]
+  - name: copies
+    code: |
+      assert optimize_block([("copy", "b", "a"), ("copy", "c", "b"), ("bin", "d", "+", "c", "c"), ("print", "d")]) == [("copy", "b", "a"), ("copy", "c", "a"), ("bin", "d", "+", "a", "a"), ("print", "d")]
+      assert optimize_block([("copy", "b", "a"), ("const", "a", 5), ("bin", "d", "+", "b", "b")]) == [("copy", "b", "a"), ("const", "a", 5), ("bin", "d", "+", "b", "b")]
+      assert optimize_block([("copy", "b", "a"), ("const", "b", 5), ("print", "b")]) == [("copy", "b", "a"), ("const", "b", 5), ("print", "b")]
+      assert optimize_block([("copy", "b", "a"), ("copy", "a", "z"), ("print", "b")]) == [("copy", "b", "a"), ("copy", "a", "z"), ("print", "b")]
+      assert optimize_block([("copy", "x", "x"), ("print", "x")]) == [("copy", "x", "x"), ("print", "x")]
+      assert optimize_block([("copy", "b", "a"), ("jumpz", "b", "end"), ("ret", "b")]) == [("copy", "b", "a"), ("jumpz", "a", "end"), ("ret", "a")]
+  - name: what must not fold
+    code: |
+      assert optimize_block([("const", "a", 1), ("const", "z", 0), ("bin", "d", "/", "a", "z"), ("bin", "e", "%", "a", "z")]) == [("const", "a", 1), ("const", "z", 0), ("bin", "d", "/", "a", "z"), ("bin", "e", "%", "a", "z")]
+      assert optimize_block([("bin", "c", "+", "a", "b")]) == [("bin", "c", "+", "a", "b")]
+      assert optimize_block([("const", "a", 1), ("bin", "b", "+", "a", "x"), ("const", "x", 2), ("bin", "c", "+", "a", "x")]) == [("const", "a", 1), ("bin", "b", "+", "a", "x"), ("const", "x", 2), ("const", "c", 3)]
+      assert optimize_block([("label", "L"), ("const", "a", 1), ("jump", "L")]) == [("label", "L"), ("const", "a", 1), ("jump", "L")]
+  - name: the program still means the same
+    code: |
+      code = [("const", "a", 6), ("const", "t1", 7), ("bin", "b", "*", "a", "t1"), ("copy", "c", "b"), ("bin", "d", "-", "c", "a"), ("print", "d"), ("const", "t2", 4), ("bin", "t3", "/", "c", "t2"), ("print", "t3"), ("ret", "d")]
+      better = optimize_block(code)
+      assert better != code
+      assert run_tac(better)["output"] == run_tac(code)["output"] == [36, 10.5]
+      assert run_tac(better)["returned"] == run_tac(code)["returned"] == 36
+      assert all(ins[0] in ("const", "print", "ret") for ins in better)
+  hints:
+  - Process instructions in order, consulting what you know so far, and forget facts when a variable is overwritten.
+  solution: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def optimize_block(block):
+        """One forward pass over a basic block doing constant folding and copy propagation. Track `consts` (variable -> known number) and `copies` (variable -> the
+        variable it currently equals). For each instruction: first replace each operand that is a copy with its source; then fold a bin or neg whose operands are all known constants into
+        ("const", dest, value) (use apply_op, but leave the bin alone if apply_op raises ValueError, e.g. division by zero); turn ("copy", d, s) into ("const", d, value) when s is a known constant. After
+        defining dest, forget every fact that involved dest (its old constant, copies from it or to it) and then record the new fact about it (const or copy; a copy of itself records nothing).
+        Labels and jumps pass through (jumpz and print and ret get their operands rewritten). Return the new block; the input is not modified."""
+        consts = {}
+        copies = {}
+        out = []
+
+        def forget(name):
+            consts.pop(name, None)
+            copies.pop(name, None)
+            for k in [k for k, v in copies.items() if v == name]:
+                del copies[k]
+
+        def src(name):
+            return copies.get(name, name)
+
+        for ins in block:
+            kind = ins[0]
+            if kind == "const":
+                forget(ins[1])
+                consts[ins[1]] = ins[2]
+                out.append(ins)
+            elif kind == "copy":
+                s = src(ins[2])
+                d = ins[1]
+                forget(d)
+                if s in consts:
+                    consts[d] = consts[s]
+                    out.append(("const", d, consts[s]))
+                else:
+                    if s != d:
+                        copies[d] = s
+                    out.append(("copy", d, s))
+            elif kind == "neg":
+                a = src(ins[2])
+                d = ins[1]
+                forget(d)
+                if a in consts:
+                    consts[d] = -consts[a]
+                    out.append(("const", d, -consts[a]))
+                else:
+                    out.append(("neg", d, a))
+            elif kind == "bin":
+                a, b = src(ins[3]), src(ins[4])
+                d = ins[1]
+                folded = None
+                if a in consts and b in consts:
+                    try:
+                        folded = apply_op(ins[2], consts[a], consts[b])
+                    except ValueError:
+                        folded = None
+                forget(d)
+                if folded is not None:
+                    consts[d] = folded
+                    out.append(("const", d, folded))
+                else:
+                    out.append(("bin", d, ins[2], a, b))
+            elif kind == "jumpz":
+                out.append(("jumpz", src(ins[1]), ins[2]))
+            elif kind in ("print", "ret"):
+                out.append((kind, src(ins[1])))
+            else:
+                out.append(ins)
+        return out
+  explanation: 'Folding and propagation feed each other: knowing one constant often reveals the next.'
+- id: cse
+  title: Common subexpressions and dead code
+  difficulty: 5
+  prompt: 'The starter has `apply_op`, `run_tac` and the earlier tools. Write `defs_uses(ins)`, returning `(defined_name_or_None, list_of_used_names)` for one instruction: `const` defines only; `copy` and `neg` use one name; `bin` uses two; `jumpz`, `print` and `ret` use one and define nothing; `label` and `jump` do neither. Write `common_subexpressions(block)`, **local common subexpression elimination**: remember, for each computation seen so far, the variable that holds its value: a key `("bin", op, a, b)` (for the commutative operators `+ * == !=` sort the operands first) or `("neg", a)`. When the same computation appears again and its holder still has that value, replace the instruction with `("copy", dest, holder)`. Whenever a variable is redefined, forget every remembered computation that uses it as an operand or holds its value. A computation whose `dest` is also one of its own operands (`x = x + 1`) is never remembered. Then write `eliminate_dead_code(block, live_out)`, a **backward** pass: start with a set of live variables equal to `live_out`; an instruction that defines a variable which is not live (`const`, `copy`, `neg` or `bin`) is deleted; otherwise its defined variable leaves the set and its used variables join it. `print`, `ret`, `jumpz`, `label` and `jump` are always kept. Return the block in its original order.'
+  starter: |-
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        pass
+
+
+    COMMUTATIVE = ("+", "*", "==", "!=")
+
+
+    def common_subexpressions(block):
+        """Local common subexpression elimination. Remember, for each computation seen so far, the variable that holds its value: a key ("bin", op, a, b) (for the
+        commutative operators + * == != sort the two operands first) or ("neg", a). When the same computation appears again and its holder still has that value, replace the
+        instruction with ("copy", dest, holder). Whenever a variable is redefined, forget every remembered computation that uses it as an operand or holds its value. A computation whose
+        dest is also one of its own operands (x = x + 1) is never remembered. Return the new block."""
+        pass
+
+
+    def eliminate_dead_code(block, live_out):
+        """Backward pass: walk the block from the end with a set of live variables that starts as `live_out`. An instruction that defines a variable which is not live
+        (const, copy, neg or bin) is deleted; otherwise its defined variable leaves the live set and its used variables join it. print, ret, jumpz, label and jump are always kept (the ones with
+        operands add them to the live set). Return the new block in the original order."""
+        pass
+  tests:
+  - name: defs and uses
+    code: |
+      assert defs_uses(("const", "a", 1)) == ("a", [])
+      assert defs_uses(("copy", "a", "b")) == ("a", ["b"])
+      assert defs_uses(("neg", "a", "b")) == ("a", ["b"])
+      assert defs_uses(("bin", "a", "+", "b", "c")) == ("a", ["b", "c"])
+      assert defs_uses(("jumpz", "c", "L")) == (None, ["c"])
+      assert defs_uses(("print", "p")) == (None, ["p"]) and defs_uses(("ret", "r")) == (None, ["r"])
+      assert defs_uses(("label", "L")) == (None, []) and defs_uses(("jump", "L")) == (None, [])
+  - name: reusing results
+    code: |
+      assert common_subexpressions([("bin", "t1", "+", "a", "b"), ("bin", "t2", "+", "b", "a"), ("bin", "t3", "*", "t1", "t2")]) == [("bin", "t1", "+", "a", "b"), ("copy", "t2", "t1"), ("bin", "t3", "*", "t1", "t2")]
+      assert common_subexpressions([("bin", "t1", "-", "a", "b"), ("bin", "t2", "-", "b", "a")]) == [("bin", "t1", "-", "a", "b"), ("bin", "t2", "-", "b", "a")]
+      assert common_subexpressions([("neg", "t1", "a"), ("neg", "t2", "a")]) == [("neg", "t1", "a"), ("copy", "t2", "t1")]
+      assert common_subexpressions([("bin", "x", "*", "a", "b"), ("bin", "y", "*", "a", "b"), ("bin", "z", "*", "a", "b")]) == [("bin", "x", "*", "a", "b"), ("copy", "y", "x"), ("copy", "z", "x")]
+      assert common_subexpressions([]) == []
+  - name: when reuse is wrong
+    code: |
+      assert common_subexpressions([("bin", "t1", "+", "a", "b"), ("const", "a", 9), ("bin", "t2", "+", "a", "b")]) == [("bin", "t1", "+", "a", "b"), ("const", "a", 9), ("bin", "t2", "+", "a", "b")]
+      assert common_subexpressions([("bin", "t1", "+", "a", "b"), ("const", "t1", 0), ("bin", "t2", "+", "a", "b")]) == [("bin", "t1", "+", "a", "b"), ("const", "t1", 0), ("bin", "t2", "+", "a", "b")]
+      assert common_subexpressions([("bin", "x", "+", "x", "one"), ("bin", "y", "+", "x", "one")]) == [("bin", "x", "+", "x", "one"), ("bin", "y", "+", "x", "one")]
+      assert common_subexpressions([("bin", "t1", "+", "a", "b"), ("bin", "a", "+", "a", "b"), ("bin", "t3", "+", "a", "b")]) == [("bin", "t1", "+", "a", "b"), ("copy", "a", "t1"), ("bin", "t3", "+", "a", "b")]
+  - name: removing dead code
+    code: |
+      assert eliminate_dead_code([("const", "a", 1), ("const", "b", 2), ("bin", "c", "+", "a", "b"), ("const", "d", 7), ("print", "c")], []) == [("const", "a", 1), ("const", "b", 2), ("bin", "c", "+", "a", "b"), ("print", "c")]
+      assert eliminate_dead_code([("const", "a", 1), ("copy", "b", "a"), ("const", "c", 3), ("print", "c")], []) == [("const", "c", 3), ("print", "c")]
+      assert eliminate_dead_code([("const", "a", 1), ("const", "a", 2), ("print", "a")], []) == [("const", "a", 2), ("print", "a")]
+      assert eliminate_dead_code([("const", "x", 1)], ["x"]) == [("const", "x", 1)]
+      assert eliminate_dead_code([("const", "x", 1)], []) == []
+      assert eliminate_dead_code([("label", "L"), ("const", "c", 0), ("jumpz", "c", "L")], []) == [("label", "L"), ("const", "c", 0), ("jumpz", "c", "L")]
+      assert eliminate_dead_code([("bin", "t", "+", "a", "b"), ("neg", "u", "t"), ("ret", "a")], []) == [("ret", "a")]
+      block = [("const", "z", 1)]
+      eliminate_dead_code(block, [])
+      assert block == [("const", "z", 1)]
+  hints:
+  - For dead code walk backwards, since what is live depends on what comes after.
+  solution: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+
+    COMMUTATIVE = ("+", "*", "==", "!=")
+
+
+    def common_subexpressions(block):
+        """Local common subexpression elimination. Remember, for each computation seen so far, the variable that holds its value: a key ("bin", op, a, b) (for the
+        commutative operators + * == != sort the two operands first) or ("neg", a). When the same computation appears again and its holder still has that value, replace the
+        instruction with ("copy", dest, holder). Whenever a variable is redefined, forget every remembered computation that uses it as an operand or holds its value. A computation whose
+        dest is also one of its own operands (x = x + 1) is never remembered. Return the new block."""
+        seen = {}
+        out = []
+        for ins in block:
+            key = None
+            if ins[0] == "bin":
+                a, b = ins[3], ins[4]
+                if ins[2] in COMMUTATIVE and b < a:
+                    a, b = b, a
+                key = ("bin", ins[2], a, b)
+            elif ins[0] == "neg":
+                key = ("neg", ins[2])
+            if key is not None and key in seen:
+                new = ("copy", ins[1], seen[key])
+            else:
+                new = ins
+            out.append(new)
+            d, _ = defs_uses(new)
+            if d is not None:
+                for k in [k for k, holder in seen.items() if holder == d or d in k[2:]]:
+                    del seen[k]
+                if key is not None and new is ins and d not in key[2:]:
+                    seen[key] = d
+        return out
+
+
+    def eliminate_dead_code(block, live_out):
+        """Backward pass: walk the block from the end with a set of live variables that starts as `live_out`. An instruction that defines a variable which is not live
+        (const, copy, neg or bin) is deleted; otherwise its defined variable leaves the live set and its used variables join it. print, ret, jumpz, label and jump are always kept (the ones with
+        operands add them to the live set). Return the new block in the original order."""
+        live = set(live_out)
+        kept = []
+        for ins in reversed(block):
+            d, uses = defs_uses(ins)
+            if d is not None and d not in live:
+                continue
+            if d is not None:
+                live.discard(d)
+            live.update(uses)
+            kept.append(ins)
+        kept.reverse()
+        return kept
+  explanation: Two simple local passes already remove a surprising amount of waste.
+- id: global
+  title: 'Capstone: global liveness and dead code removal'
+  difficulty: 5
+  prompt: 'The starter has `lower_program`, `apply_op`, `run_tac`, `basic_blocks`, `build_cfg`, `defs_uses` and `eliminate_dead_code`. Write `liveness(blocks, cfg)`, **global liveness analysis**. A variable is **live** at a point if some path from there reads it before writing it. For each block compute `use` (variables read before any write in the block) and `defs` (variables written). Then iterate until nothing changes: `live_out[b]` is the union of `live_in[s]` over the successors `s`, and `live_in[b] = use[b]` union (`live_out[b]` minus `defs[b]`). Return `(live_in, live_out)` as lists indexed by block holding **sorted** lists of names. Write `dead_code_elimination(code)`: repeat { split into blocks, build the graph, run liveness, apply `eliminate_dead_code` to each block with its `live_out`, join the blocks } until the code stops changing, because removing one assignment can make another one dead. Return the new instruction list (`[]` for empty code).'
+  starter: |-
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def lower_program(stmts):
+        """Lower statements to flat three-address code with labels L1, L2, ... and temporaries t1, t2, ... Statements: ("assign", name, expr), ("print", expr),
+        ("return", expr), ("if", cond, then_list, else_list), ("while", cond, body_list). A while loop is: label top; evaluate cond; jumpz cond end; body; jump top; label end.
+        An if is: evaluate cond; jumpz cond else; then; jump end; label else; else-part; label end."""
+        code = []
+        counters = {"t": 0, "L": 0}
+
+        def tmp():
+            counters["t"] += 1
+            return "t%d" % counters["t"]
+
+        def label():
+            counters["L"] += 1
+            return "L%d" % counters["L"]
+
+        def expr(e):
+            if e[0] == "num":
+                t = tmp()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = expr(e[2])
+                t = tmp()
+                code.append(("neg", t, a))
+                return t
+            a = expr(e[2])
+            b = expr(e[3])
+            t = tmp()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.append(("copy", s[1], expr(s[2])))
+            elif s[0] == "print":
+                code.append(("print", expr(s[1])))
+            elif s[0] == "return":
+                code.append(("ret", expr(s[1])))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                c = expr(s[1])
+                code.append(("jumpz", c, end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                c = expr(s[1])
+                code.append(("jumpz", c, other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+
+    def basic_blocks(code):
+        """Split instructions into basic blocks: straight-line runs entered only at the top and left only at the bottom. A new block starts at the first instruction,
+        at every ("label", ...), and right after every jump, jumpz or ret. Return a list of lists of instructions (empty code gives an empty list)."""
+        blocks = []
+        for i, ins in enumerate(code):
+            starts = i == 0 or ins[0] == "label" or code[i - 1][0] in ("jump", "jumpz", "ret")
+            if starts:
+                blocks.append([])
+            blocks[-1].append(ins)
+        return blocks
+
+
+    def build_cfg(blocks):
+        """The control flow graph: a dict from block index to the sorted list of successor block indexes. Look at the LAST instruction: a jump goes to the block that
+        starts with that label; a jumpz goes to that block or falls through to the next block; ret has no successors; anything else falls through to the next block (if any)."""
+        where = {}
+        for i, block in enumerate(blocks):
+            if block[0][0] == "label":
+                where[block[0][1]] = i
+        cfg = {}
+        for i, block in enumerate(blocks):
+            last = block[-1]
+            out = set()
+            if last[0] == "jump":
+                out.add(where[last[1]])
+            elif last[0] == "jumpz":
+                out.add(where[last[2]])
+                if i + 1 < len(blocks):
+                    out.add(i + 1)
+            elif last[0] != "ret" and i + 1 < len(blocks):
+                out.add(i + 1)
+            cfg[i] = sorted(out)
+        return cfg
+
+
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+
+
+
+    def eliminate_dead_code(block, live_out):
+        live = set(live_out)
+        kept = []
+        for ins in reversed(block):
+            d, uses = defs_uses(ins)
+            if d is not None and d not in live:
+                continue
+            if d is not None:
+                live.discard(d)
+            live.update(uses)
+            kept.append(ins)
+        kept.reverse()
+        return kept
+
+
+    def liveness(blocks, cfg):
+        """Global liveness analysis by iteration. A variable is LIVE at a point if some path from there reads it before writing it. For each block compute
+        use (variables read before any write in the block) and defs (variables written). Then repeat until nothing changes: live_out[b] = union of live_in[s] for successors s, and
+        live_in[b] = use[b] union (live_out[b] minus defs[b]). Return (live_in, live_out), each a list indexed by block holding a SORTED list of names."""
+        pass
+
+
+    def dead_code_elimination(code):
+        """Remove every assignment whose value is never used, across the whole program: repeat { split into blocks, build the cfg, run liveness, apply eliminate_dead_code to each block with
+        its live_out, join the blocks } until the code stops changing (removing one assignment can make another dead). Return the new instruction list."""
+        pass
+  tests:
+  - name: liveness of a loop
+    code: |
+      prog = [("assign", "x", ("num", 0)), ("while", ("binop", "<", ("var", "x"), ("num", 3)), [("assign", "x", ("binop", "+", ("var", "x"), ("num", 1)))]), ("print", ("var", "x"))]
+      blocks = basic_blocks(lower_program(prog))
+      cfg = build_cfg(blocks)
+      live_in, live_out = liveness(blocks, cfg)
+      assert live_in == [[], ["x"], ["x"], ["x"]]
+      assert live_out == [["x"], ["x"], ["x"], []]
+  - name: liveness with branches
+    code: |
+      code = [("const", "a", 1), ("const", "b", 2), ("jumpz", "a", "other"), ("print", "a"), ("jump", "end"), ("label", "other"), ("print", "b"), ("label", "end"), ("ret", "a")]
+      blocks = basic_blocks(code)
+      cfg = build_cfg(blocks)
+      live_in, live_out = liveness(blocks, cfg)
+      assert len(blocks) == 4
+      assert live_in == [[], ["a"], ["a", "b"], ["a"]]
+      assert live_out == [["a", "b"], ["a"], ["a"], []]
+      single = liveness([[("const", "k", 1), ("print", "k")]], {0: []})
+      assert single == ([[]], [[]])
+  - name: removing dead assignments globally
+    code: |
+      prog = [("assign", "x", ("num", 5)), ("assign", "y", ("binop", "*", ("var", "x"), ("num", 2))), ("assign", "z", ("num", 7)),
+              ("if", ("binop", "<", ("var", "x"), ("num", 3)), [("print", ("var", "y"))], [("print", ("var", "x"))])]
+      code = lower_program(prog)
+      better = dead_code_elimination(code)
+      assert len(better) < len(code)
+      assert ("copy", "z", "t4") not in better and all(ins[1] != "z" for ins in better if ins[0] == "copy")
+      assert run_tac(better)["output"] == run_tac(code)["output"] == [5]
+      assert dead_code_elimination([]) == []
+      assert dead_code_elimination(better) == better
+  - name: chains and loops
+    code: |
+      code = [("const", "a", 1), ("copy", "b", "a"), ("copy", "c", "b"), ("const", "r", 9), ("ret", "r")]
+      assert dead_code_elimination(code) == [("const", "r", 9), ("ret", "r")]
+      prog = [("assign", "i", ("num", 0)), ("assign", "s", ("num", 0)), ("assign", "waste", ("num", 1)),
+              ("while", ("binop", "<", ("var", "i"), ("num", 4)), [("assign", "s", ("binop", "+", ("var", "s"), ("var", "i"))), ("assign", "waste", ("binop", "*", ("var", "waste"), ("num", 2))), ("assign", "i", ("binop", "+", ("var", "i"), ("num", 1)))]),
+              ("print", ("var", "s"))]
+      code = lower_program(prog)
+      better = dead_code_elimination(code)
+      assert run_tac(better)["output"] == run_tac(code)["output"] == [6]
+      assert any(ins[0] == "copy" and ins[1] == "waste" for ins in better)
+      assert any(ins[0] == "copy" and ins[1] == "s" for ins in better) and any(ins[0] == "copy" and ins[1] == "i" for ins in better)
+  hints:
+  - 'Liveness flows backwards: a variable is live-in if the block reads it, or it is live-out and the block does not overwrite it.'
+  solution: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def lower_program(stmts):
+        """Lower statements to flat three-address code with labels L1, L2, ... and temporaries t1, t2, ... Statements: ("assign", name, expr), ("print", expr),
+        ("return", expr), ("if", cond, then_list, else_list), ("while", cond, body_list). A while loop is: label top; evaluate cond; jumpz cond end; body; jump top; label end.
+        An if is: evaluate cond; jumpz cond else; then; jump end; label else; else-part; label end."""
+        code = []
+        counters = {"t": 0, "L": 0}
+
+        def tmp():
+            counters["t"] += 1
+            return "t%d" % counters["t"]
+
+        def label():
+            counters["L"] += 1
+            return "L%d" % counters["L"]
+
+        def expr(e):
+            if e[0] == "num":
+                t = tmp()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = expr(e[2])
+                t = tmp()
+                code.append(("neg", t, a))
+                return t
+            a = expr(e[2])
+            b = expr(e[3])
+            t = tmp()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.append(("copy", s[1], expr(s[2])))
+            elif s[0] == "print":
+                code.append(("print", expr(s[1])))
+            elif s[0] == "return":
+                code.append(("ret", expr(s[1])))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                c = expr(s[1])
+                code.append(("jumpz", c, end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                c = expr(s[1])
+                code.append(("jumpz", c, other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+
+    def basic_blocks(code):
+        """Split instructions into basic blocks: straight-line runs entered only at the top and left only at the bottom. A new block starts at the first instruction,
+        at every ("label", ...), and right after every jump, jumpz or ret. Return a list of lists of instructions (empty code gives an empty list)."""
+        blocks = []
+        for i, ins in enumerate(code):
+            starts = i == 0 or ins[0] == "label" or code[i - 1][0] in ("jump", "jumpz", "ret")
+            if starts:
+                blocks.append([])
+            blocks[-1].append(ins)
+        return blocks
+
+
+    def build_cfg(blocks):
+        """The control flow graph: a dict from block index to the sorted list of successor block indexes. Look at the LAST instruction: a jump goes to the block that
+        starts with that label; a jumpz goes to that block or falls through to the next block; ret has no successors; anything else falls through to the next block (if any)."""
+        where = {}
+        for i, block in enumerate(blocks):
+            if block[0][0] == "label":
+                where[block[0][1]] = i
+        cfg = {}
+        for i, block in enumerate(blocks):
+            last = block[-1]
+            out = set()
+            if last[0] == "jump":
+                out.add(where[last[1]])
+            elif last[0] == "jumpz":
+                out.add(where[last[2]])
+                if i + 1 < len(blocks):
+                    out.add(i + 1)
+            elif last[0] != "ret" and i + 1 < len(blocks):
+                out.add(i + 1)
+            cfg[i] = sorted(out)
+        return cfg
+
+
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+
+
+
+    def eliminate_dead_code(block, live_out):
+        live = set(live_out)
+        kept = []
+        for ins in reversed(block):
+            d, uses = defs_uses(ins)
+            if d is not None and d not in live:
+                continue
+            if d is not None:
+                live.discard(d)
+            live.update(uses)
+            kept.append(ins)
+        kept.reverse()
+        return kept
+
+
+    def liveness(blocks, cfg):
+        """Global liveness analysis by iteration. A variable is LIVE at a point if some path from there reads it before writing it. For each block compute
+        use (variables read before any write in the block) and defs (variables written). Then repeat until nothing changes: live_out[b] = union of live_in[s] for successors s, and
+        live_in[b] = use[b] union (live_out[b] minus defs[b]). Return (live_in, live_out), each a list indexed by block holding a SORTED list of names."""
+        use, defs = [], []
+        for block in blocks:
+            u, d = set(), set()
+            for ins in block:
+                defined, used = defs_uses(ins)
+                u.update(v for v in used if v not in d)
+                if defined is not None:
+                    d.add(defined)
+            use.append(u)
+            defs.append(d)
+        live_in = [set() for _ in blocks]
+        live_out = [set() for _ in blocks]
+        changed = True
+        while changed:
+            changed = False
+            for b in reversed(range(len(blocks))):
+                out = set()
+                for s in cfg[b]:
+                    out |= live_in[s]
+                new_in = use[b] | (out - defs[b])
+                if out != live_out[b] or new_in != live_in[b]:
+                    live_out[b], live_in[b] = out, new_in
+                    changed = True
+        return [sorted(s) for s in live_in], [sorted(s) for s in live_out]
+
+
+    def dead_code_elimination(code):
+        """Remove every assignment whose value is never used, across the whole program: repeat { split into blocks, build the cfg, run liveness, apply eliminate_dead_code to each block with
+        its live_out, join the blocks } until the code stops changing (removing one assignment can make another dead). Return the new instruction list."""
+        while True:
+            blocks = basic_blocks(code)
+            if not blocks:
+                return []
+            cfg = build_cfg(blocks)
+            _, live_out = liveness(blocks, cfg)
+            new = []
+            for i, block in enumerate(blocks):
+                new += eliminate_dead_code(block, live_out[i])
+            if new == code:
+                return code
+            code = new
+  explanation: 'Dataflow analysis is the engine behind most compiler optimizations: iterate simple facts to a fixed point.'
+commonMistakes:
+- title: Folding a division by zero
+  explanation: The error must still happen when the program runs.
+- title: Forgetting to invalidate facts after an assignment
+  explanation: A copy or constant that referred to the old value is no longer true.
+- title: Treating b - a as the same as a - b
+  explanation: Only commutative operators may have their operands sorted.
+- title: Dead code removal that looks only inside one block
+  explanation: A variable may be used in a later block; liveness must cross the graph.
+- title: Computing liveness forwards
+  explanation: What is live depends on the future, so walk backwards.
+summary:
+- Three-address code is a flat, simple intermediate language with labels and jumps.
+- Basic blocks and the control-flow graph show the shape of a program.
+- Constant folding and copy propagation use what is already known.
+- CSE reuses a computed value while its inputs are unchanged.
+- Liveness is a backward dataflow analysis, iterated to a fixed point.
+- Every optimization must preserve observable behaviour.
+next: u23-codegen
+quiz:
+- type: mcq
+  question: Why compile to an IR instead of straight to machine code?
+  options:
+  - One IR connects many languages and machines, and is good for optimizing
+  - It is shorter to write
+  - Machines read it directly
+  - It avoids parsing
+  answer: 0
+  explanation: The IR decouples front ends from back ends.
+- type: mcq
+  question: A basic block is...
+  options:
+  - A straight-line run entered only at the top and left only at the bottom
+  - Any function
+  - A loop
+  - One instruction
+  answer: 0
+  explanation: No jumps in or out except at the ends.
+- type: mcq
+  question: Why not fold 1 / 0 at compile time?
+  options:
+  - The error must still happen at run time
+  - Division is slow
+  - It is not a constant
+  - Folding only handles addition
+  answer: 0
+  explanation: Optimizations preserve behaviour, including errors.
+- type: mcq
+  question: When is a variable live?
+  options:
+  - Some path reads it before writing it
+  - It has been assigned
+  - It is a temporary
+  - It is used twice
+  answer: 0
+  explanation: Liveness is about future reads.
+- type: mcq
+  question: Why iterate liveness to a fixed point?
+  options:
+  - Loops feed information back around the graph
+  - To make the code faster
+  - To rename variables
+  - To find syntax errors
+  answer: 0
+  explanation: One pass may miss values flowing around a cycle.
+- type: mcq
+  question: Which operands may be reordered to find common subexpressions?
+  options:
+  - Those of commutative operators such as + and *
+  - Those of -
+  - Those of /
+  - All of them
+  answer: 0
+  explanation: Only commutative operations are symmetric.
+- type: code
+  question: Write `count_instructions(code, kind)` returning how many instructions in the list `code` have the given first element `kind` (for example `"bin"`).
+  starter: |
+    def count_instructions(code, kind):
+        pass
+  tests:
+  - name: count
+    code: |
+      code = [("const", "a", 1), ("bin", "b", "+", "a", "a"), ("bin", "c", "*", "b", "b"), ("print", "c")]
+      assert count_instructions(code, "bin") == 2 and count_instructions(code, "const") == 1 and count_instructions(code, "jump") == 0
+      assert count_instructions([], "bin") == 0
+  solution: |
+    def count_instructions(code, kind):
+        return sum(1 for ins in code if ins[0] == kind)

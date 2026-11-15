@@ -1,0 +1,1404 @@
+id: u23-semantics
+title: 'Semantic Analysis: Scopes and Types'
+minutes: 95
+objective: 'Learn what a compiler checks after the syntax is right: that every name refers to something, that every operation is applied to the right kind of data, and that functions return properly. You will build a symbol table, a type checker, a call graph and a linter.'
+outcomes:
+- Explain what semantic analysis checks that the grammar cannot
+- Build a symbol table with nested scopes
+- Write a type checker that reports several errors
+- Detect missing returns and recursion with a call graph
+- Write a simple linter
+sections:
+- heading: Syntax is not enough
+  body: |-
+    A program can be perfectly shaped and still be nonsense. `let x = y + 1` has valid syntax even if `y` was never declared, and `"hello" * true` follows the grammar even though multiplying text by a truth value means nothing. The grammar cannot catch these problems because they depend on **meaning**, and checking meaning is the job of **semantic analysis**, the compiler phase after parsing. It works on the abstract syntax tree and asks questions such as: is this name declared? Does this expression have the right type? Does this function return on every path?
+
+    Semantic analysis is where most of the error messages you see come from. Python skips most of it until the code runs; compiled languages such as Rust and Java check it all in advance, which is why a program that compiles often works. Catching mistakes early is cheap: a message that points to the line is far better than a crash an hour later.
+- heading: Scopes and symbol tables
+  body: |-
+    A **scope** is the region of a program where a name is visible. In most languages, a block between braces opens a new scope, so a variable declared inside a loop is not visible after it. Scopes **nest**: an inner scope can see its parents' names, and it can declare its own name that **shadows**, or hides, an outer one of the same name. Declaring the same name twice in the *same* scope is an error called **redeclaration**.
+
+    The compiler keeps this information in a **symbol table**: a dictionary from names to facts about them, such as their type. Nested scopes become a chain of tables, each pointing to its parent. To **declare** a name, add it to the current table (failing if it is already there). To **look up** a name, search the current table, then its parent, and so on outward until it is found or the chain ends, in which case the name is **undeclared**. The `scope_distance` of a name, the number of steps outward to the scope that declares it, is what some compilers use to locate the variable at run time.
+
+    One detail matters: in `let x = x + 1` the right-hand side is resolved *before* the new `x` exists, so it refers to an outer `x`. The order of operations in the checker matches the order in which the program's meaning is defined.
+- heading: Types and checking
+  body: |-
+    A **type** is a set of values together with the operations allowed on them. A **type checker** assigns a type to every expression, and reports an error whenever an operation receives the wrong types. For our small language the rules are short: adding two `int` values gives an `int`; adding an `int` and a `float` gives a `float` (the integer is **widened**, which is safe because no information is lost); dividing always gives a `float`; adding two strings joins them; comparing numbers gives a `bool`; `and`, `or` and `not` need `bool` values. Storing a `float` in an `int` variable is rejected, because it would lose the fractional part.
+
+    A type checker is really an **evaluator that computes types instead of values**: the same recursive walk, with a rule per node kind. Because it never runs the program, it is also *conservative*: it may reject a program that would have worked, and the rules are chosen so it never accepts one that would crash on a type error.
+
+    Good checkers report **many errors in one run**. To avoid a cascade of nonsense errors after the first mistake, a variable whose declaration failed is recorded with the special type `unknown`, which silently propagates: any expression using it is also `unknown`, with no new complaint. Checking **statements** adds a few more rules: conditions in `if` and `while` must be `bool`, assignments must store a compatible type, and every block opens a scope.
+
+    For functions, the checker also verifies that the number and types of arguments match the declaration, and that the function **returns on every path**. A `while` loop never guarantees a return, because its body might run zero times. A **call graph** (which function calls which) reveals recursion, which is a function reaching itself through the graph, and dead code, which no entry point can reach. Finally, a **linter** is a gentler cousin of a type checker that warns about suspicious but legal code: variables never read, or names that shadow others.
+examples:
+- title: Finding name errors
+  intro: Resolving names in a small program with deliberate mistakes.
+  code: |
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        return {"names": {}, "parent": parent}
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        if name in scope["names"]:
+            raise ValueError("redeclared " + name)
+        scope["names"][name] = info
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        s = scope
+        while s is not None:
+            if name in s["names"]:
+                return s["names"][name]
+            s = s["parent"]
+        raise ValueError("undeclared " + name)
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        s = scope
+        hops = 0
+        while s is not None:
+            if name in s["names"]:
+                return hops
+            s = s["parent"]
+            hops += 1
+        raise ValueError("undeclared " + name)
+
+
+    def resolve_names(program):
+        """Walk a list of statements and return the list of error strings, in source order: 'undeclared x' for a variable that is read or assigned
+        without a declaration in scope, and 'redeclared x' for a let of a name already declared in the SAME scope (the later let is ignored).
+        Statements: ("let", name, annotation, expr), ("assign", name, expr), ("print", expr), ("if", cond, then_list, else_list), ("while", cond, body_list), ("block", stmts).
+        Expressions: ("num", v), ("bool", v), ("str", s), ("var", name), ("unary", op, e), ("binop", op, l, r). The expression of a let is resolved BEFORE the name is
+        declared, so 'let x = x' reads an outer x. Each block, if-branch and while body gets a new scope. Keep going after an error."""
+        errors = []
+
+        def expr(e, scope):
+            if e[0] == "var":
+                try:
+                    lookup(scope, e[1])
+                except ValueError as error:
+                    errors.append(str(error))
+            elif e[0] == "unary":
+                expr(e[2], scope)
+            elif e[0] == "binop":
+                expr(e[2], scope)
+                expr(e[3], scope)
+
+        def stmts(items, scope):
+            for s in items:
+                kind = s[0]
+                if kind == "let":
+                    expr(s[3], scope)
+                    try:
+                        declare(scope, s[1], True)
+                    except ValueError as error:
+                        errors.append(str(error))
+                elif kind == "assign":
+                    try:
+                        lookup(scope, s[1])
+                    except ValueError as error:
+                        errors.append(str(error))
+                    expr(s[2], scope)
+                elif kind == "print":
+                    expr(s[1], scope)
+                elif kind == "if":
+                    expr(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                    stmts(s[3], new_scope(scope))
+                elif kind == "while":
+                    expr(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                elif kind == "block":
+                    stmts(s[1], new_scope(scope))
+
+        stmts(program, new_scope())
+        return errors
+
+    program = [
+        ("let", "total", None, ("num", 0)),
+        ("let", "total", None, ("num", 1)),
+        ("print", ("var", "count")),
+        ("block", [("let", "total", None, ("binop", "+", ("var", "total"), ("num", 1))), ("print", ("var", "total"))]),
+        ("assign", "missing", ("num", 5)),
+    ]
+    for error in resolve_names(program):
+        print(error)
+    inner = new_scope(new_scope())
+    declare(inner["parent"], "x", "int")
+    print("distance to x:", scope_distance(inner, "x"))
+  output: |
+    redeclared total
+    undeclared count
+    undeclared missing
+    distance to x: 1
+  lines:
+  - line: 92
+    note: One error string per problem, in source order.
+  - line: 96
+    note: The scope that declares x is one step up.
+- title: A small type checker
+  intro: Type-checking a program with a string plus an integer, a lossy store and a non-boolean condition.
+  code: |
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        return {"names": {}, "parent": parent}
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        if name in scope["names"]:
+            raise ValueError("redeclared " + name)
+        scope["names"][name] = info
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        s = scope
+        while s is not None:
+            if name in s["names"]:
+                return s["names"][name]
+            s = s["parent"]
+        raise ValueError("undeclared " + name)
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        s = scope
+        hops = 0
+        while s is not None:
+            if name in s["names"]:
+                return hops
+            s = s["parent"]
+            hops += 1
+        raise ValueError("undeclared " + name)
+
+
+
+
+    NUMERIC = ("int", "float")
+
+
+    def can_assign(target, value):
+        """May a value of type `value` be stored in a variable of type `target`? Same type, or int into float (widening). 'unknown' on either side is accepted."""
+        if "unknown" in (target, value):
+            return True
+        return target == value or (target == "float" and value == "int")
+
+
+    def type_of(expr, env):
+        """The type ('int', 'float', 'bool' or 'str') of an expression; env maps variable names to types. Raise ValueError('undeclared x') for a variable
+        not in env, or ValueError('type error: ...') for a wrongly typed operation. Rules: ("num", v) is int or float; ("bool", v) bool; ("str", s) str; + - * on two
+        numbers give int if both are int, else float; / on numbers always gives float; + on two strs gives str (the only str operator); < > <= >= on two numbers give bool;
+        == != on two numbers, or two operands of the same type, give bool; 'and' 'or' need two bools; unary 'not' needs a bool; unary '-' needs a number and keeps its type.
+        A variable whose type is 'unknown' (left over from an earlier error) makes any expression using it 'unknown' without a new error."""
+        kind = expr[0]
+        if kind == "num":
+            return "float" if isinstance(expr[1], float) else "int"
+        if kind == "bool":
+            return "bool"
+        if kind == "str":
+            return "str"
+        if kind == "var":
+            if expr[1] not in env:
+                raise ValueError("undeclared " + expr[1])
+            return env[expr[1]]
+        if kind == "unary":
+            t = type_of(expr[2], env)
+            if t == "unknown":
+                return t
+            if expr[1] == "not":
+                if t != "bool":
+                    raise ValueError("type error: not needs bool, got " + t)
+                return "bool"
+            if t not in NUMERIC:
+                raise ValueError("type error: - needs a number, got " + t)
+            return t
+        op = expr[1]
+        a, b = type_of(expr[2], env), type_of(expr[3], env)
+        if "unknown" in (a, b):
+            return "unknown"
+        both_num = a in NUMERIC and b in NUMERIC
+        if op in ("+", "-", "*", "/"):
+            if op == "+" and a == b == "str":
+                return "str"
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            if op == "/":
+                return "float"
+            return "int" if a == b == "int" else "float"
+        if op in ("<", ">", "<=", ">="):
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            return "bool"
+        if op in ("==", "!="):
+            if not (both_num or a == b):
+                raise ValueError("type error: cannot compare %s with %s" % (a, b))
+            return "bool"
+        if op in ("and", "or"):
+            if a != "bool" or b != "bool":
+                raise ValueError("type error: %s needs bools, got %s and %s" % (op, a, b))
+            return "bool"
+        raise ValueError("type error: unknown operator " + op)
+
+
+    def visible(scope):
+        """Flatten a scope chain into one dict name -> type (inner names win)."""
+        chain = []
+        s = scope
+        while s is not None:
+            chain.append(s["names"])
+            s = s["parent"]
+        env = {}
+        for names in reversed(chain):
+            env.update(names)
+        return env
+
+
+    def check_program(program):
+        """Type-check a list of statements (the same forms as resolve_names, where a let's annotation is None or a type name) and return the list of error
+        strings in source order, at most ONE error per statement or condition. The scope info is the variable's type. Rules: a let declares its name with the annotation if
+        there is one, otherwise with the type of its expression; if the expression is wrong, record the error and declare the name as the annotation or 'unknown'.
+        A let whose expression type cannot be assigned to its annotation gives 'type error: cannot store T in x'. A repeated let in the same scope gives 'redeclared x'.
+        An assign needs a declared variable ('undeclared x') and a type assignable to it (same 'type error: cannot store T in x'). if and while conditions must be bool, else
+        'type error: condition must be bool, got T' (an 'unknown' condition is accepted). print checks its expression. Blocks, if-branches and while bodies each get a new scope."""
+        errors = []
+
+        def typed(e, scope):
+            try:
+                return type_of(e, visible(scope))
+            except ValueError as error:
+                errors.append(str(error))
+                return None
+
+        def condition(e, scope):
+            t = typed(e, scope)
+            if t is not None and t not in ("bool", "unknown"):
+                errors.append("type error: condition must be bool, got " + t)
+
+        def stmts(items, scope):
+            for s in items:
+                kind = s[0]
+                if kind == "let":
+                    t = typed(s[3], scope)
+                    declared = s[2]
+                    if t is not None and declared is not None and not can_assign(declared, t):
+                        errors.append("type error: cannot store %s in %s" % (t, s[1]))
+                    final = declared or t or "unknown"
+                    try:
+                        declare(scope, s[1], final)
+                    except ValueError as error:
+                        errors.append(str(error))
+                elif kind == "assign":
+                    t = typed(s[2], scope)
+                    try:
+                        target = lookup(scope, s[1])
+                    except ValueError as error:
+                        errors.append(str(error))
+                        continue
+                    if t is not None and not can_assign(target, t):
+                        errors.append("type error: cannot store %s in %s" % (t, s[1]))
+                elif kind == "print":
+                    typed(s[1], scope)
+                elif kind == "if":
+                    condition(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                    stmts(s[3], new_scope(scope))
+                elif kind == "while":
+                    condition(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                elif kind == "block":
+                    stmts(s[1], new_scope(scope))
+
+        stmts(program, new_scope())
+        return errors
+
+    program = [
+        ("let", "age", "int", ("num", 30)),
+        ("let", "name", None, ("str", "Ada")),
+        ("let", "ratio", None, ("binop", "/", ("var", "age"), ("num", 4))),
+        ("let", "bad", None, ("binop", "+", ("var", "name"), ("var", "age"))),
+        ("assign", "age", ("num", 31.5)),
+        ("if", ("var", "age"), [("print", ("var", "ratio"))], []),
+    ]
+    print("ratio has type", type_of(("var", "ratio"), {"ratio": "float"}))
+    for error in check_program(program):
+        print(error)
+    print("1 + 2 * 3.0 has type", type_of(("binop", "+", ("num", 1), ("binop", "*", ("num", 2), ("num", 3.0))), {}))
+  output: |
+    ratio has type float
+    type error: + needs numbers, got str and int
+    type error: cannot store float in age
+    type error: condition must be bool, got int
+    1 + 2 * 3.0 has type float
+  lines:
+  - line: 183
+    note: Errors are collected, not raised.
+  - line: 185
+    note: int times float widens to float, so the sum is float.
+playground:
+  prompt: Declare a variable in an inner scope, then look it up from the outer scope and watch the error.
+  code: |
+    inner = {'names': {'x': 'int'}, 'parent': None}
+    outer = {'names': {}, 'parent': None}
+    print(inner['names'].get('x'))
+    print(outer['names'].get('x'))
+exercises:
+- id: scopes
+  title: Symbol tables and scopes
+  difficulty: 4
+  prompt: 'Scopes are dicts `{"names": {...}, "parent": ...}`. Write `new_scope(parent=None)`, `declare(scope, name, info)` (raise `ValueError("redeclared NAME")` if this very scope already has the name; shadowing an outer name is fine), `lookup(scope, name)` (search outward; `ValueError("undeclared NAME")` if no scope has it) and `scope_distance(scope, name)` (0 means this scope, 1 its parent, ...). Then write `resolve_names(program)`, which walks statements and returns error strings in source order: `undeclared x` for a variable read or assigned without a declaration in scope, and `redeclared x` for a `let` of a name already declared in the same scope (the later `let` is ignored). Statements: `("let", name, annotation, expr)`, `("assign", name, expr)`, `("print", expr)`, `("if", cond, then_list, else_list)`, `("while", cond, body_list)`, `("block", stmts)`; expressions: `num`, `bool`, `str`, `("var", name)`, `("unary", op, e)`, `("binop", op, l, r)`. A `let`''s expression is resolved **before** its name is declared, and every block, branch and loop body gets a new scope.'
+  starter: |-
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        pass
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        pass
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        pass
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        pass
+
+
+    def resolve_names(program):
+        """Walk a list of statements and return the list of error strings, in source order: 'undeclared x' for a variable that is read or assigned
+        without a declaration in scope, and 'redeclared x' for a let of a name already declared in the SAME scope (the later let is ignored).
+        Statements: ("let", name, annotation, expr), ("assign", name, expr), ("print", expr), ("if", cond, then_list, else_list), ("while", cond, body_list), ("block", stmts).
+        Expressions: ("num", v), ("bool", v), ("str", s), ("var", name), ("unary", op, e), ("binop", op, l, r). The expression of a let is resolved BEFORE the name is
+        declared, so 'let x = x' reads an outer x. Each block, if-branch and while body gets a new scope. Keep going after an error."""
+        pass
+  tests:
+  - name: the symbol table
+    code: |
+      g = new_scope()
+      declare(g, "x", "int")
+      inner = new_scope(g)
+      declare(inner, "y", "str")
+      assert lookup(inner, "x") == "int" and lookup(inner, "y") == "str"
+      assert scope_distance(inner, "y") == 0 and scope_distance(inner, "x") == 1
+      declare(inner, "x", "bool")
+      assert lookup(inner, "x") == "bool" and lookup(g, "x") == "int"
+      assert scope_distance(inner, "x") == 0
+      for bad in (lambda: lookup(g, "y"), lambda: scope_distance(g, "q")):
+          try:
+              bad()
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e).startswith("undeclared ")
+      try:
+          declare(g, "x", "float")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert str(e) == "redeclared x"
+      assert g["parent"] is None and inner["parent"] is g
+  - name: correct programs
+    code: |
+      prog = [("let", "x", None, ("num", 1)), ("let", "y", None, ("binop", "+", ("var", "x"), ("num", 2))), ("print", ("var", "y")),
+              ("if", ("var", "x"), [("let", "z", None, ("var", "y")), ("assign", "x", ("var", "z"))], []), ("block", [("let", "x", None, ("var", "x"))])]
+      assert resolve_names(prog) == []
+      assert resolve_names([]) == []
+  - name: errors
+    code: |
+      prog = [("print", ("var", "a")), ("let", "x", None, ("num", 1)), ("let", "x", None, ("num", 2)), ("assign", "q", ("var", "x")),
+              ("block", [("let", "w", None, ("num", 0))]), ("print", ("var", "w")), ("let", "n", None, ("var", "n"))]
+      assert resolve_names(prog) == ["undeclared a", "redeclared x", "undeclared q", "undeclared w", "undeclared n"]
+      prog2 = [("while", ("var", "go"), [("assign", "k", ("binop", "+", ("var", "k"), ("var", "j")))]), ("if", ("bool", True), [("let", "t", None, ("num", 1))], [("print", ("var", "t"))])]
+      assert resolve_names(prog2) == ["undeclared go", "undeclared k", "undeclared k", "undeclared j", "undeclared t"]
+  - name: shadowing is allowed
+    code: |
+      prog = [("let", "x", None, ("num", 1)), ("block", [("let", "x", None, ("binop", "+", ("var", "x"), ("num", 1))), ("print", ("var", "x"))]), ("print", ("var", "x"))]
+      assert resolve_names(prog) == []
+  hints:
+  - Walk the statements with a current scope; make a child scope for each block, branch and loop body.
+  solution: |
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        return {"names": {}, "parent": parent}
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        if name in scope["names"]:
+            raise ValueError("redeclared " + name)
+        scope["names"][name] = info
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        s = scope
+        while s is not None:
+            if name in s["names"]:
+                return s["names"][name]
+            s = s["parent"]
+        raise ValueError("undeclared " + name)
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        s = scope
+        hops = 0
+        while s is not None:
+            if name in s["names"]:
+                return hops
+            s = s["parent"]
+            hops += 1
+        raise ValueError("undeclared " + name)
+
+
+    def resolve_names(program):
+        """Walk a list of statements and return the list of error strings, in source order: 'undeclared x' for a variable that is read or assigned
+        without a declaration in scope, and 'redeclared x' for a let of a name already declared in the SAME scope (the later let is ignored).
+        Statements: ("let", name, annotation, expr), ("assign", name, expr), ("print", expr), ("if", cond, then_list, else_list), ("while", cond, body_list), ("block", stmts).
+        Expressions: ("num", v), ("bool", v), ("str", s), ("var", name), ("unary", op, e), ("binop", op, l, r). The expression of a let is resolved BEFORE the name is
+        declared, so 'let x = x' reads an outer x. Each block, if-branch and while body gets a new scope. Keep going after an error."""
+        errors = []
+
+        def expr(e, scope):
+            if e[0] == "var":
+                try:
+                    lookup(scope, e[1])
+                except ValueError as error:
+                    errors.append(str(error))
+            elif e[0] == "unary":
+                expr(e[2], scope)
+            elif e[0] == "binop":
+                expr(e[2], scope)
+                expr(e[3], scope)
+
+        def stmts(items, scope):
+            for s in items:
+                kind = s[0]
+                if kind == "let":
+                    expr(s[3], scope)
+                    try:
+                        declare(scope, s[1], True)
+                    except ValueError as error:
+                        errors.append(str(error))
+                elif kind == "assign":
+                    try:
+                        lookup(scope, s[1])
+                    except ValueError as error:
+                        errors.append(str(error))
+                    expr(s[2], scope)
+                elif kind == "print":
+                    expr(s[1], scope)
+                elif kind == "if":
+                    expr(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                    stmts(s[3], new_scope(scope))
+                elif kind == "while":
+                    expr(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                elif kind == "block":
+                    stmts(s[1], new_scope(scope))
+
+        stmts(program, new_scope())
+        return errors
+  explanation: A scope chain is a linked list of dictionaries searched from the inside out.
+- id: types
+  title: Type checking expressions
+  difficulty: 5
+  prompt: 'Write `can_assign(target, value)` (the same type, or an `int` stored into a `float`; the special type `"unknown"` on either side is accepted) and `type_of(expr, env)`, where `env` maps variable names to type names. It returns `"int"`, `"float"`, `"bool"` or `"str"`. Raise `ValueError("undeclared x")` for a variable not in `env`, or a `ValueError` whose message starts `type error` for a wrongly typed operation. Rules: `+ - *` on two numbers give `int` if both are `int`, else `float`; `/` on numbers always gives `float`; `+` on two `str` gives `str` (the only string operator); `< > <= >=` on two numbers give `bool`; `==` and `!=` on two numbers, or on two operands of the same type, give `bool`; `and`, `or` need two `bool`s; unary `not` needs a `bool`; unary `-` needs a number and keeps its type. A variable whose type is `"unknown"` (left over from an earlier error) makes any expression using it `"unknown"` without a new error. Expressions: `("num", v)` (a Python `float` means `float`), `("bool", v)`, `("str", s)`, `("var", name)`, `("unary", op, e)`, `("binop", op, l, r)`.'
+  starter: |-
+    NUMERIC = ("int", "float")
+
+
+    def can_assign(target, value):
+        """May a value of type `value` be stored in a variable of type `target`? Same type, or int into float (widening). 'unknown' on either side is accepted."""
+        pass
+
+
+    def type_of(expr, env):
+        """The type ('int', 'float', 'bool' or 'str') of an expression; env maps variable names to types. Raise ValueError('undeclared x') for a variable
+        not in env, or ValueError('type error: ...') for a wrongly typed operation. Rules: ("num", v) is int or float; ("bool", v) bool; ("str", s) str; + - * on two
+        numbers give int if both are int, else float; / on numbers always gives float; + on two strs gives str (the only str operator); < > <= >= on two numbers give bool;
+        == != on two numbers, or two operands of the same type, give bool; 'and' 'or' need two bools; unary 'not' needs a bool; unary '-' needs a number and keeps its type.
+        A variable whose type is 'unknown' (left over from an earlier error) makes any expression using it 'unknown' without a new error."""
+        pass
+  tests:
+  - name: numbers
+    code: |
+      n = lambda v: ("num", v)
+      assert type_of(n(1), {}) == "int" and type_of(n(1.5), {}) == "float"
+      assert type_of(("binop", "+", n(1), n(2)), {}) == "int"
+      assert type_of(("binop", "+", n(1), n(2.0)), {}) == "float"
+      assert type_of(("binop", "*", n(2.0), n(2.0)), {}) == "float"
+      assert type_of(("binop", "/", n(4), n(2)), {}) == "float"
+      assert type_of(("unary", "-", n(3)), {}) == "int" and type_of(("unary", "-", n(3.5)), {}) == "float"
+      assert type_of(("binop", "-", ("var", "a"), ("var", "b")), {"a": "int", "b": "float"}) == "float"
+  - name: booleans, strings and comparison
+    code: |
+      n = lambda v: ("num", v)
+      s = lambda v: ("str", v)
+      b = lambda v: ("bool", v)
+      assert type_of(("binop", "<", n(1), n(2.5)), {}) == "bool"
+      assert type_of(("binop", "==", s("a"), s("b")), {}) == "bool"
+      assert type_of(("binop", "==", n(1), n(1.0)), {}) == "bool"
+      assert type_of(("binop", "!=", b(True), b(False)), {}) == "bool"
+      assert type_of(("binop", "and", b(True), ("binop", "<", n(1), n(2))), {}) == "bool"
+      assert type_of(("unary", "not", b(False)), {}) == "bool"
+      assert type_of(("binop", "+", s("a"), s("b")), {}) == "str"
+      assert type_of(("str", ""), {}) == "str"
+  - name: type errors
+    code: |
+      n = lambda v: ("num", v)
+      s = lambda v: ("str", v)
+      b = lambda v: ("bool", v)
+      bad = [("binop", "+", n(1), s("a")), ("binop", "-", s("a"), s("b")), ("binop", "*", b(True), n(2)), ("binop", "<", s("a"), s("b")),
+             ("binop", "==", n(1), s("1")), ("binop", "and", n(1), b(True)), ("unary", "not", n(1)), ("unary", "-", s("a")), ("binop", "/", s("a"), n(1)),
+             ("binop", "or", b(True), s("x"))]
+      for e in bad:
+          try:
+              type_of(e, {})
+              raise AssertionError("accepted %r" % (e,))
+          except ValueError as err:
+              assert str(err).startswith("type error"), str(err)
+      try:
+          type_of(("var", "zz"), {"a": "int"})
+          raise AssertionError("accepted")
+      except ValueError as err:
+          assert str(err) == "undeclared zz"
+  - name: unknown and assignment
+    code: |
+      assert type_of(("binop", "+", ("var", "u"), ("num", 1)), {"u": "unknown"}) == "unknown"
+      assert type_of(("binop", "<", ("var", "u"), ("str", "x")), {"u": "unknown"}) == "unknown"
+      assert type_of(("unary", "not", ("var", "u")), {"u": "unknown"}) == "unknown"
+      assert can_assign("int", "int") and can_assign("float", "float") and can_assign("float", "int")
+      assert not can_assign("int", "float") and not can_assign("str", "int") and not can_assign("bool", "int")
+      assert can_assign("int", "unknown") and can_assign("unknown", "str")
+  hints:
+  - Compute the types of both operands first, then decide from the operator and the two types.
+  solution: |
+    NUMERIC = ("int", "float")
+
+
+    def can_assign(target, value):
+        """May a value of type `value` be stored in a variable of type `target`? Same type, or int into float (widening). 'unknown' on either side is accepted."""
+        if "unknown" in (target, value):
+            return True
+        return target == value or (target == "float" and value == "int")
+
+
+    def type_of(expr, env):
+        """The type ('int', 'float', 'bool' or 'str') of an expression; env maps variable names to types. Raise ValueError('undeclared x') for a variable
+        not in env, or ValueError('type error: ...') for a wrongly typed operation. Rules: ("num", v) is int or float; ("bool", v) bool; ("str", s) str; + - * on two
+        numbers give int if both are int, else float; / on numbers always gives float; + on two strs gives str (the only str operator); < > <= >= on two numbers give bool;
+        == != on two numbers, or two operands of the same type, give bool; 'and' 'or' need two bools; unary 'not' needs a bool; unary '-' needs a number and keeps its type.
+        A variable whose type is 'unknown' (left over from an earlier error) makes any expression using it 'unknown' without a new error."""
+        kind = expr[0]
+        if kind == "num":
+            return "float" if isinstance(expr[1], float) else "int"
+        if kind == "bool":
+            return "bool"
+        if kind == "str":
+            return "str"
+        if kind == "var":
+            if expr[1] not in env:
+                raise ValueError("undeclared " + expr[1])
+            return env[expr[1]]
+        if kind == "unary":
+            t = type_of(expr[2], env)
+            if t == "unknown":
+                return t
+            if expr[1] == "not":
+                if t != "bool":
+                    raise ValueError("type error: not needs bool, got " + t)
+                return "bool"
+            if t not in NUMERIC:
+                raise ValueError("type error: - needs a number, got " + t)
+            return t
+        op = expr[1]
+        a, b = type_of(expr[2], env), type_of(expr[3], env)
+        if "unknown" in (a, b):
+            return "unknown"
+        both_num = a in NUMERIC and b in NUMERIC
+        if op in ("+", "-", "*", "/"):
+            if op == "+" and a == b == "str":
+                return "str"
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            if op == "/":
+                return "float"
+            return "int" if a == b == "int" else "float"
+        if op in ("<", ">", "<=", ">="):
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            return "bool"
+        if op in ("==", "!="):
+            if not (both_num or a == b):
+                raise ValueError("type error: cannot compare %s with %s" % (a, b))
+            return "bool"
+        if op in ("and", "or"):
+            if a != "bool" or b != "bool":
+                raise ValueError("type error: %s needs bools, got %s and %s" % (op, a, b))
+            return "bool"
+        raise ValueError("type error: unknown operator " + op)
+  explanation: A type checker is an evaluator that computes types instead of values.
+- id: checker
+  title: A program type checker
+  difficulty: 5
+  prompt: 'The starter has the symbol-table functions from the last exercise and `type_of`. Write `visible(scope)` (flatten a scope chain into one dict name to type, inner names winning) and `check_program(program)`, returning the list of error strings in source order, with at most **one error per statement or condition**. A scope''s info is the variable''s type. A `let` declares its name with the annotation if there is one, otherwise with the type of its expression; if the expression is wrong, record that error and declare the name as the annotation or `"unknown"` (so later statements do not pile up more errors). A `let` whose value cannot be stored in its annotation gives `type error: cannot store T in x`; a repeated `let` in the same scope gives `redeclared x`. An `assign` needs a declared variable (`undeclared x`) and a value assignable to it (the same `type error: cannot store T in x`). `if` and `while` conditions must be `bool`, else `type error: condition must be bool, got T` (an `"unknown"` condition is accepted). `print` checks its expression. Blocks, branches and loop bodies each get a new scope. Use `can_assign`.'
+  starter: |-
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        return {"names": {}, "parent": parent}
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        if name in scope["names"]:
+            raise ValueError("redeclared " + name)
+        scope["names"][name] = info
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        s = scope
+        while s is not None:
+            if name in s["names"]:
+                return s["names"][name]
+            s = s["parent"]
+        raise ValueError("undeclared " + name)
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        s = scope
+        hops = 0
+        while s is not None:
+            if name in s["names"]:
+                return hops
+            s = s["parent"]
+            hops += 1
+        raise ValueError("undeclared " + name)
+
+
+
+
+    NUMERIC = ("int", "float")
+
+
+    def can_assign(target, value):
+        """May a value of type `value` be stored in a variable of type `target`? Same type, or int into float (widening). 'unknown' on either side is accepted."""
+        if "unknown" in (target, value):
+            return True
+        return target == value or (target == "float" and value == "int")
+
+
+    def type_of(expr, env):
+        """The type ('int', 'float', 'bool' or 'str') of an expression; env maps variable names to types. Raise ValueError('undeclared x') for a variable
+        not in env, or ValueError('type error: ...') for a wrongly typed operation. Rules: ("num", v) is int or float; ("bool", v) bool; ("str", s) str; + - * on two
+        numbers give int if both are int, else float; / on numbers always gives float; + on two strs gives str (the only str operator); < > <= >= on two numbers give bool;
+        == != on two numbers, or two operands of the same type, give bool; 'and' 'or' need two bools; unary 'not' needs a bool; unary '-' needs a number and keeps its type.
+        A variable whose type is 'unknown' (left over from an earlier error) makes any expression using it 'unknown' without a new error."""
+        kind = expr[0]
+        if kind == "num":
+            return "float" if isinstance(expr[1], float) else "int"
+        if kind == "bool":
+            return "bool"
+        if kind == "str":
+            return "str"
+        if kind == "var":
+            if expr[1] not in env:
+                raise ValueError("undeclared " + expr[1])
+            return env[expr[1]]
+        if kind == "unary":
+            t = type_of(expr[2], env)
+            if t == "unknown":
+                return t
+            if expr[1] == "not":
+                if t != "bool":
+                    raise ValueError("type error: not needs bool, got " + t)
+                return "bool"
+            if t not in NUMERIC:
+                raise ValueError("type error: - needs a number, got " + t)
+            return t
+        op = expr[1]
+        a, b = type_of(expr[2], env), type_of(expr[3], env)
+        if "unknown" in (a, b):
+            return "unknown"
+        both_num = a in NUMERIC and b in NUMERIC
+        if op in ("+", "-", "*", "/"):
+            if op == "+" and a == b == "str":
+                return "str"
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            if op == "/":
+                return "float"
+            return "int" if a == b == "int" else "float"
+        if op in ("<", ">", "<=", ">="):
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            return "bool"
+        if op in ("==", "!="):
+            if not (both_num or a == b):
+                raise ValueError("type error: cannot compare %s with %s" % (a, b))
+            return "bool"
+        if op in ("and", "or"):
+            if a != "bool" or b != "bool":
+                raise ValueError("type error: %s needs bools, got %s and %s" % (op, a, b))
+            return "bool"
+        raise ValueError("type error: unknown operator " + op)
+
+
+    def visible(scope):
+        """Flatten a scope chain into one dict name -> type (inner names win)."""
+        pass
+
+
+    def check_program(program):
+        """Type-check a list of statements (the same forms as resolve_names, where a let's annotation is None or a type name) and return the list of error
+        strings in source order, at most ONE error per statement or condition. The scope info is the variable's type. Rules: a let declares its name with the annotation if
+        there is one, otherwise with the type of its expression; if the expression is wrong, record the error and declare the name as the annotation or 'unknown'.
+        A let whose expression type cannot be assigned to its annotation gives 'type error: cannot store T in x'. A repeated let in the same scope gives 'redeclared x'.
+        An assign needs a declared variable ('undeclared x') and a type assignable to it (same 'type error: cannot store T in x'). if and while conditions must be bool, else
+        'type error: condition must be bool, got T' (an 'unknown' condition is accepted). print checks its expression. Blocks, if-branches and while bodies each get a new scope."""
+        pass
+  tests:
+  - name: correct programs
+    code: |
+      L = lambda name, e, ann=None: ("let", name, ann, e)
+      prog = [L("x", ("num", 1)), L("f", ("num", 2.5), "float"), L("g", ("num", 1), "float"), ("assign", "f", ("binop", "*", ("var", "x"), ("var", "f"))),
+              ("while", ("binop", "<", ("var", "x"), ("num", 10)), [("assign", "x", ("binop", "+", ("var", "x"), ("num", 1)))]),
+              L("s", ("binop", "+", ("str", "a"), ("str", "b"))), ("print", ("var", "s")), ("if", ("bool", True), [L("x", ("str", "shadow"))], [])]
+      assert check_program(prog) == []
+      assert check_program([]) == []
+      assert visible(new_scope()) == {}
+  - name: mismatches
+    code: |
+      L = lambda name, e, ann=None: ("let", name, ann, e)
+      prog = [L("a", ("num", 1), "str"), L("b", ("num", 1.5), "int"), L("c", ("binop", "+", ("num", 1), ("str", "x"))), ("assign", "a", ("num", 2)),
+              L("d", ("num", 1)), ("assign", "d", ("num", 2.5)), ("assign", "d", ("bool", True))]
+      assert check_program(prog) == ["type error: cannot store int in a", "type error: cannot store float in b", "type error: needs numbers" if False else check_program(prog)[2],
+                                     "type error: cannot store int in a", "type error: cannot store float in d", "type error: cannot store bool in d"]
+      assert check_program(prog)[2].startswith("type error")
+  - name: conditions and scopes
+    code: |
+      L = lambda name, e, ann=None: ("let", name, ann, e)
+      prog = [L("x", ("num", 1)), ("if", ("var", "x"), [], []), ("while", ("num", 0), [("print", ("var", "inner"))]), ("block", [L("t", ("num", 1))]), ("print", ("var", "t")),
+              L("x", ("num", 2)), ("if", ("bool", True), [], [L("q", ("bool", False)), ("assign", "q", ("num", 1))])]
+      assert check_program(prog) == ["type error: condition must be bool, got int", "type error: condition must be bool, got int", "undeclared inner", "undeclared t", "redeclared x", "type error: cannot store int in q"]
+  - name: errors do not cascade
+    code: |
+      L = lambda name, e, ann=None: ("let", name, ann, e)
+      prog = [L("bad", ("binop", "+", ("num", 1), ("str", "x"))), L("next", ("binop", "*", ("var", "bad"), ("num", 2))), ("if", ("var", "bad"), [], []), ("assign", "bad", ("num", 3)),
+              L("typed", ("binop", "-", ("str", "a"), ("num", 1)), "int"), ("assign", "typed", ("num", 4)), ("print", ("var", "typed"))]
+      errors = check_program(prog)
+      assert len(errors) == 2 and all(e.startswith("type error") for e in errors), errors
+  hints:
+  - Reuse type_of for expressions and keep a scope whose info is each variable's type; catch ValueError per statement.
+  solution: |
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        return {"names": {}, "parent": parent}
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        if name in scope["names"]:
+            raise ValueError("redeclared " + name)
+        scope["names"][name] = info
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        s = scope
+        while s is not None:
+            if name in s["names"]:
+                return s["names"][name]
+            s = s["parent"]
+        raise ValueError("undeclared " + name)
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        s = scope
+        hops = 0
+        while s is not None:
+            if name in s["names"]:
+                return hops
+            s = s["parent"]
+            hops += 1
+        raise ValueError("undeclared " + name)
+
+
+
+
+    NUMERIC = ("int", "float")
+
+
+    def can_assign(target, value):
+        """May a value of type `value` be stored in a variable of type `target`? Same type, or int into float (widening). 'unknown' on either side is accepted."""
+        if "unknown" in (target, value):
+            return True
+        return target == value or (target == "float" and value == "int")
+
+
+    def type_of(expr, env):
+        """The type ('int', 'float', 'bool' or 'str') of an expression; env maps variable names to types. Raise ValueError('undeclared x') for a variable
+        not in env, or ValueError('type error: ...') for a wrongly typed operation. Rules: ("num", v) is int or float; ("bool", v) bool; ("str", s) str; + - * on two
+        numbers give int if both are int, else float; / on numbers always gives float; + on two strs gives str (the only str operator); < > <= >= on two numbers give bool;
+        == != on two numbers, or two operands of the same type, give bool; 'and' 'or' need two bools; unary 'not' needs a bool; unary '-' needs a number and keeps its type.
+        A variable whose type is 'unknown' (left over from an earlier error) makes any expression using it 'unknown' without a new error."""
+        kind = expr[0]
+        if kind == "num":
+            return "float" if isinstance(expr[1], float) else "int"
+        if kind == "bool":
+            return "bool"
+        if kind == "str":
+            return "str"
+        if kind == "var":
+            if expr[1] not in env:
+                raise ValueError("undeclared " + expr[1])
+            return env[expr[1]]
+        if kind == "unary":
+            t = type_of(expr[2], env)
+            if t == "unknown":
+                return t
+            if expr[1] == "not":
+                if t != "bool":
+                    raise ValueError("type error: not needs bool, got " + t)
+                return "bool"
+            if t not in NUMERIC:
+                raise ValueError("type error: - needs a number, got " + t)
+            return t
+        op = expr[1]
+        a, b = type_of(expr[2], env), type_of(expr[3], env)
+        if "unknown" in (a, b):
+            return "unknown"
+        both_num = a in NUMERIC and b in NUMERIC
+        if op in ("+", "-", "*", "/"):
+            if op == "+" and a == b == "str":
+                return "str"
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            if op == "/":
+                return "float"
+            return "int" if a == b == "int" else "float"
+        if op in ("<", ">", "<=", ">="):
+            if not both_num:
+                raise ValueError("type error: %s needs numbers, got %s and %s" % (op, a, b))
+            return "bool"
+        if op in ("==", "!="):
+            if not (both_num or a == b):
+                raise ValueError("type error: cannot compare %s with %s" % (a, b))
+            return "bool"
+        if op in ("and", "or"):
+            if a != "bool" or b != "bool":
+                raise ValueError("type error: %s needs bools, got %s and %s" % (op, a, b))
+            return "bool"
+        raise ValueError("type error: unknown operator " + op)
+
+
+    def visible(scope):
+        """Flatten a scope chain into one dict name -> type (inner names win)."""
+        chain = []
+        s = scope
+        while s is not None:
+            chain.append(s["names"])
+            s = s["parent"]
+        env = {}
+        for names in reversed(chain):
+            env.update(names)
+        return env
+
+
+    def check_program(program):
+        """Type-check a list of statements (the same forms as resolve_names, where a let's annotation is None or a type name) and return the list of error
+        strings in source order, at most ONE error per statement or condition. The scope info is the variable's type. Rules: a let declares its name with the annotation if
+        there is one, otherwise with the type of its expression; if the expression is wrong, record the error and declare the name as the annotation or 'unknown'.
+        A let whose expression type cannot be assigned to its annotation gives 'type error: cannot store T in x'. A repeated let in the same scope gives 'redeclared x'.
+        An assign needs a declared variable ('undeclared x') and a type assignable to it (same 'type error: cannot store T in x'). if and while conditions must be bool, else
+        'type error: condition must be bool, got T' (an 'unknown' condition is accepted). print checks its expression. Blocks, if-branches and while bodies each get a new scope."""
+        errors = []
+
+        def typed(e, scope):
+            try:
+                return type_of(e, visible(scope))
+            except ValueError as error:
+                errors.append(str(error))
+                return None
+
+        def condition(e, scope):
+            t = typed(e, scope)
+            if t is not None and t not in ("bool", "unknown"):
+                errors.append("type error: condition must be bool, got " + t)
+
+        def stmts(items, scope):
+            for s in items:
+                kind = s[0]
+                if kind == "let":
+                    t = typed(s[3], scope)
+                    declared = s[2]
+                    if t is not None and declared is not None and not can_assign(declared, t):
+                        errors.append("type error: cannot store %s in %s" % (t, s[1]))
+                    final = declared or t or "unknown"
+                    try:
+                        declare(scope, s[1], final)
+                    except ValueError as error:
+                        errors.append(str(error))
+                elif kind == "assign":
+                    t = typed(s[2], scope)
+                    try:
+                        target = lookup(scope, s[1])
+                    except ValueError as error:
+                        errors.append(str(error))
+                        continue
+                    if t is not None and not can_assign(target, t):
+                        errors.append("type error: cannot store %s in %s" % (t, s[1]))
+                elif kind == "print":
+                    typed(s[1], scope)
+                elif kind == "if":
+                    condition(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                    stmts(s[3], new_scope(scope))
+                elif kind == "while":
+                    condition(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                elif kind == "block":
+                    stmts(s[1], new_scope(scope))
+
+        stmts(program, new_scope())
+        return errors
+  explanation: Real compilers collect many errors in one pass and avoid cascades by marking failed names as unknown.
+- id: functions
+  title: Functions, control flow and recursion
+  difficulty: 5
+  prompt: 'Statements now include `("func", name, params, return_type, body)` and `("return", expr)`, and expressions include calls `("call", name, [args])`. Write `returns_on_all_paths(stmts)`: true if running the list always ends in a `return`. A list qualifies if some statement in it is a `return`, an `("if", cond, then, else)` whose then **and** else lists both always return, or a `("block", stmts)` that always returns. A `while` never counts, because its body might run zero times. Write `calls_in_expr(e)` (function names called in an expression, in order of appearance, with repeats, including calls inside arguments), `calls_in_stmts(stmts)` (the same over statements: let, assign, print, return, if, while, block), `call_graph(program)` (for a list of top-level `func` statements, a dict from each function name to the sorted list of distinct names it calls, including names that are not defined) and `recursive_functions(program)` (sorted names of functions that can reach themselves through calls to functions defined in the program, directly or indirectly; ignore calls to undefined names).'
+  starter: |-
+    def returns_on_all_paths(stmts):
+        """True if running this statement list always ends in a ("return", expr). A list qualifies if some statement in it always returns: a return itself, an
+        ("if", cond, then, else) whose then AND else lists both always return, or a ("block", stmts) that does. A while loop never counts (it might run zero times)."""
+        pass
+
+
+    def calls_in_expr(e):
+        """Names of functions called anywhere in an expression, in order of appearance, with repeats. Calls look like ("call", name, [args]);
+        other nodes are num, bool, str, var, ("unary", op, e), ("binop", op, l, r)."""
+        pass
+
+
+    def calls_in_stmts(stmts):
+        pass
+
+
+    def call_graph(program):
+        """For a list of top-level ("func", name, params, return_type, body) statements, a dict mapping each function name to the sorted list of DISTINCT names it calls
+        anywhere in its body (including names that are not defined as functions here)."""
+        pass
+
+
+    def recursive_functions(program):
+        """Sorted names of functions that can reach themselves through calls to functions defined in the program: directly (f calls f) or indirectly
+        (f calls g and g calls f). Calls to undefined names are ignored."""
+        pass
+  tests:
+  - name: all paths return
+    code: |
+      R = ("return", ("num", 1))
+      assert returns_on_all_paths([R]) and returns_on_all_paths([("print", ("num", 0)), R, ("print", ("num", 1))])
+      assert not returns_on_all_paths([]) and not returns_on_all_paths([("print", ("num", 0))])
+      assert returns_on_all_paths([("if", ("bool", True), [R], [R])])
+      assert not returns_on_all_paths([("if", ("bool", True), [R], [])])
+      assert not returns_on_all_paths([("if", ("bool", True), [], [R])])
+      assert returns_on_all_paths([("if", ("bool", True), [("if", ("bool", False), [R], [R])], [("block", [R])])])
+      assert not returns_on_all_paths([("while", ("bool", True), [R])])
+      assert returns_on_all_paths([("block", [("print", ("num", 0)), R])])
+      assert not returns_on_all_paths([("block", [("print", ("num", 0))])])
+  - name: calls
+    code: |
+      c = lambda name, *args: ("call", name, list(args))
+      assert calls_in_expr(("num", 1)) == [] and calls_in_expr(("var", "x")) == []
+      assert calls_in_expr(c("f", ("num", 1))) == ["f"]
+      assert calls_in_expr(c("f", c("g", ("num", 1)), c("h"))) == ["f", "g", "h"]
+      assert calls_in_expr(("binop", "+", c("a"), ("unary", "-", c("b")))) == ["a", "b"]
+      body = [("let", "x", None, c("p")), ("if", c("q"), [("print", c("r"))], [("return", c("p"))]), ("while", c("s"), [("assign", "x", c("t"))]), ("block", [("print", c("u"))])]
+      assert calls_in_stmts(body) == ["p", "q", "r", "p", "s", "t", "u"]
+  - name: call graph
+    code: |
+      c = lambda name, *args: ("call", name, list(args))
+      prog = [("func", "main", [], "int", [("let", "a", None, c("helper", c("helper", ("num", 1)))), ("print", c("unknown")), ("return", c("area"))]),
+              ("func", "helper", [("n", "int")], "int", [("return", ("var", "n"))]), ("func", "area", [], "int", [("return", c("helper", ("num", 2)))])]
+      assert call_graph(prog) == {"main": ["area", "helper", "unknown"], "helper": [], "area": ["helper"]}
+      assert call_graph([]) == {}
+  - name: recursion
+    code: |
+      c = lambda name, *args: ("call", name, list(args))
+      f = lambda name, *calls: ("func", name, [], "int", [("print", c(x)) for x in calls] + [("return", ("num", 0))])
+      assert recursive_functions([f("a", "a")]) == ["a"]
+      assert recursive_functions([f("a", "b"), f("b", "a"), f("c", "a"), f("d")]) == ["a", "b"]
+      assert recursive_functions([f("a", "b"), f("b", "c"), f("c", "d"), f("d", "b")]) == ["b", "c", "d"]
+      assert recursive_functions([f("a", "nope"), f("b")]) == []
+      assert recursive_functions([]) == []
+      assert recursive_functions([f("x", "y", "z"), f("y", "z"), f("z")]) == []
+  hints:
+  - 'Reachability: from each function, follow call edges and see whether you can return to the start.'
+  solution: |
+    def returns_on_all_paths(stmts):
+        """True if running this statement list always ends in a ("return", expr). A list qualifies if some statement in it always returns: a return itself, an
+        ("if", cond, then, else) whose then AND else lists both always return, or a ("block", stmts) that does. A while loop never counts (it might run zero times)."""
+        for s in stmts:
+            if s[0] == "return":
+                return True
+            if s[0] == "if" and returns_on_all_paths(s[2]) and returns_on_all_paths(s[3]):
+                return True
+            if s[0] == "block" and returns_on_all_paths(s[1]):
+                return True
+        return False
+
+
+    def calls_in_expr(e):
+        """Names of functions called anywhere in an expression, in order of appearance, with repeats. Calls look like ("call", name, [args]);
+        other nodes are num, bool, str, var, ("unary", op, e), ("binop", op, l, r)."""
+        if e[0] == "call":
+            found = [e[1]]
+            for a in e[2]:
+                found += calls_in_expr(a)
+            return found
+        if e[0] == "unary":
+            return calls_in_expr(e[2])
+        if e[0] == "binop":
+            return calls_in_expr(e[2]) + calls_in_expr(e[3])
+        return []
+
+
+    def calls_in_stmts(stmts):
+        found = []
+        for s in stmts:
+            k = s[0]
+            if k == "let":
+                found += calls_in_expr(s[3])
+            elif k in ("assign",):
+                found += calls_in_expr(s[2])
+            elif k in ("print", "return"):
+                found += calls_in_expr(s[1])
+            elif k == "if":
+                found += calls_in_expr(s[1]) + calls_in_stmts(s[2]) + calls_in_stmts(s[3])
+            elif k == "while":
+                found += calls_in_expr(s[1]) + calls_in_stmts(s[2])
+            elif k == "block":
+                found += calls_in_stmts(s[1])
+        return found
+
+
+    def call_graph(program):
+        """For a list of top-level ("func", name, params, return_type, body) statements, a dict mapping each function name to the sorted list of DISTINCT names it calls
+        anywhere in its body (including names that are not defined as functions here)."""
+        return {s[1]: sorted(set(calls_in_stmts(s[4]))) for s in program if s[0] == "func"}
+
+
+    def recursive_functions(program):
+        """Sorted names of functions that can reach themselves through calls to functions defined in the program: directly (f calls f) or indirectly
+        (f calls g and g calls f). Calls to undefined names are ignored."""
+        graph = call_graph(program)
+        result = []
+        for name in graph:
+            seen = set()
+            stack = [c for c in graph[name] if c in graph]
+            while stack:
+                current = stack.pop()
+                if current == name:
+                    result.append(name)
+                    break
+                if current in seen:
+                    continue
+                seen.add(current)
+                stack += [c for c in graph[current] if c in graph]
+        return sorted(result)
+  explanation: Control flow and call graphs are the raw material for later compiler analyses.
+- id: lint
+  title: 'Capstone: a linter'
+  difficulty: 5
+  prompt: 'The starter has the scope helpers. Write `reads_in_expr(e)` (all variable names an expression reads, with repeats) and `lint(program)`, returning a pair `(unused, shadowing)` of sorted lists of distinct variable names. `unused` holds names with at least one `let` whose variable is never **read** afterwards; assigning to it does not count as a read. `shadowing` holds names declared by a `let` while a variable of the same name is visible in an **enclosing** scope; a repeat in the **same** scope is a redeclaration, so ignore it (it does not declare a new variable). Statements: `let`, `assign`, `print`, `if`, `while` and `block` as before. Reads are resolved to the nearest enclosing declaration, reads of undeclared names are ignored, and the `let`''s expression is evaluated before the new name exists. Hint: store a unique id for each declaration in the scope instead of a type.'
+  starter: |-
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        return {"names": {}, "parent": parent}
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        if name in scope["names"]:
+            raise ValueError("redeclared " + name)
+        scope["names"][name] = info
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        s = scope
+        while s is not None:
+            if name in s["names"]:
+                return s["names"][name]
+            s = s["parent"]
+        raise ValueError("undeclared " + name)
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        s = scope
+        hops = 0
+        while s is not None:
+            if name in s["names"]:
+                return hops
+            s = s["parent"]
+            hops += 1
+        raise ValueError("undeclared " + name)
+
+
+
+
+    def reads_in_expr(e):
+        """All variable names read by an expression, in order (with repeats)."""
+        pass
+
+
+    def lint(program):
+        """Return (unused, shadowing), two sorted lists of distinct variable names. `unused`: names with at least one `let` whose variable is never READ afterwards
+        (assigning to it does not count as reading it). `shadowing`: names declared by a let while a variable of the same name is visible in an ENCLOSING scope (a repeat in the
+        same scope is a redeclaration, not shadowing; ignore it). Statements: let, assign, print, if, while, block as in resolve_names. Reads are resolved to the nearest
+        enclosing declaration, and reads of undeclared names are ignored. The let's expression is evaluated before the new name exists."""
+        pass
+  tests:
+  - name: unused variables
+    code: |
+      L = lambda name, e: ("let", name, None, e)
+      prog = [L("a", ("num", 1)), L("b", ("num", 2)), L("c", ("var", "a")), ("print", ("var", "c"))]
+      assert lint(prog) == (["b"], [])
+      prog = [L("x", ("num", 1)), ("assign", "x", ("num", 2))]
+      assert lint(prog) == (["x"], [])
+      prog = [L("x", ("num", 1)), ("assign", "x", ("binop", "+", ("var", "x"), ("num", 1)))]
+      assert lint(prog) == ([], [])
+      assert lint([]) == ([], [])
+      assert reads_in_expr(("binop", "+", ("var", "a"), ("unary", "-", ("binop", "*", ("var", "b"), ("var", "a"))))) == ["a", "b", "a"]
+      assert reads_in_expr(("num", 3)) == [] and reads_in_expr(("str", "x")) == []
+  - name: shadowing
+    code: |
+      L = lambda name, e: ("let", name, None, e)
+      prog = [L("x", ("num", 1)), ("block", [L("x", ("num", 2)), ("print", ("var", "x"))]), ("print", ("var", "x"))]
+      assert lint(prog) == ([], ["x"])
+      prog = [L("y", ("num", 1)), L("y", ("num", 2)), ("print", ("var", "y"))]
+      assert lint(prog) == ([], [])
+      prog = [L("v", ("num", 1)), ("if", ("bool", True), [("while", ("bool", False), [L("v", ("num", 2))])], [])]
+      assert lint(prog) == (["v"], ["v"])
+  - name: reads bind to the nearest declaration
+    code: |
+      L = lambda name, e: ("let", name, None, e)
+      prog = [L("x", ("num", 1)), ("block", [L("x", ("var", "x")), ("print", ("var", "x"))])]
+      assert lint(prog) == ([], ["x"])
+      prog = [L("x", ("num", 1)), ("block", [L("x", ("num", 2))]), ("print", ("var", "x"))]
+      assert lint(prog) == (["x"], ["x"])
+      prog = [("print", ("var", "ghost")), L("a", ("num", 1))]
+      assert lint(prog) == (["a"], [])
+      prog = [("if", ("bool", True), [L("t", ("num", 1))], [L("t", ("num", 2)), ("print", ("var", "t"))])]
+      assert lint(prog) == (["t"], [])
+  hints:
+  - Give every declaration its own id so reads can mark exactly the variable they refer to.
+  solution: |
+    def new_scope(parent=None):
+        """A scope is a dict {"names": {...}, "parent": enclosing scope or None}."""
+        return {"names": {}, "parent": parent}
+
+
+    def declare(scope, name, info):
+        """Record name -> info in THIS scope. ValueError('redeclared NAME') if this very scope already has the name (an outer scope's name may be shadowed)."""
+        if name in scope["names"]:
+            raise ValueError("redeclared " + name)
+        scope["names"][name] = info
+
+
+    def lookup(scope, name):
+        """Find the info for a name, searching this scope, then its parent, and so on. ValueError('undeclared NAME') when no scope has it."""
+        s = scope
+        while s is not None:
+            if name in s["names"]:
+                return s["names"][name]
+            s = s["parent"]
+        raise ValueError("undeclared " + name)
+
+
+    def scope_distance(scope, name):
+        """How many steps up the chain the declaring scope is: 0 means this scope, 1 its parent, and so on. ValueError('undeclared NAME') if absent."""
+        s = scope
+        hops = 0
+        while s is not None:
+            if name in s["names"]:
+                return hops
+            s = s["parent"]
+            hops += 1
+        raise ValueError("undeclared " + name)
+
+
+
+
+    def reads_in_expr(e):
+        """All variable names read by an expression, in order (with repeats)."""
+        if e[0] == "var":
+            return [e[1]]
+        if e[0] == "unary":
+            return reads_in_expr(e[2])
+        if e[0] == "binop":
+            return reads_in_expr(e[2]) + reads_in_expr(e[3])
+        return []
+
+
+    def lint(program):
+        """Return (unused, shadowing), two sorted lists of distinct variable names. `unused`: names with at least one `let` whose variable is never READ afterwards
+        (assigning to it does not count as reading it). `shadowing`: names declared by a let while a variable of the same name is visible in an ENCLOSING scope (a repeat in the
+        same scope is a redeclaration, not shadowing; ignore it). Statements: let, assign, print, if, while, block as in resolve_names. Reads are resolved to the nearest
+        enclosing declaration, and reads of undeclared names are ignored. The let's expression is evaluated before the new name exists."""
+        declared = []
+        used = set()
+        shadowing = set()
+
+        def read(e, scope):
+            for name in reads_in_expr(e):
+                s = scope
+                while s is not None:
+                    if name in s["names"]:
+                        used.add(s["names"][name])
+                        break
+                    s = s["parent"]
+
+        def visible_somewhere(scope, name):
+            s = scope
+            while s is not None:
+                if name in s["names"]:
+                    return True
+                s = s["parent"]
+            return False
+
+        def stmts(items, scope):
+            for s in items:
+                k = s[0]
+                if k == "let":
+                    read(s[3], scope)
+                    if s[1] in scope["names"]:
+                        continue
+                    if visible_somewhere(scope["parent"], s[1]):
+                        shadowing.add(s[1])
+                    ident = len(declared)
+                    declared.append(s[1])
+                    scope["names"][s[1]] = ident
+                elif k == "assign":
+                    read(s[2], scope)
+                elif k == "print":
+                    read(s[1], scope)
+                elif k == "if":
+                    read(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                    stmts(s[3], new_scope(scope))
+                elif k == "while":
+                    read(s[1], scope)
+                    stmts(s[2], new_scope(scope))
+                elif k == "block":
+                    stmts(s[1], new_scope(scope))
+
+        stmts(program, new_scope())
+        unused = sorted({declared[i] for i in range(len(declared)) if i not in used})
+        return unused, sorted(shadowing)
+  explanation: Linters are small analyses over the tree plus a scope chain.
+commonMistakes:
+- title: Declaring a let's name before resolving its expression
+  explanation: let x = x + 1 would then read the variable it is creating.
+- title: Treating shadowing as redeclaration
+  explanation: Only a repeat in the same scope is an error; an inner scope may hide an outer name.
+- title: Letting one error cause many
+  explanation: Mark failed names unknown so later uses do not repeat the complaint.
+- title: Counting a while loop as always returning
+  explanation: The body may never run.
+- title: Counting an assignment as reading a variable
+  explanation: A variable that is only written is still unused.
+summary:
+- Semantic analysis checks meaning that the grammar cannot.
+- A symbol table is a chain of dictionaries, one per scope.
+- Shadowing is legal; redeclaration in the same scope is not.
+- A type checker evaluates types instead of values.
+- Unknown types stop errors from cascading.
+- Call graphs and linters are more analyses over the same tree.
+next: u23-optimize
+quiz:
+- type: mcq
+  question: Why can't the grammar detect an undeclared variable?
+  options:
+  - It depends on meaning, not shape
+  - Grammars cannot handle names
+  - The tokens are wrong
+  - It would be too slow
+  answer: 0
+  explanation: Declarations are context the grammar does not track.
+- type: mcq
+  question: What is shadowing?
+  options:
+  - An inner declaration hides an outer one of the same name
+  - Two declarations in one scope
+  - Deleting a variable
+  - Reading before declaring
+  answer: 0
+  explanation: The inner name wins inside its scope.
+- type: mcq
+  question: Adding an int and a float gives...
+  options:
+  - float
+  - int
+  - an error
+  - str
+  answer: 0
+  explanation: The int is widened.
+- type: mcq
+  question: Why is a failed variable given type 'unknown'?
+  options:
+  - To avoid cascading errors
+  - To save memory
+  - To speed up lookups
+  - To allow any operation to crash
+  answer: 0
+  explanation: Later uses silently stay unknown.
+- type: mcq
+  question: Does a while loop guarantee that a function returns?
+  options:
+  - No, the body might run zero times
+  - Yes, always
+  - Only if it has a return
+  - Only for infinite loops
+  answer: 0
+  explanation: Conservative analysis cannot assume it runs.
+- type: mcq
+  question: In 'let x = x + 1', the right-hand x is looked up...
+  options:
+  - before the new x is declared
+  - after
+  - in the new scope only
+  - never
+  answer: 0
+  explanation: The expression is resolved first.
+- type: code
+  question: 'Write `max_depth(scope)` that returns how many scopes are in the chain starting at `scope` (a scope with no parent has depth 1). Scopes are dicts `{"names": {...}, "parent": scope or None}`.'
+  starter: |
+    def max_depth(scope):
+        pass
+  tests:
+  - name: depth
+    code: |
+      a = {"names": {}, "parent": None}
+      b = {"names": {}, "parent": a}
+      c = {"names": {"x": 1}, "parent": b}
+      assert max_depth(a) == 1 and max_depth(b) == 2 and max_depth(c) == 3
+  solution: |
+    def max_depth(scope):
+        depth = 0
+        while scope is not None:
+            depth += 1
+            scope = scope['parent']
+        return depth

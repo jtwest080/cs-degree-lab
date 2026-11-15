@@ -1,0 +1,2016 @@
+id: u23-codegen
+title: Code Generation and Registers
+minutes: 100
+objective: 'Learn how a compiler produces something a machine can run: bytecode for a stack machine, an assembler that resolves jump targets, a virtual machine that executes it, peephole clean-up, and register allocation by graph coloring.'
+outcomes:
+- Compile expressions and statements to stack-machine bytecode
+- Explain assemblers, labels and jump targets
+- Write a virtual machine
+- Compute liveness and an interference graph
+- Allocate registers by graph coloring and explain spilling
+sections:
+- heading: 'Targets: stack machines and register machines'
+  body: |-
+    The last phase of a compiler, **code generation**, produces instructions for a **target machine**. Two designs dominate. A **stack machine** keeps temporary values on a stack: to compute `a + b * 2` it pushes `a`, pushes `b`, pushes `2`, multiplies (which pops two values and pushes the product) and adds. There are no register names to choose, so compiling to it is easy: walk the tree in post-order and every operator finds its operands waiting on top of the stack. Java bytecode, the `.NET` instruction set and CPython's own bytecode are stack machines, which is also why they are easy to interpret.
+
+    A **register machine**, such as the processor in your computer, has a small set of fast storage slots called **registers** and instructions that name them: `add r1, r2, r3`. Programs run much faster because values do not travel through memory, but the compiler must now decide which value lives in which register. Typical processors have between 8 and 32 general registers, far fewer than the variables and temporaries in a real program, so choosing well matters.
+- heading: Assemblers, jumps and virtual machines
+  body: |-
+    Control flow in bytecode is built from **jumps**. A jump says "continue at instruction number 17". Humans and compilers prefer **labels**, names for positions; an **assembler** is the small program that replaces labels with real addresses (here, list indexes) in two passes: first find where each label lands, then rewrite every jump. (The compiler also must pick unique label names; a counter does it.) A `while` loop compiles to: a label at the top, the test, a conditional jump to the end label when it fails, the body, an unconditional jump back to the top, and the end label. An `if` compiles to a conditional jump over the "then" part, with a jump over the "else" part at its end.
+
+    A **virtual machine** (VM) runs bytecode in software: a loop with a **program counter** (the index of the next instruction), a stack, a table of variables, and a big case analysis on the instruction. A jump just assigns the program counter. Our `run_vm` is a complete little VM, and a real one such as Python's differs mainly in speed and in having more instructions. Because the VM is code you control, it is also a safe place to add limits such as our step counter that stops infinite loops.
+
+    After generating code, a **peephole optimizer** looks through a small window of instructions and replaces wasteful patterns by better ones: folding `push 2, push 3, add` into `push 5`, or deleting a jump to the very next instruction. Each rewrite can create the opportunity for the next, so the pass repeats until nothing changes.
+- heading: Register allocation by graph coloring
+  body: |-
+    Back to registers. Two variables may share a register only if they never hold needed values at the same time. A variable is **live** at a point if its current value will be read later (the idea from the optimization lesson). Walk the code backwards keeping a set of live variables; whenever an instruction **defines** a variable while others are live, that variable **interferes** with them: it must not be placed in the same register. Draw each variable as a vertex and each interference as an edge, and you have an **interference graph**. (A copy `y = x` is the exception: both hold the same value, so they may share a register, which lets the compiler delete the copy altogether.)
+
+    Now assigning registers is exactly **graph coloring**: give each vertex a color (a register) so that connected vertices differ, using at most `k` colors for `k` registers. Finding the minimum number of colors is NP-hard (the same family of problems as the earlier algorithms unit), but a simple heuristic works very well in practice, and is the core of the classic **Chaitin** allocator. **Simplify:** a vertex with fewer than `k` neighbours can always be colored later, whatever its neighbours get, so remove it and put it on a stack; repeat. If every remaining vertex has `k` or more neighbours, pick one as a **potential spill** and remove it anyway, hoping its neighbours will share colors. **Select:** pop the stack and color each vertex with a free color. If a potential spill finds none, it becomes an **actual spill**: the variable lives in memory, with a load before each use and a store after each definition. Spilling costs time, so compilers choose spill candidates carefully, usually favouring variables used rarely, outside loops.
+
+    The size of the largest live set is the **register pressure**, a lower bound on the registers required. This is a real-world payoff from the graph theory in the earlier units. Real back ends add much more: choosing among machine instructions (**instruction selection**), obeying **calling conventions** (which registers a function may overwrite), and scheduling instructions to keep the processor busy. But the pipeline you have now built, from characters to tokens to trees to checked trees to three-address code to optimized code to registers, is the same one inside every compiler.
+examples:
+- title: Bytecode and a virtual machine
+  intro: Compiling an expression and a loop to stack code, assembling it and running it.
+  code: |
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def compile_expr(ast):
+        """Compile an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to STACK MACHINE code: a list of instructions
+        ("push", value), ("load", name), ("neg",) and ("op", operator). Post-order: operands first, then the operator, so that at run time its operands are on top of the stack."""
+        kind = ast[0]
+        if kind == "num":
+            return [("push", ast[1])]
+        if kind == "var":
+            return [("load", ast[1])]
+        if kind == "unary":
+            return compile_expr(ast[2]) + [("neg",)]
+        return compile_expr(ast[2]) + compile_expr(ast[3]) + [("op", ast[1])]
+
+
+    def run_expr_vm(code, env=None):
+        """Run expression bytecode on a stack and return the single value left. push puts a value on the stack; load pushes a variable; neg replaces the top with its
+        negative; ("op", o) pops b, then a, and pushes apply_op(o, a, b). ValueError('stack underflow') when an instruction needs more values than the stack has,
+        ValueError('undefined NAME') for an unknown variable, and ValueError('bad program') if the final stack does not hold exactly one value."""
+        env = env or {}
+        stack = []
+        for ins in code:
+            if ins[0] == "push":
+                stack.append(ins[1])
+            elif ins[0] == "load":
+                if ins[1] not in env:
+                    raise ValueError("undefined " + ins[1])
+                stack.append(env[ins[1]])
+            elif ins[0] == "neg":
+                if not stack:
+                    raise ValueError("stack underflow")
+                stack.append(-stack.pop())
+            else:
+                if len(stack) < 2:
+                    raise ValueError("stack underflow")
+                b = stack.pop()
+                a = stack.pop()
+                stack.append(apply_op(ins[1], a, b))
+        if len(stack) != 1:
+            raise ValueError("bad program")
+        return stack[0]
+
+
+    def max_stack_depth(code):
+        """The largest number of values the stack holds at any moment while running expression bytecode (0 for empty code). push and load add one, op removes one net (pops two, pushes
+        one), neg changes nothing."""
+        depth = best = 0
+        for ins in code:
+            if ins[0] in ("push", "load"):
+                depth += 1
+            elif ins[0] == "op":
+                depth -= 1
+            best = max(best, depth)
+        return best
+
+
+    def assemble(code):
+        """Resolve labels: remove every ("label", name) pseudo-instruction and replace the name in each jump and jumpz by the integer index of the instruction that follows
+        the label in the new list. A label at the very end points one past the last instruction. ValueError('duplicate label NAME'), ValueError('unknown label NAME')."""
+        where = {}
+        count = 0
+        for ins in code:
+            if ins[0] == "label":
+                if ins[1] in where:
+                    raise ValueError("duplicate label " + ins[1])
+                where[ins[1]] = count
+            else:
+                count += 1
+        out = []
+        for ins in code:
+            if ins[0] == "label":
+                continue
+            if ins[0] in ("jump", "jumpz"):
+                if ins[1] not in where:
+                    raise ValueError("unknown label " + str(ins[1]))
+                out.append((ins[0], where[ins[1]]))
+            else:
+                out.append(ins)
+        return out
+
+
+    def run_vm(code, env=None, limit=10000):
+        """Run ASSEMBLED bytecode with a program counter and a value stack. Instructions: ("push", v); ("load", name); ("store", name) pops a value into a variable; ("neg",);
+        ("op", o); ("print",) pops and records a value; ("ret",) pops a value and stops with it; ("jump", index); ("jumpz", index) pops and jumps if the value is 0; ("pop",) discards the top.
+        Running off the end stops. Return {"env": variables, "output": printed values, "returned": value or None, "stack": what is left on the stack}.
+        Start from a copy of env. ValueError('stack underflow'), ValueError('undefined NAME'), ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        stack, output = [], []
+        pc = steps = 0
+
+        def pop():
+            if not stack:
+                raise ValueError("stack underflow")
+            return stack.pop()
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            pc += 1
+            kind = ins[0]
+            if kind == "push":
+                stack.append(ins[1])
+            elif kind == "load":
+                if ins[1] not in env:
+                    raise ValueError("undefined " + ins[1])
+                stack.append(env[ins[1]])
+            elif kind == "store":
+                env[ins[1]] = pop()
+            elif kind == "neg":
+                stack.append(-pop())
+            elif kind == "op":
+                b = pop()
+                a = pop()
+                stack.append(apply_op(ins[1], a, b))
+            elif kind == "print":
+                output.append(pop())
+            elif kind == "pop":
+                pop()
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": pop(), "stack": stack}
+            elif kind == "jump":
+                pc = ins[1]
+            elif kind == "jumpz":
+                if pop() == 0:
+                    pc = ins[1]
+        return {"env": env, "output": output, "returned": None, "stack": stack}
+
+
+    def compile_program(stmts):
+        """Compile statements to bytecode WITH labels (not yet assembled). Statements: ("assign", name, expr) -> expression code then ("store", name); ("print", expr) -> expression then
+        ("print",); ("return", expr) -> expression then ("ret",); ("while", cond, body): label top, cond, ("jumpz", end), body, ("jump", top), label end; ("if", cond, then, else): cond,
+        ("jumpz", other), then, ("jump", end), label other, else, label end. Labels are named L1, L2, ... in the order they are created (for a while: top is L1, end L2; for an if: other is L1,
+        end L2; nested constructs continue the numbering). Use compile_expr for expressions."""
+        code = []
+        counter = [0]
+
+        def label():
+            counter[0] += 1
+            return "L%d" % counter[0]
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.extend(compile_expr(s[2]))
+                code.append(("store", s[1]))
+            elif s[0] == "print":
+                code.extend(compile_expr(s[1]))
+                code.append(("print",))
+            elif s[0] == "return":
+                code.extend(compile_expr(s[1]))
+                code.append(("ret",))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                code.extend(compile_expr(s[1]))
+                code.append(("jumpz", end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                code.extend(compile_expr(s[1]))
+                code.append(("jumpz", other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+
+    def peephole(code):
+        """Peephole optimization: slide a small window over the code and rewrite wasteful patterns, repeating until nothing changes. Patterns: ("push", a), ("push", b), ("op", o) becomes
+        ("push", apply_op(o, a, b)) (unless apply_op raises ValueError); ("push", v), ("neg",) becomes ("push", -v); a ("jump", L) immediately followed by ("label", L) loses the jump. Return the new list."""
+        code = list(code)
+        changed = True
+        while changed:
+            changed = False
+            out = []
+            i = 0
+            while i < len(code):
+                if i + 2 < len(code) and code[i][0] == "push" and code[i + 1][0] == "push" and code[i + 2][0] == "op":
+                    try:
+                        value = apply_op(code[i + 2][1], code[i][1], code[i + 1][1])
+                    except ValueError:
+                        value = None
+                    if value is not None:
+                        out.append(("push", value))
+                        i += 3
+                        changed = True
+                        continue
+                if i + 1 < len(code) and code[i][0] == "push" and code[i + 1][0] == "neg":
+                    out.append(("push", -code[i][1]))
+                    i += 2
+                    changed = True
+                    continue
+                if i + 1 < len(code) and code[i][0] == "jump" and code[i + 1] == ("label", code[i][1]):
+                    i += 1
+                    changed = True
+                    continue
+                out.append(code[i])
+                i += 1
+            code = out
+        return code
+
+    expr = ("binop", "*", ("binop", "+", ("var", "a"), ("num", 2)), ("unary", "-", ("var", "b")))
+    code = compile_expr(expr)
+    print("bytecode:", code)
+    print("value:", run_expr_vm(code, {"a": 3, "b": 4}), "stack depth:", max_stack_depth(code))
+    program = [("assign", "n", ("num", 4)), ("assign", "f", ("num", 1)),
+               ("while", ("binop", ">", ("var", "n"), ("num", 1)), [("assign", "f", ("binop", "*", ("var", "f"), ("var", "n"))), ("assign", "n", ("binop", "-", ("var", "n"), ("num", 1)))]),
+               ("print", ("var", "f"))]
+    raw = compile_program(program)
+    assembled = assemble(raw)
+    print("instructions:", len(assembled), " first jump goes to index", [ins[1] for ins in assembled if ins[0] == "jumpz"][0])
+    print("output:", run_vm(assembled)["output"])
+    print("peephole:", peephole([("push", 2), ("push", 3), ("op", "*"), ("push", 4), ("op", "+")]))
+  output: |
+    bytecode: [('load', 'a'), ('push', 2), ('op', '+'), ('load', 'b'), ('neg',), ('op', '*')]
+    value: -20 stack depth: 2
+    instructions: 19  first jump goes to index 17
+    output: [24]
+    peephole: [('push', 10)]
+  lines:
+  - line: 231
+    note: Operands first, then the operator.
+  - line: 238
+    note: Labels become indexes.
+  - line: 240
+    note: The VM runs the loop.
+  - line: 241
+    note: Constant arithmetic is folded away.
+- title: Allocating registers
+  intro: Building an interference graph for an expression and coloring it with six and then three registers.
+  code: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+    def live_after(code, live_out=()):
+        """For STRAIGHT-LINE three-address code (no labels or jumps), a list whose element i is the sorted list of variables live immediately AFTER instruction i, given that the
+        variables in `live_out` are live at the end. Walk backwards keeping a live set; after processing instruction i going down, the set for i is what it was before you removed i's own
+        definition and added its uses. Use defs_uses."""
+        live = set(live_out)
+        result = [None] * len(code)
+        for i in range(len(code) - 1, -1, -1):
+            result[i] = sorted(live)
+            defined, used = defs_uses(code[i])
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return result
+
+
+    def live_at_entry(code, live_out=()):
+        """Sorted list of variables live before the first instruction (the inputs the code reads before writing, plus live_out variables never written)."""
+        live = set(live_out)
+        for ins in reversed(code):
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return sorted(live)
+
+
+    def interference_graph(code, live_out=()):
+        """Build the interference graph: a dict from every variable mentioned in the code to the sorted list of variables it interferes with (cannot share a register with).
+        Two variables interfere if one is DEFINED while the other is live just after that instruction: add an edge between the defined variable and each other variable in live_after,
+        EXCEPT that a copy ("copy", d, s) does not make d interfere with s (they hold the same value). Also, all variables live at entry interfere with each other. Variables with no
+        conflicts still appear, with an empty list."""
+        names = set(live_out)
+        for ins in code:
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                names.add(defined)
+            names.update(used)
+        edges = {n: set() for n in names}
+        after = live_after(code, live_out)
+        for i, ins in enumerate(code):
+            defined, _ = defs_uses(ins)
+            if defined is None:
+                continue
+            for other in after[i]:
+                if other == defined:
+                    continue
+                if ins[0] == "copy" and other == ins[2]:
+                    continue
+                edges[defined].add(other)
+                edges[other].add(defined)
+        entry = live_at_entry(code, live_out)
+        for a in entry:
+            for b in entry:
+                if a != b:
+                    edges[a].add(b)
+        return {n: sorted(v) for n, v in edges.items()}
+
+
+    def register_pressure(code, live_out=()):
+        """The most variables that are live at the same time: the maximum over the size of live_at_entry and of every live_after set. It is a lower bound on the registers needed."""
+        sizes = [len(live_at_entry(code, live_out))] + [len(s) for s in live_after(code, live_out)]
+        return max(sizes)
+
+    def color_graph(graph, k):
+        """Chaitin-style graph coloring with k colors (0..k-1). SIMPLIFY: repeatedly pick a vertex to remove and push on a stack. If some remaining vertex has fewer than k
+        remaining neighbours, take the one with the smallest name; otherwise take the vertex with the most remaining neighbours (ties: smallest name) as a POTENTIAL SPILL.
+        SELECT: pop the stack in reverse order; give each vertex the lowest color not used by its already-colored neighbours in the ORIGINAL graph; if no color is free it is spilled.
+        Return (colors dict, sorted list of spilled vertices). An empty graph gives ({}, [])."""
+        remaining = {v: set(ns) for v, ns in graph.items()}
+        stack = []
+        while remaining:
+            low = sorted(v for v in remaining if len(remaining[v]) < k)
+            if low:
+                pick = low[0]
+            else:
+                pick = sorted(remaining, key=lambda v: (-len(remaining[v]), v))[0]
+            stack.append(pick)
+            for n in remaining.pop(pick):
+                remaining[n].discard(pick)
+        colors = {}
+        spilled = []
+        for v in reversed(stack):
+            used = {colors[n] for n in graph[v] if n in colors}
+            free = [c for c in range(k) if c not in used]
+            if free:
+                colors[v] = free[0]
+            else:
+                spilled.append(v)
+        return colors, sorted(spilled)
+
+
+    def allocate(code, k, live_out=()):
+        """Register allocation for straight-line code: build the interference graph, color it with k colors and return (assignment, spilled): assignment maps EVERY variable to a
+        name: "R0".."R(k-1)" for the color it got, or "mem_" plus its own name if it was spilled to memory; spilled is the sorted list of spilled variables."""
+        colors, spilled = color_graph(interference_graph(code, live_out), k)
+        assignment = {v: "R%d" % c for v, c in colors.items()}
+        for v in spilled:
+            assignment[v] = "mem_" + v
+        return assignment, spilled
+
+
+    def rewrite(code, assignment):
+        """Rename every variable in the instructions by the assignment (names that are not in it stay). Constants, operators and labels are not variables."""
+        m = lambda n: assignment.get(n, n)
+        out = []
+        for ins in code:
+            k = ins[0]
+            if k == "const":
+                out.append(("const", m(ins[1]), ins[2]))
+            elif k in ("copy", "neg"):
+                out.append((k, m(ins[1]), m(ins[2])))
+            elif k == "bin":
+                out.append(("bin", m(ins[1]), ins[2], m(ins[3]), m(ins[4])))
+            elif k in ("print", "ret", "jumpz"):
+                out.append((k, m(ins[1])) + tuple(ins[2:]))
+            else:
+                out.append(ins)
+        return out
+
+    a, b, c, d = ("var", "a"), ("var", "b"), ("var", "c"), ("var", "d")
+    expr = ("binop", "+", ("binop", "*", ("binop", "+", a, b), ("binop", "+", c, d)), ("binop", "*", ("binop", "-", a, b), ("binop", "-", c, d)))
+    code, result = lower(expr)
+    print("instructions:", len(code), " register pressure:", register_pressure(code, [result]))
+    graph = interference_graph(code, [result])
+    for name in sorted(graph):
+        print(name, "conflicts with", graph[name])
+    for k in (6, 3):
+        assign, spilled = allocate(code, k, [result])
+        env = {"a": 7, "b": 3, "c": 5, "d": 2}
+        new = rewrite(code, assign)
+        value = run_tac(new, {assign[n]: v for n, v in env.items()})["env"][assign[result]]
+        print("k =", k, "spilled:", spilled, "result:", value)
+  output: |
+    instructions: 7  register pressure: 6
+    a conflicts with ['b', 'c', 'd', 't1', 't2', 't3']
+    b conflicts with ['a', 'c', 'd', 't1', 't2', 't3']
+    c conflicts with ['a', 'b', 'd', 't1', 't2', 't3', 't4']
+    d conflicts with ['a', 'b', 'c', 't1', 't2', 't3', 't4']
+    t1 conflicts with ['a', 'b', 'c', 'd', 't2']
+    t2 conflicts with ['a', 'b', 'c', 'd', 't1']
+    t3 conflicts with ['a', 'b', 'c', 'd', 't4', 't5', 't6']
+    t4 conflicts with ['c', 'd', 't3', 't5']
+    t5 conflicts with ['t3', 't4']
+    t6 conflicts with ['t3']
+    t7 conflicts with []
+    k = 6 spilled: [] result: 82
+    k = 3 spilled: ['a', 'b', 'c'] result: 82
+  lines:
+  - line: 234
+    note: Variables that are live together conflict.
+  - line: 238
+    note: Fewer registers force spills.
+  - line: 242
+    note: The result is the same in every case.
+playground:
+  prompt: Write stack bytecode by hand for 2 + 3 * 4 and trace the stack.
+  code: |
+    code = [('push', 2), ('push', 3), ('push', 4), ('op', '*'), ('op', '+')]
+    stack = []
+    for ins in code:
+        if ins[0] == 'push':
+            stack.append(ins[1])
+        else:
+            b, a = stack.pop(), stack.pop()
+            stack.append(a * b if ins[1] == '*' else a + b)
+        print(ins, stack)
+exercises:
+- id: stack
+  title: Compiling to a stack machine
+  difficulty: 4
+  prompt: 'The starter has `apply_op`. A **stack machine** keeps temporary values on a stack instead of in named registers; Java bytecode and Python bytecode work this way. Write `compile_expr(ast)` for an expression AST (`num`, `var`, `("unary", "-", e)`, `("binop", op, l, r)`), producing a list of instructions `("push", value)`, `("load", name)`, `("neg",)` and `("op", operator)`. Use post-order: operands first, then the operator, so its operands are on top of the stack when it runs. Write `run_expr_vm(code, env=None)`, which runs such code and returns the single value left: `push` puts a value on the stack, `load` pushes a variable, `neg` replaces the top with its negative, and `("op", o)` pops `b`, then `a`, and pushes `apply_op(o, a, b)`. Raise `ValueError("stack underflow")` when an instruction needs more values than the stack has, `ValueError("undefined NAME")` for an unknown variable, and `ValueError("bad program")` if the final stack does not hold exactly one value. Write `max_stack_depth(code)`: the largest number of values on the stack at any moment (0 for empty code).'
+  starter: |-
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def compile_expr(ast):
+        """Compile an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to STACK MACHINE code: a list of instructions
+        ("push", value), ("load", name), ("neg",) and ("op", operator). Post-order: operands first, then the operator, so that at run time its operands are on top of the stack."""
+        pass
+
+
+    def run_expr_vm(code, env=None):
+        """Run expression bytecode on a stack and return the single value left. push puts a value on the stack; load pushes a variable; neg replaces the top with its
+        negative; ("op", o) pops b, then a, and pushes apply_op(o, a, b). ValueError('stack underflow') when an instruction needs more values than the stack has,
+        ValueError('undefined NAME') for an unknown variable, and ValueError('bad program') if the final stack does not hold exactly one value."""
+        pass
+
+
+    def max_stack_depth(code):
+        """The largest number of values the stack holds at any moment while running expression bytecode (0 for empty code). push and load add one, op removes one net (pops two, pushes
+        one), neg changes nothing."""
+        pass
+  tests:
+  - name: compiling
+    code: |
+      assert compile_expr(("binop", "+", ("num", 1), ("binop", "*", ("num", 2), ("num", 3)))) == [("push", 1), ("push", 2), ("push", 3), ("op", "*"), ("op", "+")]
+      assert compile_expr(("var", "x")) == [("load", "x")]
+      assert compile_expr(("unary", "-", ("var", "a"))) == [("load", "a"), ("neg",)]
+      assert compile_expr(("binop", "-", ("binop", "-", ("var", "a"), ("var", "b")), ("var", "c"))) == [("load", "a"), ("load", "b"), ("op", "-"), ("load", "c"), ("op", "-")]
+      assert compile_expr(("num", 5)) == [("push", 5)]
+  - name: running
+    code: |
+      e = ("binop", "+", ("num", 1), ("binop", "*", ("num", 2), ("num", 3)))
+      assert run_expr_vm(compile_expr(e)) == 7
+      e = ("binop", "-", ("binop", "*", ("var", "x"), ("var", "x")), ("unary", "-", ("var", "y")))
+      assert run_expr_vm(compile_expr(e), {"x": 4, "y": 3}) == 19
+      assert run_expr_vm(compile_expr(("binop", "/", ("num", 7), ("num", 2)))) == 3.5
+      assert run_expr_vm(compile_expr(("binop", "<", ("var", "a"), ("var", "b"))), {"a": 1, "b": 2}) == 1
+      assert run_expr_vm([("push", 9)]) == 9
+  - name: errors
+    code: |
+      for code, env in (([("op", "+")], {}), ([("push", 1), ("op", "+")], {}), ([("neg",)], {})):
+          try:
+              run_expr_vm(code, env)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "stack underflow" in str(e)
+      for code in ([], [("push", 1), ("push", 2)]):
+          try:
+              run_expr_vm(code)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad program" in str(e)
+      try:
+          run_expr_vm([("load", "q")], {})
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "undefined q" in str(e)
+      try:
+          run_expr_vm([("push", 1), ("push", 0), ("op", "/")])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "division by zero" in str(e)
+  - name: stack depth
+    code: |
+      v = lambda n: ("var", n)
+      add = lambda a, b: ("binop", "+", a, b)
+      assert max_stack_depth([]) == 0
+      assert max_stack_depth(compile_expr(v("a"))) == 1
+      assert max_stack_depth(compile_expr(add(add(add(v("a"), v("b")), v("c")), v("d")))) == 2
+      assert max_stack_depth(compile_expr(add(v("a"), add(v("b"), add(v("c"), v("d")))))) == 4
+      assert max_stack_depth(compile_expr(("binop", "*", add(v("a"), v("b")), add(v("c"), v("d"))))) == 3
+      assert max_stack_depth(compile_expr(("unary", "-", ("unary", "-", v("a"))))) == 1
+  hints:
+  - Compile the left operand, then the right operand, then the operator.
+  solution: |
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def compile_expr(ast):
+        """Compile an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to STACK MACHINE code: a list of instructions
+        ("push", value), ("load", name), ("neg",) and ("op", operator). Post-order: operands first, then the operator, so that at run time its operands are on top of the stack."""
+        kind = ast[0]
+        if kind == "num":
+            return [("push", ast[1])]
+        if kind == "var":
+            return [("load", ast[1])]
+        if kind == "unary":
+            return compile_expr(ast[2]) + [("neg",)]
+        return compile_expr(ast[2]) + compile_expr(ast[3]) + [("op", ast[1])]
+
+
+    def run_expr_vm(code, env=None):
+        """Run expression bytecode on a stack and return the single value left. push puts a value on the stack; load pushes a variable; neg replaces the top with its
+        negative; ("op", o) pops b, then a, and pushes apply_op(o, a, b). ValueError('stack underflow') when an instruction needs more values than the stack has,
+        ValueError('undefined NAME') for an unknown variable, and ValueError('bad program') if the final stack does not hold exactly one value."""
+        env = env or {}
+        stack = []
+        for ins in code:
+            if ins[0] == "push":
+                stack.append(ins[1])
+            elif ins[0] == "load":
+                if ins[1] not in env:
+                    raise ValueError("undefined " + ins[1])
+                stack.append(env[ins[1]])
+            elif ins[0] == "neg":
+                if not stack:
+                    raise ValueError("stack underflow")
+                stack.append(-stack.pop())
+            else:
+                if len(stack) < 2:
+                    raise ValueError("stack underflow")
+                b = stack.pop()
+                a = stack.pop()
+                stack.append(apply_op(ins[1], a, b))
+        if len(stack) != 1:
+            raise ValueError("bad program")
+        return stack[0]
+
+
+    def max_stack_depth(code):
+        """The largest number of values the stack holds at any moment while running expression bytecode (0 for empty code). push and load add one, op removes one net (pops two, pushes
+        one), neg changes nothing."""
+        depth = best = 0
+        for ins in code:
+            if ins[0] in ("push", "load"):
+                depth += 1
+            elif ins[0] == "op":
+                depth -= 1
+            best = max(best, depth)
+        return best
+  explanation: 'A stack machine needs no register names: the order of instructions encodes the structure of the tree.'
+- id: vm
+  title: Assembler and virtual machine
+  difficulty: 5
+  prompt: 'The starter has `apply_op`. Write `assemble(code)`: resolve labels by removing every `("label", name)` pseudo-instruction and replacing the name in each `jump` and `jumpz` with the integer index of the instruction that follows the label in the new list (a label at the very end points one past the last instruction). Raise `ValueError("duplicate label NAME")` and `ValueError("unknown label NAME")`. Write `run_vm(code, env=None, limit=10000)`, which runs **assembled** bytecode with a program counter and a value stack. Instructions: `("push", v)`; `("load", name)`; `("store", name)` pops a value into a variable; `("neg",)`; `("op", o)` (pop `b`, pop `a`, push `apply_op(o, a, b)`); `("print",)` pops and records a value; `("ret",)` pops a value and stops with it; `("jump", index)`; `("jumpz", index)` pops and jumps if the value is 0; `("pop",)` discards the top. Running off the end stops. Return `{"env": variables, "output": printed values, "returned": value or None, "stack": what is left on the stack}`, starting from a copy of `env`. Raise `ValueError("stack underflow")`, `ValueError("undefined NAME")` and `ValueError("too many steps")` (after `limit` executed instructions).'
+  starter: |-
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def assemble(code):
+        """Resolve labels: remove every ("label", name) pseudo-instruction and replace the name in each jump and jumpz by the integer index of the instruction that follows
+        the label in the new list. A label at the very end points one past the last instruction. ValueError('duplicate label NAME'), ValueError('unknown label NAME')."""
+        pass
+
+
+    def run_vm(code, env=None, limit=10000):
+        """Run ASSEMBLED bytecode with a program counter and a value stack. Instructions: ("push", v); ("load", name); ("store", name) pops a value into a variable; ("neg",);
+        ("op", o); ("print",) pops and records a value; ("ret",) pops a value and stops with it; ("jump", index); ("jumpz", index) pops and jumps if the value is 0; ("pop",) discards the top.
+        Running off the end stops. Return {"env": variables, "output": printed values, "returned": value or None, "stack": what is left on the stack}.
+        Start from a copy of env. ValueError('stack underflow'), ValueError('undefined NAME'), ValueError('too many steps') after `limit` executed instructions."""
+        pass
+  tests:
+  - name: assembling
+    code: |
+      assert assemble([("label", "a"), ("push", 1), ("jump", "a")]) == [("push", 1), ("jump", 0)]
+      assert assemble([("jump", "end"), ("push", 1), ("label", "end")]) == [("jump", 2), ("push", 1)]
+      assert assemble([("label", "x"), ("label", "y"), ("push", 1), ("jumpz", "x"), ("jump", "y")]) == [("push", 1), ("jumpz", 0), ("jump", 0)]
+      assert assemble([]) == []
+      code = [("label", "a"), ("push", 1)]
+      assemble(code)
+      assert code == [("label", "a"), ("push", 1)]
+      for bad, msg in (([("jump", "nowhere")], "unknown label"), ([("label", "a"), ("label", "a")], "duplicate label")):
+          try:
+              assemble(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: running a loop
+    code: |
+      code = assemble([("push", 0), ("store", "s"), ("push", 1), ("store", "i"), ("label", "top"), ("load", "i"), ("push", 5), ("op", "<"), ("jumpz", "end"),
+                       ("load", "s"), ("load", "i"), ("op", "+"), ("store", "s"), ("load", "i"), ("push", 1), ("op", "+"), ("store", "i"), ("jump", "top"),
+                       ("label", "end"), ("load", "s"), ("print",), ("load", "s"), ("ret",)])
+      res = run_vm(code)
+      assert res["output"] == [10] and res["returned"] == 10 and res["env"]["s"] == 10 and res["env"]["i"] == 5 and res["stack"] == []
+  - name: small programs
+    code: |
+      res = run_vm([("push", 2), ("push", 3), ("op", "*"), ("neg",), ("print",), ("push", 7)])
+      assert res["output"] == [-6] and res["returned"] is None and res["stack"] == [7]
+      res = run_vm([("load", "n"), ("push", 1), ("op", "+"), ("store", "n"), ("push", 5), ("push", 6), ("pop",), ("ret",), ("push", 9), ("print",)], {"n": 1})
+      assert res["env"]["n"] == 2 and res["returned"] == 5 and res["output"] == []
+      res = run_vm([("push", 0), ("jumpz", 3), ("push", 1), ("push", 2), ("print",)])
+      assert res["output"] == [2] and res["stack"] == []
+      env = {"a": 1}
+      run_vm([("push", 5), ("store", "a")], env)
+      assert env == {"a": 1}
+  - name: errors
+    code: |
+      for code, msg in (([("op", "+")], "stack underflow"), ([("print",)], "stack underflow"), ([("push", 1), ("op", "+")], "stack underflow"), ([("load", "z")], "undefined z"),
+                        ([("push", 1), ("push", 0), ("op", "/")], "division by zero"), ([("jump", 0)], "too many steps")):
+          try:
+              run_vm(code, limit=100)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e), (code, str(e))
+      assert run_vm([])["returned"] is None
+  hints:
+  - The program counter is just an index; a jump simply assigns to it.
+  solution: |
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def assemble(code):
+        """Resolve labels: remove every ("label", name) pseudo-instruction and replace the name in each jump and jumpz by the integer index of the instruction that follows
+        the label in the new list. A label at the very end points one past the last instruction. ValueError('duplicate label NAME'), ValueError('unknown label NAME')."""
+        where = {}
+        count = 0
+        for ins in code:
+            if ins[0] == "label":
+                if ins[1] in where:
+                    raise ValueError("duplicate label " + ins[1])
+                where[ins[1]] = count
+            else:
+                count += 1
+        out = []
+        for ins in code:
+            if ins[0] == "label":
+                continue
+            if ins[0] in ("jump", "jumpz"):
+                if ins[1] not in where:
+                    raise ValueError("unknown label " + str(ins[1]))
+                out.append((ins[0], where[ins[1]]))
+            else:
+                out.append(ins)
+        return out
+
+
+    def run_vm(code, env=None, limit=10000):
+        """Run ASSEMBLED bytecode with a program counter and a value stack. Instructions: ("push", v); ("load", name); ("store", name) pops a value into a variable; ("neg",);
+        ("op", o); ("print",) pops and records a value; ("ret",) pops a value and stops with it; ("jump", index); ("jumpz", index) pops and jumps if the value is 0; ("pop",) discards the top.
+        Running off the end stops. Return {"env": variables, "output": printed values, "returned": value or None, "stack": what is left on the stack}.
+        Start from a copy of env. ValueError('stack underflow'), ValueError('undefined NAME'), ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        stack, output = [], []
+        pc = steps = 0
+
+        def pop():
+            if not stack:
+                raise ValueError("stack underflow")
+            return stack.pop()
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            pc += 1
+            kind = ins[0]
+            if kind == "push":
+                stack.append(ins[1])
+            elif kind == "load":
+                if ins[1] not in env:
+                    raise ValueError("undefined " + ins[1])
+                stack.append(env[ins[1]])
+            elif kind == "store":
+                env[ins[1]] = pop()
+            elif kind == "neg":
+                stack.append(-pop())
+            elif kind == "op":
+                b = pop()
+                a = pop()
+                stack.append(apply_op(ins[1], a, b))
+            elif kind == "print":
+                output.append(pop())
+            elif kind == "pop":
+                pop()
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": pop(), "stack": stack}
+            elif kind == "jump":
+                pc = ins[1]
+            elif kind == "jumpz":
+                if pop() == 0:
+                    pc = ins[1]
+        return {"env": env, "output": output, "returned": None, "stack": stack}
+  explanation: A virtual machine is a loop with a program counter, a stack and a big if-chain on the instruction kind.
+- id: codegen
+  title: Compiling statements, and peephole optimization
+  difficulty: 5
+  prompt: 'The starter has `apply_op`, `compile_expr`, `assemble` and `run_vm`. Write `compile_program(stmts)`: compile statements to bytecode **with labels** (not yet assembled). `("assign", name, expr)` is the expression code then `("store", name)`; `("print", expr)` is the expression then `("print",)`; `("return", expr)` is the expression then `("ret",)`; `("while", cond, body)` is: label `top`, the condition, `("jumpz", end)`, the body, `("jump", top)`, label `end`; `("if", cond, then_list, else_list)` is: the condition, `("jumpz", other)`, then-part, `("jump", end)`, label `other`, else-part, label `end`. Labels are named `L1`, `L2`, ... in creation order (for a `while`, `top` is `L1` and `end` is `L2`; for an `if`, `other` is `L1` and `end` is `L2`; nested constructs continue the numbering). Then write `peephole(code)`: slide a small window over the code and rewrite wasteful patterns, repeating until nothing changes: `push a`, `push b`, `op o` becomes `push (a o b)` (unless `apply_op` raises `ValueError`); `push v`, `neg` becomes `push -v`; a `("jump", L)` immediately followed by `("label", L)` loses the jump.'
+  starter: |-
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def compile_expr(ast):
+        """Compile an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to STACK MACHINE code: a list of instructions
+        ("push", value), ("load", name), ("neg",) and ("op", operator). Post-order: operands first, then the operator, so that at run time its operands are on top of the stack."""
+        kind = ast[0]
+        if kind == "num":
+            return [("push", ast[1])]
+        if kind == "var":
+            return [("load", ast[1])]
+        if kind == "unary":
+            return compile_expr(ast[2]) + [("neg",)]
+        return compile_expr(ast[2]) + compile_expr(ast[3]) + [("op", ast[1])]
+
+
+
+
+    def assemble(code):
+        """Resolve labels: remove every ("label", name) pseudo-instruction and replace the name in each jump and jumpz by the integer index of the instruction that follows
+        the label in the new list. A label at the very end points one past the last instruction. ValueError('duplicate label NAME'), ValueError('unknown label NAME')."""
+        where = {}
+        count = 0
+        for ins in code:
+            if ins[0] == "label":
+                if ins[1] in where:
+                    raise ValueError("duplicate label " + ins[1])
+                where[ins[1]] = count
+            else:
+                count += 1
+        out = []
+        for ins in code:
+            if ins[0] == "label":
+                continue
+            if ins[0] in ("jump", "jumpz"):
+                if ins[1] not in where:
+                    raise ValueError("unknown label " + str(ins[1]))
+                out.append((ins[0], where[ins[1]]))
+            else:
+                out.append(ins)
+        return out
+
+
+    def run_vm(code, env=None, limit=10000):
+        """Run ASSEMBLED bytecode with a program counter and a value stack. Instructions: ("push", v); ("load", name); ("store", name) pops a value into a variable; ("neg",);
+        ("op", o); ("print",) pops and records a value; ("ret",) pops a value and stops with it; ("jump", index); ("jumpz", index) pops and jumps if the value is 0; ("pop",) discards the top.
+        Running off the end stops. Return {"env": variables, "output": printed values, "returned": value or None, "stack": what is left on the stack}.
+        Start from a copy of env. ValueError('stack underflow'), ValueError('undefined NAME'), ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        stack, output = [], []
+        pc = steps = 0
+
+        def pop():
+            if not stack:
+                raise ValueError("stack underflow")
+            return stack.pop()
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            pc += 1
+            kind = ins[0]
+            if kind == "push":
+                stack.append(ins[1])
+            elif kind == "load":
+                if ins[1] not in env:
+                    raise ValueError("undefined " + ins[1])
+                stack.append(env[ins[1]])
+            elif kind == "store":
+                env[ins[1]] = pop()
+            elif kind == "neg":
+                stack.append(-pop())
+            elif kind == "op":
+                b = pop()
+                a = pop()
+                stack.append(apply_op(ins[1], a, b))
+            elif kind == "print":
+                output.append(pop())
+            elif kind == "pop":
+                pop()
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": pop(), "stack": stack}
+            elif kind == "jump":
+                pc = ins[1]
+            elif kind == "jumpz":
+                if pop() == 0:
+                    pc = ins[1]
+        return {"env": env, "output": output, "returned": None, "stack": stack}
+
+
+    def compile_program(stmts):
+        """Compile statements to bytecode WITH labels (not yet assembled). Statements: ("assign", name, expr) -> expression code then ("store", name); ("print", expr) -> expression then
+        ("print",); ("return", expr) -> expression then ("ret",); ("while", cond, body): label top, cond, ("jumpz", end), body, ("jump", top), label end; ("if", cond, then, else): cond,
+        ("jumpz", other), then, ("jump", end), label other, else, label end. Labels are named L1, L2, ... in the order they are created (for a while: top is L1, end L2; for an if: other is L1,
+        end L2; nested constructs continue the numbering). Use compile_expr for expressions."""
+        pass
+
+
+    def peephole(code):
+        """Peephole optimization: slide a small window over the code and rewrite wasteful patterns, repeating until nothing changes. Patterns: ("push", a), ("push", b), ("op", o) becomes
+        ("push", apply_op(o, a, b)) (unless apply_op raises ValueError); ("push", v), ("neg",) becomes ("push", -v); a ("jump", L) immediately followed by ("label", L) loses the jump. Return the new list."""
+        pass
+  tests:
+  - name: exact bytecode
+    code: |
+      assert compile_program([("assign", "x", ("binop", "+", ("num", 1), ("num", 2)))]) == [("push", 1), ("push", 2), ("op", "+"), ("store", "x")]
+      assert compile_program([("print", ("var", "x")), ("return", ("num", 0))]) == [("load", "x"), ("print",), ("push", 0), ("ret",)]
+      w = compile_program([("while", ("var", "c"), [("print", ("num", 1))])])
+      assert w == [("label", "L1"), ("load", "c"), ("jumpz", "L2"), ("push", 1), ("print",), ("jump", "L1"), ("label", "L2")]
+      i = compile_program([("if", ("var", "c"), [("print", ("num", 1))], [("print", ("num", 2))])])
+      assert i == [("load", "c"), ("jumpz", "L1"), ("push", 1), ("print",), ("jump", "L2"), ("label", "L1"), ("push", 2), ("print",), ("label", "L2")]
+      assert compile_program([]) == []
+  - name: running compiled programs
+    code: |
+      fact = [("assign", "n", ("num", 5)), ("assign", "f", ("num", 1)),
+              ("while", ("binop", ">", ("var", "n"), ("num", 1)), [("assign", "f", ("binop", "*", ("var", "f"), ("var", "n"))), ("assign", "n", ("binop", "-", ("var", "n"), ("num", 1)))]),
+              ("print", ("var", "f")), ("return", ("var", "f"))]
+      res = run_vm(assemble(compile_program(fact)))
+      assert res["output"] == [120] and res["returned"] == 120
+      branch = [("assign", "x", ("num", 3)), ("if", ("binop", "<", ("var", "x"), ("num", 2)), [("print", ("num", 100))], [("print", ("num", 200))]), ("print", ("var", "x"))]
+      assert run_vm(assemble(compile_program(branch)))["output"] == [200, 3]
+      early = [("print", ("num", 1)), ("return", ("num", 7)), ("print", ("num", 2))]
+      res = run_vm(assemble(compile_program(early)))
+      assert res["output"] == [1] and res["returned"] == 7
+  - name: nested constructs
+    code: |
+      nested = [("assign", "i", ("num", 0)), ("assign", "total", ("num", 0)),
+                ("while", ("binop", "<", ("var", "i"), ("num", 3)), [
+                    ("assign", "j", ("num", 0)),
+                    ("while", ("binop", "<", ("var", "j"), ("num", 2)), [("assign", "total", ("binop", "+", ("var", "total"), ("num", 1))), ("assign", "j", ("binop", "+", ("var", "j"), ("num", 1)))]),
+                    ("if", ("binop", "==", ("var", "i"), ("num", 1)), [("print", ("var", "total"))], []),
+                    ("assign", "i", ("binop", "+", ("var", "i"), ("num", 1)))]),
+                ("print", ("var", "total"))]
+      code = compile_program(nested)
+      labels = [ins[1] for ins in code if ins[0] == "label"]
+      assert len(labels) == len(set(labels)) == 6 and labels[0] == "L1"
+      assert run_vm(assemble(code))["output"] == [4, 6]
+  - name: peephole
+    code: |
+      assert peephole([("push", 2), ("push", 3), ("op", "+"), ("store", "x")]) == [("push", 5), ("store", "x")]
+      assert peephole([("push", 1), ("push", 2), ("op", "+"), ("push", 3), ("op", "*")]) == [("push", 9)]
+      assert peephole([("push", 1), ("push", 0), ("op", "/")]) == [("push", 1), ("push", 0), ("op", "/")]
+      assert peephole([("push", 4), ("neg",)]) == [("push", -4)]
+      assert peephole([("push", 1), ("push", 2), ("op", "-"), ("neg",)]) == [("push", 1)]
+      assert peephole([("jump", "L"), ("label", "L"), ("push", 1)]) == [("label", "L"), ("push", 1)]
+      assert peephole([("jump", "L"), ("label", "M"), ("label", "L")]) == [("jump", "L"), ("label", "M"), ("label", "L")]
+      assert peephole([("load", "x"), ("push", 2), ("op", "*")]) == [("load", "x"), ("push", 2), ("op", "*")]
+      assert peephole([]) == []
+      prog = [("assign", "x", ("binop", "+", ("binop", "*", ("num", 2), ("num", 3)), ("binop", "*", ("num", 4), ("num", 5)))), ("print", ("var", "x"))]
+      raw = compile_program(prog)
+      fast = peephole(raw)
+      assert fast == [("push", 26), ("store", "x"), ("load", "x"), ("print",)] and len(fast) < len(raw)
+      assert run_vm(assemble(fast))["output"] == run_vm(assemble(raw))["output"] == [26]
+  hints:
+  - Allocate labels with a counter; compile a while loop as top-label, test, exit jump, body, back jump, end-label.
+  solution: |
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def compile_expr(ast):
+        """Compile an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to STACK MACHINE code: a list of instructions
+        ("push", value), ("load", name), ("neg",) and ("op", operator). Post-order: operands first, then the operator, so that at run time its operands are on top of the stack."""
+        kind = ast[0]
+        if kind == "num":
+            return [("push", ast[1])]
+        if kind == "var":
+            return [("load", ast[1])]
+        if kind == "unary":
+            return compile_expr(ast[2]) + [("neg",)]
+        return compile_expr(ast[2]) + compile_expr(ast[3]) + [("op", ast[1])]
+
+
+
+
+    def assemble(code):
+        """Resolve labels: remove every ("label", name) pseudo-instruction and replace the name in each jump and jumpz by the integer index of the instruction that follows
+        the label in the new list. A label at the very end points one past the last instruction. ValueError('duplicate label NAME'), ValueError('unknown label NAME')."""
+        where = {}
+        count = 0
+        for ins in code:
+            if ins[0] == "label":
+                if ins[1] in where:
+                    raise ValueError("duplicate label " + ins[1])
+                where[ins[1]] = count
+            else:
+                count += 1
+        out = []
+        for ins in code:
+            if ins[0] == "label":
+                continue
+            if ins[0] in ("jump", "jumpz"):
+                if ins[1] not in where:
+                    raise ValueError("unknown label " + str(ins[1]))
+                out.append((ins[0], where[ins[1]]))
+            else:
+                out.append(ins)
+        return out
+
+
+    def run_vm(code, env=None, limit=10000):
+        """Run ASSEMBLED bytecode with a program counter and a value stack. Instructions: ("push", v); ("load", name); ("store", name) pops a value into a variable; ("neg",);
+        ("op", o); ("print",) pops and records a value; ("ret",) pops a value and stops with it; ("jump", index); ("jumpz", index) pops and jumps if the value is 0; ("pop",) discards the top.
+        Running off the end stops. Return {"env": variables, "output": printed values, "returned": value or None, "stack": what is left on the stack}.
+        Start from a copy of env. ValueError('stack underflow'), ValueError('undefined NAME'), ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        stack, output = [], []
+        pc = steps = 0
+
+        def pop():
+            if not stack:
+                raise ValueError("stack underflow")
+            return stack.pop()
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            pc += 1
+            kind = ins[0]
+            if kind == "push":
+                stack.append(ins[1])
+            elif kind == "load":
+                if ins[1] not in env:
+                    raise ValueError("undefined " + ins[1])
+                stack.append(env[ins[1]])
+            elif kind == "store":
+                env[ins[1]] = pop()
+            elif kind == "neg":
+                stack.append(-pop())
+            elif kind == "op":
+                b = pop()
+                a = pop()
+                stack.append(apply_op(ins[1], a, b))
+            elif kind == "print":
+                output.append(pop())
+            elif kind == "pop":
+                pop()
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": pop(), "stack": stack}
+            elif kind == "jump":
+                pc = ins[1]
+            elif kind == "jumpz":
+                if pop() == 0:
+                    pc = ins[1]
+        return {"env": env, "output": output, "returned": None, "stack": stack}
+
+
+    def compile_program(stmts):
+        """Compile statements to bytecode WITH labels (not yet assembled). Statements: ("assign", name, expr) -> expression code then ("store", name); ("print", expr) -> expression then
+        ("print",); ("return", expr) -> expression then ("ret",); ("while", cond, body): label top, cond, ("jumpz", end), body, ("jump", top), label end; ("if", cond, then, else): cond,
+        ("jumpz", other), then, ("jump", end), label other, else, label end. Labels are named L1, L2, ... in the order they are created (for a while: top is L1, end L2; for an if: other is L1,
+        end L2; nested constructs continue the numbering). Use compile_expr for expressions."""
+        code = []
+        counter = [0]
+
+        def label():
+            counter[0] += 1
+            return "L%d" % counter[0]
+
+        def stmt(s):
+            if s[0] == "assign":
+                code.extend(compile_expr(s[2]))
+                code.append(("store", s[1]))
+            elif s[0] == "print":
+                code.extend(compile_expr(s[1]))
+                code.append(("print",))
+            elif s[0] == "return":
+                code.extend(compile_expr(s[1]))
+                code.append(("ret",))
+            elif s[0] == "while":
+                top, end = label(), label()
+                code.append(("label", top))
+                code.extend(compile_expr(s[1]))
+                code.append(("jumpz", end))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", top))
+                code.append(("label", end))
+            else:
+                other, end = label(), label()
+                code.extend(compile_expr(s[1]))
+                code.append(("jumpz", other))
+                for x in s[2]:
+                    stmt(x)
+                code.append(("jump", end))
+                code.append(("label", other))
+                for x in s[3]:
+                    stmt(x)
+                code.append(("label", end))
+
+        for s in stmts:
+            stmt(s)
+        return code
+
+
+    def peephole(code):
+        """Peephole optimization: slide a small window over the code and rewrite wasteful patterns, repeating until nothing changes. Patterns: ("push", a), ("push", b), ("op", o) becomes
+        ("push", apply_op(o, a, b)) (unless apply_op raises ValueError); ("push", v), ("neg",) becomes ("push", -v); a ("jump", L) immediately followed by ("label", L) loses the jump. Return the new list."""
+        code = list(code)
+        changed = True
+        while changed:
+            changed = False
+            out = []
+            i = 0
+            while i < len(code):
+                if i + 2 < len(code) and code[i][0] == "push" and code[i + 1][0] == "push" and code[i + 2][0] == "op":
+                    try:
+                        value = apply_op(code[i + 2][1], code[i][1], code[i + 1][1])
+                    except ValueError:
+                        value = None
+                    if value is not None:
+                        out.append(("push", value))
+                        i += 3
+                        changed = True
+                        continue
+                if i + 1 < len(code) and code[i][0] == "push" and code[i + 1][0] == "neg":
+                    out.append(("push", -code[i][1]))
+                    i += 2
+                    changed = True
+                    continue
+                if i + 1 < len(code) and code[i][0] == "jump" and code[i + 1] == ("label", code[i][1]):
+                    i += 1
+                    changed = True
+                    continue
+                out.append(code[i])
+                i += 1
+            code = out
+        return code
+  explanation: Code generation is a systematic translation, and a peephole pass cleans up the obvious waste it leaves behind.
+- id: interference
+  title: Live ranges and the interference graph
+  difficulty: 5
+  prompt: 'Real processors have only a few **registers**, fast storage slots, so a compiler must decide which variables share which register. Two variables can share one only if they are never **live** at the same time. The starter has `defs_uses`. For **straight-line** three-address code (no labels or jumps) write `live_after(code, live_out=())`, a list whose element `i` is the sorted list of variables live immediately **after** instruction `i`, given that the variables in `live_out` are live at the end (walk backwards keeping a live set). Write `live_at_entry(code, live_out=())`, the sorted variables live before the first instruction. Write `interference_graph(code, live_out=())`: a dict from **every** variable mentioned in the code (or in `live_out`) to the sorted list of variables it **interferes** with. Two variables interfere if one is **defined** while the other is live just after that instruction, so add an edge between the defined variable and each other variable in `live_after`, **except** that a copy `("copy", d, s)` does not make `d` interfere with `s` (they hold the same value). Also, all variables live at entry interfere with each other. Variables with no conflicts still appear, with an empty list. Finally write `register_pressure(code, live_out=())`: the most variables live at the same time (the size of the entry set, or of any `live_after` set). It is a lower bound on the registers needed.'
+  starter: |-
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+
+    def live_after(code, live_out=()):
+        """For STRAIGHT-LINE three-address code (no labels or jumps), a list whose element i is the sorted list of variables live immediately AFTER instruction i, given that the
+        variables in `live_out` are live at the end. Walk backwards keeping a live set; after processing instruction i going down, the set for i is what it was before you removed i's own
+        definition and added its uses. Use defs_uses."""
+        pass
+
+
+    def live_at_entry(code, live_out=()):
+        """Sorted list of variables live before the first instruction (the inputs the code reads before writing, plus live_out variables never written)."""
+        pass
+
+
+    def interference_graph(code, live_out=()):
+        """Build the interference graph: a dict from every variable mentioned in the code to the sorted list of variables it interferes with (cannot share a register with).
+        Two variables interfere if one is DEFINED while the other is live just after that instruction: add an edge between the defined variable and each other variable in live_after,
+        EXCEPT that a copy ("copy", d, s) does not make d interfere with s (they hold the same value). Also, all variables live at entry interfere with each other. Variables with no
+        conflicts still appear, with an empty list."""
+        pass
+
+
+    def register_pressure(code, live_out=()):
+        """The most variables that are live at the same time: the maximum over the size of live_at_entry and of every live_after set. It is a lower bound on the registers needed."""
+        pass
+  tests:
+  - name: live sets
+    code: |
+      code = [("bin", "t1", "+", "a", "b"), ("bin", "t2", "-", "a", "b"), ("bin", "t3", "*", "t1", "t2")]
+      assert live_after(code, ["t3"]) == [["a", "b", "t1"], ["t1", "t2"], ["t3"]]
+      assert live_after(code) == [["a", "b", "t1"], ["t1", "t2"], []]
+      assert live_at_entry(code, ["t3"]) == ["a", "b"]
+      assert live_at_entry([("const", "x", 1), ("print", "x")]) == []
+      assert live_after([], ["x"]) == [] and live_at_entry([], ["x"]) == ["x"]
+      code = [("const", "a", 1), ("const", "a", 2), ("print", "a")]
+      assert live_after(code) == [[], ["a"], []]
+  - name: the graph
+    code: |
+      code = [("bin", "t1", "+", "a", "b"), ("bin", "t2", "-", "a", "b"), ("bin", "t3", "*", "t1", "t2")]
+      g = interference_graph(code, ["t3"])
+      assert g == {"a": ["b", "t1"], "b": ["a", "t1"], "t1": ["a", "b", "t2"], "t2": ["t1"], "t3": []}
+      g2 = interference_graph([("const", "y", 1), ("print", "y"), ("print", "x")])
+      assert g2 == {"x": ["y"], "y": ["x"]}
+      g3 = interference_graph([("const", "d", 1), ("ret", "x")])
+      assert g3 == {"d": ["x"], "x": ["d"]}
+      assert interference_graph([]) == {}
+  - name: copies do not interfere
+    code: |
+      g = interference_graph([("copy", "y", "x"), ("print", "y"), ("print", "x")])
+      assert g == {"x": [], "y": []}
+      g = interference_graph([("copy", "y", "x"), ("const", "x", 5), ("print", "y"), ("print", "x")])
+      assert g == {"x": ["y"], "y": ["x"]}
+      g = interference_graph([("neg", "y", "x"), ("print", "y"), ("print", "x")])
+      assert g == {"x": ["y"], "y": ["x"]}
+  - name: pressure
+    code: |
+      code = [("bin", "t1", "+", "a", "b"), ("bin", "t2", "-", "a", "b"), ("bin", "t3", "*", "t1", "t2")]
+      assert register_pressure(code, ["t3"]) == 3
+      assert register_pressure(code) == 3
+      assert register_pressure([]) == 0
+      assert register_pressure([("const", "x", 1), ("print", "x")]) == 1
+      assert register_pressure([("const", "a", 1), ("const", "b", 2), ("const", "c", 3), ("bin", "d", "+", "a", "b"), ("bin", "e", "+", "d", "c"), ("ret", "e")]) == 3
+  hints:
+  - Walk the instructions backwards, updating the live set; the set you hold when you reach instruction i is live after it.
+  solution: |
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+
+    def live_after(code, live_out=()):
+        """For STRAIGHT-LINE three-address code (no labels or jumps), a list whose element i is the sorted list of variables live immediately AFTER instruction i, given that the
+        variables in `live_out` are live at the end. Walk backwards keeping a live set; after processing instruction i going down, the set for i is what it was before you removed i's own
+        definition and added its uses. Use defs_uses."""
+        live = set(live_out)
+        result = [None] * len(code)
+        for i in range(len(code) - 1, -1, -1):
+            result[i] = sorted(live)
+            defined, used = defs_uses(code[i])
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return result
+
+
+    def live_at_entry(code, live_out=()):
+        """Sorted list of variables live before the first instruction (the inputs the code reads before writing, plus live_out variables never written)."""
+        live = set(live_out)
+        for ins in reversed(code):
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return sorted(live)
+
+
+    def interference_graph(code, live_out=()):
+        """Build the interference graph: a dict from every variable mentioned in the code to the sorted list of variables it interferes with (cannot share a register with).
+        Two variables interfere if one is DEFINED while the other is live just after that instruction: add an edge between the defined variable and each other variable in live_after,
+        EXCEPT that a copy ("copy", d, s) does not make d interfere with s (they hold the same value). Also, all variables live at entry interfere with each other. Variables with no
+        conflicts still appear, with an empty list."""
+        names = set(live_out)
+        for ins in code:
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                names.add(defined)
+            names.update(used)
+        edges = {n: set() for n in names}
+        after = live_after(code, live_out)
+        for i, ins in enumerate(code):
+            defined, _ = defs_uses(ins)
+            if defined is None:
+                continue
+            for other in after[i]:
+                if other == defined:
+                    continue
+                if ins[0] == "copy" and other == ins[2]:
+                    continue
+                edges[defined].add(other)
+                edges[other].add(defined)
+        entry = live_at_entry(code, live_out)
+        for a in entry:
+            for b in entry:
+                if a != b:
+                    edges[a].add(b)
+        return {n: sorted(v) for n, v in edges.items()}
+
+
+    def register_pressure(code, live_out=()):
+        """The most variables that are live at the same time: the maximum over the size of live_at_entry and of every live_after set. It is a lower bound on the registers needed."""
+        sizes = [len(live_at_entry(code, live_out))] + [len(s) for s in live_after(code, live_out)]
+        return max(sizes)
+  explanation: Liveness tells the compiler which values must be kept at the same time.
+- id: alloc
+  title: 'Capstone: register allocation by graph coloring'
+  difficulty: 5
+  prompt: 'The starter has `lower`, `apply_op`, `run_tac`, `defs_uses` and the interference-graph tools. Write `color_graph(graph, k)`, **Chaitin-style graph coloring** with colors `0..k-1`. **Simplify:** repeatedly pick a vertex to remove and push it on a stack. If some remaining vertex has fewer than `k` remaining neighbours, take the one with the smallest name; otherwise take the vertex with the **most** remaining neighbours (ties: smallest name) as a *potential spill*. **Select:** pop the stack in reverse order; give each vertex the lowest color not used by its already-colored neighbours (in the original graph); if no color is free, the vertex is **spilled**. Return `(colors dict, sorted list of spilled vertices)`; an empty graph gives `({}, [])`. Write `allocate(code, k, live_out=())`: build the interference graph, color it, and return `(assignment, spilled)`, where `assignment` maps **every** variable to `"R0"` ... `"R(k-1)"` for its color, or `"mem_"` plus its own name if it was spilled to memory. Write `rewrite(code, assignment)`: rename every variable in the instructions (constants, operators and labels are not variables).'
+  starter: |-
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+    def live_after(code, live_out=()):
+        """For STRAIGHT-LINE three-address code (no labels or jumps), a list whose element i is the sorted list of variables live immediately AFTER instruction i, given that the
+        variables in `live_out` are live at the end. Walk backwards keeping a live set; after processing instruction i going down, the set for i is what it was before you removed i's own
+        definition and added its uses. Use defs_uses."""
+        live = set(live_out)
+        result = [None] * len(code)
+        for i in range(len(code) - 1, -1, -1):
+            result[i] = sorted(live)
+            defined, used = defs_uses(code[i])
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return result
+
+
+    def live_at_entry(code, live_out=()):
+        """Sorted list of variables live before the first instruction (the inputs the code reads before writing, plus live_out variables never written)."""
+        live = set(live_out)
+        for ins in reversed(code):
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return sorted(live)
+
+
+    def interference_graph(code, live_out=()):
+        """Build the interference graph: a dict from every variable mentioned in the code to the sorted list of variables it interferes with (cannot share a register with).
+        Two variables interfere if one is DEFINED while the other is live just after that instruction: add an edge between the defined variable and each other variable in live_after,
+        EXCEPT that a copy ("copy", d, s) does not make d interfere with s (they hold the same value). Also, all variables live at entry interfere with each other. Variables with no
+        conflicts still appear, with an empty list."""
+        names = set(live_out)
+        for ins in code:
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                names.add(defined)
+            names.update(used)
+        edges = {n: set() for n in names}
+        after = live_after(code, live_out)
+        for i, ins in enumerate(code):
+            defined, _ = defs_uses(ins)
+            if defined is None:
+                continue
+            for other in after[i]:
+                if other == defined:
+                    continue
+                if ins[0] == "copy" and other == ins[2]:
+                    continue
+                edges[defined].add(other)
+                edges[other].add(defined)
+        entry = live_at_entry(code, live_out)
+        for a in entry:
+            for b in entry:
+                if a != b:
+                    edges[a].add(b)
+        return {n: sorted(v) for n, v in edges.items()}
+
+
+    def register_pressure(code, live_out=()):
+        """The most variables that are live at the same time: the maximum over the size of live_at_entry and of every live_after set. It is a lower bound on the registers needed."""
+        sizes = [len(live_at_entry(code, live_out))] + [len(s) for s in live_after(code, live_out)]
+        return max(sizes)
+
+
+    def color_graph(graph, k):
+        """Chaitin-style graph coloring with k colors (0..k-1). SIMPLIFY: repeatedly pick a vertex to remove and push on a stack. If some remaining vertex has fewer than k
+        remaining neighbours, take the one with the smallest name; otherwise take the vertex with the most remaining neighbours (ties: smallest name) as a POTENTIAL SPILL.
+        SELECT: pop the stack in reverse order; give each vertex the lowest color not used by its already-colored neighbours in the ORIGINAL graph; if no color is free it is spilled.
+        Return (colors dict, sorted list of spilled vertices). An empty graph gives ({}, [])."""
+        pass
+
+
+    def allocate(code, k, live_out=()):
+        """Register allocation for straight-line code: build the interference graph, color it with k colors and return (assignment, spilled): assignment maps EVERY variable to a
+        name: "R0".."R(k-1)" for the color it got, or "mem_" plus its own name if it was spilled to memory; spilled is the sorted list of spilled variables."""
+        pass
+
+
+    def rewrite(code, assignment):
+        """Rename every variable in the instructions by the assignment (names that are not in it stay). Constants, operators and labels are not variables."""
+        pass
+  tests:
+  - name: coloring
+    code: |
+      def valid(graph, colors):
+          return all(colors[a] != colors[b] for a in graph for b in graph[a] if a in colors and b in colors)
+      tri = {"a": ["b", "c"], "b": ["a", "c"], "c": ["a", "b"]}
+      colors, spilled = color_graph(tri, 3)
+      assert sorted(colors.values()) == [0, 1, 2] and spilled == [] and valid(tri, colors)
+      colors, spilled = color_graph(tri, 2)
+      assert spilled == ["a"] and colors == {"c": 0, "b": 1}
+      path = {"a": ["b"], "b": ["a", "c"], "c": ["b", "d"], "d": ["c"]}
+      colors, spilled = color_graph(path, 2)
+      assert spilled == [] and valid(path, colors) and set(colors.values()) <= {0, 1}
+      assert color_graph({}, 3) == ({}, [])
+      iso = {"x": [], "y": [], "z": []}
+      assert color_graph(iso, 1) == ({"x": 0, "y": 0, "z": 0}, [])
+      k4 = {v: sorted(set("abcd") - {v}) for v in "abcd"}
+      colors, spilled = color_graph(k4, 3)
+      assert len(spilled) == 1 and valid(k4, colors) and len(colors) == 3
+  - name: allocating registers
+    code: |
+      code = [("bin", "t1", "+", "a", "b"), ("bin", "t2", "-", "a", "b"), ("bin", "t3", "*", "t1", "t2")]
+      assign, spilled = allocate(code, 3, ["t3"])
+      assert spilled == [] and set(assign) == {"a", "b", "t1", "t2", "t3"}
+      assert all(v in ("R0", "R1", "R2") for v in assign.values())
+      assert len({assign["a"], assign["b"], assign["t1"]}) == 3 and assign["t1"] != assign["t2"]
+      assign, spilled = allocate(code, 2, ["t3"])
+      assert len(spilled) >= 1 and all(assign[v] == "mem_" + v for v in spilled)
+      assert all(assign[v] in ("R0", "R1") for v in assign if v not in spilled)
+      assert allocate([], 4) == ({}, [])
+  - name: renaming
+    code: |
+      code = [("const", "x", 4), ("copy", "y", "x"), ("neg", "z", "y"), ("bin", "w", "+", "z", "x"), ("print", "w"), ("ret", "w")]
+      m = {"x": "R0", "y": "R1", "z": "R1", "w": "R0"}
+      assert rewrite(code, m) == [("const", "R0", 4), ("copy", "R1", "R0"), ("neg", "R1", "R1"), ("bin", "R0", "+", "R1", "R0"), ("print", "R0"), ("ret", "R0")]
+      assert rewrite(code, {}) == code and rewrite([], m) == []
+      assert rewrite([("jumpz", "x", "L1"), ("label", "L1"), ("jump", "L1")], {"x": "R2", "L1": "bad"}) == [("jumpz", "R2", "L1"), ("label", "L1"), ("jump", "L1")]
+  - name: the allocated program computes the same
+    code: |
+      a, b, c, d = ("var", "a"), ("var", "b"), ("var", "c"), ("var", "d")
+      e = ("binop", "+", ("binop", "*", ("binop", "+", a, b), ("binop", "+", c, d)), ("binop", "*", ("binop", "-", a, b), ("binop", "-", c, d)))
+      code, result = lower(e)
+      env = {"a": 7, "b": 3, "c": 5, "d": 2}
+      expected = run_tac(code, env)["env"][result]
+      assert expected == (10 * 7) + (4 * 3)
+      for k in (6, 4, 3, 2):
+          assign, spilled = allocate(code, k, [result])
+          new = rewrite(code, assign)
+          got = run_tac(new, {assign[n]: v for n, v in env.items()})["env"][assign[result]]
+          assert got == expected, (k, got)
+          regs = {v for v in assign.values() if not v.startswith("mem_")}
+          assert len(regs) <= k
+          if k >= 6:
+              assert spilled == []
+      assert register_pressure(code, [result]) <= 6
+  hints:
+  - Remove easy vertices first; vertices left over are only potential spills until the select phase tries to color them.
+  solution: |
+    def lower(ast):
+        """Lower an expression AST (("num", v), ("var", name), ("unary", "-", e), ("binop", op, l, r)) to three-address code. Return (code, result_name).
+        Every operation gets a fresh temporary t1, t2, ... (numbered from 1 in the order they are created, operands before the operation, left before right).
+        Instructions: ("const", dest, value), ("neg", dest, a), ("bin", dest, op, a, b). A variable needs no instruction: its own name is the result."""
+        code = []
+        counter = [0]
+
+        def fresh():
+            counter[0] += 1
+            return "t%d" % counter[0]
+
+        def walk(e):
+            if e[0] == "num":
+                t = fresh()
+                code.append(("const", t, e[1]))
+                return t
+            if e[0] == "var":
+                return e[1]
+            if e[0] == "unary":
+                a = walk(e[2])
+                t = fresh()
+                code.append(("neg", t, a))
+                return t
+            a = walk(e[2])
+            b = walk(e[3])
+            t = fresh()
+            code.append(("bin", t, e[1], a, b))
+            return t
+
+        result = walk(ast)
+        return code, result
+
+
+    def apply_op(op, a, b):
+        """Apply a binary operator to two numbers: + - * (as usual), / (true division), % (remainder); the comparisons < <= > >= == != give 1 or 0.
+        ValueError('division by zero') for / or % with b == 0, and ValueError('unknown operator OP') for anything else."""
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if op in ("/", "%"):
+            if b == 0:
+                raise ValueError("division by zero")
+            return a / b if op == "/" else a % b
+        table = {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a == b, "!=": a != b}
+        if op in table:
+            return 1 if table[op] else 0
+        raise ValueError("unknown operator " + str(op))
+
+
+    def run_tac(code, env=None, limit=10000):
+        """Execute a list of instructions. Besides const, neg and bin there are ("copy", dest, src), ("label", name), ("jump", name), ("jumpz", cond, name)
+        (jump if the variable is 0), ("print", a) and ("ret", a), which stops. Return {"env": variables, "output": printed values in order, "returned": the ret value or None}.
+        Start from a copy of env. ValueError('undefined NAME') for reading a variable that has no value, ValueError('too many steps') after `limit` executed instructions."""
+        env = dict(env or {})
+        labels = {ins[1]: i for i, ins in enumerate(code) if ins[0] == "label"}
+        output = []
+        pc = 0
+        steps = 0
+
+        def get(name):
+            if name not in env:
+                raise ValueError("undefined " + name)
+            return env[name]
+
+        while pc < len(code):
+            steps += 1
+            if steps > limit:
+                raise ValueError("too many steps")
+            ins = code[pc]
+            kind = ins[0]
+            pc += 1
+            if kind == "const":
+                env[ins[1]] = ins[2]
+            elif kind == "copy":
+                env[ins[1]] = get(ins[2])
+            elif kind == "neg":
+                env[ins[1]] = -get(ins[2])
+            elif kind == "bin":
+                env[ins[1]] = apply_op(ins[2], get(ins[3]), get(ins[4]))
+            elif kind == "print":
+                output.append(get(ins[1]))
+            elif kind == "ret":
+                return {"env": env, "output": output, "returned": get(ins[1])}
+            elif kind == "jump":
+                pc = labels[ins[1]]
+            elif kind == "jumpz":
+                if get(ins[1]) == 0:
+                    pc = labels[ins[2]]
+        return {"env": env, "output": output, "returned": None}
+
+
+    def defs_uses(ins):
+        """Return (defined_name_or_None, list_of_used_names) for one instruction: const defines only; copy and neg use one name; bin uses two; jumpz, print and ret use
+        one name and define nothing; label and jump neither define nor use."""
+        kind = ins[0]
+        if kind == "const":
+            return ins[1], []
+        if kind == "copy" or kind == "neg":
+            return ins[1], [ins[2]]
+        if kind == "bin":
+            return ins[1], [ins[3], ins[4]]
+        if kind == "jumpz":
+            return None, [ins[1]]
+        if kind in ("print", "ret"):
+            return None, [ins[1]]
+        return None, []
+
+    def live_after(code, live_out=()):
+        """For STRAIGHT-LINE three-address code (no labels or jumps), a list whose element i is the sorted list of variables live immediately AFTER instruction i, given that the
+        variables in `live_out` are live at the end. Walk backwards keeping a live set; after processing instruction i going down, the set for i is what it was before you removed i's own
+        definition and added its uses. Use defs_uses."""
+        live = set(live_out)
+        result = [None] * len(code)
+        for i in range(len(code) - 1, -1, -1):
+            result[i] = sorted(live)
+            defined, used = defs_uses(code[i])
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return result
+
+
+    def live_at_entry(code, live_out=()):
+        """Sorted list of variables live before the first instruction (the inputs the code reads before writing, plus live_out variables never written)."""
+        live = set(live_out)
+        for ins in reversed(code):
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                live.discard(defined)
+            live.update(used)
+        return sorted(live)
+
+
+    def interference_graph(code, live_out=()):
+        """Build the interference graph: a dict from every variable mentioned in the code to the sorted list of variables it interferes with (cannot share a register with).
+        Two variables interfere if one is DEFINED while the other is live just after that instruction: add an edge between the defined variable and each other variable in live_after,
+        EXCEPT that a copy ("copy", d, s) does not make d interfere with s (they hold the same value). Also, all variables live at entry interfere with each other. Variables with no
+        conflicts still appear, with an empty list."""
+        names = set(live_out)
+        for ins in code:
+            defined, used = defs_uses(ins)
+            if defined is not None:
+                names.add(defined)
+            names.update(used)
+        edges = {n: set() for n in names}
+        after = live_after(code, live_out)
+        for i, ins in enumerate(code):
+            defined, _ = defs_uses(ins)
+            if defined is None:
+                continue
+            for other in after[i]:
+                if other == defined:
+                    continue
+                if ins[0] == "copy" and other == ins[2]:
+                    continue
+                edges[defined].add(other)
+                edges[other].add(defined)
+        entry = live_at_entry(code, live_out)
+        for a in entry:
+            for b in entry:
+                if a != b:
+                    edges[a].add(b)
+        return {n: sorted(v) for n, v in edges.items()}
+
+
+    def register_pressure(code, live_out=()):
+        """The most variables that are live at the same time: the maximum over the size of live_at_entry and of every live_after set. It is a lower bound on the registers needed."""
+        sizes = [len(live_at_entry(code, live_out))] + [len(s) for s in live_after(code, live_out)]
+        return max(sizes)
+
+
+    def color_graph(graph, k):
+        """Chaitin-style graph coloring with k colors (0..k-1). SIMPLIFY: repeatedly pick a vertex to remove and push on a stack. If some remaining vertex has fewer than k
+        remaining neighbours, take the one with the smallest name; otherwise take the vertex with the most remaining neighbours (ties: smallest name) as a POTENTIAL SPILL.
+        SELECT: pop the stack in reverse order; give each vertex the lowest color not used by its already-colored neighbours in the ORIGINAL graph; if no color is free it is spilled.
+        Return (colors dict, sorted list of spilled vertices). An empty graph gives ({}, [])."""
+        remaining = {v: set(ns) for v, ns in graph.items()}
+        stack = []
+        while remaining:
+            low = sorted(v for v in remaining if len(remaining[v]) < k)
+            if low:
+                pick = low[0]
+            else:
+                pick = sorted(remaining, key=lambda v: (-len(remaining[v]), v))[0]
+            stack.append(pick)
+            for n in remaining.pop(pick):
+                remaining[n].discard(pick)
+        colors = {}
+        spilled = []
+        for v in reversed(stack):
+            used = {colors[n] for n in graph[v] if n in colors}
+            free = [c for c in range(k) if c not in used]
+            if free:
+                colors[v] = free[0]
+            else:
+                spilled.append(v)
+        return colors, sorted(spilled)
+
+
+    def allocate(code, k, live_out=()):
+        """Register allocation for straight-line code: build the interference graph, color it with k colors and return (assignment, spilled): assignment maps EVERY variable to a
+        name: "R0".."R(k-1)" for the color it got, or "mem_" plus its own name if it was spilled to memory; spilled is the sorted list of spilled variables."""
+        colors, spilled = color_graph(interference_graph(code, live_out), k)
+        assignment = {v: "R%d" % c for v, c in colors.items()}
+        for v in spilled:
+            assignment[v] = "mem_" + v
+        return assignment, spilled
+
+
+    def rewrite(code, assignment):
+        """Rename every variable in the instructions by the assignment (names that are not in it stay). Constants, operators and labels are not variables."""
+        m = lambda n: assignment.get(n, n)
+        out = []
+        for ins in code:
+            k = ins[0]
+            if k == "const":
+                out.append(("const", m(ins[1]), ins[2]))
+            elif k in ("copy", "neg"):
+                out.append((k, m(ins[1]), m(ins[2])))
+            elif k == "bin":
+                out.append(("bin", m(ins[1]), ins[2], m(ins[3]), m(ins[4])))
+            elif k in ("print", "ret", "jumpz"):
+                out.append((k, m(ins[1])) + tuple(ins[2:]))
+            else:
+                out.append(ins)
+        return out
+  explanation: 'Graph coloring turns register allocation into a classic problem: the compiler spills to memory only when it must.'
+commonMistakes:
+- title: Compiling the right operand before the left
+  explanation: For a - b the machine pops b first, so a must be pushed first.
+- title: Reusing a label name
+  explanation: Every while and if needs its own labels; use a counter.
+- title: Making a copy's two sides interfere
+  explanation: They hold the same value and may share a register.
+- title: Coloring in the wrong order
+  explanation: Color in the reverse of the simplify order, or the low-degree guarantee is lost.
+- title: Assuming spilling only costs space
+  explanation: It also costs a memory access at each use and definition.
+summary:
+- Stack machines are simple targets; register machines are fast targets.
+- An assembler turns labels into addresses; a VM is a loop with a program counter.
+- Peephole optimization removes waste in small windows.
+- Interference graphs record which variables are live together.
+- Register allocation is graph coloring; spilling is the fallback.
+next: u23-memory
+quiz:
+- type: mcq
+  question: What does an assembler do with labels?
+  options:
+  - Replaces them with addresses
+  - Deletes the program
+  - Sorts them
+  - Executes them
+  answer: 0
+  explanation: Jumps need numbers, labels are names.
+- type: mcq
+  question: In a stack machine, where are an operator's operands?
+  options:
+  - On top of the stack
+  - In registers
+  - In memory addresses
+  - In the next instruction
+  answer: 0
+  explanation: Post-order puts them there.
+- type: mcq
+  question: Two variables interfere when...
+  options:
+  - one is defined while the other is live
+  - they have the same type
+  - they are both constants
+  - they are in different blocks
+  answer: 0
+  explanation: They cannot share a register.
+- type: mcq
+  question: Why is a copy y = x special?
+  options:
+  - y and x hold the same value so they may share a register
+  - Copies are free
+  - Copies are removed first
+  - Copies interfere with everything
+  answer: 0
+  explanation: The copy exception allows coalescing.
+- type: mcq
+  question: What is a spill?
+  options:
+  - A variable kept in memory because no register was free
+  - A syntax error
+  - An unused variable
+  - A jump out of a loop
+  answer: 0
+  explanation: Memory is the fallback.
+- type: mcq
+  question: A vertex with fewer than k neighbours is simplified first because...
+  options:
+  - it can always be colored later
+  - it is the most important
+  - it is dead code
+  - it has the largest degree
+  answer: 0
+  explanation: Some color among k will be free.
+- type: code
+  question: Write `count_jumps(code)` that returns how many instructions in the bytecode list are `"jump"` or `"jumpz"`.
+  starter: |
+    def count_jumps(code):
+        pass
+  tests:
+  - name: count
+    code: |
+      assert count_jumps([("push", 1), ("jumpz", 3), ("jump", 0), ("label", "x")]) == 2
+      assert count_jumps([]) == 0 and count_jumps([("push", 1)]) == 0
+  solution: |
+    def count_jumps(code):
+        return sum(1 for ins in code if ins[0] in ('jump', 'jumpz'))

@@ -1,0 +1,2567 @@
+id: u23-lexing
+title: 'Lexical Analysis: From Text to Tokens'
+minutes: 95
+objective: 'Learn the first stage of every compiler and interpreter: turning raw source text into tokens. You will see why ''longest match'' decides between == and =, and build the machinery behind it: regular expressions, nondeterministic and deterministic automata, the subset construction and DFA minimization, finishing with a working scanner generator.'
+outcomes:
+- Explain what a compiler does and its main phases
+- Write a tokenizer using maximal munch
+- Convert a regular expression to an NFA and simulate it
+- Convert an NFA to a DFA and minimize it
+- Build a scanner from automata
+sections:
+- heading: What a compiler does
+  body: |-
+    A **compiler** translates a program from one language (the **source**, such as C or Rust) into another (the **target**, usually machine code the processor runs). An **interpreter** instead runs the source directly. Real systems mix them: Python compiles to **bytecode** and then interprets it. You met this picture in the first unit; now we open the box. A compiler is a **pipeline**, a chain of stages each doing one job and handing the result to the next:
+
+    1. **Lexical analysis** (the **lexer** or **scanner**) turns the characters of the source into **tokens**.
+    2. **Syntax analysis** (the **parser**) arranges the tokens into a tree following the grammar of the language.
+    3. **Semantic analysis** checks meaning: are variables declared, do the types fit?
+    4. **Intermediate code and optimization** rewrites the program into a simple form and makes it faster.
+    5. **Code generation** produces the target instructions.
+
+    Splitting the work like this keeps each part simple and lets you reuse parts: one optimizer can serve many languages. This unit builds each stage in turn, and the project assembles a tiny complete compiler.
+- heading: Tokens, lexemes and maximal munch
+  body: |-
+    Source code arrives as one long string of characters. The lexer groups them into **tokens**: the smallest meaningful units, such as keywords (`if`), identifiers (`count`), numbers (`3.14`), operators (`==`) and punctuation (`;`). The exact text of a token, like `count`, is its **lexeme**; its category, `IDENT`, is its **kind** or **type**. Whitespace and comments are usually thrown away. Each token also remembers its **position** so error messages can say "line 3, column 8".
+
+    How does the lexer decide where one token ends? By the rule of **maximal munch**: always take the *longest* possible match. In `a == b`, after `a` the next characters are `==`. The rule for `=` matches one character, the rule for `==` matches two, so the longer wins. Likewise `iffy` could start with the keyword `if`, but the identifier rule matches all four letters, so it wins, and `iffy` is correctly one identifier. When two rules match equally long text (the word `if` matches both the keyword rule and the identifier rule), the rule listed *first* wins, which is why keyword rules come before the identifier rule.
+
+    Each token's shape is described with a **regular expression**: `[0-9]+` means "one or more digits", `[a-z]+` means one or more lowercase letters. Regular expressions are the right tool because they are simple, and, as we shall see, can be turned into a very fast machine.
+- heading: 'Automata: the machine behind a regular expression'
+  body: |-
+    A **finite automaton** is a tiny machine with a set of **states**, a start state, some **accepting states** and transitions labelled with characters. It reads text one character at a time, following transitions; if it ends in an accepting state, the text matches. In a **DFA** (deterministic finite automaton) each state has at most one move per character, so running it is just a table lookup per character: very fast. An **NFA** (nondeterministic finite automaton) may have several moves for a character, and **epsilon edges** (free moves that consume no input). NFAs are easy to build from regular expressions: **Thompson's construction** builds a small NFA for each piece (a character, a choice `a|b`, repetition `a*`) and wires pieces together with epsilon edges.
+
+    To run an NFA, keep the *set* of all states you might be in. The **epsilon closure** of a set is everything reachable using only free moves. For each character, move every state in the set along matching edges, then take the closure again. The **subset construction** does this calculation ahead of time: each DFA state *is* a set of NFA states, and its transitions are precomputed. A DFA may need up to `2^n` states for an `n`-state NFA, but usually far fewer. Finally **DFA minimization** merges states that no input can distinguish: split states into groups by whether they accept, then keep splitting groups whenever two members lead to different groups on some character, until nothing changes. A **scanner generator** such as `lex` or `flex` does exactly this: it compiles all the token rules into one fast DFA.
+examples:
+- title: A tokenizer and a scanner
+  intro: Maximal munch with Python's re module, then the same tokens from scratch with automata.
+  code: |
+    import re
+
+    RULES = [
+        ("NUMBER", r"[0-9]+(\.[0-9]+)?"),
+        ("IF", r"if"),
+        ("WHILE", r"while"),
+        ("IDENT", r"[A-Za-z_][A-Za-z_0-9]*"),
+        ("EQ", r"=="),
+        ("ASSIGN", r"="),
+        ("PLUS", r"\+"),
+        ("STAR", r"\*"),
+        ("LPAREN", r"\("),
+        ("RPAREN", r"\)"),
+        ("SEMI", r";"),
+        ("WS", r"[ \t\n]+"),
+    ]
+
+
+    def tokenize(source, rules=RULES):
+        """Turn source text into a list of (kind, text, position) tokens. At each position try EVERY rule with re.match and take the LONGEST
+        match; if two rules match equally long, the rule listed first wins (so 'if' is a keyword but 'iffy' is an identifier).
+        Tokens of kind WS (whitespace) are discarded. If nothing matches, raise ValueError with a message that contains the position."""
+        tokens = []
+        pos = 0
+        while pos < len(source):
+            best = None
+            for kind, pattern in rules:
+                m = re.compile(pattern).match(source, pos)
+                if m and m.end() > pos and (best is None or m.end() - pos > len(best[1])):
+                    best = (kind, m.group(), pos)
+            if best is None:
+                raise ValueError("unexpected character %r at position %d" % (source[pos], pos))
+            if best[0] != "WS":
+                tokens.append(best)
+            pos += len(best[1])
+        return tokens
+
+
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        alphabet = sorted(alphabet)
+        start = frozenset(epsilon_closure(nfa, {nfa["start"]}))
+        ids = {start: 0}
+        queue = [start]
+        delta = {}
+        accepts = set()
+        while queue:
+            current = queue.pop(0)
+            if nfa["accept"] in current:
+                accepts.add(ids[current])
+            for ch in alphabet:
+                target = frozenset(step(nfa, current, ch))
+                if not target:
+                    continue
+                if target not in ids:
+                    ids[target] = len(ids)
+                    queue.append(target)
+                delta[(ids[current], ch)] = ids[target]
+        return {"start": 0, "accepts": accepts, "delta": delta}
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        state = dfa["start"]
+        for ch in text:
+            state = dfa["delta"].get((state, ch))
+            if state is None:
+                return False
+        return state in dfa["accepts"]
+
+
+    def minimize_dfa(dfa, alphabet):
+        """Merge states that behave identically (Moore's partition refinement). Steps: find the states reachable from the start; add one
+        extra DEAD state (-1) that every missing move goes to; split the states into groups, first accepting versus not accepting; then
+        repeatedly give each state the signature (its current group, the groups its moves lead to in sorted alphabet order) and regroup by
+        signature, until the number of groups stops growing. Finally build the new DFA from the groups reachable from the start group,
+        numbering groups 0, 1, 2 ... in breadth-first discovery order (alphabet in sorted order), and OMIT the group that contains DEAD
+        (and every move into it). If the start group is the dead group return {"start": 0, "accepts": set(), "delta": {}}."""
+        alphabet = sorted(alphabet)
+        delta = dfa["delta"]
+        accepts = set(dfa["accepts"])
+        DEAD = -1
+        states = {dfa["start"]}
+        stack = [dfa["start"]]
+        while stack:
+            s = stack.pop()
+            for ch in alphabet:
+                t = delta.get((s, ch))
+                if t is not None and t not in states:
+                    states.add(t)
+                    stack.append(t)
+        states.add(DEAD)
+
+        def go(s, ch):
+            return DEAD if s == DEAD else delta.get((s, ch), DEAD)
+
+        group = {s: int(s in accepts) for s in states}
+        count = len(set(group.values()))
+        while True:
+            signature = {s: (group[s], tuple(group[go(s, ch)] for ch in alphabet)) for s in states}
+            ids = {}
+            group = {s: ids.setdefault(signature[s], len(ids)) for s in sorted(states)}
+            if len(ids) == count:
+                break
+            count = len(ids)
+        dead_group = group[DEAD]
+        start_group = group[dfa["start"]]
+        if start_group == dead_group:
+            return {"start": 0, "accepts": set(), "delta": {}}
+        representative = {}
+        for s in sorted(states):
+            representative.setdefault(group[s], s)
+        order = {start_group: 0}
+        queue = [start_group]
+        new_delta = {}
+        new_accepts = set()
+        while queue:
+            g = queue.pop(0)
+            r = representative[g]
+            if r in accepts:
+                new_accepts.add(order[g])
+            for ch in alphabet:
+                target = group[go(r, ch)]
+                if target == dead_group:
+                    continue
+                if target not in order:
+                    order[target] = len(order)
+                    queue.append(target)
+                new_delta[(order[g], ch)] = order[target]
+        return {"start": 0, "accepts": new_accepts, "delta": new_delta}
+
+
+    def regex_dfa(pattern, alphabet):
+        """The smallest DFA for a pattern: build the NFA, convert it with nfa_to_dfa, minimise it."""
+        return minimize_dfa(nfa_to_dfa(regex_to_nfa(pattern), alphabet), alphabet)
+
+
+    def longest_match(dfa, text, start):
+        """The end position (exclusive) of the LONGEST prefix of text[start:] that the DFA accepts, or -1 if no prefix (not even the empty one)
+        is accepted. Walk forward from `start`, remembering the last position where the DFA was in an accepting state; stop at a missing move."""
+        state = dfa["start"]
+        best = start if state in dfa["accepts"] else -1
+        for i in range(start, len(text)):
+            state = dfa["delta"].get((state, text[i]))
+            if state is None:
+                break
+            if state in dfa["accepts"]:
+                best = i + 1
+        return best
+
+
+    def lex(rules, text):
+        """A scanner built from scratch. `rules` is a list of (name, pattern) using this lesson's regex syntax. Build one minimal DFA per
+        rule with the alphabet set(text). At each position take the rule with the longest non-empty match (the earlier rule wins ties),
+        emit (name, lexeme, position) and move on. Tokens named WS are discarded. Raise ValueError mentioning the position if nothing matches."""
+        alphabet = set(text)
+        dfas = [(name, regex_dfa(pattern, alphabet)) for name, pattern in rules]
+        tokens = []
+        pos = 0
+        while pos < len(text):
+            best_name, best_end = None, pos
+            for name, dfa in dfas:
+                end = longest_match(dfa, text, pos)
+                if end > best_end:
+                    best_name, best_end = name, end
+            if best_name is None:
+                raise ValueError("unexpected character %r at position %d" % (text[pos], pos))
+            if best_name != "WS":
+                tokens.append((best_name, text[pos:best_end], pos))
+            pos = best_end
+        return tokens
+
+    print(tokenize("while (count == 10) iffy = iffy + 2.5;"))
+    rules = [("NUM", "[0-9]+"), ("IF", "if"), ("ID", "[a-z]+"), ("EQ", "=="), ("ASSIGN", "="), ("WS", "[ ]+")]
+    print(lex(rules, "if x == 42"))
+    print(lex(rules, "iffy = 7"))
+  output: |
+    [('WHILE', 'while', 0), ('LPAREN', '(', 6), ('IDENT', 'count', 7), ('EQ', '==', 13), ('NUMBER', '10', 16), ('RPAREN', ')', 18), ('IDENT', 'iffy', 20), ('ASSIGN', '=', 25), ('IDENT', 'iffy', 27), ('PLUS', '+', 32), ('NUMBER', '2.5', 34), ('SEMI', ';', 37)]
+    [('IF', 'if', 0), ('ID', 'x', 3), ('EQ', '==', 5), ('NUM', '42', 8)]
+    [('ID', 'iffy', 0), ('ASSIGN', '=', 5), ('NUM', '7', 7)]
+  lines:
+  - line: 322
+    note: 'Each token: kind, text, position.'
+  - line: 325
+    note: iffy stays one identifier.
+- title: From regex to minimal DFA
+  intro: 'The pattern (a|b)*abb, simulated and compiled: the NFA, the subset construction and the minimal machine.'
+  code: |
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        alphabet = sorted(alphabet)
+        start = frozenset(epsilon_closure(nfa, {nfa["start"]}))
+        ids = {start: 0}
+        queue = [start]
+        delta = {}
+        accepts = set()
+        while queue:
+            current = queue.pop(0)
+            if nfa["accept"] in current:
+                accepts.add(ids[current])
+            for ch in alphabet:
+                target = frozenset(step(nfa, current, ch))
+                if not target:
+                    continue
+                if target not in ids:
+                    ids[target] = len(ids)
+                    queue.append(target)
+                delta[(ids[current], ch)] = ids[target]
+        return {"start": 0, "accepts": accepts, "delta": delta}
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        state = dfa["start"]
+        for ch in text:
+            state = dfa["delta"].get((state, ch))
+            if state is None:
+                return False
+        return state in dfa["accepts"]
+
+
+    def minimize_dfa(dfa, alphabet):
+        """Merge states that behave identically (Moore's partition refinement). Steps: find the states reachable from the start; add one
+        extra DEAD state (-1) that every missing move goes to; split the states into groups, first accepting versus not accepting; then
+        repeatedly give each state the signature (its current group, the groups its moves lead to in sorted alphabet order) and regroup by
+        signature, until the number of groups stops growing. Finally build the new DFA from the groups reachable from the start group,
+        numbering groups 0, 1, 2 ... in breadth-first discovery order (alphabet in sorted order), and OMIT the group that contains DEAD
+        (and every move into it). If the start group is the dead group return {"start": 0, "accepts": set(), "delta": {}}."""
+        alphabet = sorted(alphabet)
+        delta = dfa["delta"]
+        accepts = set(dfa["accepts"])
+        DEAD = -1
+        states = {dfa["start"]}
+        stack = [dfa["start"]]
+        while stack:
+            s = stack.pop()
+            for ch in alphabet:
+                t = delta.get((s, ch))
+                if t is not None and t not in states:
+                    states.add(t)
+                    stack.append(t)
+        states.add(DEAD)
+
+        def go(s, ch):
+            return DEAD if s == DEAD else delta.get((s, ch), DEAD)
+
+        group = {s: int(s in accepts) for s in states}
+        count = len(set(group.values()))
+        while True:
+            signature = {s: (group[s], tuple(group[go(s, ch)] for ch in alphabet)) for s in states}
+            ids = {}
+            group = {s: ids.setdefault(signature[s], len(ids)) for s in sorted(states)}
+            if len(ids) == count:
+                break
+            count = len(ids)
+        dead_group = group[DEAD]
+        start_group = group[dfa["start"]]
+        if start_group == dead_group:
+            return {"start": 0, "accepts": set(), "delta": {}}
+        representative = {}
+        for s in sorted(states):
+            representative.setdefault(group[s], s)
+        order = {start_group: 0}
+        queue = [start_group]
+        new_delta = {}
+        new_accepts = set()
+        while queue:
+            g = queue.pop(0)
+            r = representative[g]
+            if r in accepts:
+                new_accepts.add(order[g])
+            for ch in alphabet:
+                target = group[go(r, ch)]
+                if target == dead_group:
+                    continue
+                if target not in order:
+                    order[target] = len(order)
+                    queue.append(target)
+                new_delta[(order[g], ch)] = order[target]
+        return {"start": 0, "accepts": new_accepts, "delta": new_delta}
+
+    print(regex_matches("(a|b)*abb", "babb"), regex_matches("(a|b)*abb", "abab"))
+    nfa = regex_to_nfa("(a|b)*abb")
+    print("NFA states:", len(nfa["edges"]))
+    dfa = nfa_to_dfa(nfa, "ab")
+    print("DFA states:", len(set(s for s, c in dfa["delta"]) | {0}))
+    small = minimize_dfa(dfa, "ab")
+    print("after minimizing:", len(set(s for s, c in small["delta"]) | {0}), "states; accepting:", sorted(small["accepts"]))
+    print("moves of the minimal machine:", sorted(small["delta"].items()))
+  output: |
+    True False
+    NFA states: 17
+    DFA states: 5
+    after minimizing: 4 states; accepting: [3]
+    moves of the minimal machine: [((0, 'a'), 1), ((0, 'b'), 0), ((1, 'a'), 1), ((1, 'b'), 2), ((2, 'a'), 1), ((2, 'b'), 3), ((3, 'a'), 1), ((3, 'b'), 0)]
+  lines:
+  - line: 245
+    note: Thompson's construction makes many small states.
+  - line: 249
+    note: Four states are enough.
+playground:
+  prompt: Try the regular expression module on a pattern of your own.
+  code: |
+    import re
+    print(re.fullmatch(r'(a|b)*abb', 'babb') is not None)
+exercises:
+- id: tokenize
+  title: A tokenizer with maximal munch
+  difficulty: 3
+  prompt: The starter has a list `RULES` of `(kind, regular expression)` pairs. Write `tokenize(source, rules=RULES)` returning a list of `(kind, text, position)`. At each position try **every** rule with `re.compile(pattern).match(source, pos)` and keep the **longest** match (if two rules match equally long, the rule listed first wins, which is why `if` is a keyword but `iffy` is an identifier). Discard tokens of kind `"WS"`. If no rule matches at some position raise `ValueError` with a message that contains the position.
+  starter: |-
+    import re
+
+    RULES = [
+        ("NUMBER", r"[0-9]+(\.[0-9]+)?"),
+        ("IF", r"if"),
+        ("WHILE", r"while"),
+        ("IDENT", r"[A-Za-z_][A-Za-z_0-9]*"),
+        ("EQ", r"=="),
+        ("ASSIGN", r"="),
+        ("PLUS", r"\+"),
+        ("STAR", r"\*"),
+        ("LPAREN", r"\("),
+        ("RPAREN", r"\)"),
+        ("SEMI", r";"),
+        ("WS", r"[ \t\n]+"),
+    ]
+
+
+    def tokenize(source, rules=RULES):
+        """Turn source text into a list of (kind, text, position) tokens. At each position try EVERY rule with re.match and take the LONGEST
+        match; if two rules match equally long, the rule listed first wins (so 'if' is a keyword but 'iffy' is an identifier).
+        Tokens of kind WS (whitespace) are discarded. If nothing matches, raise ValueError with a message that contains the position."""
+        pass
+  tests:
+  - name: a statement
+    code: |
+      toks = tokenize("x = 3 + 42;")
+      assert [t[0] for t in toks] == ["IDENT", "ASSIGN", "NUMBER", "PLUS", "NUMBER", "SEMI"]
+      assert [t[1] for t in toks] == ["x", "=", "3", "+", "42", ";"]
+      assert [t[2] for t in toks] == [0, 2, 4, 6, 8, 10]
+      assert tokenize("") == [] and tokenize("   \n ") == []
+      assert tokenize("3.14")[0] == ("NUMBER", "3.14", 0)
+  - name: longest match and keywords
+    code: |
+      assert [t[0] for t in tokenize("a == b = c")] == ["IDENT", "EQ", "IDENT", "ASSIGN", "IDENT"]
+      assert [t[0] for t in tokenize("if (x) while")] == ["IF", "LPAREN", "IDENT", "RPAREN", "WHILE"]
+      assert tokenize("iffy")[0][:2] == ("IDENT", "iffy")
+      assert tokenize("whilex")[0][:2] == ("IDENT", "whilex")
+      assert [t[0] for t in tokenize("a*b+c")] == ["IDENT", "STAR", "IDENT", "PLUS", "IDENT"]
+  - name: errors name the position
+    code: |
+      try:
+          tokenize("x = @")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "4" in str(e)
+      try:
+          tokenize("abc $ d")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "4" in str(e)
+      small = [("A", "a"), ("AB", "ab"), ("B", "b"), ("WS", " ")]
+      assert tokenize("ab a b", small) == [("AB", "ab", 0), ("A", "a", 3), ("B", "b", 5)]
+      assert tokenize("aab", small) == [("A", "a", 0), ("AB", "ab", 1)]
+  hints:
+  - re.match(text, pos) is anchored at pos; compare match lengths, not just whether there is a match.
+  solution: |
+    import re
+
+    RULES = [
+        ("NUMBER", r"[0-9]+(\.[0-9]+)?"),
+        ("IF", r"if"),
+        ("WHILE", r"while"),
+        ("IDENT", r"[A-Za-z_][A-Za-z_0-9]*"),
+        ("EQ", r"=="),
+        ("ASSIGN", r"="),
+        ("PLUS", r"\+"),
+        ("STAR", r"\*"),
+        ("LPAREN", r"\("),
+        ("RPAREN", r"\)"),
+        ("SEMI", r";"),
+        ("WS", r"[ \t\n]+"),
+    ]
+
+
+    def tokenize(source, rules=RULES):
+        """Turn source text into a list of (kind, text, position) tokens. At each position try EVERY rule with re.match and take the LONGEST
+        match; if two rules match equally long, the rule listed first wins (so 'if' is a keyword but 'iffy' is an identifier).
+        Tokens of kind WS (whitespace) are discarded. If nothing matches, raise ValueError with a message that contains the position."""
+        tokens = []
+        pos = 0
+        while pos < len(source):
+            best = None
+            for kind, pattern in rules:
+                m = re.compile(pattern).match(source, pos)
+                if m and m.end() > pos and (best is None or m.end() - pos > len(best[1])):
+                    best = (kind, m.group(), pos)
+            if best is None:
+                raise ValueError("unexpected character %r at position %d" % (source[pos], pos))
+            if best[0] != "WS":
+                tokens.append(best)
+            pos += len(best[1])
+        return tokens
+  explanation: Maximal munch means a scanner always takes the longest token it can.
+- id: nfa
+  title: Simulating an NFA
+  difficulty: 4
+  prompt: 'A **nondeterministic finite automaton** (NFA) may have several choices at once, and free moves called epsilon edges. The starter has `regex_to_nfa` (Thompson''s construction, study it) and `matches_symbol`. An NFA is `{"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}}` where `None` marks an epsilon edge. Write `epsilon_closure(nfa, states)`: every state reachable from `states` using only epsilon edges (including `states` themselves), as a set (use a stack). Write `step(nfa, states, ch)`: the set of states reached by reading character `ch` (follow edges whose symbol satisfies `matches_symbol(symbol, ch)`) and then taking the epsilon closure. Write `nfa_accepts(nfa, text)`: keep the **set** of states you could be in, starting from the closure of `{start}`; after all of `text`, accept if the accept state is in the set. Write `regex_matches(pattern, text)`: True if the **whole** text matches the pattern.'
+  starter: |-
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        pass
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        pass
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        pass
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        pass
+  tests:
+  - name: closure and step
+    code: |
+      nfa = regex_to_nfa("a*")
+      start = epsilon_closure(nfa, {nfa["start"]})
+      assert nfa["start"] in start and nfa["accept"] in start
+      nfa2 = regex_to_nfa("ab")
+      s0 = epsilon_closure(nfa2, {nfa2["start"]})
+      s1 = step(nfa2, s0, "a")
+      assert s1 and nfa2["accept"] not in s1
+      assert nfa2["accept"] in step(nfa2, s1, "b")
+      assert step(nfa2, s0, "z") == set()
+      assert epsilon_closure(nfa2, set()) == set()
+  - name: matching
+    code: |
+      assert regex_matches("abc", "abc") and not regex_matches("abc", "abcd") and not regex_matches("abc", "ab")
+      assert regex_matches("a*", "") and regex_matches("a*", "aaaa") and not regex_matches("a*", "aab")
+      assert regex_matches("a+", "aa") and not regex_matches("a+", "")
+      assert regex_matches("ab?c", "ac") and regex_matches("ab?c", "abc") and not regex_matches("ab?c", "abbc")
+      assert regex_matches("cat|dog", "dog") and not regex_matches("cat|dog", "cow")
+      assert regex_matches("(a|b)*abb", "babb") and not regex_matches("(a|b)*abb", "abab")
+      assert regex_matches("", "") and not regex_matches("", "a")
+      assert regex_matches("a.c", "axc") and not regex_matches("a.c", "ac")
+  - name: classes and escapes
+    code: |
+      assert regex_matches("[0-9]+", "2024") and not regex_matches("[0-9]+", "20a4")
+      assert regex_matches("[a-c]x", "bx") and not regex_matches("[a-c]x", "dx")
+      assert regex_matches("[0-9]+(\\.[0-9]+)?", "3.14") and regex_matches("[0-9]+(\\.[0-9]+)?", "42")
+      assert not regex_matches("[0-9]+(\\.[0-9]+)?", "3x14")
+      assert regex_matches("\\(a\\)", "(a)")
+      for bad in ("(a", "a)", "*a", "a|*", "[ab"):
+          try:
+              regex_to_nfa(bad)
+              raise AssertionError("accepted " + bad)
+          except ValueError:
+              pass
+  hints:
+  - Keep sets of states, never just one state; that is what makes it nondeterministic.
+  solution: |
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+  explanation: An NFA is simulated by tracking every place it could be at once.
+- id: subset
+  title: From NFA to DFA
+  difficulty: 4
+  prompt: 'A **deterministic** finite automaton (DFA) has exactly one move per character, so it runs without keeping sets. The **subset construction** converts: each DFA state stands for a *set* of NFA states. The starter has `regex_to_nfa`, `epsilon_closure`, `step` and `nfa_accepts`. Write `nfa_to_dfa(nfa, alphabet)`: start with `frozenset(epsilon_closure(nfa, {start}))` as state 0; use a queue (first in, first out), iterate `sorted(alphabet)`, compute `step(nfa, S, ch)` for each set `S` and skip empty results (a missing move means reject); number new sets 1, 2, 3 in the order they are discovered; a DFA state accepts when its set contains the NFA''s accept state. Return `{"start": 0, "accepts": set_of_ints, "delta": {(state, char): state}}`. Write `dfa_accepts(dfa, text)`: follow one move per character (a missing move rejects at once) and report whether the final state accepts.'
+  starter: |-
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        pass
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        pass
+  tests:
+  - name: small machines
+    code: |
+      dfa = nfa_to_dfa(regex_to_nfa("ab*"), "ab")
+      assert dfa["start"] == 0 and 0 not in dfa["accepts"]
+      assert dfa["delta"][(0, "a")] == 1 and 1 in dfa["accepts"]
+      assert dfa["delta"][(1, "b")] in dfa["accepts"] and (0, "b") not in dfa["delta"]
+      assert dfa_accepts(dfa, "abbb") and dfa_accepts(dfa, "a") and not dfa_accepts(dfa, "") and not dfa_accepts(dfa, "ba")
+      assert not dfa_accepts(dfa, "az")
+  - name: agrees with the NFA
+    code: |
+      import itertools
+      for pattern in ["(a|b)*abb", "a*b*", "(ab|a)*c?", "a(b|c)+d?", "(a|b)(a|b)", "a?a?a"]:
+          nfa = regex_to_nfa(pattern)
+          dfa = nfa_to_dfa(nfa, "abcd")
+          for n in range(0, 6):
+              for tup in itertools.product("abcd", repeat=n):
+                  word = "".join(tup)
+                  assert dfa_accepts(dfa, word) == nfa_accepts(nfa, word), (pattern, word)
+  - name: state counts
+    code: |
+      dfa = nfa_to_dfa(regex_to_nfa("(a|b)*abb"), "ab")
+      assert len(set(s for s, c in dfa["delta"]) | set(dfa["delta"].values())) == 5
+      assert len(dfa["accepts"]) == 1
+      assert dfa_accepts(dfa, "abb") and dfa_accepts(dfa, "aabb") and not dfa_accepts(dfa, "abba")
+      empty = nfa_to_dfa(regex_to_nfa(""), "ab")
+      assert empty["accepts"] == {0} and empty["delta"] == {}
+  hints:
+  - Number the sets in the order a first-in first-out queue discovers them, so everyone gets the same numbering.
+  solution: |
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        alphabet = sorted(alphabet)
+        start = frozenset(epsilon_closure(nfa, {nfa["start"]}))
+        ids = {start: 0}
+        queue = [start]
+        delta = {}
+        accepts = set()
+        while queue:
+            current = queue.pop(0)
+            if nfa["accept"] in current:
+                accepts.add(ids[current])
+            for ch in alphabet:
+                target = frozenset(step(nfa, current, ch))
+                if not target:
+                    continue
+                if target not in ids:
+                    ids[target] = len(ids)
+                    queue.append(target)
+                delta[(ids[current], ch)] = ids[target]
+        return {"start": 0, "accepts": accepts, "delta": delta}
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        state = dfa["start"]
+        for ch in text:
+            state = dfa["delta"].get((state, ch))
+            if state is None:
+                return False
+        return state in dfa["accepts"]
+  explanation: Every NFA has an equivalent DFA, possibly with exponentially more states.
+- id: minimize
+  title: Minimizing a DFA
+  difficulty: 5
+  prompt: 'The starter has everything from before. Write `minimize_dfa(dfa, alphabet)` using Moore''s partition refinement. Find the states reachable from the start; add an extra `DEAD` state `-1` that every missing move goes to; put the states in groups, first accepting versus not; then repeatedly give each state the signature `(its group, tuple of the groups its moves lead to in sorted alphabet order)` and regroup by signature (number groups in the order you meet states sorted ascending), until the number of groups stops growing. Build the new DFA from the groups reachable from the start group, numbering groups 0, 1, 2 in breadth-first discovery order (alphabet in sorted order), and **omit** the group containing `DEAD` and every move into it. If the start group is the dead group, return `{"start": 0, "accepts": set(), "delta": {}}`.'
+  starter: |-
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        alphabet = sorted(alphabet)
+        start = frozenset(epsilon_closure(nfa, {nfa["start"]}))
+        ids = {start: 0}
+        queue = [start]
+        delta = {}
+        accepts = set()
+        while queue:
+            current = queue.pop(0)
+            if nfa["accept"] in current:
+                accepts.add(ids[current])
+            for ch in alphabet:
+                target = frozenset(step(nfa, current, ch))
+                if not target:
+                    continue
+                if target not in ids:
+                    ids[target] = len(ids)
+                    queue.append(target)
+                delta[(ids[current], ch)] = ids[target]
+        return {"start": 0, "accepts": accepts, "delta": delta}
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        state = dfa["start"]
+        for ch in text:
+            state = dfa["delta"].get((state, ch))
+            if state is None:
+                return False
+        return state in dfa["accepts"]
+
+
+    def minimize_dfa(dfa, alphabet):
+        """Merge states that behave identically (Moore's partition refinement). Steps: find the states reachable from the start; add one
+        extra DEAD state (-1) that every missing move goes to; split the states into groups, first accepting versus not accepting; then
+        repeatedly give each state the signature (its current group, the groups its moves lead to in sorted alphabet order) and regroup by
+        signature, until the number of groups stops growing. Finally build the new DFA from the groups reachable from the start group,
+        numbering groups 0, 1, 2 ... in breadth-first discovery order (alphabet in sorted order), and OMIT the group that contains DEAD
+        (and every move into it). If the start group is the dead group return {"start": 0, "accepts": set(), "delta": {}}."""
+        pass
+  tests:
+  - name: minimal sizes
+    code: |
+      def size(d):
+          return len(set(s for s, c in d["delta"]) | set(d["delta"].values()) | {d["start"]})
+      alpha = "ab"
+      assert size(minimize_dfa(nfa_to_dfa(regex_to_nfa("(a|b)*abb"), alpha), alpha)) == 4
+      assert size(minimize_dfa(nfa_to_dfa(regex_to_nfa("a*"), alpha), alpha)) == 1
+      assert size(minimize_dfa(nfa_to_dfa(regex_to_nfa("(a|b)*"), alpha), alpha)) == 1
+      assert size(minimize_dfa(nfa_to_dfa(regex_to_nfa("ab|ab"), alpha), alpha)) == 3
+      assert size(minimize_dfa(nfa_to_dfa(regex_to_nfa("(a|b)(a|b)(a|b)"), alpha), alpha)) == 4
+  - name: same language
+    code: |
+      import itertools
+      for pattern in ["(a|b)*abb", "a*b*", "(ab|a)*b?", "a(b|a)+", "(a|b)(a|b)", "a?a?a", "(aa|aaa)+"]:
+          big = nfa_to_dfa(regex_to_nfa(pattern), "ab")
+          small = minimize_dfa(big, "ab")
+          for n in range(0, 8):
+              for tup in itertools.product("ab", repeat=n):
+                  word = "".join(tup)
+                  assert dfa_accepts(small, word) == dfa_accepts(big, word), (pattern, word)
+          assert len(set(s for s, c in small["delta"]) | {small["start"]}) <= len(set(s for s, c in big["delta"]) | {big["start"]})
+  - name: special cases
+    code: |
+      dead = {"start": 0, "accepts": set(), "delta": {(0, "a"): 1, (1, "a"): 1}}
+      assert minimize_dfa(dead, "a") == {"start": 0, "accepts": set(), "delta": {}}
+      everything = {"start": 0, "accepts": {0, 1}, "delta": {(0, "a"): 1, (1, "a"): 0}}
+      assert minimize_dfa(everything, "a") == {"start": 0, "accepts": {0}, "delta": {(0, "a"): 0}}
+      m = minimize_dfa(nfa_to_dfa(regex_to_nfa("ab"), "ab"), "ab")
+      assert m == {"start": 0, "accepts": {2}, "delta": {(0, "a"): 1, (1, "b"): 2}}
+  hints:
+  - 'Two states are the same when they accept the same words from here on: same acceptance and same groups after every character.'
+  solution: |
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        alphabet = sorted(alphabet)
+        start = frozenset(epsilon_closure(nfa, {nfa["start"]}))
+        ids = {start: 0}
+        queue = [start]
+        delta = {}
+        accepts = set()
+        while queue:
+            current = queue.pop(0)
+            if nfa["accept"] in current:
+                accepts.add(ids[current])
+            for ch in alphabet:
+                target = frozenset(step(nfa, current, ch))
+                if not target:
+                    continue
+                if target not in ids:
+                    ids[target] = len(ids)
+                    queue.append(target)
+                delta[(ids[current], ch)] = ids[target]
+        return {"start": 0, "accepts": accepts, "delta": delta}
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        state = dfa["start"]
+        for ch in text:
+            state = dfa["delta"].get((state, ch))
+            if state is None:
+                return False
+        return state in dfa["accepts"]
+
+
+    def minimize_dfa(dfa, alphabet):
+        """Merge states that behave identically (Moore's partition refinement). Steps: find the states reachable from the start; add one
+        extra DEAD state (-1) that every missing move goes to; split the states into groups, first accepting versus not accepting; then
+        repeatedly give each state the signature (its current group, the groups its moves lead to in sorted alphabet order) and regroup by
+        signature, until the number of groups stops growing. Finally build the new DFA from the groups reachable from the start group,
+        numbering groups 0, 1, 2 ... in breadth-first discovery order (alphabet in sorted order), and OMIT the group that contains DEAD
+        (and every move into it). If the start group is the dead group return {"start": 0, "accepts": set(), "delta": {}}."""
+        alphabet = sorted(alphabet)
+        delta = dfa["delta"]
+        accepts = set(dfa["accepts"])
+        DEAD = -1
+        states = {dfa["start"]}
+        stack = [dfa["start"]]
+        while stack:
+            s = stack.pop()
+            for ch in alphabet:
+                t = delta.get((s, ch))
+                if t is not None and t not in states:
+                    states.add(t)
+                    stack.append(t)
+        states.add(DEAD)
+
+        def go(s, ch):
+            return DEAD if s == DEAD else delta.get((s, ch), DEAD)
+
+        group = {s: int(s in accepts) for s in states}
+        count = len(set(group.values()))
+        while True:
+            signature = {s: (group[s], tuple(group[go(s, ch)] for ch in alphabet)) for s in states}
+            ids = {}
+            group = {s: ids.setdefault(signature[s], len(ids)) for s in sorted(states)}
+            if len(ids) == count:
+                break
+            count = len(ids)
+        dead_group = group[DEAD]
+        start_group = group[dfa["start"]]
+        if start_group == dead_group:
+            return {"start": 0, "accepts": set(), "delta": {}}
+        representative = {}
+        for s in sorted(states):
+            representative.setdefault(group[s], s)
+        order = {start_group: 0}
+        queue = [start_group]
+        new_delta = {}
+        new_accepts = set()
+        while queue:
+            g = queue.pop(0)
+            r = representative[g]
+            if r in accepts:
+                new_accepts.add(order[g])
+            for ch in alphabet:
+                target = group[go(r, ch)]
+                if target == dead_group:
+                    continue
+                if target not in order:
+                    order[target] = len(order)
+                    queue.append(target)
+                new_delta[(order[g], ch)] = order[target]
+        return {"start": 0, "accepts": new_accepts, "delta": new_delta}
+  explanation: Minimization throws away states that no input can tell apart.
+- id: scanner
+  title: 'Capstone: a scanner generator'
+  difficulty: 5
+  prompt: 'Build a lexer from scratch with no `re` module. The starter has all the earlier machinery. Write `regex_dfa(pattern, alphabet)` (NFA, then `nfa_to_dfa`, then `minimize_dfa`). Write `longest_match(dfa, text, start)`: the end position (exclusive) of the **longest** prefix of `text[start:]` that the DFA accepts, or `-1` if none (walk forward remembering the last position where the DFA was in an accepting state; stop at a missing move). Write `lex(rules, text)`: `rules` is a list of `(name, pattern)`; build one DFA per rule with the alphabet `set(text)`; at each position choose the rule with the longest **non-empty** match (the earlier rule wins ties), emit `(name, lexeme, position)`, and continue after it; discard tokens named `"WS"`; raise `ValueError` mentioning the position if nothing matches.'
+  starter: |-
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        alphabet = sorted(alphabet)
+        start = frozenset(epsilon_closure(nfa, {nfa["start"]}))
+        ids = {start: 0}
+        queue = [start]
+        delta = {}
+        accepts = set()
+        while queue:
+            current = queue.pop(0)
+            if nfa["accept"] in current:
+                accepts.add(ids[current])
+            for ch in alphabet:
+                target = frozenset(step(nfa, current, ch))
+                if not target:
+                    continue
+                if target not in ids:
+                    ids[target] = len(ids)
+                    queue.append(target)
+                delta[(ids[current], ch)] = ids[target]
+        return {"start": 0, "accepts": accepts, "delta": delta}
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        state = dfa["start"]
+        for ch in text:
+            state = dfa["delta"].get((state, ch))
+            if state is None:
+                return False
+        return state in dfa["accepts"]
+
+
+    def minimize_dfa(dfa, alphabet):
+        """Merge states that behave identically (Moore's partition refinement). Steps: find the states reachable from the start; add one
+        extra DEAD state (-1) that every missing move goes to; split the states into groups, first accepting versus not accepting; then
+        repeatedly give each state the signature (its current group, the groups its moves lead to in sorted alphabet order) and regroup by
+        signature, until the number of groups stops growing. Finally build the new DFA from the groups reachable from the start group,
+        numbering groups 0, 1, 2 ... in breadth-first discovery order (alphabet in sorted order), and OMIT the group that contains DEAD
+        (and every move into it). If the start group is the dead group return {"start": 0, "accepts": set(), "delta": {}}."""
+        alphabet = sorted(alphabet)
+        delta = dfa["delta"]
+        accepts = set(dfa["accepts"])
+        DEAD = -1
+        states = {dfa["start"]}
+        stack = [dfa["start"]]
+        while stack:
+            s = stack.pop()
+            for ch in alphabet:
+                t = delta.get((s, ch))
+                if t is not None and t not in states:
+                    states.add(t)
+                    stack.append(t)
+        states.add(DEAD)
+
+        def go(s, ch):
+            return DEAD if s == DEAD else delta.get((s, ch), DEAD)
+
+        group = {s: int(s in accepts) for s in states}
+        count = len(set(group.values()))
+        while True:
+            signature = {s: (group[s], tuple(group[go(s, ch)] for ch in alphabet)) for s in states}
+            ids = {}
+            group = {s: ids.setdefault(signature[s], len(ids)) for s in sorted(states)}
+            if len(ids) == count:
+                break
+            count = len(ids)
+        dead_group = group[DEAD]
+        start_group = group[dfa["start"]]
+        if start_group == dead_group:
+            return {"start": 0, "accepts": set(), "delta": {}}
+        representative = {}
+        for s in sorted(states):
+            representative.setdefault(group[s], s)
+        order = {start_group: 0}
+        queue = [start_group]
+        new_delta = {}
+        new_accepts = set()
+        while queue:
+            g = queue.pop(0)
+            r = representative[g]
+            if r in accepts:
+                new_accepts.add(order[g])
+            for ch in alphabet:
+                target = group[go(r, ch)]
+                if target == dead_group:
+                    continue
+                if target not in order:
+                    order[target] = len(order)
+                    queue.append(target)
+                new_delta[(order[g], ch)] = order[target]
+        return {"start": 0, "accepts": new_accepts, "delta": new_delta}
+
+
+    def regex_dfa(pattern, alphabet):
+        """The smallest DFA for a pattern: build the NFA, convert it with nfa_to_dfa, minimise it."""
+        pass
+
+
+    def longest_match(dfa, text, start):
+        """The end position (exclusive) of the LONGEST prefix of text[start:] that the DFA accepts, or -1 if no prefix (not even the empty one)
+        is accepted. Walk forward from `start`, remembering the last position where the DFA was in an accepting state; stop at a missing move."""
+        pass
+
+
+    def lex(rules, text):
+        """A scanner built from scratch. `rules` is a list of (name, pattern) using this lesson's regex syntax. Build one minimal DFA per
+        rule with the alphabet set(text). At each position take the rule with the longest non-empty match (the earlier rule wins ties),
+        emit (name, lexeme, position) and move on. Tokens named WS are discarded. Raise ValueError mentioning the position if nothing matches."""
+        pass
+  tests:
+  - name: longest matches
+    code: |
+      d = regex_dfa("[0-9]+", "0123456789ab")
+      assert longest_match(d, "123abc", 0) == 3 and longest_match(d, "abc", 0) == -1
+      assert longest_match(d, "ab12", 2) == 4
+      e = regex_dfa("a*", "ab")
+      assert longest_match(e, "bbb", 0) == 0 and longest_match(e, "aab", 0) == 2
+      assert longest_match(regex_dfa("ab|abab", "ab"), "ababab", 0) == 4
+  - name: a small language
+    code: |
+      rules = [("NUM", "[0-9]+"), ("IF", "if"), ("ID", "[a-z]+"), ("EQ", "=="), ("ASSIGN", "="), ("WS", "[ ]+")]
+      toks = lex(rules, "if x == 42")
+      assert toks == [("IF", "if", 0), ("ID", "x", 3), ("EQ", "==", 5), ("NUM", "42", 8)]
+      assert lex(rules, "iffy = 7") == [("ID", "iffy", 0), ("ASSIGN", "=", 5), ("NUM", "7", 7)]
+      assert lex(rules, "") == []
+      assert lex(rules, "a=b==c")[1][0] == "ASSIGN" and lex(rules, "a=b==c")[3][0] == "EQ"
+  - name: errors
+    code: |
+      rules = [("NUM", "[0-9]+"), ("WS", " +")]
+      try:
+          lex(rules, "12 x")
+          raise AssertionError("accepted")
+      except ValueError as err:
+          assert "3" in str(err)
+      try:
+          lex(rules, "?")
+          raise AssertionError("accepted")
+      except ValueError as err:
+          assert "0" in str(err)
+      dec = [("NUM", "[0-9]+(\\.[0-9]+)?"), ("DOT", "\\."), ("WS", " ")]
+      assert lex(dec, "3.14 .5 7.") == [("NUM", "3.14", 0), ("DOT", ".", 5), ("NUM", "5", 6), ("NUM", "7", 8), ("DOT", ".", 9)]
+  hints:
+  - Build the DFAs once per call, then loop over positions.
+  solution: |
+    def regex_to_nfa(pattern):
+        """Thompson's construction (given to you; study it). Supports literal characters, '.' (any character), [abc] and [a-z] classes,
+        backslash escapes, grouping with ( ), alternation |, and the postfix operators * + ?. Returns
+        {"start": s, "accept": a, "edges": {state: [(symbol or None, next_state), ...]}} where None marks an epsilon edge (a free move)."""
+        edges = {}
+        pos = [0]
+
+        def new_state():
+            edges[len(edges)] = []
+            return len(edges) - 1
+
+        def peek():
+            return pattern[pos[0]] if pos[0] < len(pattern) else None
+
+        def expr():
+            s, a = term()
+            while peek() == "|":
+                pos[0] += 1
+                s2, a2 = term()
+                ns, na = new_state(), new_state()
+                edges[ns] += [(None, s), (None, s2)]
+                edges[a].append((None, na))
+                edges[a2].append((None, na))
+                s, a = ns, na
+            return s, a
+
+        def term():
+            s = new_state()
+            a = s
+            while peek() not in (None, "|", ")"):
+                s2, a2 = factor()
+                edges[a].append((None, s2))
+                a = a2
+            return s, a
+
+        def factor():
+            s, a = atom()
+            while peek() in ("*", "+", "?"):
+                op = pattern[pos[0]]
+                pos[0] += 1
+                ns, na = new_state(), new_state()
+                edges[ns].append((None, s))
+                edges[a].append((None, na))
+                if op in "*?":
+                    edges[ns].append((None, na))
+                if op in "*+":
+                    edges[a].append((None, s))
+                s, a = ns, na
+            return s, a
+
+        def atom():
+            c = peek()
+            if c == "(":
+                pos[0] += 1
+                frag = expr()
+                if peek() != ")":
+                    raise ValueError("missing )")
+                pos[0] += 1
+                return frag
+            if c is None or c in "*+?)|":
+                raise ValueError("unexpected %r" % c)
+            s, a = new_state(), new_state()
+            if c == "[":
+                pos[0] += 1
+                chars = []
+                while peek() not in (None, "]"):
+                    ch = pattern[pos[0]]
+                    if pos[0] + 2 < len(pattern) and pattern[pos[0] + 1] == "-" and pattern[pos[0] + 2] != "]":
+                        chars += [chr(x) for x in range(ord(ch), ord(pattern[pos[0] + 2]) + 1)]
+                        pos[0] += 3
+                    else:
+                        chars.append(ch)
+                        pos[0] += 1
+                if peek() != "]":
+                    raise ValueError("missing ]")
+                pos[0] += 1
+                for ch in chars:
+                    edges[s].append((ch, a))
+                return s, a
+            if c == "\\":
+                pos[0] += 1
+                c = peek()
+                if c is None:
+                    raise ValueError("dangling backslash")
+                symbol = "\\" + c
+            else:
+                symbol = c
+            pos[0] += 1
+            edges[s].append((symbol, a))
+            return s, a
+
+        start, accept = expr()
+        if pos[0] != len(pattern):
+            raise ValueError("unmatched )")
+        return {"start": start, "accept": accept, "edges": edges}
+
+
+    def matches_symbol(symbol, ch):
+        """Does an edge labelled `symbol` accept the character ch? '.' accepts anything; a two-character label like backslash-plus accepts that literal character."""
+        if symbol == ".":
+            return True
+        if len(symbol) == 2 and symbol[0] == "\\":
+            return symbol[1] == ch
+        return symbol == ch
+
+
+    def epsilon_closure(nfa, states):
+        """Every state reachable from `states` using only epsilon (None) edges, including the starting states themselves, as a set.
+        Use a stack: pop a state, push each epsilon-neighbour you have not seen."""
+        seen = set(states)
+        stack = list(states)
+        while stack:
+            s = stack.pop()
+            for symbol, target in nfa["edges"][s]:
+                if symbol is None and target not in seen:
+                    seen.add(target)
+                    stack.append(target)
+        return seen
+
+
+    def step(nfa, states, ch):
+        """The set of states reachable from `states` by reading the single character ch (using matches_symbol) and then following any epsilon edges."""
+        moved = set()
+        for s in states:
+            for symbol, target in nfa["edges"][s]:
+                if symbol is not None and matches_symbol(symbol, ch):
+                    moved.add(target)
+        return epsilon_closure(nfa, moved)
+
+
+    def nfa_accepts(nfa, text):
+        """True if the NFA can finish in its accept state after reading ALL of text. Keep the SET of states you could be in:
+        start with the closure of {start}, replace it by step(...) for each character, and at the end look for the accept state."""
+        states = epsilon_closure(nfa, {nfa["start"]})
+        for ch in text:
+            states = step(nfa, states, ch)
+            if not states:
+                return False
+        return nfa["accept"] in states
+
+
+    def regex_matches(pattern, text):
+        """True if the WHOLE text matches the pattern."""
+        return nfa_accepts(regex_to_nfa(pattern), text)
+
+
+    def nfa_to_dfa(nfa, alphabet):
+        """The subset construction. Each DFA state stands for a SET of NFA states. Start with epsilon_closure({start}) as state 0. Using a
+        queue (first in, first out) and iterating `sorted(alphabet)` in order, compute step(nfa, S, ch) for each set S; skip empty results
+        (a missing move means reject); number new sets 1, 2, 3 ... in the order they are discovered. A DFA state accepts when its set
+        contains the NFA's accept state. Return {"start": 0, "accepts": set of ints, "delta": {(state, char): state}}."""
+        alphabet = sorted(alphabet)
+        start = frozenset(epsilon_closure(nfa, {nfa["start"]}))
+        ids = {start: 0}
+        queue = [start]
+        delta = {}
+        accepts = set()
+        while queue:
+            current = queue.pop(0)
+            if nfa["accept"] in current:
+                accepts.add(ids[current])
+            for ch in alphabet:
+                target = frozenset(step(nfa, current, ch))
+                if not target:
+                    continue
+                if target not in ids:
+                    ids[target] = len(ids)
+                    queue.append(target)
+                delta[(ids[current], ch)] = ids[target]
+        return {"start": 0, "accepts": accepts, "delta": delta}
+
+
+    def dfa_accepts(dfa, text):
+        """Run the DFA: follow one move per character (a missing move means reject at once) and report whether the final state accepts."""
+        state = dfa["start"]
+        for ch in text:
+            state = dfa["delta"].get((state, ch))
+            if state is None:
+                return False
+        return state in dfa["accepts"]
+
+
+    def minimize_dfa(dfa, alphabet):
+        """Merge states that behave identically (Moore's partition refinement). Steps: find the states reachable from the start; add one
+        extra DEAD state (-1) that every missing move goes to; split the states into groups, first accepting versus not accepting; then
+        repeatedly give each state the signature (its current group, the groups its moves lead to in sorted alphabet order) and regroup by
+        signature, until the number of groups stops growing. Finally build the new DFA from the groups reachable from the start group,
+        numbering groups 0, 1, 2 ... in breadth-first discovery order (alphabet in sorted order), and OMIT the group that contains DEAD
+        (and every move into it). If the start group is the dead group return {"start": 0, "accepts": set(), "delta": {}}."""
+        alphabet = sorted(alphabet)
+        delta = dfa["delta"]
+        accepts = set(dfa["accepts"])
+        DEAD = -1
+        states = {dfa["start"]}
+        stack = [dfa["start"]]
+        while stack:
+            s = stack.pop()
+            for ch in alphabet:
+                t = delta.get((s, ch))
+                if t is not None and t not in states:
+                    states.add(t)
+                    stack.append(t)
+        states.add(DEAD)
+
+        def go(s, ch):
+            return DEAD if s == DEAD else delta.get((s, ch), DEAD)
+
+        group = {s: int(s in accepts) for s in states}
+        count = len(set(group.values()))
+        while True:
+            signature = {s: (group[s], tuple(group[go(s, ch)] for ch in alphabet)) for s in states}
+            ids = {}
+            group = {s: ids.setdefault(signature[s], len(ids)) for s in sorted(states)}
+            if len(ids) == count:
+                break
+            count = len(ids)
+        dead_group = group[DEAD]
+        start_group = group[dfa["start"]]
+        if start_group == dead_group:
+            return {"start": 0, "accepts": set(), "delta": {}}
+        representative = {}
+        for s in sorted(states):
+            representative.setdefault(group[s], s)
+        order = {start_group: 0}
+        queue = [start_group]
+        new_delta = {}
+        new_accepts = set()
+        while queue:
+            g = queue.pop(0)
+            r = representative[g]
+            if r in accepts:
+                new_accepts.add(order[g])
+            for ch in alphabet:
+                target = group[go(r, ch)]
+                if target == dead_group:
+                    continue
+                if target not in order:
+                    order[target] = len(order)
+                    queue.append(target)
+                new_delta[(order[g], ch)] = order[target]
+        return {"start": 0, "accepts": new_accepts, "delta": new_delta}
+
+
+    def regex_dfa(pattern, alphabet):
+        """The smallest DFA for a pattern: build the NFA, convert it with nfa_to_dfa, minimise it."""
+        return minimize_dfa(nfa_to_dfa(regex_to_nfa(pattern), alphabet), alphabet)
+
+
+    def longest_match(dfa, text, start):
+        """The end position (exclusive) of the LONGEST prefix of text[start:] that the DFA accepts, or -1 if no prefix (not even the empty one)
+        is accepted. Walk forward from `start`, remembering the last position where the DFA was in an accepting state; stop at a missing move."""
+        state = dfa["start"]
+        best = start if state in dfa["accepts"] else -1
+        for i in range(start, len(text)):
+            state = dfa["delta"].get((state, text[i]))
+            if state is None:
+                break
+            if state in dfa["accepts"]:
+                best = i + 1
+        return best
+
+
+    def lex(rules, text):
+        """A scanner built from scratch. `rules` is a list of (name, pattern) using this lesson's regex syntax. Build one minimal DFA per
+        rule with the alphabet set(text). At each position take the rule with the longest non-empty match (the earlier rule wins ties),
+        emit (name, lexeme, position) and move on. Tokens named WS are discarded. Raise ValueError mentioning the position if nothing matches."""
+        alphabet = set(text)
+        dfas = [(name, regex_dfa(pattern, alphabet)) for name, pattern in rules]
+        tokens = []
+        pos = 0
+        while pos < len(text):
+            best_name, best_end = None, pos
+            for name, dfa in dfas:
+                end = longest_match(dfa, text, pos)
+                if end > best_end:
+                    best_name, best_end = name, end
+            if best_name is None:
+                raise ValueError("unexpected character %r at position %d" % (text[pos], pos))
+            if best_name != "WS":
+                tokens.append((best_name, text[pos:best_end], pos))
+            pos = best_end
+        return tokens
+  explanation: 'This is how real scanner generators such as lex and flex work: regular expressions compiled to automata.'
+commonMistakes:
+- title: Taking the first match instead of the longest
+  explanation: Then `==` becomes two `=` tokens.
+- title: Putting the identifier rule before keywords
+  explanation: With equal lengths the earlier rule wins, so keywords would never be recognised.
+- title: Forgetting epsilon closure after each step
+  explanation: Free moves must be followed or valid input will be rejected.
+- title: Tracking only one state of an NFA
+  explanation: Keep the whole set of possible states.
+- title: Using regular expressions for nested structures
+  explanation: Balanced parentheses are beyond finite automata; that is the parser's job.
+summary:
+- 'A compiler is a pipeline: lexer, parser, semantic analysis, optimization, code generation.'
+- The lexer turns characters into tokens using the longest-match rule.
+- Regular expressions become NFAs by Thompson's construction.
+- The subset construction converts an NFA to a DFA, and minimization merges equivalent states.
+- Scanner generators compile token rules into a DFA.
+next: u23-parsing
+quiz:
+- type: mcq
+  question: What does the lexer produce?
+  options:
+  - A list of tokens
+  - A syntax tree
+  - Machine code
+  - Type errors
+  answer: 0
+  explanation: Tokens are the input of the parser.
+- type: mcq
+  question: Why is iffy a single identifier rather than the keyword if followed by fy?
+  options:
+  - Maximal munch takes the longest match
+  - Keywords are not allowed
+  - The lexer ignores keywords
+  - Identifiers always win
+  answer: 0
+  explanation: The identifier rule matches four letters.
+- type: mcq
+  question: What is an epsilon edge?
+  options:
+  - A move that consumes no input
+  - A move on the letter e
+  - An error transition
+  - A transition to the start state
+  answer: 0
+  explanation: It is a free move.
+- type: mcq
+  question: What does the subset construction build?
+  options:
+  - A DFA from an NFA
+  - An NFA from a regex
+  - A parse tree
+  - Machine code
+  answer: 0
+  explanation: Each DFA state is a set of NFA states.
+- type: mcq
+  question: A DFA is fast because...
+  options:
+  - each character causes exactly one lookup
+  - it has fewer states always
+  - it uses recursion
+  - it skips input
+  answer: 0
+  explanation: No sets to track.
+- type: mcq
+  question: Minimizing a DFA...
+  options:
+  - merges states that no input can tell apart
+  - removes accepting states
+  - makes it nondeterministic
+  - adds epsilon edges
+  answer: 0
+  explanation: It keeps the same language with fewer states.
+- type: code
+  question: Write `kind_of(word)` returning `'KEYWORD'` if the word is one of `if`, `while` or `return`, otherwise `'IDENT'`.
+  starter: |
+    def kind_of(word):
+        pass
+  tests:
+  - name: kinds
+    code: |
+      assert kind_of("if") == "KEYWORD" and kind_of("while") == "KEYWORD" and kind_of("return") == "KEYWORD"
+      assert kind_of("iffy") == "IDENT" and kind_of("x") == "IDENT" and kind_of("") == "IDENT"
+  solution: |
+    def kind_of(word):
+        return 'KEYWORD' if word in ('if', 'while', 'return') else 'IDENT'

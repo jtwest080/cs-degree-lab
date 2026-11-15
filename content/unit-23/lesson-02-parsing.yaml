@@ -1,0 +1,1899 @@
+id: u23-parsing
+title: Grammars and Parsing
+minutes: 95
+objective: Learn how a compiler discovers the structure of a program. You will meet context-free grammars, derivations and parse trees, and build a predictive top-down parser from FIRST and FOLLOW sets, including how to rewrite a grammar so that such a parser can handle it.
+outcomes:
+- Read and write a context-free grammar
+- Replay a leftmost derivation
+- Compute nullable, FIRST and FOLLOW sets
+- Build an LL(1) table and a predictive parser
+- Eliminate immediate left recursion
+sections:
+- heading: Why regular expressions are not enough
+  body: |-
+    After the lexer, the compiler has a flat list of tokens: `id + id * id`. It still has no idea that the multiplication happens before the addition, or that parentheses must come in matching pairs. Regular expressions and finite automata cannot even express "balanced parentheses", because a finite machine has no way to count arbitrarily deep nesting. We need something stronger: a **context-free grammar** (CFG).
+
+    A grammar is a set of **production rules**. The symbols on the left are **nonterminals**: names for kinds of phrases, such as `Expr` or `Statement`. The symbols that actually appear in the program (the tokens) are **terminals**. A rule says "this phrase can be built from these parts": `Expr -> Expr + Term` means an expression can be an expression, a plus sign, then a term. The `|` symbol separates alternatives, and **eps** (ε, epsilon) stands for the **empty production**: nothing at all. One nonterminal is the **start symbol**. A **derivation** starts with the start symbol and repeatedly replaces a nonterminal by the right side of one of its rules until only terminals remain; the result is a **sentence** of the language. In a **leftmost derivation** you always replace the leftmost nonterminal. The grammar `S -> a S b | eps` generates `ab`, `aabb`, `aaabbb`: exactly the balanced strings regular expressions cannot describe.
+- heading: Parse trees, ambiguity and structure
+  body: |-
+    Recording which rule was used at each step produces a **parse tree**: the start symbol at the root, each nonterminal node having the symbols of its rule as children, and the tokens as leaves read left to right. The tree *is* the structure of the program: for `1 + 2 * 3` the grammar should put `2 * 3` below `+` so multiplication binds tighter. Grammars encode precedence by layering: `Expr` handles `+`, which uses `Term`, which handles `*`, which uses `Factor` (a number or a parenthesised `Expr`). Deeper layers bind tighter.
+
+    A grammar is **ambiguous** if some sentence has two different parse trees. `E -> E + E | E * E | id` is ambiguous: `id + id * id` can be grouped either way, and a program could then mean two different things. Fixing ambiguity (by layering, as above) is part of designing a language. Another design question is **associativity**: does `a - b - c` mean `(a - b) - c`? Left recursive rules like `E -> E - T` give left associativity naturally. The trouble is that the simplest parsers, the *top-down* ones, cannot handle left recursion, as you will see below.
+- heading: Predictive parsing with FIRST and FOLLOW
+  body: |-
+    A **top-down parser** starts from the start symbol and tries to match the input, expanding nonterminals as it goes. The danger is choosing the wrong alternative and having to backtrack. A **predictive parser** never guesses: it chooses the alternative by peeking at the **next token** (the lookahead). Grammars that allow this with a single token of lookahead are called **LL(1)**: read input Left to right, build a Leftmost derivation, 1 token of lookahead.
+
+    To decide, we compute three things. A nonterminal is **nullable** if it can produce the empty string. **FIRST(X)** is the set of terminals that can begin a string derived from `X`. **FOLLOW(A)** is the set of terminals that can appear right after `A` somewhere in the language (the special marker `$` marks end of input). Then the **parsing table** says: to expand `A` when the next token is `t`, use alternative `i` if `t` is in FIRST of alternative `i`, or, if alternative `i` can vanish, if `t` is in FOLLOW(A). If a table cell gets two alternatives, the grammar is not LL(1). The parser itself is a simple recursive procedure: to parse a terminal, check it matches the next token; to parse a nonterminal, look up the table and parse its chosen alternative's symbols in order. It builds the parse tree as it goes, and when the table has no entry it reports a **syntax error** at that token's position.
+
+    **Left recursion** breaks this: `E -> E + T | T` has `E` in the first position of its own rule, so FIRST sets of both alternatives overlap and the parser would expand `E` forever. The fix: rewrite `E -> T E'` and `E' -> + T E' | eps`. The language is unchanged but the grammar is now LL(1). (Parser generators for other techniques, such as LR parsers used by yacc and bison, handle left recursion directly.)
+examples:
+- title: A predictive parser at work
+  intro: 'The classic expression grammar: FIRST and FOLLOW sets, the table, a parse tree and a syntax error.'
+  code: |
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = {nt: set() for nt in grammar}
+        follow[start].add("$")
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    for i, sym in enumerate(alt):
+                        if sym not in grammar:
+                            continue
+                        f, vanishes = first_of_sequence(alt[i + 1:], first, nullable)
+                        new = set(f)
+                        if vanishes:
+                            new |= follow[nt]
+                        if not new <= follow[sym]:
+                            follow[sym] |= new
+                            changed = True
+        return follow
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = follow_sets(grammar, start)
+        table = {}
+        for nt, alts in grammar.items():
+            for i, alt in enumerate(alts):
+                f, vanishes = first_of_sequence(alt, first, nullable)
+                for terminal in (f | follow[nt]) if vanishes else f:
+                    if (nt, terminal) in table and table[(nt, terminal)] != i:
+                        raise ValueError("conflict for %s on %s" % (nt, terminal))
+                    table[(nt, terminal)] = i
+        return table
+
+
+    def parse(grammar, start, table, tokens):
+        """A predictive (top-down) parser. Parse the list of terminal tokens with the table and return the parse tree as nested pairs
+        (symbol, children): a terminal is (token, []) and a nonterminal is (name, [child trees]). To expand a nonterminal look at the NEXT token
+        (or '$' after the last one), look up table[(nonterminal, token)] to choose the alternative, and parse its symbols in order.
+        ValueError whose message contains the token position when a terminal does not match, the table has no entry, or tokens are left over."""
+        tokens = list(tokens) + ["$"]
+        pos = 0
+
+        def build(symbol):
+            nonlocal pos
+            if symbol not in grammar:
+                if tokens[pos] != symbol:
+                    raise ValueError("expected %s but found %s at position %d" % (symbol, tokens[pos], pos))
+                pos += 1
+                return (symbol, [])
+            key = (symbol, tokens[pos])
+            if key not in table:
+                raise ValueError("unexpected %s at position %d" % (tokens[pos], pos))
+            return (symbol, [build(s) for s in grammar[symbol][table[key]]])
+
+        tree = build(start)
+        if tokens[pos] != "$":
+            raise ValueError("extra input %s at position %d" % (tokens[pos], pos))
+        return tree
+
+
+    def leaves(tree, grammar):
+        """The terminals of a parse tree from left to right (the original tokens). A node whose symbol is not a nonterminal of `grammar` is a
+        terminal; a nonterminal with no children came from an empty production and contributes nothing."""
+        symbol, children = tree
+        if symbol not in grammar:
+            return [symbol]
+        return [leaf for child in children for leaf in leaves(child, grammar)]
+
+    start, grammar = parse_grammar("""
+    E -> T Ep
+    Ep -> + T Ep | eps
+    T -> F Tp
+    Tp -> * F Tp | eps
+    F -> ( E ) | id
+    """)
+    print("terminals:", sorted(terminals_of(grammar)))
+    print("FIRST(E):", sorted(first_sets(grammar)["E"]), " FOLLOW(Ep):", sorted(follow_sets(grammar, start)["Ep"]))
+    table = ll1_table(grammar, start)
+    print("table entries:", len(table))
+    tree = parse(grammar, start, table, ["id", "+", "id", "*", "id"])
+    print("parsed tokens:", leaves(tree, grammar))
+    print("first rule used:", tree[0], "->", [child[0] for child in tree[1]])
+    try:
+        parse(grammar, start, table, ["id", "+", "+"])
+    except ValueError as error:
+        print("error:", error)
+  output: |
+    terminals: ['(', ')', '*', '+', 'id']
+    FIRST(E): ['(', 'id']  FOLLOW(Ep): ['$', ')']
+    table entries: 13
+    parsed tokens: ['id', '+', 'id', '*', 'id']
+    first rule used: E -> ['T', 'Ep']
+    error: unexpected + at position 2
+  lines:
+  - line: 179
+    note: Computed by repeating until nothing changes.
+  - line: 183
+    note: The tree's leaves are the original tokens.
+  - line: 188
+    note: The error names the position.
+- title: Derivations and left recursion
+  intro: Replay a derivation, then rewrite a left recursive grammar so it becomes LL(1).
+  code: |
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = {nt: set() for nt in grammar}
+        follow[start].add("$")
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    for i, sym in enumerate(alt):
+                        if sym not in grammar:
+                            continue
+                        f, vanishes = first_of_sequence(alt[i + 1:], first, nullable)
+                        new = set(f)
+                        if vanishes:
+                            new |= follow[nt]
+                        if not new <= follow[sym]:
+                            follow[sym] |= new
+                            changed = True
+        return follow
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = follow_sets(grammar, start)
+        table = {}
+        for nt, alts in grammar.items():
+            for i, alt in enumerate(alts):
+                f, vanishes = first_of_sequence(alt, first, nullable)
+                for terminal in (f | follow[nt]) if vanishes else f:
+                    if (nt, terminal) in table and table[(nt, terminal)] != i:
+                        raise ValueError("conflict for %s on %s" % (nt, terminal))
+                    table[(nt, terminal)] = i
+        return table
+
+
+    def eliminate_left_recursion(grammar):
+        """Remove IMMEDIATE left recursion. For a nonterminal A with alternatives A -> A alpha1 | ... | beta1 | ... (the alphas follow a leading A,
+        the betas do not start with A), rewrite as A -> beta1 A' | ... and A' -> alpha1 A' | ... | eps where A' is the name A + "'". Nonterminals
+        without left recursion are copied unchanged. Keep the order of the nonterminals, putting A' right after A. Return a new grammar;
+        ValueError if every alternative of some A starts with A (nothing can ever stop the recursion)."""
+        result = {}
+        for nt, alts in grammar.items():
+            recursive = [alt[1:] for alt in alts if alt and alt[0] == nt]
+            others = [alt for alt in alts if not (alt and alt[0] == nt)]
+            if not recursive:
+                result[nt] = [list(a) for a in alts]
+                continue
+            if not others:
+                raise ValueError("%s can never stop recursing" % nt)
+            new = nt + "'"
+            result[nt] = [alt + [new] for alt in others]
+            result[new] = [alt + [new] for alt in recursive] + [[]]
+        return result
+
+
+    def is_ll1(grammar, start):
+        """True if a predictive parser can parse the grammar with one token of lookahead (the table has no conflicts)."""
+        try:
+            ll1_table(grammar, start)
+            return True
+        except ValueError:
+            return False
+
+
+    def generate_words(grammar, start, max_len):
+        """All strings of at most max_len terminals the grammar can produce (as tuples), found by expanding the leftmost nonterminal. For testing."""
+        words = set()
+        seen = set()
+        stack = [(start,)]
+        while stack:
+            form = stack.pop()
+            if form in seen or len(form) > 2 * max_len + 4:
+                continue
+            seen.add(form)
+            if sum(1 for s in form if s not in grammar) > max_len:
+                continue
+            i = next((k for k, s in enumerate(form) if s in grammar), None)
+            if i is None:
+                words.add(form)
+                continue
+            for alt in grammar[form[i]]:
+                stack.append(form[:i] + tuple(alt) + form[i + 1:])
+        return words
+
+    start, g = parse_grammar("S -> a S b | eps")
+    for forms in derive(g, start, [0, 0, 1]):
+        print(" ".join(forms) if forms else "")
+    left_start, left = parse_grammar("E -> E + T | T\nT -> id")
+    print("is the left recursive grammar LL(1)?", is_ll1(left, left_start))
+    fixed = eliminate_left_recursion(left)
+    print("rewritten rules:", fixed)
+    print("LL(1) now?", is_ll1(fixed, left_start))
+    print("same sentences up to length 5:", generate_words(left, left_start, 5) == generate_words(fixed, left_start, 5))
+  output: |
+    S
+    a S b
+    a a S b b
+    a a b b
+    is the left recursive grammar LL(1)? False
+    rewritten rules: {'E': [['T', "E'"]], "E'": [['+', 'T', "E'"], []], 'T': [['id']]}
+    LL(1) now? True
+    same sentences up to length 5: True
+  lines:
+  - line: 190
+    note: 'False: it would loop forever.'
+  - line: 193
+    note: The rewrite fixed it.
+  - line: 194
+    note: The language did not change.
+playground:
+  prompt: Write a different grammar rule on paper and derive a short sentence by hand.
+  code: |
+    print('S -> a S b | eps')
+exercises:
+- id: grammar
+  title: Reading and using a grammar
+  difficulty: 3
+  prompt: 'A **context-free grammar** is a set of rules: a **nonterminal** (a name for a kind of phrase) on the left, and on the right sequences of nonterminals and **terminals** (the actual tokens), with `|` separating alternatives. Write `parse_grammar(text)` for rules written one per line like `E -> T Ep` and `Ep -> + T Ep | eps` (symbols separated by spaces; `eps` means the empty production). Return `(start_symbol, grammar)` where the start symbol is the left side of the first rule and `grammar` is `{nonterminal: [[symbol, ...], ...]}` with `[]` for the empty production; a left side that appears twice adds alternatives; `ValueError` for a line without `->` or an empty alternative. Write `terminals_of(grammar)` (symbols on right sides that are not keys) and `derive(grammar, start, choices)`: replay a **leftmost derivation**: begin with the tuple `(start,)`; for each number `i` in `choices` replace the leftmost nonterminal of the current form by its `i`-th alternative; return the list of all forms as tuples (`ValueError` if no nonterminal is left or the alternative does not exist).'
+  starter: |-
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        pass
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        pass
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        pass
+  tests:
+  - name: reading rules
+    code: |
+      start, g = parse_grammar("E -> T Ep\nEp -> + T Ep | eps\nT -> id")
+      assert start == "E"
+      assert g == {"E": [["T", "Ep"]], "Ep": [["+", "T", "Ep"], []], "T": [["id"]]}
+      assert terminals_of(g) == {"+", "id"}
+      s2, g2 = parse_grammar("\n  S -> a S b | eps  \n\nS -> c\n")
+      assert s2 == "S" and g2 == {"S": [["a", "S", "b"], [], ["c"]]}
+      for bad in ("S a b", "S -> a | ", "S ->"):
+          try:
+              parse_grammar(bad)
+              raise AssertionError("accepted " + bad)
+          except ValueError:
+              pass
+  - name: derivations
+    code: |
+      start, g = parse_grammar("S -> a S b | eps")
+      forms = derive(g, start, [0, 0, 1])
+      assert forms == [("S",), ("a", "S", "b"), ("a", "a", "S", "b", "b"), ("a", "a", "b", "b")]
+      assert derive(g, start, []) == [("S",)]
+      for bad in ([1, 0], [2], [-1]):
+          try:
+              derive(g, start, bad)
+              raise AssertionError("accepted")
+          except ValueError:
+              pass
+      start, e = parse_grammar("E -> E + T | T\nT -> id")
+      assert derive(e, start, [0, 1, 0, 0])[-1] == ("id", "+", "id")
+  hints:
+  - The leftmost nonterminal is the first symbol of the form that is a key of the grammar.
+  solution: |
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+  explanation: 'A derivation is a recipe: start symbol in, a sentence of the language out.'
+- id: first
+  title: Nullable symbols and FIRST sets
+  difficulty: 5
+  prompt: 'To decide which rule to use by peeking at the next token we need **FIRST sets**. Write `nullable_set(grammar)`: the nonterminals that can produce the empty string (repeat until nothing changes: a nonterminal is nullable if some alternative is empty or made only of nullable nonterminals). Write `first_of_sequence(symbols, first, nullable)`: go through the symbols; a terminal (a symbol not in `first`) adds itself and stops; a nonterminal adds `first[nt]` and continues only if it is nullable; return `(set_of_terminals, can_vanish)` where the flag says the whole sequence can produce nothing. Write `first_sets(grammar)`: `FIRST(A)` for every nonterminal (the terminals that can start a string derived from `A`; do not include the empty string), repeating over all productions until nothing changes.'
+  starter: |-
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        pass
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        pass
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        pass
+  tests:
+  - name: nullable
+    code: |
+      _, g = parse_grammar("S -> A B\nA -> a | eps\nB -> b | eps\nC -> c")
+      assert nullable_set(g) == {"S", "A", "B"}
+      _, h = parse_grammar("S -> S a | eps")
+      assert nullable_set(h) == {"S"}
+      _, k = parse_grammar("S -> a")
+      assert nullable_set(k) == set()
+  - name: first of a sequence
+    code: |
+      first = {"A": {"a"}, "B": {"b"}}
+      assert first_of_sequence(["A", "B", "c"], first, {"A"}) == ({"a", "b"}, False)
+      assert first_of_sequence(["A", "B"], first, {"A", "B"}) == ({"a", "b"}, True)
+      assert first_of_sequence([], first, set()) == (set(), True)
+      assert first_of_sequence(["x", "A"], first, {"A"}) == ({"x"}, False)
+      assert first_of_sequence(["A", "B"], first, set()) == ({"a"}, False)
+  - name: first sets
+    code: |
+      _, g = parse_grammar("""
+      E -> T Ep
+      Ep -> + T Ep | eps
+      T -> F Tp
+      Tp -> * F Tp | eps
+      F -> ( E ) | id
+      """)
+      f = first_sets(g)
+      assert f["E"] == {"(", "id"} and f["T"] == {"(", "id"} and f["F"] == {"(", "id"}
+      assert f["Ep"] == {"+"} and f["Tp"] == {"*"}
+      _, h = parse_grammar("S -> A B\nA -> a | eps\nB -> b | eps")
+      fh = first_sets(h)
+      assert fh["S"] == {"a", "b"} and fh["A"] == {"a"} and fh["B"] == {"b"}
+      _, r = parse_grammar("S -> S a | b")
+      assert first_sets(r)["S"] == {"b"}
+  hints:
+  - Start with every FIRST set empty and keep adding until a full pass changes nothing.
+  solution: |
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+  explanation: FIRST sets tell the parser which rule can start with the next token.
+- id: table
+  title: FOLLOW sets and the LL(1) table
+  difficulty: 5
+  prompt: 'The starter has `nullable_set`, `first_of_sequence` and `first_sets`. Write `follow_sets(grammar, start)`: `FOLLOW(A)` is the set of terminals that can appear right after `A`; the end marker `"$"` follows the start symbol. For each production `X -> ... B beta`, add `FIRST(beta)` to `FOLLOW(B)`, and also `FOLLOW(X)` if `beta` is empty or can vanish; repeat until nothing changes. Write `ll1_table(grammar, start)`: a dictionary `{(nonterminal, terminal): alternative number}`. For every alternative `i` of `A`, put `i` under each terminal in `FIRST(alternative)`; if the alternative can vanish, also under each terminal in `FOLLOW(A)`. If a cell would receive two different numbers the grammar is not **LL(1)** (one token of lookahead is not enough): raise `ValueError` mentioning the nonterminal and the terminal.'
+  starter: |-
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        pass
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        pass
+  tests:
+  - name: follow sets
+    code: |
+      start, g = parse_grammar("""
+      E -> T Ep
+      Ep -> + T Ep | eps
+      T -> F Tp
+      Tp -> * F Tp | eps
+      F -> ( E ) | id
+      """)
+      fo = follow_sets(g, start)
+      assert fo["E"] == {")", "$"} and fo["Ep"] == {")", "$"}
+      assert fo["T"] == {"+", ")", "$"} and fo["Tp"] == {"+", ")", "$"}
+      assert fo["F"] == {"*", "+", ")", "$"}
+  - name: the table
+    code: |
+      start, g = parse_grammar("""
+      E -> T Ep
+      Ep -> + T Ep | eps
+      T -> F Tp
+      Tp -> * F Tp | eps
+      F -> ( E ) | id
+      """)
+      t = ll1_table(g, start)
+      assert t[("E", "id")] == 0 and t[("E", "(")] == 0
+      assert t[("Ep", "+")] == 0 and t[("Ep", ")")] == 1 and t[("Ep", "$")] == 1
+      assert t[("F", "(")] == 0 and t[("F", "id")] == 1
+      assert ("E", "+") not in t and ("F", "*") not in t
+  - name: grammars that are not LL(1)
+    code: |
+      for text in ("E -> E + T | T\nT -> id", "S -> a b | a c", "S -> A a\nA -> a | eps"):
+          st, gr = parse_grammar(text)
+          try:
+              ll1_table(gr, st)
+              raise AssertionError("accepted " + text)
+          except ValueError as e:
+              assert "on" in str(e)
+      st, gr = parse_grammar("S -> a S | b")
+      assert ll1_table(gr, st) == {("S", "a"): 0, ("S", "b"): 1}
+  hints:
+  - A cell with two entries means the parser cannot choose by looking at one token.
+  solution: |
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = {nt: set() for nt in grammar}
+        follow[start].add("$")
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    for i, sym in enumerate(alt):
+                        if sym not in grammar:
+                            continue
+                        f, vanishes = first_of_sequence(alt[i + 1:], first, nullable)
+                        new = set(f)
+                        if vanishes:
+                            new |= follow[nt]
+                        if not new <= follow[sym]:
+                            follow[sym] |= new
+                            changed = True
+        return follow
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = follow_sets(grammar, start)
+        table = {}
+        for nt, alts in grammar.items():
+            for i, alt in enumerate(alts):
+                f, vanishes = first_of_sequence(alt, first, nullable)
+                for terminal in (f | follow[nt]) if vanishes else f:
+                    if (nt, terminal) in table and table[(nt, terminal)] != i:
+                        raise ValueError("conflict for %s on %s" % (nt, terminal))
+                    table[(nt, terminal)] = i
+        return table
+  explanation: The table turns a grammar into a decision procedure.
+- id: predictive
+  title: A predictive parser
+  difficulty: 4
+  prompt: 'The starter has the table builder. Write `parse(grammar, start, table, tokens)`, a **top-down** parser that returns the **parse tree** as nested pairs `(symbol, children)`: a terminal is `(token, [])` and a nonterminal is `(name, [child trees])`. Append `"$"` to the tokens. To expand a nonterminal, look at the **next** token, find `table[(nonterminal, token)]` to choose the alternative, and parse its symbols in order; to match a terminal, it must equal the next token. Raise `ValueError` whose message contains the token position when a terminal does not match, the table has no entry, or tokens are left over after the start symbol is done. Write `leaves(tree, grammar)`: the terminals of a parse tree from left to right (a node whose symbol is not a nonterminal of `grammar` is a terminal; an empty production contributes nothing).'
+  starter: |-
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = {nt: set() for nt in grammar}
+        follow[start].add("$")
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    for i, sym in enumerate(alt):
+                        if sym not in grammar:
+                            continue
+                        f, vanishes = first_of_sequence(alt[i + 1:], first, nullable)
+                        new = set(f)
+                        if vanishes:
+                            new |= follow[nt]
+                        if not new <= follow[sym]:
+                            follow[sym] |= new
+                            changed = True
+        return follow
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = follow_sets(grammar, start)
+        table = {}
+        for nt, alts in grammar.items():
+            for i, alt in enumerate(alts):
+                f, vanishes = first_of_sequence(alt, first, nullable)
+                for terminal in (f | follow[nt]) if vanishes else f:
+                    if (nt, terminal) in table and table[(nt, terminal)] != i:
+                        raise ValueError("conflict for %s on %s" % (nt, terminal))
+                    table[(nt, terminal)] = i
+        return table
+
+
+    def parse(grammar, start, table, tokens):
+        """A predictive (top-down) parser. Parse the list of terminal tokens with the table and return the parse tree as nested pairs
+        (symbol, children): a terminal is (token, []) and a nonterminal is (name, [child trees]). To expand a nonterminal look at the NEXT token
+        (or '$' after the last one), look up table[(nonterminal, token)] to choose the alternative, and parse its symbols in order.
+        ValueError whose message contains the token position when a terminal does not match, the table has no entry, or tokens are left over."""
+        pass
+
+
+    def leaves(tree, grammar):
+        """The terminals of a parse tree from left to right (the original tokens). A node whose symbol is not a nonterminal of `grammar` is a
+        terminal; a nonterminal with no children came from an empty production and contributes nothing."""
+        pass
+  tests:
+  - name: parsing expressions
+    code: |
+      start, g = parse_grammar("""
+      E -> T Ep
+      Ep -> + T Ep | eps
+      T -> F Tp
+      Tp -> * F Tp | eps
+      F -> ( E ) | id
+      """)
+      table = ll1_table(g, start)
+      tokens = ["id", "+", "id", "*", "id"]
+      tree = parse(g, start, table, tokens)
+      assert tree[0] == "E" and leaves(tree, g) == tokens
+      t2 = parse(g, start, table, ["(", "id", ")"])
+      assert leaves(t2, g) == ["(", "id", ")"]
+      assert leaves(parse(g, start, table, ["id"]), g) == ["id"]
+      assert parse(g, start, table, ["id"])[1][0][0] == "T"
+  - name: syntax errors
+    code: |
+      start, g = parse_grammar("""
+      E -> T Ep
+      Ep -> + T Ep | eps
+      T -> F Tp
+      Tp -> * F Tp | eps
+      F -> ( E ) | id
+      """)
+      table = ll1_table(g, start)
+      for tokens, where in ((["id", "+"], "2"), (["id", "id"], "1"), ([")"], "0"), (["(", "id"], "2"), ([], "0")):
+          try:
+              parse(g, start, table, tokens)
+              raise AssertionError("accepted %r" % tokens)
+          except ValueError as e:
+              assert where in str(e), (tokens, str(e))
+  - name: a different grammar
+    code: |
+      start, g = parse_grammar("S -> a S b | eps")
+      table = ll1_table(g, start)
+      assert leaves(parse(g, start, table, ["a", "a", "b", "b"]), g) == ["a", "a", "b", "b"]
+      assert parse(g, start, table, []) == ("S", [])
+      for bad in (["a", "b", "b"], ["a", "a", "b"]):
+          try:
+              parse(g, start, table, bad)
+              raise AssertionError("accepted")
+          except ValueError:
+              pass
+  hints:
+  - The next token is only looked at, not consumed, until a terminal is matched.
+  solution: |
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = {nt: set() for nt in grammar}
+        follow[start].add("$")
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    for i, sym in enumerate(alt):
+                        if sym not in grammar:
+                            continue
+                        f, vanishes = first_of_sequence(alt[i + 1:], first, nullable)
+                        new = set(f)
+                        if vanishes:
+                            new |= follow[nt]
+                        if not new <= follow[sym]:
+                            follow[sym] |= new
+                            changed = True
+        return follow
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = follow_sets(grammar, start)
+        table = {}
+        for nt, alts in grammar.items():
+            for i, alt in enumerate(alts):
+                f, vanishes = first_of_sequence(alt, first, nullable)
+                for terminal in (f | follow[nt]) if vanishes else f:
+                    if (nt, terminal) in table and table[(nt, terminal)] != i:
+                        raise ValueError("conflict for %s on %s" % (nt, terminal))
+                    table[(nt, terminal)] = i
+        return table
+
+
+    def parse(grammar, start, table, tokens):
+        """A predictive (top-down) parser. Parse the list of terminal tokens with the table and return the parse tree as nested pairs
+        (symbol, children): a terminal is (token, []) and a nonterminal is (name, [child trees]). To expand a nonterminal look at the NEXT token
+        (or '$' after the last one), look up table[(nonterminal, token)] to choose the alternative, and parse its symbols in order.
+        ValueError whose message contains the token position when a terminal does not match, the table has no entry, or tokens are left over."""
+        tokens = list(tokens) + ["$"]
+        pos = 0
+
+        def build(symbol):
+            nonlocal pos
+            if symbol not in grammar:
+                if tokens[pos] != symbol:
+                    raise ValueError("expected %s but found %s at position %d" % (symbol, tokens[pos], pos))
+                pos += 1
+                return (symbol, [])
+            key = (symbol, tokens[pos])
+            if key not in table:
+                raise ValueError("unexpected %s at position %d" % (tokens[pos], pos))
+            return (symbol, [build(s) for s in grammar[symbol][table[key]]])
+
+        tree = build(start)
+        if tokens[pos] != "$":
+            raise ValueError("extra input %s at position %d" % (tokens[pos], pos))
+        return tree
+
+
+    def leaves(tree, grammar):
+        """The terminals of a parse tree from left to right (the original tokens). A node whose symbol is not a nonterminal of `grammar` is a
+        terminal; a nonterminal with no children came from an empty production and contributes nothing."""
+        symbol, children = tree
+        if symbol not in grammar:
+            return [symbol]
+        return [leaf for child in children for leaf in leaves(child, grammar)]
+  explanation: A grammar plus a table gives a parser that needs no guessing.
+- id: recursion
+  title: 'Capstone: making grammars parseable'
+  difficulty: 5
+  prompt: 'The starter has everything so far plus `generate_words(grammar, start, max_len)` (all token strings up to a length, for testing). A rule like `E -> E + T | T` is **left recursive**: a top-down parser would expand `E` into `E` forever. Write `eliminate_left_recursion(grammar)` for **immediate** left recursion: for a nonterminal `A` with alternatives `A -> A alpha | ... | beta | ...` (some alternatives start with `A`, the betas do not), produce `A -> beta A''` for each beta and `A'' -> alpha A''` for each alpha plus `A'' -> eps` (the empty alternative `[]`, last), where `A''` is the name `A + "''"`. Copy nonterminals without left recursion unchanged, keep the order of nonterminals with `A''` right after `A`, return a **new** dictionary, and raise `ValueError` if every alternative of some `A` starts with `A`. Write `is_ll1(grammar, start)`: True when `ll1_table` raises no conflict.'
+  starter: |-
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = {nt: set() for nt in grammar}
+        follow[start].add("$")
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    for i, sym in enumerate(alt):
+                        if sym not in grammar:
+                            continue
+                        f, vanishes = first_of_sequence(alt[i + 1:], first, nullable)
+                        new = set(f)
+                        if vanishes:
+                            new |= follow[nt]
+                        if not new <= follow[sym]:
+                            follow[sym] |= new
+                            changed = True
+        return follow
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = follow_sets(grammar, start)
+        table = {}
+        for nt, alts in grammar.items():
+            for i, alt in enumerate(alts):
+                f, vanishes = first_of_sequence(alt, first, nullable)
+                for terminal in (f | follow[nt]) if vanishes else f:
+                    if (nt, terminal) in table and table[(nt, terminal)] != i:
+                        raise ValueError("conflict for %s on %s" % (nt, terminal))
+                    table[(nt, terminal)] = i
+        return table
+
+
+    def generate_words(grammar, start, max_len):
+        """All strings of at most max_len terminals the grammar can produce (as tuples), found by expanding the leftmost nonterminal. For testing."""
+        words = set()
+        seen = set()
+        stack = [(start,)]
+        while stack:
+            form = stack.pop()
+            if form in seen or len(form) > 2 * max_len + 4:
+                continue
+            seen.add(form)
+            if sum(1 for s in form if s not in grammar) > max_len:
+                continue
+            i = next((k for k, s in enumerate(form) if s in grammar), None)
+            if i is None:
+                words.add(form)
+                continue
+            for alt in grammar[form[i]]:
+                stack.append(form[:i] + tuple(alt) + form[i + 1:])
+        return words
+
+
+    def eliminate_left_recursion(grammar):
+        """Remove IMMEDIATE left recursion. For a nonterminal A with alternatives A -> A alpha1 | ... | beta1 | ... (the alphas follow a leading A,
+        the betas do not start with A), rewrite as A -> beta1 A' | ... and A' -> alpha1 A' | ... | eps where A' is the name A + "'". Nonterminals
+        without left recursion are copied unchanged. Keep the order of the nonterminals, putting A' right after A. Return a new grammar;
+        ValueError if every alternative of some A starts with A (nothing can ever stop the recursion)."""
+        pass
+
+
+    def is_ll1(grammar, start):
+        """True if a predictive parser can parse the grammar with one token of lookahead (the table has no conflicts)."""
+        pass
+  tests:
+  - name: the rewrite
+    code: |
+      start, g = parse_grammar("E -> E + T | T\nT -> id")
+      h = eliminate_left_recursion(g)
+      assert list(h) == ["E", "E'", "T"]
+      assert h["E"] == [["T", "E'"]] and h["E'"] == [["+", "T", "E'"], []] and h["T"] == [["id"]]
+      assert g == {"E": [["E", "+", "T"], ["T"]], "T": [["id"]]}
+      k = eliminate_left_recursion(parse_grammar("A -> A a | A b | c | d")[1])
+      assert k == {"A": [["c", "A'"], ["d", "A'"]], "A'": [["a", "A'"], ["b", "A'"], []]}
+      same = parse_grammar("S -> a S | b")[1]
+      assert eliminate_left_recursion(same) == same
+      try:
+          eliminate_left_recursion(parse_grammar("S -> S a")[1])
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  - name: same language
+    code: |
+      for text in ("E -> E + T | T\nT -> T * F | F\nF -> ( E ) | id", "S -> S a | S b | c", "L -> L , x | x"):
+          st, g = parse_grammar(text)
+          h = eliminate_left_recursion(g)
+          assert generate_words(g, st, 5) == generate_words(h, st, 5), text
+  - name: which grammars are LL(1)
+    code: |
+      st0, g0 = parse_grammar("S -> a S | b")
+      assert is_ll1(g0, st0) is True
+      st, g = parse_grammar("E -> E + T | T\nT -> id")
+      assert is_ll1(g, st) is False
+      assert is_ll1(eliminate_left_recursion(g), st) is True
+      st2, g2 = parse_grammar("E -> E + T | T\nT -> T * F | F\nF -> ( E ) | id")
+      assert is_ll1(g2, st2) is False and is_ll1(eliminate_left_recursion(g2), st2) is True
+      st3, g3 = parse_grammar("S -> a b | a c")
+      assert is_ll1(g3, st3) is False
+  hints:
+  - Keep the original alternatives for the betas but add A' to the end of each.
+  solution: |
+    def parse_grammar(text):
+        """Read a grammar written one rule per line, like  E -> T Ep  or  Ep -> + T Ep | eps  (symbols are separated by spaces, '|'
+        separates alternatives, and the word eps means the empty production). Return (start_symbol, grammar) where the start symbol is the
+        left side of the first rule and grammar is {nonterminal: [[symbol, ...], ...]} (an empty list is the empty production). A rule whose
+        left side appears twice adds more alternatives. ValueError for a line without '->' or with an empty alternative."""
+        start = None
+        grammar = {}
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "->" not in line:
+                raise ValueError("missing -> in %r" % line)
+            left, right = line.split("->", 1)
+            left = left.strip()
+            if start is None:
+                start = left
+            for alternative in right.split("|"):
+                symbols = alternative.split()
+                if not symbols:
+                    raise ValueError("empty alternative in %r" % line)
+                grammar.setdefault(left, []).append([] if symbols == ["eps"] else symbols)
+        return start, grammar
+
+
+    def terminals_of(grammar):
+        """The set of symbols that appear on right sides but are not nonterminals (not keys of the grammar)."""
+        return {s for alts in grammar.values() for alt in alts for s in alt if s not in grammar}
+
+
+    def derive(grammar, start, choices):
+        """Replay a LEFTMOST derivation. Begin with the tuple (start,). For each number i in choices, replace the leftmost nonterminal of the
+        current form with the i-th alternative of its rule. Return the list of all forms (tuples), starting with (start,).
+        ValueError if there is no nonterminal left to replace or an alternative number does not exist."""
+        forms = [(start,)]
+        for i in choices:
+            form = forms[-1]
+            spot = next((k for k, s in enumerate(form) if s in grammar), None)
+            if spot is None:
+                raise ValueError("nothing left to replace")
+            alternatives = grammar[form[spot]]
+            if not 0 <= i < len(alternatives):
+                raise ValueError("no alternative %d for %s" % (i, form[spot]))
+            forms.append(form[:spot] + tuple(alternatives[i]) + form[spot + 1:])
+        return forms
+
+
+    def nullable_set(grammar):
+        """The nonterminals that can produce the empty string. Repeat until nothing changes: a nonterminal is nullable if one of its
+        alternatives is empty or consists only of nullable nonterminals."""
+        nullable = set()
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                if nt not in nullable and any(all(s in nullable for s in alt) for alt in alts):
+                    nullable.add(nt)
+                    changed = True
+        return nullable
+
+
+    def first_of_sequence(symbols, first, nullable):
+        """FIRST of a list of symbols: the set of terminals that can begin it, and a flag saying whether the whole list can vanish.
+        Go through the symbols; a terminal adds itself and stops; a nonterminal adds first[nt] and continues only if it is nullable.
+        `first` maps each nonterminal to its set; a symbol that is not a key of `first` is a terminal. Return (set, can_vanish)."""
+        result = set()
+        for s in symbols:
+            if s not in first:
+                result.add(s)
+                return result, False
+            result |= first[s]
+            if s not in nullable:
+                return result, False
+        return result, True
+
+
+    def first_sets(grammar):
+        """FIRST(A) for every nonterminal A: the terminals that can appear first in a string derived from A (the empty string is not included;
+        use nullable_set for that). Repeat over all productions until nothing changes."""
+        nullable = nullable_set(grammar)
+        first = {nt: set() for nt in grammar}
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    new, _ = first_of_sequence(alt, first, nullable)
+                    if not new <= first[nt]:
+                        first[nt] |= new
+                        changed = True
+        return first
+
+
+    def follow_sets(grammar, start):
+        """FOLLOW(A): the terminals that can appear right after A in some derivation; the end-of-input marker '$' follows the start symbol.
+        For each production X -> ... B beta: add FIRST(beta) to FOLLOW(B); if beta can vanish (or is empty) add FOLLOW(X) too. Repeat until stable."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = {nt: set() for nt in grammar}
+        follow[start].add("$")
+        changed = True
+        while changed:
+            changed = False
+            for nt, alts in grammar.items():
+                for alt in alts:
+                    for i, sym in enumerate(alt):
+                        if sym not in grammar:
+                            continue
+                        f, vanishes = first_of_sequence(alt[i + 1:], first, nullable)
+                        new = set(f)
+                        if vanishes:
+                            new |= follow[nt]
+                        if not new <= follow[sym]:
+                            follow[sym] |= new
+                            changed = True
+        return follow
+
+
+    def ll1_table(grammar, start):
+        """The predictive parsing table {(nonterminal, next terminal): alternative number}. For each production A -> alpha numbered i: put i under
+        every terminal in FIRST(alpha); if alpha can vanish also under every terminal in FOLLOW(A). If a cell would get two different alternatives
+        the grammar is not LL(1): raise ValueError naming the nonterminal and the terminal."""
+        nullable = nullable_set(grammar)
+        first = first_sets(grammar)
+        follow = follow_sets(grammar, start)
+        table = {}
+        for nt, alts in grammar.items():
+            for i, alt in enumerate(alts):
+                f, vanishes = first_of_sequence(alt, first, nullable)
+                for terminal in (f | follow[nt]) if vanishes else f:
+                    if (nt, terminal) in table and table[(nt, terminal)] != i:
+                        raise ValueError("conflict for %s on %s" % (nt, terminal))
+                    table[(nt, terminal)] = i
+        return table
+
+
+    def generate_words(grammar, start, max_len):
+        """All strings of at most max_len terminals the grammar can produce (as tuples), found by expanding the leftmost nonterminal. For testing."""
+        words = set()
+        seen = set()
+        stack = [(start,)]
+        while stack:
+            form = stack.pop()
+            if form in seen or len(form) > 2 * max_len + 4:
+                continue
+            seen.add(form)
+            if sum(1 for s in form if s not in grammar) > max_len:
+                continue
+            i = next((k for k, s in enumerate(form) if s in grammar), None)
+            if i is None:
+                words.add(form)
+                continue
+            for alt in grammar[form[i]]:
+                stack.append(form[:i] + tuple(alt) + form[i + 1:])
+        return words
+
+
+    def eliminate_left_recursion(grammar):
+        """Remove IMMEDIATE left recursion. For a nonterminal A with alternatives A -> A alpha1 | ... | beta1 | ... (the alphas follow a leading A,
+        the betas do not start with A), rewrite as A -> beta1 A' | ... and A' -> alpha1 A' | ... | eps where A' is the name A + "'". Nonterminals
+        without left recursion are copied unchanged. Keep the order of the nonterminals, putting A' right after A. Return a new grammar;
+        ValueError if every alternative of some A starts with A (nothing can ever stop the recursion)."""
+        result = {}
+        for nt, alts in grammar.items():
+            recursive = [alt[1:] for alt in alts if alt and alt[0] == nt]
+            others = [alt for alt in alts if not (alt and alt[0] == nt)]
+            if not recursive:
+                result[nt] = [list(a) for a in alts]
+                continue
+            if not others:
+                raise ValueError("%s can never stop recursing" % nt)
+            new = nt + "'"
+            result[nt] = [alt + [new] for alt in others]
+            result[new] = [alt + [new] for alt in recursive] + [[]]
+        return result
+
+
+    def is_ll1(grammar, start):
+        """True if a predictive parser can parse the grammar with one token of lookahead (the table has no conflicts)."""
+        try:
+            ll1_table(grammar, start)
+            return True
+        except ValueError:
+            return False
+  explanation: Rewriting a grammar can make it parseable without changing the language.
+commonMistakes:
+- title: Using a regular expression for nested structure
+  explanation: Balanced brackets need a grammar and a stack.
+- title: Forgetting that FIRST can include FOLLOW for nullable rules
+  explanation: An empty alternative is chosen when the next token can follow the nonterminal.
+- title: Leaving left recursion in a top-down grammar
+  explanation: The parser loops forever.
+- title: Writing an ambiguous grammar
+  explanation: Layer the rules so every sentence has one parse tree.
+- title: Treating FIRST sets as including epsilon
+  explanation: Track nullability separately so the sets only hold real tokens.
+summary:
+- Context-free grammars describe nested structure that regular expressions cannot.
+- A parse tree records which rules built a sentence; ambiguity means two trees.
+- FIRST, FOLLOW and nullable sets let a parser choose a rule from one token of lookahead.
+- An LL(1) table and a recursive procedure give a predictive parser.
+- Left recursion must be removed for top-down parsing.
+next: u23-pratt
+quiz:
+- type: mcq
+  question: What do nonterminals stand for?
+  options:
+  - Kinds of phrases defined by rules
+  - Tokens in the input
+  - Errors
+  - Numbers
+  answer: 0
+  explanation: Terminals are the tokens; nonterminals are names for phrases.
+- type: mcq
+  question: A grammar is ambiguous when...
+  options:
+  - a sentence has two different parse trees
+  - it is too long
+  - it has a nonterminal with no rule
+  - it uses epsilon
+  answer: 0
+  explanation: The same tokens could mean two things.
+- type: mcq
+  question: What is LL(1) lookahead?
+  options:
+  - One token of lookahead decides every choice
+  - One level of nesting
+  - One rule per nonterminal
+  - One terminal in the grammar
+  answer: 0
+  explanation: No guessing or backtracking is needed.
+- type: mcq
+  question: Why is E -> E + T a problem for a top-down parser?
+  options:
+  - It recurses without consuming input
+  - It is ambiguous
+  - It has no terminals
+  - It is too short
+  answer: 0
+  explanation: The parser would expand E forever.
+- type: mcq
+  question: When is an empty alternative chosen in the table?
+  options:
+  - When the next token is in FOLLOW of the nonterminal
+  - When the input is empty always
+  - Never
+  - When the next token is in FIRST of everything
+  answer: 0
+  explanation: The nonterminal vanishes and the parent continues.
+- type: mcq
+  question: What is a parse tree?
+  options:
+  - The structure showing which rules built the sentence
+  - A list of tokens
+  - A symbol table
+  - A type checker
+  answer: 0
+  explanation: It is the output of the parser.
+- type: code
+  question: Write `is_balanced(text)` returning True if the brackets `(`, `[` and `{` in `text` are properly nested and closed (ignore every other character). A grammar would say `S -> ( S ) S | [ S ] S | { S } S | eps`; use a stack.
+  starter: |
+    def is_balanced(text):
+        pass
+  tests:
+  - name: balanced
+    code: |
+      assert is_balanced("") and is_balanced("([]{})") and is_balanced("a(b)c[d]")
+      assert not is_balanced("(") and not is_balanced(")(") and not is_balanced("([)]") and not is_balanced("{[}")
+      assert is_balanced("((()))()") and not is_balanced("(()")
+  solution: |
+    def is_balanced(text):
+        pairs = {')': '(', ']': '[', '}': '{'}
+        stack = []
+        for ch in text:
+            if ch in '([{':
+                stack.append(ch)
+            elif ch in pairs:
+                if not stack or stack.pop() != pairs[ch]:
+                    return False
+        return not stack
