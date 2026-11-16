@@ -36,6 +36,7 @@ export default function Layout({ route, children }) {
         <nav className={menuOpen ? 'open' : ''}>
           {link(href.dashboard(), 'Dashboard', 'dashboard')}
           {link(href.review(), 'Review', 'review', due)}
+          {link(href.placement(), 'Placement', 'placement')}
           {link(href.exams(), 'Exams', 'exams')}
           {link(href.capstones(), 'Capstones', 'capstones')}
           {link(href.reading(), 'Reading', 'reading')}

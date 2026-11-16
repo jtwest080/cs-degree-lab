@@ -6,6 +6,7 @@ import Dashboard from './components/Dashboard.jsx';
 import LessonView from './components/LessonView.jsx';
 import ProjectView from './components/ProjectView.jsx';
 import Review from './components/Review.jsx';
+import Placement from './components/Placement.jsx';
 import Exams from './components/Exams.jsx';
 import { CapstoneList, CapstoneView } from './components/Capstones.jsx';
 import Reading from './components/Reading.jsx';
@@ -39,6 +40,9 @@ export default function App() {
       break;
     case 'review':
       page = <Review />;
+      break;
+    case 'placement':
+      page = <Placement />;
       break;
     case 'exams':
       page = <Exams />;

@@ -108,7 +108,13 @@ export default function Dashboard() {
         <div className="stat"><div className="stat-num">{due}</div><div className="stat-label">reviews due</div></div>
       </section>
 
-      <h2 className="section-title">Your degree: 18 units</h2>
+      {stats.lessonsDone < 30 && (
+        <p className="card muted">
+          Already know some Python or web basics? <a href={href.placement()}>Take a placement check</a> to skip what you know.
+        </p>
+      )}
+
+      <h2 className="section-title">Your degree: {units.length} units</h2>
       <div className="units">
         {units.map((u) => (
           <UnitCard key={u.number} unit={u} progress={progress} defaultOpen={u.number === currentUnit} />
