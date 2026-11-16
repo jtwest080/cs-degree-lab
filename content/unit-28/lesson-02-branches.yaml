@@ -1,0 +1,2447 @@
+id: u28-branches
+title: Branches and History
+minutes: 100
+objective: Learn that a branch is only a label on a commit, and use that to understand `git branch`, `git switch`, `git log` and `git status`. You will build history walking, branch management, ancestor queries and the 'ahead and behind' counts that GitHub shows.
+outcomes:
+- Walk a commit history
+- Create, list, switch and delete branches
+- Compute ancestors and commit ranges
+- Explain what git status compares
+- Count how far two branches have diverged
+sections:
+- heading: History and the log
+  body: |-
+    Each commit stores the hash of its parent, so history is a chain you can walk backwards: start at the newest commit, read its parent, read that parent's parent, and stop at the first commit, which has none. That walk is exactly what `git log` does. The version `git log --oneline` prints one short line per commit: the first seven characters of the hash and the first line of the message.
+
+    ```bash
+    git log --oneline
+    # 3f2a9c1 Add search box
+    # b81d0e4 Fix typo in header
+    # 9a7c5d2 First version
+    ```
+
+    A good **commit message** is a short summary line (under about 50 characters, in the imperative: "Add search box", not "added stuff"), then optionally an empty line and a longer explanation of *why*. Months later you will read these to understand what the project did and why.
+- heading: A branch is a sticky note
+  body: |-
+    Working on a new idea in the main version of a project is risky: if it goes wrong, everyone is affected. A **branch** is a separate line of development. You try your idea on your own branch and join it back into the main one only when it works.
+
+    The surprising thing is how cheap this is. A branch is not a copy of the files. It is just a **name that points at one commit**, like a sticky note on a page of the history. `HEAD` is the pointer that says which branch you are on now. When you commit, Git creates the new commit with the current commit as its parent and then moves the sticky note of your current branch forward to it. Other branches stay where they were.
+
+    ```bash
+    git branch                 # list branches; * marks the current one
+    git switch -c idea         # create a branch called idea and move to it
+    git switch main            # go back to main
+    git branch -d idea         # delete the label (the commits are kept)
+    ```
+
+    In the main branch of most projects (called `main` or older `master`) work is finished and stable; feature branches hold work in progress.
+- heading: What git status compares
+  body: |-
+    You edit files in your **working folder**. Git does not see those edits as history until you commit them, so there are three places: the working folder (what you are editing), the **staging area** (what you chose to include in the next commit with `git add`) and the **repository** (the saved commits). Our simplified model skips the staging area and compares the working folder with the newest commit.
+
+    `git status` reports the difference: files that are **new**, **modified** or **deleted** since the last commit. If it prints nothing to commit, the working folder is **clean**. Git will refuse to switch branches if that would overwrite changes you have not saved, which protects you from losing work.
+
+    Because history is a graph, you can also ask about relationships: which commits are on my branch but not on `main`? That set difference is what GitHub shows as "2 commits ahead, 1 commit behind". It will be the heart of merging in the next lesson.
+examples:
+- title: Branches and the log
+  intro: Make a branch, commit on it and compare the logs of both branches.
+  code: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+    def log_hashes(repo, start=None):
+        """The HISTORY of a branch: starting at `start` (a commit hash; by default the newest commit of the current branch) follow the FIRST parent again and again and return the list of commit hashes, newest first. An empty list if the branch has no commits."""
+        h = start if start is not None else repo["branches"][repo["head"]]
+        out = []
+        while h:
+            out.append(h)
+            parents = read_commit(repo["store"], h)["parents"]
+            h = parents[0] if parents else None
+        return out
+
+
+    def log_lines(repo, start=None):
+        """What `git log --oneline` prints: for each commit of log_hashes, the 7-character short hash, a space and the FIRST line of its message."""
+        lines = []
+        for h in log_hashes(repo, start):
+            msg = read_commit(repo["store"], h)["message"].split("\n")[0]
+            lines.append(short_hash(h) + " " + msg)
+        return lines
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        return [("* " if n == repo["head"] else "  ") + n for n in sorted(repo["branches"])]
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        if name == repo["head"]:
+            raise ValueError("cannot delete current branch")
+        del repo["branches"][name]
+
+    repo = new_repo()
+    commit_snapshot(repo, {"notes.txt": "start\n"}, "Start the notes", "Ada")
+    commit_snapshot(repo, {"notes.txt": "start\nmore\n"}, "Add more", "Ada")
+    create_branch(repo, "idea")
+    switch(repo, "idea")
+    commit_snapshot(repo, {"notes.txt": "start\nmore\nidea\n"}, "Try an idea", "Ada")
+    print(list_branches(repo))
+    for line in log_lines(repo):
+        print(line[8:])
+    switch(repo, "main")
+    print("main log:", [line[8:] for line in log_lines(repo)])
+  output: |
+    ['* idea', '  main']
+    Try an idea
+    Add more
+    Start the notes
+    main log: ['Add more', 'Start the notes']
+  lines:
+  - line: 174
+    note: The new branch points at the same commit as main.
+  - line: 177
+    note: The star marks the branch you are on.
+  - line: 178
+    note: The idea branch sees all three commits.
+  - line: 181
+    note: 'Main has not moved: it only sees two commits.'
+- title: Ahead and behind
+  intro: Two branches that have gone different ways.
+  code: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        return [("* " if n == repo["head"] else "  ") + n for n in sorted(repo["branches"])]
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        if name == repo["head"]:
+            raise ValueError("cannot delete current branch")
+        del repo["branches"][name]
+
+
+    def ancestors(store, h):
+        """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+        seen = set()
+        todo = [h]
+        while todo:
+            c = todo.pop()
+            if c not in seen:
+                seen.add(c)
+                todo.extend(read_commit(store, c)["parents"])
+        return seen
+
+
+    def is_ancestor(store, a, b):
+        """True if commit a is in the history of commit b (or is b itself)."""
+        return a in ancestors(store, b)
+
+
+    def commits_not_in(store, a, b):
+        """The set of commits reachable from a that are NOT reachable from b (what `git log b..a` lists)."""
+        return ancestors(store, a) - ancestors(store, b)
+
+
+    def reachable_commits(repo):
+        """The set of ALL commit hashes reachable from any branch."""
+        out = set()
+        for tip in repo["branches"].values():
+            if tip:
+                out |= ancestors(repo["store"], tip)
+        return out
+
+
+    def ahead_behind(repo, a, b):
+        """Compare two BRANCHES by name. Return (ahead, behind): ahead is how many commits are in a but not in b, behind how many are in b but not in a. (A branch with no commits has an empty history.) ValueError('no such branch') if either is unknown."""
+        for n in (a, b):
+            if n not in repo["branches"]:
+                raise ValueError("no such branch")
+        ta, tb = repo["branches"][a], repo["branches"][b]
+        sa = ancestors(repo["store"], ta) if ta else set()
+        sb = ancestors(repo["store"], tb) if tb else set()
+        return len(sa - sb), len(sb - sa)
+
+
+    def branch_summary(repo):
+        """A dict {branch name: {"tip": short hash or None, "commits": number of commits in its whole history (all parents), "current": True/False}} for every branch."""
+        out = {}
+        for name, tip in repo["branches"].items():
+            n = len(ancestors(repo["store"], tip)) if tip else 0
+            out[name] = {"tip": short_hash(tip) if tip else None, "commits": n, "current": name == repo["head"]}
+        return out
+
+    repo = new_repo()
+    c1 = commit_snapshot(repo, {"a": "1"}, "one", "Ada")
+    create_branch(repo, "feature")
+    commit_snapshot(repo, {"a": "2"}, "main two", "Ada")
+    switch(repo, "feature")
+    f1 = commit_snapshot(repo, {"a": "1", "f": "x"}, "feature one", "Bo")
+    f2 = commit_snapshot(repo, {"a": "1", "f": "y"}, "feature two", "Bo")
+    print("feature is ahead/behind main by:", ahead_behind(repo, "feature", "main"))
+    print("commits only on feature:", len(commits_not_in(repo["store"], f2, repo["branches"]["main"])))
+    print("is the first commit shared?", is_ancestor(repo["store"], c1, f2) and is_ancestor(repo["store"], c1, repo["branches"]["main"]))
+    for name, info in sorted(branch_summary(repo).items()):
+        print(name, str(info["commits"]) + " commits" + (" (current)" if info["current"] else ""))
+  output: |
+    feature is ahead/behind main by: (2, 1)
+    commits only on feature: 2
+    is the first commit shared? True
+    feature 3 commits (current)
+    main 2 commits
+  lines:
+  - line: 206
+    note: The branch starts where main is.
+  - line: 207
+    note: main moves on.
+  - line: 211
+    note: Two commits only on feature, one only on main.
+  - line: 212
+    note: The same set difference counted another way.
+  - line: 213
+    note: Both branches share the first commit.
+  - line: 214
+    note: History size of each branch.
+playground:
+  prompt: Make a list of commit messages and print them like git log.
+  code: |
+    log = ['Add search box', 'Fix typo', 'First version']
+    for i, m in enumerate(log):
+        print(i, m)
+exercises:
+- id: log
+  title: History and the log
+  difficulty: 3
+  prompt: 'Every commit points at its parent, so a branch''s **history** is a chain you can walk. All the earlier helpers are given. Write `log_hashes(repo, start=None)`: starting at `start` (a commit hash; by default the newest commit of the current branch) follow the **first parent** again and again and return the list of commit hashes, newest first (an empty list if the branch has no commits). Write `log_lines(repo, start=None)`: what `git log --oneline` prints: for each commit the 7-character short hash, a space, and the **first line** of its message.'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+
+
+    def log_hashes(repo, start=None):
+        """The HISTORY of a branch: starting at `start` (a commit hash; by default the newest commit of the current branch) follow the FIRST parent again and again and return the list of commit hashes, newest first. An empty list if the branch has no commits."""
+        pass
+
+
+    def log_lines(repo, start=None):
+        """What `git log --oneline` prints: for each commit of log_hashes, the 7-character short hash, a space and the FIRST line of its message."""
+        pass
+  tests:
+  - name: walking back
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      assert log_hashes(r) == [c3, c2, c1] and log_hashes(r, c2) == [c2, c1] and log_hashes(r, c1) == [c1]
+      assert log_hashes(new_repo()) == []
+  - name: one-line log
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      assert log_lines(r) == [c3[:7] + " third", c2[:7] + " second", c1[:7] + " first"]
+      assert log_lines(r, c2) == [c2[:7] + " second", c1[:7] + " first"] and log_lines(new_repo()) == []
+  - name: merge commits follow the first parent
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      t = make_tree(r["store"], {"a": "m"})
+      m = make_commit(r["store"], t, [c1, c3], "merge", "Bo", 9)
+      assert log_hashes(r, m) == [m, c1]
+  hints:
+  - Stop when a commit has no parents.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+
+
+    def log_hashes(repo, start=None):
+        """The HISTORY of a branch: starting at `start` (a commit hash; by default the newest commit of the current branch) follow the FIRST parent again and again and return the list of commit hashes, newest first. An empty list if the branch has no commits."""
+        h = start if start is not None else repo["branches"][repo["head"]]
+        out = []
+        while h:
+            out.append(h)
+            parents = read_commit(repo["store"], h)["parents"]
+            h = parents[0] if parents else None
+        return out
+
+
+    def log_lines(repo, start=None):
+        """What `git log --oneline` prints: for each commit of log_hashes, the 7-character short hash, a space and the FIRST line of its message."""
+        lines = []
+        for h in log_hashes(repo, start):
+            msg = read_commit(repo["store"], h)["message"].split("\n")[0]
+            lines.append(short_hash(h) + " " + msg)
+        return lines
+  explanation: 'git log is just this loop: start at a commit and keep stepping to the parent.'
+- id: branches
+  title: Branches are just labels
+  difficulty: 4
+  prompt: 'A **branch** is only a name that points at a commit, and `repo["head"]` says which branch you are on. The earlier helpers are given. Write `create_branch(repo, name)`: make a new branch that points at the current branch''s newest commit (it does not switch); `ValueError("branch exists")` if the name is taken and `ValueError("no commits yet")` if the current branch has no commit (check "branch exists" first). Write `switch(repo, name)`: make `name` the current branch; `ValueError("no such branch")` if it does not exist. Write `list_branches(repo)`: what `git branch` prints: one string per branch, sorted by name, `"* name"` for the current branch and two spaces then the name for the others. Write `delete_branch(repo, name)`: delete a branch label (the commits stay in the store); `ValueError("no such branch")` if missing and `ValueError("cannot delete current branch")` for the branch you are on (check "no such branch" first).'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        pass
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        pass
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        pass
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        pass
+  tests:
+  - name: create and switch
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      create_branch(r, "feature")
+      assert r["branches"]["feature"] == c3 and r["head"] == "main"
+      switch(r, "feature")
+      c4 = commit_snapshot(r, {"a": "4\n"}, "on feature", "Ada")
+      assert r["branches"]["feature"] == c4 and r["branches"]["main"] == c3 and read_commit(r["store"], c4)["parents"] == [c3]
+      for fn, args, msg in ((create_branch, ("feature",), "branch exists"), (switch, ("nope",), "no such branch")):
+          try:
+              fn(r, *args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+      try:
+          create_branch(new_repo(), "x")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no commits yet" in str(e)
+  - name: listing
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      assert list_branches(r) == ["* main"]
+      create_branch(r, "zeta"); create_branch(r, "alpha")
+      assert list_branches(r) == ["  alpha", "* main", "  zeta"]
+      switch(r, "zeta")
+      assert list_branches(r) == ["  alpha", "  main", "* zeta"]
+  - name: deleting
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      create_branch(r, "old")
+      delete_branch(r, "old")
+      assert "old" not in r["branches"] and c3 in r["store"]
+      for name, msg in (("main", "cannot delete current branch"), ("old", "no such branch")):
+          try:
+              delete_branch(r, name)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  hints:
+  - A branch is a dict entry from name to hash.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        return [("* " if n == repo["head"] else "  ") + n for n in sorted(repo["branches"])]
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        if name == repo["head"]:
+            raise ValueError("cannot delete current branch")
+        del repo["branches"][name]
+  explanation: Because a branch is only a label, creating one is instant and costs almost nothing.
+- id: ancestry
+  title: Ancestors and ranges
+  difficulty: 5
+  prompt: 'Commits form a graph, and merges give a commit **several parents**. All the earlier helpers are given. Write `ancestors(store, h)`: the **set** of commit hashes reachable from `h` by following **all** parents, including `h` itself. Write `is_ancestor(store, a, b)`: true if commit `a` is in the history of commit `b` (or is `b`). Write `commits_not_in(store, a, b)`: the set of commits reachable from `a` that are **not** reachable from `b` (this is what `git log b..a` lists).'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+
+
+    def ancestors(store, h):
+        """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+        pass
+
+
+    def is_ancestor(store, a, b):
+        """True if commit a is in the history of commit b (or is b itself)."""
+        pass
+
+
+    def commits_not_in(store, a, b):
+        """The set of commits reachable from a that are NOT reachable from b (what `git log b..a` lists)."""
+        pass
+  tests:
+  - name: ancestors
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      s = r["store"]
+      assert ancestors(s, c3) == {c1, c2, c3} and ancestors(s, c1) == {c1}
+      t = make_tree(s, {"z": "z"})
+      side = make_commit(s, t, [c1], "side", "Bo", 7)
+      m = make_commit(s, t, [c3, side], "merge", "Ada", 8)
+      assert ancestors(s, m) == {c1, c2, c3, side, m}
+  - name: is ancestor
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      s = r["store"]
+      assert is_ancestor(s, c1, c3) and is_ancestor(s, c3, c3) and not is_ancestor(s, c3, c1) and is_ancestor(s, c2, c3)
+  - name: ranges
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      s = r["store"]
+      t = make_tree(s, {"z": "z"})
+      side = make_commit(s, t, [c1], "side", "Bo", 7)
+      assert commits_not_in(s, c3, c1) == {c2, c3} and commits_not_in(s, c3, side) == {c2, c3} and commits_not_in(s, side, c3) == {side}
+      assert commits_not_in(s, c1, c3) == set() and commits_not_in(s, c3, c3) == set()
+  hints:
+  - Keep a set of commits you have already seen so that you never visit one twice.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+
+
+    def ancestors(store, h):
+        """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+        seen = set()
+        todo = [h]
+        while todo:
+            c = todo.pop()
+            if c not in seen:
+                seen.add(c)
+                todo.extend(read_commit(store, c)["parents"])
+        return seen
+
+
+    def is_ancestor(store, a, b):
+        """True if commit a is in the history of commit b (or is b itself)."""
+        return a in ancestors(store, b)
+
+
+    def commits_not_in(store, a, b):
+        """The set of commits reachable from a that are NOT reachable from b (what `git log b..a` lists)."""
+        return ancestors(store, a) - ancestors(store, b)
+  explanation: Everything about branches and merges (what is shared, what is new) is a question about ancestor sets.
+- id: status
+  title: Uncommitted work
+  difficulty: 4
+  prompt: 'The **working folder** is what you are editing now; the **repository** only knows what you committed. The earlier helpers are given. Write `status(repo, working)`: what `git status` reports: compare the working folder (a dict `{path: text}`) with the files of the current branch''s newest commit (an empty folder if there is no commit) and return `file_changes(...)`: the added, modified and deleted paths. Write `is_clean(repo, working)`: true when there are no changes at all. Write `safe_switch(repo, name, working)`: like `git switch`, but refuse to lose uncommitted work: `ValueError("uncommitted changes")` if the folder is not clean (check this **first**), `ValueError("no such branch")` for an unknown branch; otherwise make it the current branch and return the dict of files of its newest commit (an empty dict if it has none).'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        return [("* " if n == repo["head"] else "  ") + n for n in sorted(repo["branches"])]
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        if name == repo["head"]:
+            raise ValueError("cannot delete current branch")
+        del repo["branches"][name]
+
+
+
+
+    def status(repo, working):
+        """What `git status` reports: compare the folder you are editing (`working`, a dict {path: text}) with the files of the current branch's newest commit (an empty folder if there is no commit). Return file_changes(tip files, working): the added, modified and deleted paths."""
+        pass
+
+
+    def is_clean(repo, working):
+        """True when there are no changes at all."""
+        pass
+
+
+    def safe_switch(repo, name, working):
+        """Switch to a branch, like `git switch`, but refuse if you would lose uncommitted work: ValueError('uncommitted changes') if the working folder is not clean (check this first); ValueError('no such branch') for an unknown branch. Otherwise make it the current branch and return the dict of files of its newest commit (an empty dict if it has none)."""
+        pass
+  tests:
+  - name: status
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      assert status(r, {"a": "3\n"}) == {"added": [], "modified": [], "deleted": []}
+      assert status(r, {"a": "edited\n", "new.txt": "n"}) == {"added": ["new.txt"], "modified": ["a"], "deleted": []}
+      assert status(r, {}) == {"added": [], "modified": [], "deleted": ["a"]}
+      assert status(new_repo(), {"x": "1"}) == {"added": ["x"], "modified": [], "deleted": []} and status(new_repo(), {}) == {"added": [], "modified": [], "deleted": []}
+      assert is_clean(r, {"a": "3\n"}) and not is_clean(r, {"a": "x"}) and not is_clean(r, {"a": "3\n", "b": "1"})
+  - name: safe switching
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      create_branch(r, "feature")
+      switch(r, "feature")
+      commit_snapshot(r, {"a": "3\n", "f": "feature file"}, "feat", "Ada")
+      files = safe_switch(r, "main", {"a": "3\n", "f": "feature file"})
+      assert r["head"] == "main" and files == {"a": "3\n"}
+      for working, name, msg in (({"a": "dirty"}, "feature", "uncommitted changes"), ({"a": "3\n"}, "nope", "no such branch"), ({"a": "dirty"}, "nope", "uncommitted changes")):
+          try:
+              safe_switch(r, name, working)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+      assert r["head"] == "main"
+  - name: an empty branch
+    code: |
+      r = new_repo()
+      r["branches"]["empty"] = None
+      assert safe_switch(r, "empty", {}) == {} and r["head"] == "empty"
+  hints:
+  - Compare with the files of the newest commit, or with {} if the branch has none.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        return [("* " if n == repo["head"] else "  ") + n for n in sorted(repo["branches"])]
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        if name == repo["head"]:
+            raise ValueError("cannot delete current branch")
+        del repo["branches"][name]
+
+
+
+
+    def status(repo, working):
+        """What `git status` reports: compare the folder you are editing (`working`, a dict {path: text}) with the files of the current branch's newest commit (an empty folder if there is no commit). Return file_changes(tip files, working): the added, modified and deleted paths."""
+        tip = repo["branches"][repo["head"]]
+        base = snapshot_of(repo, tip) if tip else {}
+        return file_changes(base, working)
+
+
+    def is_clean(repo, working):
+        """True when there are no changes at all."""
+        s = status(repo, working)
+        return not (s["added"] or s["modified"] or s["deleted"])
+
+
+    def safe_switch(repo, name, working):
+        """Switch to a branch, like `git switch`, but refuse if you would lose uncommitted work: ValueError('uncommitted changes') if the working folder is not clean (check this first); ValueError('no such branch') for an unknown branch. Otherwise make it the current branch and return the dict of files of its newest commit (an empty dict if it has none)."""
+        if not is_clean(repo, working):
+            raise ValueError("uncommitted changes")
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+        tip = repo["branches"][name]
+        return snapshot_of(repo, tip) if tip else {}
+  explanation: Git refuses to switch when it would overwrite changes you have not saved; this check protects your work.
+- id: graph
+  title: 'Capstone: seeing the whole graph'
+  difficulty: 5
+  prompt: 'All the earlier helpers are given. Write `reachable_commits(repo)`: the set of **all** commit hashes reachable from **any** branch. Write `ahead_behind(repo, a, b)`: compare two **branches** by name and return `(ahead, behind)`: how many commits are in `a` but not in `b`, and how many are in `b` but not in `a` (a branch without commits has an empty history); `ValueError("no such branch")` if either is unknown. Write `branch_summary(repo)`: a dict `{branch name: {"tip": short hash or None, "commits": number of commits in its whole history (all parents), "current": True or False}}`.'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        return [("* " if n == repo["head"] else "  ") + n for n in sorted(repo["branches"])]
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        if name == repo["head"]:
+            raise ValueError("cannot delete current branch")
+        del repo["branches"][name]
+
+
+    def ancestors(store, h):
+        """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+        seen = set()
+        todo = [h]
+        while todo:
+            c = todo.pop()
+            if c not in seen:
+                seen.add(c)
+                todo.extend(read_commit(store, c)["parents"])
+        return seen
+
+
+    def is_ancestor(store, a, b):
+        """True if commit a is in the history of commit b (or is b itself)."""
+        return a in ancestors(store, b)
+
+
+    def commits_not_in(store, a, b):
+        """The set of commits reachable from a that are NOT reachable from b (what `git log b..a` lists)."""
+        return ancestors(store, a) - ancestors(store, b)
+
+
+
+
+    def reachable_commits(repo):
+        """The set of ALL commit hashes reachable from any branch."""
+        pass
+
+
+    def ahead_behind(repo, a, b):
+        """Compare two BRANCHES by name. Return (ahead, behind): ahead is how many commits are in a but not in b, behind how many are in b but not in a. (A branch with no commits has an empty history.) ValueError('no such branch') if either is unknown."""
+        pass
+
+
+    def branch_summary(repo):
+        """A dict {branch name: {"tip": short hash or None, "commits": number of commits in its whole history (all parents), "current": True/False}} for every branch."""
+        pass
+  tests:
+  - name: reachable
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      create_branch(r, "feature"); switch(r, "feature")
+      c4 = commit_snapshot(r, {"a": "4"}, "f1", "Ada")
+      assert reachable_commits(r) == {c1, c2, c3, c4}
+      assert reachable_commits(new_repo()) == set()
+      r["branches"]["lonely"] = None
+      assert reachable_commits(r) == {c1, c2, c3, c4}
+  - name: ahead and behind
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      create_branch(r, "feature"); switch(r, "feature")
+      commit_snapshot(r, {"a": "4"}, "f1", "Ada"); commit_snapshot(r, {"a": "5"}, "f2", "Ada")
+      switch(r, "main")
+      commit_snapshot(r, {"a": "m"}, "m1", "Bo")
+      assert ahead_behind(r, "feature", "main") == (2, 1) and ahead_behind(r, "main", "feature") == (1, 2) and ahead_behind(r, "main", "main") == (0, 0)
+      r["branches"]["new"] = None
+      assert ahead_behind(r, "new", "main") == (0, 4) and ahead_behind(r, "main", "new") == (4, 0)
+      try:
+          ahead_behind(r, "main", "zzz")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no such branch" in str(e)
+  - name: summary
+    code: |
+      def build():
+          r = new_repo()
+          c1 = commit_snapshot(r, {"a": "1\n"}, "first\n\nlong body", "Ada")
+          c2 = commit_snapshot(r, {"a": "2\n"}, "second", "Ada")
+          c3 = commit_snapshot(r, {"a": "3\n"}, "third", "Ada")
+          return r, c1, c2, c3
+
+      r, c1, c2, c3 = build()
+      create_branch(r, "feature"); switch(r, "feature")
+      c4 = commit_snapshot(r, {"a": "4"}, "f1", "Ada")
+      r["branches"]["empty"] = None
+      s = branch_summary(r)
+      assert s == {"main": {"tip": c3[:7], "commits": 3, "current": False}, "feature": {"tip": c4[:7], "commits": 4, "current": True}, "empty": {"tip": None, "commits": 0, "current": False}}
+  hints:
+  - 'Use sets: subtracting one set of ancestors from another gives the commits that are only on one side.'
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+    def create_branch(repo, name):
+        """Make a new branch that points at the current branch's newest commit (it does not switch to it). ValueError('branch exists') if the name is taken; ValueError('no commits yet') if the current branch has no commit to point at. (Check 'branch exists' first.)"""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch. ValueError('no such branch') if it does not exist."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def list_branches(repo):
+        """What `git branch` prints: one string per branch, sorted by name, `* name` for the current branch and two spaces and the name for the others."""
+        return [("* " if n == repo["head"] else "  ") + n for n in sorted(repo["branches"])]
+
+
+    def delete_branch(repo, name):
+        """Delete a branch label (the commits stay in the store). ValueError('no such branch') if missing; ValueError('cannot delete current branch') for the branch you are on. (Check 'no such branch' first.)"""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        if name == repo["head"]:
+            raise ValueError("cannot delete current branch")
+        del repo["branches"][name]
+
+
+    def ancestors(store, h):
+        """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+        seen = set()
+        todo = [h]
+        while todo:
+            c = todo.pop()
+            if c not in seen:
+                seen.add(c)
+                todo.extend(read_commit(store, c)["parents"])
+        return seen
+
+
+    def is_ancestor(store, a, b):
+        """True if commit a is in the history of commit b (or is b itself)."""
+        return a in ancestors(store, b)
+
+
+    def commits_not_in(store, a, b):
+        """The set of commits reachable from a that are NOT reachable from b (what `git log b..a` lists)."""
+        return ancestors(store, a) - ancestors(store, b)
+
+
+
+
+    def reachable_commits(repo):
+        """The set of ALL commit hashes reachable from any branch."""
+        out = set()
+        for tip in repo["branches"].values():
+            if tip:
+                out |= ancestors(repo["store"], tip)
+        return out
+
+
+    def ahead_behind(repo, a, b):
+        """Compare two BRANCHES by name. Return (ahead, behind): ahead is how many commits are in a but not in b, behind how many are in b but not in a. (A branch with no commits has an empty history.) ValueError('no such branch') if either is unknown."""
+        for n in (a, b):
+            if n not in repo["branches"]:
+                raise ValueError("no such branch")
+        ta, tb = repo["branches"][a], repo["branches"][b]
+        sa = ancestors(repo["store"], ta) if ta else set()
+        sb = ancestors(repo["store"], tb) if tb else set()
+        return len(sa - sb), len(sb - sa)
+
+
+    def branch_summary(repo):
+        """A dict {branch name: {"tip": short hash or None, "commits": number of commits in its whole history (all parents), "current": True/False}} for every branch."""
+        out = {}
+        for name, tip in repo["branches"].items():
+            n = len(ancestors(repo["store"], tip)) if tip else 0
+            out[name] = {"tip": short_hash(tip) if tip else None, "commits": n, "current": name == repo["head"]}
+        return out
+  explanation: The numbers next to a branch on GitHub ("2 ahead, 1 behind") are computed exactly like this.
+commonMistakes:
+- title: Thinking a branch is a copy of the project
+  explanation: A branch is only a pointer to a commit.
+- title: Deleting a branch and thinking the work is gone
+  explanation: The commits stay until Git cleans up unreachable ones.
+- title: Switching branches with uncommitted changes
+  explanation: Commit or stash first.
+- title: Committing on the wrong branch
+  explanation: Check git status before you commit.
+- title: Vague commit messages
+  explanation: Say what changed.
+summary:
+- History is a chain of commits, each pointing to its parent.
+- A branch is a name that points at a commit; HEAD says which one you are on.
+- Committing moves the current branch forward.
+- git status compares your working folder with the last commit.
+- Ahead and behind counts come from set differences of ancestors.
+next: u28-diff
+quiz:
+- type: mcq
+  question: What is a branch?
+  options:
+  - A name that points at one commit
+  - A copy of every file
+  - A remote server
+  - A kind of commit message
+  answer: 0
+  explanation: A sticky note on the history.
+- type: mcq
+  question: What does committing do to the current branch?
+  options:
+  - Moves it forward to the new commit
+  - Deletes it
+  - Creates a copy
+  - Nothing
+  answer: 0
+  explanation: The label moves.
+- type: mcq
+  question: What does git status report?
+  options:
+  - Differences between the working folder and the last commit
+  - The remote's name
+  - The hash of the first commit
+  - The size of the repo
+  answer: 0
+  explanation: Added, modified, deleted.
+- type: mcq
+  question: What does HEAD tell you?
+  options:
+  - Which branch or commit you are on now
+  - The newest file
+  - The author
+  - The error
+  answer: 0
+  explanation: It is the current position.
+- type: mcq
+  question: What does 'two commits ahead' mean?
+  options:
+  - Your branch has two commits the other lacks
+  - You have two files more
+  - Two people changed a file
+  - The remote is broken
+  answer: 0
+  explanation: A set difference.
+- type: mcq
+  question: Why does Git refuse to switch with uncommitted changes sometimes?
+  options:
+  - It would overwrite work that is not saved
+  - It is slow
+  - The branch is private
+  - The names clash
+  answer: 0
+  explanation: It protects your edits.
+- type: code
+  question: Write `first_line(message)` returning the first line of a commit message with surrounding spaces removed; an empty message gives an empty string.
+  starter: |
+    def first_line(message):
+        pass
+  tests:
+  - name: first line
+    code: |
+      assert first_line("Add search\n\nLong text") == "Add search" and first_line("  hi  ") == "hi" and first_line("") == "" and first_line("\nbody") == ""
+  solution: |
+    def first_line(message):
+        return message.split("\n")[0].strip()

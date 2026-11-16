@@ -1,0 +1,1355 @@
+id: u28-collab
+title: 'Teamwork: Reviews, Issues and Automation'
+minutes: 100
+objective: 'Learn how teams use Git and GitHub together: code owners and reviews, healthy pull requests, issues and searching them, cleaning up branches, and continuous integration that runs tests automatically before anything is merged.'
+outcomes:
+- Explain code review and code owners
+- Judge the size and quality of a pull request
+- Search and label issues
+- Clean up old branches
+- Describe continuous integration
+sections:
+- heading: Code review
+  body: |-
+    Writing code is only half of engineering; the other half is reading it. In a **code review** a teammate reads your change before it is merged. Studies and experience agree that reviews find bugs early, spread knowledge so that nobody is the only person who understands a part, and keep the style of a project consistent. A review is not a test of you; it is a way of making the code better together.
+
+    What makes a change reviewable? It is **small** (reviewers lose focus after a few hundred lines), it does **one thing**, it has a clear title and a description that explains *why*, and it comes with **tests**. As a reviewer: read the description first, then the tests, then the code; be kind and specific; ask questions instead of giving orders; separate must-fix problems from taste.
+
+    Large projects add a **CODEOWNERS** file that says who must approve changes to which files, so changes to the payment code always reach the payment team.
+- heading: Issues and project hygiene
+  body: |-
+    An **issue** is a tracked piece of work: a bug report, a feature request or a question. Good bug reports say what you did, what you expected and what happened instead, ideally with the smallest example that shows the problem. **Labels** such as `bug`, `enhancement` or `question` help teams sort them (called **triage**) and a search box with filters like `label:bug state:open` finds them again. A pull request can say "Fixes #42" in its description, and GitHub then closes issue 42 automatically when the PR is merged.
+
+    Repositories also need housekeeping. Merged branches should be deleted: the commits are safe in `main`, only the label goes. Long-forgotten branches suggest abandoned work that someone should either finish or close. Releases are tagged (`v1.4.2`), and a README explains what the project is and how to run it.
+- heading: Continuous integration
+  body: |-
+    Humans forget to run the tests. **Continuous integration (CI)** makes a machine do it: whenever you push or open a pull request, a service such as **GitHub Actions** starts a fresh computer, installs the project, runs the tests and linters, and reports a green tick or a red cross on the pull request. Combined with **branch protection**, a change that fails the checks simply cannot be merged.
+
+    A CI **workflow** is a file in the repository (in `.github/workflows/`), written in YAML, made of **jobs**, each a list of **steps** (check out the code, install, run tests). Jobs may **need** other jobs: deploying must wait for the tests. So a pipeline is a graph of dependencies, and running it means a **topological sort**, the same algorithm that decides the order in which you must take courses. If a job fails, jobs that depend on it are **skipped**.
+
+    ```text
+    build -> test -> deploy
+    lint --------->
+    ```
+
+    **Continuous delivery** goes one step further and ships every successful change to users automatically. Together with reviews and small steps, this is how modern teams release dozens of times a day with confidence.
+examples:
+- title: Owners and checks
+  intro: Who must review a change, and is the pull request in good shape?
+  code: |
+    from fnmatch import fnmatchcase
+
+
+    def matches(path, pattern):
+        """Does ONE ignore pattern match a file path such as 'src/build/out.o'? (Ignore any leading '!' of the pattern: that is handled elsewhere.) A trailing '/' means the pattern is for DIRECTORIES only. If the pattern (without that trailing slash) contains no '/', it matches when it matches any single path component (use fnmatchcase; a directory-only pattern may not match the last component, which is the file). Otherwise it is ANCHORED to the project root (remove a leading '/'): it matches when it matches any prefix of the path made of whole components (again, a directory-only pattern may not match the whole path)."""
+        parts = path.split("/")
+        pat = pattern.lstrip("!")
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        if "/" not in pat:
+            for i, part in enumerate(parts):
+                if dir_only and i == len(parts) - 1:
+                    continue
+                if fnmatchcase(part, pat):
+                    return True
+            return False
+        pat = pat.lstrip("/")
+        for k in range(1, len(parts) + 1):
+            if dir_only and k == len(parts):
+                continue
+            if fnmatchcase("/".join(parts[:k]), pat):
+                return True
+        return False
+
+
+    def is_ignored(path, patterns):
+        """Apply a .gitignore file (a list of lines) to a path: skip empty lines and lines starting with '#' (after strip()); go through the patterns in order and let the LAST pattern that matches decide: a pattern starting with '!' un-ignores the path, any other ignores it. A path that no pattern matches is not ignored."""
+        result = False
+        for line in patterns:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if matches(path, line):
+                result = not line.startswith("!")
+        return result
+
+
+    def tracked(paths, patterns):
+        """The paths that are NOT ignored, in their original order."""
+        return [p for p in paths if not is_ignored(p, patterns)]
+
+
+    def owners_for(path, rules):
+        """A CODEOWNERS file says who must review changes to which files. `rules` is a list of (pattern, [owners]) pairs in file order and patterns work like .gitignore patterns (use the given `matches`). The LAST rule that matches the path wins; return its list of owners, or an empty list if no rule matches."""
+        owners = []
+        for pattern, who in rules:
+            if matches(path, pattern):
+                owners = list(who)
+        return owners
+
+
+    def reviewers_for(paths, rules, author):
+        """Who should be asked to review a change that touches `paths`? The sorted list of distinct owners (owners_for each path), without the author of the change."""
+        found = set()
+        for p in paths:
+            found.update(owners_for(p, rules))
+        found.discard(author)
+        return sorted(found)
+
+    rules = [("*", ["@lead"]), ("docs/", ["@writers"]), ("*.py", ["@devs"])]
+    changed = ["docs/guide.md", "src/app.py"]
+    print("review by:", reviewers_for(changed, rules, "@bo"))
+
+    def pr_size(insertions, deletions):
+        """Classify a pull request by the total number of lines changed (insertions + deletions): 'small' up to 50, 'medium' up to 250, 'large' up to 1000, otherwise 'huge'."""
+        total = insertions + deletions
+        if total <= 50:
+            return "small"
+        if total <= 250:
+            return "medium"
+        if total <= 1000:
+            return "large"
+        return "huge"
+
+
+    def check_pr(title, body, files, insertions, deletions):
+        """Automatic checks on a pull request. Return a list of problems in THIS order (only those that apply): 'title is empty' (title.strip() is empty), 'title too long' (more than 72 characters after strip()), 'no description' (body.strip() is empty), 'too big' (pr_size is 'large' or 'huge'), 'no tests' (some changed path starts with 'src/' but none starts with 'tests/'), 'too many files' (more than 20 files)."""
+        problems = []
+        if not title.strip():
+            problems.append("title is empty")
+        if len(title.strip()) > 72:
+            problems.append("title too long")
+        if not body.strip():
+            problems.append("no description")
+        if pr_size(insertions, deletions) in ("large", "huge"):
+            problems.append("too big")
+        if any(f.startswith("src/") for f in files) and not any(f.startswith("tests/") for f in files):
+            problems.append("no tests")
+        if len(files) > 20:
+            problems.append("too many files")
+        return problems
+
+    print(pr_size(40, 30), "|", check_pr("Add search", "", ["src/search.py"], 120, 10))
+  output: |
+    review by: ['@devs', '@writers']
+    medium | ['no description', 'no tests']
+  lines:
+  - line: 62
+    note: The writers and the developers are asked.
+  - line: 93
+    note: A medium change, but it has no description and touches src without tests.
+- title: A pipeline
+  intro: Run order, then a failing test that skips the deploy.
+  code: |
+    def run_order(jobs):
+        """A CI PIPELINE (such as GitHub Actions) is a set of jobs; `jobs` is a dict {name: {"needs": [names of jobs that must run first], "steps": [step names]}}. Return the order in which to run the jobs: ValueError('unknown job: X') for a needed job that does not exist (check this first), otherwise repeatedly run the first job in alphabetical order whose needs are all done (topological sort); if jobs remain but none is ready raise ValueError('cycle')."""
+        for name, job in jobs.items():
+            for need in job["needs"]:
+                if need not in jobs:
+                    raise ValueError("unknown job: " + need)
+        done, order = set(), []
+        while len(order) < len(jobs):
+            ready = sorted(n for n, j in jobs.items() if n not in done and all(d in done for d in j["needs"]))
+            if not ready:
+                raise ValueError("cycle")
+            done.add(ready[0])
+            order.append(ready[0])
+        return order
+
+
+    def run_pipeline(jobs, outcomes):
+        """Run the pipeline: go through run_order. A job is 'skipped' if any job it needs is not 'success'; otherwise it runs its steps in order and is 'failed' as soon as a step has outcomes[step] == False (a step missing from `outcomes` counts as passing), else 'success'. Return the dict {job name: 'success' | 'failed' | 'skipped'}."""
+        status = {}
+        for name in run_order(jobs):
+            job = jobs[name]
+            if any(status[d] != "success" for d in job["needs"]):
+                status[name] = "skipped"
+            elif any(outcomes.get(step, True) is False for step in job["steps"]):
+                status[name] = "failed"
+            else:
+                status[name] = "success"
+        return status
+
+
+    def pipeline_ok(jobs, outcomes):
+        """True when EVERY job of the pipeline succeeded (so the pull request may be merged)."""
+        return all(s == "success" for s in run_pipeline(jobs, outcomes).values())
+
+    jobs = {
+        "build": {"needs": [], "steps": ["compile"]},
+        "lint": {"needs": [], "steps": ["style"]},
+        "test": {"needs": ["build"], "steps": ["unit", "integration"]},
+        "deploy": {"needs": ["test", "lint"], "steps": ["upload"]},
+    }
+    print(run_order(jobs))
+    print(run_pipeline(jobs, {}))
+    print(run_pipeline(jobs, {"integration": False}))
+    print(pipeline_ok(jobs, {}), pipeline_ok(jobs, {"style": False}))
+  output: |
+    ['build', 'lint', 'test', 'deploy']
+    {'build': 'success', 'lint': 'success', 'test': 'success', 'deploy': 'success'}
+    {'build': 'success', 'lint': 'success', 'test': 'failed', 'deploy': 'skipped'}
+    True False
+  lines:
+  - line: 41
+    note: Jobs run only after the jobs they need.
+  - line: 42
+    note: Everything passes.
+  - line: 43
+    note: A failing step fails its job and skips the deploy.
+  - line: 44
+    note: Any failure means the pull request cannot be merged.
+playground:
+  prompt: Sort three jobs by their dependencies by hand.
+  code: |
+    needs = {'deploy': ['test'], 'test': ['build'], 'build': []}
+    order = []
+    while len(order) < len(needs):
+        for job in sorted(needs):
+            if job not in order and all(d in order for d in needs[job]):
+                order.append(job)
+                break
+    print(order)
+exercises:
+- id: owners
+  title: Code owners
+  difficulty: 4
+  prompt: 'Big projects say who must review which files in a **CODEOWNERS** file. The helpers `matches` and `is_ignored` (from the `.gitignore` exercise) are given. Write `owners_for(path, rules)`: `rules` is a list of `(pattern, [owners])` pairs in file order and the patterns work like `.gitignore` patterns (use `matches`); the **last** rule that matches the path wins; return its list of owners or an empty list. Write `reviewers_for(paths, rules, author)`: who should be asked to review a change that touches `paths`? The sorted list of **distinct** owners of those paths, without the author of the change.'
+  starter: |-
+    from fnmatch import fnmatchcase
+
+
+    def matches(path, pattern):
+        """Does ONE ignore pattern match a file path such as 'src/build/out.o'? (Ignore any leading '!' of the pattern: that is handled elsewhere.) A trailing '/' means the pattern is for DIRECTORIES only. If the pattern (without that trailing slash) contains no '/', it matches when it matches any single path component (use fnmatchcase; a directory-only pattern may not match the last component, which is the file). Otherwise it is ANCHORED to the project root (remove a leading '/'): it matches when it matches any prefix of the path made of whole components (again, a directory-only pattern may not match the whole path)."""
+        parts = path.split("/")
+        pat = pattern.lstrip("!")
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        if "/" not in pat:
+            for i, part in enumerate(parts):
+                if dir_only and i == len(parts) - 1:
+                    continue
+                if fnmatchcase(part, pat):
+                    return True
+            return False
+        pat = pat.lstrip("/")
+        for k in range(1, len(parts) + 1):
+            if dir_only and k == len(parts):
+                continue
+            if fnmatchcase("/".join(parts[:k]), pat):
+                return True
+        return False
+
+
+    def is_ignored(path, patterns):
+        """Apply a .gitignore file (a list of lines) to a path: skip empty lines and lines starting with '#' (after strip()); go through the patterns in order and let the LAST pattern that matches decide: a pattern starting with '!' un-ignores the path, any other ignores it. A path that no pattern matches is not ignored."""
+        result = False
+        for line in patterns:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if matches(path, line):
+                result = not line.startswith("!")
+        return result
+
+
+    def tracked(paths, patterns):
+        """The paths that are NOT ignored, in their original order."""
+        return [p for p in paths if not is_ignored(p, patterns)]
+
+
+
+
+    def owners_for(path, rules):
+        """A CODEOWNERS file says who must review changes to which files. `rules` is a list of (pattern, [owners]) pairs in file order and patterns work like .gitignore patterns (use the given `matches`). The LAST rule that matches the path wins; return its list of owners, or an empty list if no rule matches."""
+        pass
+
+
+    def reviewers_for(paths, rules, author):
+        """Who should be asked to review a change that touches `paths`? The sorted list of distinct owners (owners_for each path), without the author of the change."""
+        pass
+  tests:
+  - name: who owns a file
+    code: |
+      rules = [("*", ["@lead"]), ("docs/", ["@writers"]), ("*.py", ["@devs"]), ("/src/api/", ["@api-team", "@lead"])]
+      assert owners_for("README.md", rules) == ["@lead"] and owners_for("docs/guide.md", rules) == ["@writers"] and owners_for("src/app.py", rules) == ["@devs"]
+      assert owners_for("src/api/routes.py", rules) == ["@api-team", "@lead"] and owners_for("x", []) == [] and owners_for("x", [("*.py", ["@a"])]) == []
+  - name: who reviews
+    code: |
+      rules = [("*", ["@lead"]), ("docs/", ["@writers"]), ("*.py", ["@devs"])]
+      assert reviewers_for(["docs/a.md", "src/b.py", "docs/c.md"], rules, "@bo") == ["@devs", "@writers"]
+      assert reviewers_for(["docs/a.md"], rules, "@writers") == [] and reviewers_for([], rules, "@bo") == [] and reviewers_for(["README"], rules, "@bo") == ["@lead"]
+  hints:
+  - The last matching rule wins, just as in .gitignore.
+  solution: |
+    from fnmatch import fnmatchcase
+
+
+    def matches(path, pattern):
+        """Does ONE ignore pattern match a file path such as 'src/build/out.o'? (Ignore any leading '!' of the pattern: that is handled elsewhere.) A trailing '/' means the pattern is for DIRECTORIES only. If the pattern (without that trailing slash) contains no '/', it matches when it matches any single path component (use fnmatchcase; a directory-only pattern may not match the last component, which is the file). Otherwise it is ANCHORED to the project root (remove a leading '/'): it matches when it matches any prefix of the path made of whole components (again, a directory-only pattern may not match the whole path)."""
+        parts = path.split("/")
+        pat = pattern.lstrip("!")
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        if "/" not in pat:
+            for i, part in enumerate(parts):
+                if dir_only and i == len(parts) - 1:
+                    continue
+                if fnmatchcase(part, pat):
+                    return True
+            return False
+        pat = pat.lstrip("/")
+        for k in range(1, len(parts) + 1):
+            if dir_only and k == len(parts):
+                continue
+            if fnmatchcase("/".join(parts[:k]), pat):
+                return True
+        return False
+
+
+    def is_ignored(path, patterns):
+        """Apply a .gitignore file (a list of lines) to a path: skip empty lines and lines starting with '#' (after strip()); go through the patterns in order and let the LAST pattern that matches decide: a pattern starting with '!' un-ignores the path, any other ignores it. A path that no pattern matches is not ignored."""
+        result = False
+        for line in patterns:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if matches(path, line):
+                result = not line.startswith("!")
+        return result
+
+
+    def tracked(paths, patterns):
+        """The paths that are NOT ignored, in their original order."""
+        return [p for p in paths if not is_ignored(p, patterns)]
+
+
+
+
+    def owners_for(path, rules):
+        """A CODEOWNERS file says who must review changes to which files. `rules` is a list of (pattern, [owners]) pairs in file order and patterns work like .gitignore patterns (use the given `matches`). The LAST rule that matches the path wins; return its list of owners, or an empty list if no rule matches."""
+        owners = []
+        for pattern, who in rules:
+            if matches(path, pattern):
+                owners = list(who)
+        return owners
+
+
+    def reviewers_for(paths, rules, author):
+        """Who should be asked to review a change that touches `paths`? The sorted list of distinct owners (owners_for each path), without the author of the change."""
+        found = set()
+        for p in paths:
+            found.update(owners_for(p, rules))
+        found.discard(author)
+        return sorted(found)
+  explanation: Required reviewers keep important code, such as payment or security code, under the eyes of the people who know it best.
+- id: prsize
+  title: Checking a pull request
+  difficulty: 4
+  prompt: 'Small pull requests get better reviews. Write `pr_size(insertions, deletions)`: by the total number of lines changed return `"small"` (up to 50), `"medium"` (up to 250), `"large"` (up to 1000) or `"huge"`. Write `check_pr(title, body, files, insertions, deletions)`: return a list of problems in **this order** (only those that apply): `"title is empty"` (the title is empty after `strip()`), `"title too long"` (more than 72 characters after `strip()`), `"no description"` (the body is empty after `strip()`), `"too big"` (size is large or huge), `"no tests"` (some changed path starts with `"src/"` but none starts with `"tests/"`), `"too many files"` (more than 20 files).'
+  starter: |-
+    def pr_size(insertions, deletions):
+        """Classify a pull request by the total number of lines changed (insertions + deletions): 'small' up to 50, 'medium' up to 250, 'large' up to 1000, otherwise 'huge'."""
+        pass
+
+
+    def check_pr(title, body, files, insertions, deletions):
+        """Automatic checks on a pull request. Return a list of problems in THIS order (only those that apply): 'title is empty' (title.strip() is empty), 'title too long' (more than 72 characters after strip()), 'no description' (body.strip() is empty), 'too big' (pr_size is 'large' or 'huge'), 'no tests' (some changed path starts with 'src/' but none starts with 'tests/'), 'too many files' (more than 20 files)."""
+        pass
+  tests:
+  - name: sizes
+    code: |
+      assert pr_size(0, 0) == "small" and pr_size(30, 20) == "small" and pr_size(30, 21) == "medium" and pr_size(200, 50) == "medium" and pr_size(200, 51) == "large" and pr_size(1000, 0) == "large" and pr_size(600, 401) == "huge"
+  - name: a good one
+    code: |
+      assert check_pr("Fix crash on start", "The app crashed when...", ["src/app.py", "tests/test_app.py"], 10, 2) == []
+      assert check_pr("Update docs", "Typos", ["docs/a.md"], 3, 3) == []
+  - name: problems
+    code: |
+      assert check_pr("", "", [], 0, 0) == ["title is empty", "no description"]
+      assert check_pr("x" * 73, "ok", ["src/a.py"], 1, 1) == ["title too long", "no tests"] and check_pr("x" * 72, "ok", [], 1, 1) == []
+      assert check_pr("  ", "text", ["src/a.py"], 500, 600) == ["title is empty", "too big", "no tests"]
+      assert check_pr("Big", "d", ["tests/f%d.py" % i for i in range(21)], 5, 5) == ["too many files"] and check_pr("Big", "d", ["src/a.py", "tests/t.py"], 800, 300) == ["too big"]
+  hints:
+  - Run the checks in the order the problems are listed.
+  solution: |
+    def pr_size(insertions, deletions):
+        """Classify a pull request by the total number of lines changed (insertions + deletions): 'small' up to 50, 'medium' up to 250, 'large' up to 1000, otherwise 'huge'."""
+        total = insertions + deletions
+        if total <= 50:
+            return "small"
+        if total <= 250:
+            return "medium"
+        if total <= 1000:
+            return "large"
+        return "huge"
+
+
+    def check_pr(title, body, files, insertions, deletions):
+        """Automatic checks on a pull request. Return a list of problems in THIS order (only those that apply): 'title is empty' (title.strip() is empty), 'title too long' (more than 72 characters after strip()), 'no description' (body.strip() is empty), 'too big' (pr_size is 'large' or 'huge'), 'no tests' (some changed path starts with 'src/' but none starts with 'tests/'), 'too many files' (more than 20 files)."""
+        problems = []
+        if not title.strip():
+            problems.append("title is empty")
+        if len(title.strip()) > 72:
+            problems.append("title too long")
+        if not body.strip():
+            problems.append("no description")
+        if pr_size(insertions, deletions) in ("large", "huge"):
+            problems.append("too big")
+        if any(f.startswith("src/") for f in files) and not any(f.startswith("tests/") for f in files):
+            problems.append("no tests")
+        if len(files) > 20:
+            problems.append("too many files")
+        return problems
+  explanation: Many teams enforce checks like these automatically on every pull request.
+- id: issues
+  title: Issues and search
+  difficulty: 4
+  prompt: '**Issues** track bugs and ideas. Write `triage_labels(title)`: suggest labels from the title (case-insensitive substring tests): `"bug"` if it contains `crash`, `error` or `bug`; `"enhancement"` if it contains `add`, `feature` or `support`; `"question"` if it contains `how` or `?`; `"documentation"` if it contains `typo` or `docs`. Return the labels as a **sorted** list, or `["needs-triage"]` if none apply. Write `search_issues(issues, query)`: `issues` is a list of dicts `{"id", "title", "state", "labels": [...], "author"}`. The query is words separated by spaces: `label:X` requires the label `X`, `-label:X` forbids it, `state:X` requires that state, `author:X` that author; **every other word** must occur in the title (ignoring case). All conditions must hold. Return the **sorted** list of matching ids.'
+  starter: |-
+    def triage_labels(title):
+        """Suggest labels for a new issue from its title (case-insensitive substring tests): 'bug' if it contains 'crash', 'error' or 'bug'; 'enhancement' if it contains 'add', 'feature' or 'support'; 'question' if it contains 'how' or '?'; 'documentation' if it contains 'typo' or 'docs'. Return the labels as a SORTED list, or ['needs-triage'] if none apply."""
+        pass
+
+
+    def search_issues(issues, query):
+        """Search issues like GitHub does. `issues` is a list of dicts {"id", "title", "state", "labels": [...], "author"}. The query is words separated by spaces: 'label:X' requires the label X, '-label:X' forbids it, 'state:X' requires that state, 'author:X' that author; every other word must occur in the title (ignoring case). All conditions must hold. Return the sorted list of matching ids."""
+        pass
+  tests:
+  - name: labels
+    code: |
+      assert triage_labels("App crashes on start") == ["bug"] and triage_labels("Add dark mode") == ["enhancement"] and triage_labels("How do I log in?") == ["question"]
+      assert triage_labels("Typo in docs") == ["documentation"] and triage_labels("Error when I add a file?") == ["bug", "enhancement", "question"] and triage_labels("Hello") == ["needs-triage"]
+  - name: searching
+    code: |
+      issues = [
+          {"id": 1, "title": "Crash on start", "state": "open", "labels": ["bug"], "author": "ada"},
+          {"id": 2, "title": "Add dark mode", "state": "open", "labels": ["enhancement"], "author": "bo"},
+          {"id": 3, "title": "Crash when saving", "state": "closed", "labels": ["bug", "urgent"], "author": "bo"},
+          {"id": 4, "title": "Docs typo", "state": "open", "labels": ["documentation"], "author": "ada"},
+      ]
+      assert search_issues(issues, "") == [1, 2, 3, 4] and search_issues(issues, "crash") == [1, 3] and search_issues(issues, "CRASH state:open") == [1]
+      assert search_issues(issues, "label:bug") == [1, 3] and search_issues(issues, "label:bug -label:urgent") == [1] and search_issues(issues, "author:bo state:open") == [2]
+      assert search_issues(issues, "label:bug author:ada dark") == [] and search_issues([], "x") == [] and search_issues(issues, "state:closed label:urgent crash saving") == [3]
+  hints:
+  - Check every token of the query against every issue; keep an issue only if all tokens pass.
+  solution: |
+    def triage_labels(title):
+        """Suggest labels for a new issue from its title (case-insensitive substring tests): 'bug' if it contains 'crash', 'error' or 'bug'; 'enhancement' if it contains 'add', 'feature' or 'support'; 'question' if it contains 'how' or '?'; 'documentation' if it contains 'typo' or 'docs'. Return the labels as a SORTED list, or ['needs-triage'] if none apply."""
+        t = title.lower()
+        labels = set()
+        if any(w in t for w in ("crash", "error", "bug")):
+            labels.add("bug")
+        if any(w in t for w in ("add", "feature", "support")):
+            labels.add("enhancement")
+        if "how" in t or "?" in t:
+            labels.add("question")
+        if "typo" in t or "docs" in t:
+            labels.add("documentation")
+        return sorted(labels) or ["needs-triage"]
+
+
+    def search_issues(issues, query):
+        """Search issues like GitHub does. `issues` is a list of dicts {"id", "title", "state", "labels": [...], "author"}. The query is words separated by spaces: 'label:X' requires the label X, '-label:X' forbids it, 'state:X' requires that state, 'author:X' that author; every other word must occur in the title (ignoring case). All conditions must hold. Return the sorted list of matching ids."""
+        found = []
+        for issue in issues:
+            ok = True
+            for token in query.split():
+                if token.startswith("label:"):
+                    ok = ok and token[6:] in issue["labels"]
+                elif token.startswith("-label:"):
+                    ok = ok and token[7:] not in issue["labels"]
+                elif token.startswith("state:"):
+                    ok = ok and issue["state"] == token[6:]
+                elif token.startswith("author:"):
+                    ok = ok and issue["author"] == token[7:]
+                else:
+                    ok = ok and token.lower() in issue["title"].lower()
+            if ok:
+                found.append(issue["id"])
+        return sorted(found)
+  explanation: This is a simplified version of the search box on every GitHub project.
+- id: hygiene
+  title: Branch hygiene
+  difficulty: 4
+  prompt: 'Old branches pile up. The merge helpers (`ancestors` and friends) are given. Write `merged_branches(repo, target)`: what `git branch --merged target` lists: the **sorted** names of the branches (not `target` itself and not branches without a commit) whose newest commit is already in the history of the tip of `target`; `ValueError("no such branch")` if `target` does not exist; an empty list if `target` has no commit. Write `stale_branches(last_activity, today, days, keep=("main",))`: `last_activity` is a dict `{branch name: day number of its newest commit}`; return the **sorted** names whose age (`today - day`) is **more than** `days` and which are not in `keep`.'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+    def ancestors(store, h):
+        """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+        seen = set()
+        todo = [h]
+        while todo:
+            c = todo.pop()
+            if c not in seen:
+                seen.add(c)
+                todo.extend(read_commit(store, c)["parents"])
+        return seen
+
+
+    def create_branch(repo, name):
+        """Make a new branch at the current branch's newest commit."""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+    def split_lines(text):
+        """The lines of a text without their line ends (text.splitlines()); an empty text has no lines."""
+        return text.splitlines()
+
+
+    def merge_lines(base, ours, theirs):
+        """THREE-WAY MERGE of lists of lines. `base` is the common ancestor, `ours` and `theirs` are the two changed versions. Use diff_lines(base, other) to record, for each side, which base lines were deleted and which lines were inserted before each base position (an insertion that comes after the "-" of base line i belongs to position i + 1; position len(base) means the end). Then build the result by going through the positions i = 0 .. len(base): first the inserted lines of position i: if both sides inserted the same lines use them once, if only one side inserted lines use those, if both inserted DIFFERENT lines write a CONFLICT: the line '<<<<<<< ours', our lines, '=======', their lines, '>>>>>>> theirs'. Then (for i < len(base)) keep base[i] unless at least one side deleted it. Return (merged lines, True if there was a conflict)."""
+        def changes(other):
+            ins = {i: [] for i in range(len(base) + 1)}
+            deleted = set()
+            i = 0
+            for tag, line in diff_lines(base, other):
+                if tag == "+":
+                    ins[i].append(line)
+                elif tag == "-":
+                    deleted.add(i)
+                    i += 1
+                else:
+                    i += 1
+            return ins, deleted
+
+        o_ins, o_del = changes(ours)
+        t_ins, t_del = changes(theirs)
+        out, conflict = [], False
+        for i in range(len(base) + 1):
+            a, b = o_ins[i], t_ins[i]
+            if a == b or not b:
+                out.extend(a)
+            elif not a:
+                out.extend(b)
+            else:
+                conflict = True
+                out.append("<<<<<<< ours")
+                out.extend(a)
+                out.append("=======")
+                out.extend(b)
+                out.append(">>>>>>> theirs")
+            if i < len(base) and i not in o_del and i not in t_del:
+                out.append(base[i])
+        return out, conflict
+
+
+    def merge_base(store, a, b):
+        """The BEST COMMON ANCESTOR of commits a and b: the point where their histories split. Take the commits that are ancestors of both (each commit counts as its own ancestor); drop every one that is a proper ancestor of another common commit; if several remain return the one with the latest commit time (ties: the larger hash). None if they share no history."""
+        common = ancestors(store, a) & ancestors(store, b)
+        best = [c for c in common if not any(c != d and c in ancestors(store, d) for d in common)]
+        if not best:
+            return None
+        return max(best, key=lambda c: (read_commit(store, c)["time"], c))
+
+
+    def merge_kind(store, a, b):
+        """What merging commit b into commit a needs: 'up-to-date' if b is already in a's history (or equal), 'fast-forward' if a is in b's history (the branch label can just move), otherwise 'merge'."""
+        if b in ancestors(store, a):
+            return "up-to-date"
+        if a in ancestors(store, b):
+            return "fast-forward"
+        return "merge"
+
+
+    def merge_files(base, ours, theirs):
+        """Merge three folders (dicts {path: text}); a path missing from a dict means the file does not exist there. For every path in any of them: if ours and theirs are equal take that (None means the file is gone); else if ours equals base take theirs; else if theirs equals base take ours; otherwise both changed it differently: if one side deleted the file and the other changed it, that is a conflict and the changed version is kept; if both have text, merge_lines on split_lines (an absent base counts as no lines) and join the result with newlines plus a final newline (an empty result is ''); a conflict from merge_lines is a conflict too. Return (merged folder, sorted list of conflicting paths). Deleted files are left out of the folder."""
+        out, conflicts = {}, []
+        for path in sorted(set(base) | set(ours) | set(theirs)):
+            b, o, t = base.get(path), ours.get(path), theirs.get(path)
+            if o == t:
+                result = o
+            elif o == b:
+                result = t
+            elif t == b:
+                result = o
+            elif o is None or t is None:
+                result = o if o is not None else t
+                conflicts.append(path)
+            else:
+                lines, bad = merge_lines(split_lines(b) if b is not None else [], split_lines(o), split_lines(t))
+                result = "\n".join(lines) + "\n" if lines else ""
+                if bad:
+                    conflicts.append(path)
+            if result is not None:
+                out[path] = result
+        return out, conflicts
+
+
+    def merge_branch(repo, other, author):
+        """Merge the branch `other` into the CURRENT branch. ValueError('no such branch') if `other` does not exist; ValueError('nothing to merge') if either branch has no commit. Use merge_kind on the two tips: 'up-to-date' returns {"kind": "up-to-date", "commit": the current tip, "conflicts": []}; 'fast-forward' moves the current branch to the other tip and returns {"kind": "fast-forward", "commit": that tip, "conflicts": []}; 'merge' merges the snapshots of the merge base, the current tip and the other tip with merge_files. If there are conflicts change nothing and return {"kind": "conflict", "commit": None, "conflicts": [paths], "files": merged folder}. Otherwise add 1 to repo['clock'], make a commit with TWO parents (current tip first, then the other tip), the message "Merge branch 'NAME'" with the other branch's name, and the merged tree, move the current branch to it and return {"kind": "merge", "commit": its hash, "conflicts": []}."""
+        if other not in repo["branches"]:
+            raise ValueError("no such branch")
+        ours, theirs = repo["branches"][repo["head"]], repo["branches"][other]
+        if ours is None or theirs is None:
+            raise ValueError("nothing to merge")
+        store = repo["store"]
+        kind = merge_kind(store, ours, theirs)
+        if kind == "up-to-date":
+            return {"kind": kind, "commit": ours, "conflicts": []}
+        if kind == "fast-forward":
+            repo["branches"][repo["head"]] = theirs
+            return {"kind": kind, "commit": theirs, "conflicts": []}
+        base = merge_base(store, ours, theirs)
+        base_files = snapshot_of(repo, base) if base else {}
+        files, conflicts = merge_files(base_files, snapshot_of(repo, ours), snapshot_of(repo, theirs))
+        if conflicts:
+            return {"kind": "conflict", "commit": None, "conflicts": conflicts, "files": files}
+        repo["clock"] += 1
+        tree = make_tree(store, files)
+        h = make_commit(store, tree, [ours, theirs], "Merge branch '" + other + "'", author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return {"kind": "merge", "commit": h, "conflicts": []}
+
+
+
+
+    def merged_branches(repo, target):
+        """What `git branch --merged target` lists: the sorted names of the branches (not `target` itself, and not branches without a commit) whose newest commit is already in the history of the tip of `target`. ValueError('no such branch') if target does not exist; an empty list if target has no commit."""
+        pass
+
+
+    def stale_branches(last_activity, today, days, keep=("main",)):
+        """Branches nobody has touched for a while. `last_activity` is a dict {branch name: day number of its newest commit}. Return the sorted names whose age (today - day) is MORE than `days` and which are not in `keep`."""
+        pass
+  tests:
+  - name: merged
+    code: |
+      r = new_repo()
+      c1 = commit_snapshot(r, {"a": "1"}, "one", "Ada")
+      create_branch(r, "done")
+      c2 = commit_snapshot(r, {"a": "2"}, "two", "Ada")
+      create_branch(r, "also-done")
+      r["branches"]["done"] = c1
+      switch(r, "done")
+      d = commit_snapshot(r, {"a": "x"}, "unmerged work", "Bo")
+      switch(r, "main")
+      r["branches"]["empty"] = None
+      assert merged_branches(r, "main") == ["also-done"] and merged_branches(r, "done") == []
+      assert merged_branches(r, "empty") == []
+      try:
+          merged_branches(r, "zzz")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "no such branch" in str(e)
+  - name: stale
+    code: |
+      last = {"main": 1, "old-feature": 10, "fresh": 98, "borderline": 70, "ancient": 3}
+      assert stale_branches(last, 100, 30) == ["ancient", "old-feature"] and stale_branches(last, 100, 30, keep=("main", "ancient")) == ["old-feature"]
+      assert stale_branches(last, 100, 30)[0] == "ancient" and stale_branches({}, 5, 1) == [] and stale_branches(last, 100, 30, keep=()) == ["ancient", "main", "old-feature"]
+      assert stale_branches({"a": 70}, 100, 30) == [] and stale_branches({"a": 69}, 100, 30) == ["a"]
+  hints:
+  - A branch whose tip is an ancestor of the target has nothing new to offer.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+
+    def ancestors(store, h):
+        """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+        seen = set()
+        todo = [h]
+        while todo:
+            c = todo.pop()
+            if c not in seen:
+                seen.add(c)
+                todo.extend(read_commit(store, c)["parents"])
+        return seen
+
+
+    def create_branch(repo, name):
+        """Make a new branch at the current branch's newest commit."""
+        if name in repo["branches"]:
+            raise ValueError("branch exists")
+        tip = repo["branches"][repo["head"]]
+        if tip is None:
+            raise ValueError("no commits yet")
+        repo["branches"][name] = tip
+
+
+    def switch(repo, name):
+        """Make `name` the current branch."""
+        if name not in repo["branches"]:
+            raise ValueError("no such branch")
+        repo["head"] = name
+
+
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+    def split_lines(text):
+        """The lines of a text without their line ends (text.splitlines()); an empty text has no lines."""
+        return text.splitlines()
+
+
+    def merge_lines(base, ours, theirs):
+        """THREE-WAY MERGE of lists of lines. `base` is the common ancestor, `ours` and `theirs` are the two changed versions. Use diff_lines(base, other) to record, for each side, which base lines were deleted and which lines were inserted before each base position (an insertion that comes after the "-" of base line i belongs to position i + 1; position len(base) means the end). Then build the result by going through the positions i = 0 .. len(base): first the inserted lines of position i: if both sides inserted the same lines use them once, if only one side inserted lines use those, if both inserted DIFFERENT lines write a CONFLICT: the line '<<<<<<< ours', our lines, '=======', their lines, '>>>>>>> theirs'. Then (for i < len(base)) keep base[i] unless at least one side deleted it. Return (merged lines, True if there was a conflict)."""
+        def changes(other):
+            ins = {i: [] for i in range(len(base) + 1)}
+            deleted = set()
+            i = 0
+            for tag, line in diff_lines(base, other):
+                if tag == "+":
+                    ins[i].append(line)
+                elif tag == "-":
+                    deleted.add(i)
+                    i += 1
+                else:
+                    i += 1
+            return ins, deleted
+
+        o_ins, o_del = changes(ours)
+        t_ins, t_del = changes(theirs)
+        out, conflict = [], False
+        for i in range(len(base) + 1):
+            a, b = o_ins[i], t_ins[i]
+            if a == b or not b:
+                out.extend(a)
+            elif not a:
+                out.extend(b)
+            else:
+                conflict = True
+                out.append("<<<<<<< ours")
+                out.extend(a)
+                out.append("=======")
+                out.extend(b)
+                out.append(">>>>>>> theirs")
+            if i < len(base) and i not in o_del and i not in t_del:
+                out.append(base[i])
+        return out, conflict
+
+
+    def merge_base(store, a, b):
+        """The BEST COMMON ANCESTOR of commits a and b: the point where their histories split. Take the commits that are ancestors of both (each commit counts as its own ancestor); drop every one that is a proper ancestor of another common commit; if several remain return the one with the latest commit time (ties: the larger hash). None if they share no history."""
+        common = ancestors(store, a) & ancestors(store, b)
+        best = [c for c in common if not any(c != d and c in ancestors(store, d) for d in common)]
+        if not best:
+            return None
+        return max(best, key=lambda c: (read_commit(store, c)["time"], c))
+
+
+    def merge_kind(store, a, b):
+        """What merging commit b into commit a needs: 'up-to-date' if b is already in a's history (or equal), 'fast-forward' if a is in b's history (the branch label can just move), otherwise 'merge'."""
+        if b in ancestors(store, a):
+            return "up-to-date"
+        if a in ancestors(store, b):
+            return "fast-forward"
+        return "merge"
+
+
+    def merge_files(base, ours, theirs):
+        """Merge three folders (dicts {path: text}); a path missing from a dict means the file does not exist there. For every path in any of them: if ours and theirs are equal take that (None means the file is gone); else if ours equals base take theirs; else if theirs equals base take ours; otherwise both changed it differently: if one side deleted the file and the other changed it, that is a conflict and the changed version is kept; if both have text, merge_lines on split_lines (an absent base counts as no lines) and join the result with newlines plus a final newline (an empty result is ''); a conflict from merge_lines is a conflict too. Return (merged folder, sorted list of conflicting paths). Deleted files are left out of the folder."""
+        out, conflicts = {}, []
+        for path in sorted(set(base) | set(ours) | set(theirs)):
+            b, o, t = base.get(path), ours.get(path), theirs.get(path)
+            if o == t:
+                result = o
+            elif o == b:
+                result = t
+            elif t == b:
+                result = o
+            elif o is None or t is None:
+                result = o if o is not None else t
+                conflicts.append(path)
+            else:
+                lines, bad = merge_lines(split_lines(b) if b is not None else [], split_lines(o), split_lines(t))
+                result = "\n".join(lines) + "\n" if lines else ""
+                if bad:
+                    conflicts.append(path)
+            if result is not None:
+                out[path] = result
+        return out, conflicts
+
+
+    def merge_branch(repo, other, author):
+        """Merge the branch `other` into the CURRENT branch. ValueError('no such branch') if `other` does not exist; ValueError('nothing to merge') if either branch has no commit. Use merge_kind on the two tips: 'up-to-date' returns {"kind": "up-to-date", "commit": the current tip, "conflicts": []}; 'fast-forward' moves the current branch to the other tip and returns {"kind": "fast-forward", "commit": that tip, "conflicts": []}; 'merge' merges the snapshots of the merge base, the current tip and the other tip with merge_files. If there are conflicts change nothing and return {"kind": "conflict", "commit": None, "conflicts": [paths], "files": merged folder}. Otherwise add 1 to repo['clock'], make a commit with TWO parents (current tip first, then the other tip), the message "Merge branch 'NAME'" with the other branch's name, and the merged tree, move the current branch to it and return {"kind": "merge", "commit": its hash, "conflicts": []}."""
+        if other not in repo["branches"]:
+            raise ValueError("no such branch")
+        ours, theirs = repo["branches"][repo["head"]], repo["branches"][other]
+        if ours is None or theirs is None:
+            raise ValueError("nothing to merge")
+        store = repo["store"]
+        kind = merge_kind(store, ours, theirs)
+        if kind == "up-to-date":
+            return {"kind": kind, "commit": ours, "conflicts": []}
+        if kind == "fast-forward":
+            repo["branches"][repo["head"]] = theirs
+            return {"kind": kind, "commit": theirs, "conflicts": []}
+        base = merge_base(store, ours, theirs)
+        base_files = snapshot_of(repo, base) if base else {}
+        files, conflicts = merge_files(base_files, snapshot_of(repo, ours), snapshot_of(repo, theirs))
+        if conflicts:
+            return {"kind": "conflict", "commit": None, "conflicts": conflicts, "files": files}
+        repo["clock"] += 1
+        tree = make_tree(store, files)
+        h = make_commit(store, tree, [ours, theirs], "Merge branch '" + other + "'", author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return {"kind": "merge", "commit": h, "conflicts": []}
+
+
+
+
+    def merged_branches(repo, target):
+        """What `git branch --merged target` lists: the sorted names of the branches (not `target` itself, and not branches without a commit) whose newest commit is already in the history of the tip of `target`. ValueError('no such branch') if target does not exist; an empty list if target has no commit."""
+        if target not in repo["branches"]:
+            raise ValueError("no such branch")
+        tip = repo["branches"][target]
+        if tip is None:
+            return []
+        inside = ancestors(repo["store"], tip)
+        return sorted(n for n, t in repo["branches"].items() if n != target and t is not None and t in inside)
+
+
+    def stale_branches(last_activity, today, days, keep=("main",)):
+        """Branches nobody has touched for a while. `last_activity` is a dict {branch name: day number of its newest commit}. Return the sorted names whose age (today - day) is MORE than `days` and which are not in `keep`."""
+        return sorted(n for n, d in last_activity.items() if today - d > days and n not in keep)
+  explanation: Teams delete merged branches after a pull request so the list stays readable.
+- id: ci
+  title: 'Capstone: a CI pipeline'
+  difficulty: 5
+  prompt: '**Continuous integration** (CI) runs tests automatically on every push, for example with GitHub Actions. A pipeline is a set of **jobs** and `jobs` is a dict `{name: {"needs": [job names that must run first], "steps": [step names]}}`. Write `run_order(jobs)`: `ValueError("unknown job: X")` for a needed job that does not exist (check this first); otherwise repeatedly run the first job, in alphabetical order, whose needs are all done (a **topological sort**); if jobs remain but none is ready raise `ValueError("cycle")`. Write `run_pipeline(jobs, outcomes)`: go through `run_order`; a job is `"skipped"` if any job it needs is not `"success"`; otherwise it runs its steps in order and is `"failed"` as soon as a step has `outcomes[step] == False` (a step missing from `outcomes` counts as passing), else `"success"`; return the dict `{job: status}`. Write `pipeline_ok(jobs, outcomes)`: true when **every** job succeeded (so the pull request may be merged).'
+  starter: |-
+    def run_order(jobs):
+        """A CI PIPELINE (such as GitHub Actions) is a set of jobs; `jobs` is a dict {name: {"needs": [names of jobs that must run first], "steps": [step names]}}. Return the order in which to run the jobs: ValueError('unknown job: X') for a needed job that does not exist (check this first), otherwise repeatedly run the first job in alphabetical order whose needs are all done (topological sort); if jobs remain but none is ready raise ValueError('cycle')."""
+        pass
+
+
+    def run_pipeline(jobs, outcomes):
+        """Run the pipeline: go through run_order. A job is 'skipped' if any job it needs is not 'success'; otherwise it runs its steps in order and is 'failed' as soon as a step has outcomes[step] == False (a step missing from `outcomes` counts as passing), else 'success'. Return the dict {job name: 'success' | 'failed' | 'skipped'}."""
+        pass
+
+
+    def pipeline_ok(jobs, outcomes):
+        """True when EVERY job of the pipeline succeeded (so the pull request may be merged)."""
+        pass
+  tests:
+  - name: order
+    code: |
+      jobs = {"deploy": {"needs": ["test", "lint"], "steps": ["upload"]}, "test": {"needs": ["build"], "steps": ["pytest"]}, "lint": {"needs": [], "steps": ["ruff"]}, "build": {"needs": [], "steps": ["compile"]}}
+      assert run_order(jobs) == ["build", "lint", "test", "deploy"] and run_order({}) == [] and run_order({"a": {"needs": [], "steps": []}}) == ["a"]
+      for bad, msg in (({"a": {"needs": ["zzz"], "steps": []}}, "unknown job: zzz"), ({"a": {"needs": ["b"], "steps": []}, "b": {"needs": ["a"], "steps": []}}, "cycle"), ({"a": {"needs": ["a"], "steps": []}}, "cycle")):
+          try:
+              run_order(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  - name: running
+    code: |
+      jobs = {"deploy": {"needs": ["test", "lint"], "steps": ["upload"]}, "test": {"needs": ["build"], "steps": ["pytest"]}, "lint": {"needs": [], "steps": ["ruff"]}, "build": {"needs": [], "steps": ["compile"]}}
+      assert run_pipeline(jobs, {}) == {"build": "success", "lint": "success", "test": "success", "deploy": "success"}
+      r = run_pipeline(jobs, {"pytest": False})
+      assert r == {"build": "success", "lint": "success", "test": "failed", "deploy": "skipped"}
+      r2 = run_pipeline(jobs, {"compile": False, "ruff": True})
+      assert r2 == {"build": "failed", "lint": "success", "test": "skipped", "deploy": "skipped"}
+  - name: ready to merge
+    code: |
+      jobs = {"test": {"needs": [], "steps": ["pytest", "mypy"]}, "docs": {"needs": ["test"], "steps": []}}
+      assert pipeline_ok(jobs, {}) and not pipeline_ok(jobs, {"mypy": False}) and pipeline_ok({}, {}) and not pipeline_ok(jobs, {"pytest": False, "mypy": True})
+  hints:
+  - Keep a set of finished jobs and pick the first alphabetical job whose needs are all in it.
+  solution: |
+    def run_order(jobs):
+        """A CI PIPELINE (such as GitHub Actions) is a set of jobs; `jobs` is a dict {name: {"needs": [names of jobs that must run first], "steps": [step names]}}. Return the order in which to run the jobs: ValueError('unknown job: X') for a needed job that does not exist (check this first), otherwise repeatedly run the first job in alphabetical order whose needs are all done (topological sort); if jobs remain but none is ready raise ValueError('cycle')."""
+        for name, job in jobs.items():
+            for need in job["needs"]:
+                if need not in jobs:
+                    raise ValueError("unknown job: " + need)
+        done, order = set(), []
+        while len(order) < len(jobs):
+            ready = sorted(n for n, j in jobs.items() if n not in done and all(d in done for d in j["needs"]))
+            if not ready:
+                raise ValueError("cycle")
+            done.add(ready[0])
+            order.append(ready[0])
+        return order
+
+
+    def run_pipeline(jobs, outcomes):
+        """Run the pipeline: go through run_order. A job is 'skipped' if any job it needs is not 'success'; otherwise it runs its steps in order and is 'failed' as soon as a step has outcomes[step] == False (a step missing from `outcomes` counts as passing), else 'success'. Return the dict {job name: 'success' | 'failed' | 'skipped'}."""
+        status = {}
+        for name in run_order(jobs):
+            job = jobs[name]
+            if any(status[d] != "success" for d in job["needs"]):
+                status[name] = "skipped"
+            elif any(outcomes.get(step, True) is False for step in job["steps"]):
+                status[name] = "failed"
+            else:
+                status[name] = "success"
+        return status
+
+
+    def pipeline_ok(jobs, outcomes):
+        """True when EVERY job of the pipeline succeeded (so the pull request may be merged)."""
+        return all(s == "success" for s in run_pipeline(jobs, outcomes).values())
+  explanation: A red cross next to a pull request means a job failed; a skipped job means something it depends on failed.
+commonMistakes:
+- title: Pull requests that change everything
+  explanation: Split big changes into small steps.
+- title: Reviewing only the style
+  explanation: Look for bugs and missing tests too.
+- title: Bug reports without steps to reproduce
+  explanation: Say exactly what you did.
+- title: Ignoring a failing CI check
+  explanation: Fix the cause or the test; never skip the check.
+- title: Leaving dead branches around
+  explanation: Delete merged branches.
+summary:
+- Code review finds bugs and spreads knowledge; small changes get better reviews.
+- CODEOWNERS says who must review which files.
+- Issues with labels and search organise the work.
+- CI runs tests automatically and blocks bad merges.
+- A pipeline is a dependency graph run in topological order.
+next: u28-project
+quiz:
+- type: mcq
+  question: Why do teams review code?
+  options:
+  - To catch bugs early and share knowledge
+  - To slow people down
+  - To rank programmers
+  - To save disk space
+  answer: 0
+  explanation: Reviews improve quality.
+- type: mcq
+  question: What makes a pull request easy to review?
+  options:
+  - It is small and does one thing
+  - It has many unrelated changes
+  - It has no description
+  - It is merged first
+  answer: 0
+  explanation: Small and focused.
+- type: mcq
+  question: What does CI do?
+  options:
+  - Runs tests automatically on every change
+  - Writes the code
+  - Deletes branches
+  - Sends emails
+  answer: 0
+  explanation: Continuous integration.
+- type: mcq
+  question: What happens to a job whose needed job failed?
+  options:
+  - It is skipped
+  - It runs anyway
+  - It is deleted
+  - It succeeds
+  answer: 0
+  explanation: Dependencies matter.
+- type: mcq
+  question: What does CODEOWNERS do?
+  options:
+  - Names who must review which files
+  - Stores passwords
+  - Sets the licence
+  - Counts lines
+  answer: 0
+  explanation: Required reviewers.
+- type: mcq
+  question: What is triage?
+  options:
+  - Sorting and labelling new issues
+  - Deleting issues
+  - Writing tests
+  - Merging
+  answer: 0
+  explanation: Deciding what needs attention first.
+- type: code
+  question: Write `needs_review(files)` returning True if any path starts with `src/` or `lib/`, and False otherwise.
+  starter: |
+    def needs_review(files):
+        pass
+  tests:
+  - name: review
+    code: |
+      assert needs_review(["README.md", "src/app.py"]) is True and needs_review(["docs/a.md"]) is False and needs_review([]) is False and needs_review(["lib/x.py"]) is True and needs_review(["source/a"]) is False
+  solution: |
+    def needs_review(files):
+        return any(f.startswith(("src/", "lib/")) for f in files)

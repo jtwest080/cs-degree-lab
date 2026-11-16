@@ -1,0 +1,1238 @@
+id: u28-diff
+title: Diff and Patch
+minutes: 100
+objective: 'Learn how Git (and every code-review tool) shows what changed: the longest common subsequence, the diff of two files, patches that can be applied and reversed, and a blame report that says who last changed each line.'
+outcomes:
+- Compute a longest common subsequence
+- Write a line diff
+- Apply and reverse a patch
+- Summarise changes across files
+- Find who last changed each line
+sections:
+- heading: What changed?
+  body: |-
+    Because Git stores snapshots, it does not remember *edits*; it works them out by comparing two snapshots. This comparison is called a **diff**. You use it constantly: `git diff` shows what you changed since the last commit, and every pull request on GitHub is a diff shown in red (removed) and green (added).
+
+    ```bash
+    git diff                   # changes not yet committed
+    git diff main..feature     # what feature changed compared to main
+    git show 3f2a9c1           # the changes made by one commit
+    ```
+
+    The challenge is to find a *small* description of the change. If you only compared line 1 to line 1, line 2 to line 2, and so on, then inserting one line at the top would look as if every line had changed. A good diff notices that most lines are still there, just shifted.
+- heading: The longest common subsequence
+  body: |-
+    The idea is to find the **longest common subsequence** (LCS) of the old and new lines: the longest list of lines that appear in both files, in the same order, though not necessarily side by side. Everything in that list is unchanged. Every old line outside it was **deleted**, and every new line outside it was **inserted**.
+
+    Finding it is a classic use of **dynamic programming** (Unit 8). Let `t[i][j]` be the length of the LCS of the old lines from `i` on and the new lines from `j` on. If the two current lines are equal, they belong to the LCS and `t[i][j] = 1 + t[i+1][j+1]`. If not, one of them must be skipped, so `t[i][j]` is the larger of the two neighbours. Fill the table from the end, then walk from the top left reading off the decisions. The cost is the product of the two lengths, so for files of a thousand lines it takes about a million steps: instant.
+
+    A diff is then the list of operations `=` (keep), `-` (delete) and `+` (insert). Real Git uses faster, cleverer algorithms (Myers' diff) that give similar results.
+- heading: Patches, reverse and blame
+  body: |-
+    A diff is more than a picture: it is a **patch**, a recipe to turn the old file into the new one. Sending someone a patch lets them apply your change to their copy. A patch only fits the text it was made from; if the lines do not match, it **fails to apply**, which is exactly the situation that produces merge conflicts in the next lesson.
+
+    Patches are reversible: swap every insertion for a deletion and the patch **undoes** the change. This is how `git revert` can undo an old commit without rewriting history.
+
+    Finally, `git blame file.py` shows for every line the commit that last changed it. You get it by walking forward through the file's versions: compute the diff between each pair, let lines that were kept keep their old owner, and give new lines to the new version. The point is not to find someone to blame but to read the commit message that explains why a puzzling line exists.
+
+    > **Tip:** When a line looks strange, run blame, then read the commit message and the whole change. It usually explains the *why* that the code cannot.
+examples:
+- title: A diff of two versions
+  intro: The changed function, as the red and green of a pull request.
+  code: |
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+    old = ["def greet(name):", "    print('Hello ' + name)", "", "greet('Ada')"]
+    new = ["def greet(name, punct='!'):", "    print('Hello ' + name + punct)", "", "greet('Ada')", "greet('Bo')"]
+
+    print("lines in common:", lcs_length(old, new))
+    for line in format_diff(diff_lines(old, new)):
+        print(("|" + line).rstrip())
+    print(diff_stats(diff_lines(old, new)))
+  output: |
+    lines in common: 2
+    |-def greet(name):
+    |-    print('Hello ' + name)
+    |+def greet(name, punct='!'):
+    |+    print('Hello ' + name + punct)
+    |
+    | greet('Ada')
+    |+greet('Bo')
+    (3, 2)
+  lines:
+  - line: 73
+    note: Only two lines of the old file survive unchanged.
+  - line: 74
+    note: A line starting with a minus was removed; a plus was added.
+  - line: 76
+    note: Three insertions and two deletions.
+- title: Patches
+  intro: Apply a patch, undo it, see it fail on other text, and summarise a change.
+  code: |
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+    def apply_patch(a, ops):
+        """Apply a diff: rebuild the NEW list of lines from the old list `a` and the operations. Go through the operations with a pointer i into `a`: "=" and "-" must match a[i] (otherwise ValueError('patch does not apply')) and move the pointer on; "=" and "+" add their line to the result. After the last operation the pointer must be at the end of `a`, otherwise ValueError('patch does not apply')."""
+        i = 0
+        out = []
+        for tag, line in ops:
+            if tag in ("=", "-"):
+                if i >= len(a) or a[i] != line:
+                    raise ValueError("patch does not apply")
+                i += 1
+            if tag in ("=", "+"):
+                out.append(line)
+        if i != len(a):
+            raise ValueError("patch does not apply")
+        return out
+
+
+    def reverse_patch(ops):
+        """The patch that undoes a patch: swap every "+" for a "-" and every "-" for a "+", keeping the order and the "=" lines."""
+        swap = {"+": "-", "-": "+", "=": "="}
+        return [(swap[t], line) for t, line in ops]
+
+
+    def split_lines(text):
+        """The lines of a text without their line ends (text.splitlines()); an empty text has no lines."""
+        return text.splitlines()
+
+
+    def diff_folders(old, new):
+        """Diff two folders (dicts {path: text}). Return a dict {path: ops} for every path whose text changed, including added files (diffed against no lines) and deleted files (diffed against no lines); unchanged files are left out. Use diff_lines on split_lines."""
+        out = {}
+        for path in sorted(set(old) | set(new)):
+            a = split_lines(old[path]) if path in old else []
+            b = split_lines(new[path]) if path in new else []
+            if old.get(path) != new.get(path):
+                out[path] = diff_lines(a, b)
+        return out
+
+
+    def summary(old, new):
+        """The one-line summary of `git diff --stat`: '<n> file(s) changed, <i> insertion(s)(+), <d> deletion(s)(-)'. Use 'file' for 1 and 'files' otherwise, 'insertion' for 1 and 'insertions' otherwise, 'deletion' for 1 and 'deletions' otherwise; leave out the insertions part if there are none and the deletions part if there are none. With no changed file at all return 'no changes'."""
+        changes = diff_folders(old, new)
+        if not changes:
+            return "no changes"
+        ins = sum(diff_stats(ops)[0] for ops in changes.values())
+        dele = sum(diff_stats(ops)[1] for ops in changes.values())
+        n = len(changes)
+        parts = ["%d file%s changed" % (n, "" if n == 1 else "s")]
+        if ins:
+            parts.append("%d insertion%s(+)" % (ins, "" if ins == 1 else "s"))
+        if dele:
+            parts.append("%d deletion%s(-)" % (dele, "" if dele == 1 else "s"))
+        return ", ".join(parts)
+
+
+    old = ["def greet(name):", "    print('Hello ' + name)", "", "greet('Ada')"]
+    new = ["def greet(name, punct='!'):", "    print('Hello ' + name + punct)", "", "greet('Ada')", "greet('Bo')"]
+
+    patch = diff_lines(old, new)
+    print("apply the patch:", apply_patch(old, patch) == new)
+    print("undo the patch:", apply_patch(new, reverse_patch(patch)) == old)
+    try:
+        apply_patch(["something else"], patch)
+    except ValueError as err:
+        print("on other text:", err)
+    before = {"app.py": "\n".join(old) + "\n", "notes.txt": "todo\n"}
+    after = {"app.py": "\n".join(new) + "\n", "notes.txt": "todo\n", "new.txt": "hi\n"}
+    print(summary(before, after))
+  output: |
+    apply the patch: True
+    undo the patch: True
+    on other text: patch does not apply
+    2 files changed, 4 insertions(+), 2 deletions(-)
+  lines:
+  - line: 127
+    note: A patch is the diff itself.
+  - line: 128
+    note: Applying the patch gives the new text.
+  - line: 129
+    note: Reversing it gives back the old text.
+  - line: 133
+    note: A patch fails when the text is not what it expects.
+  - line: 136
+    note: The one-line summary of git diff --stat.
+playground:
+  prompt: Compare two lists of lines.
+  code: |
+    import difflib
+    old = ['a', 'b', 'c']
+    new = ['a', 'B', 'c']
+    for line in difflib.unified_diff(old, new, lineterm=''):
+        print(line)
+exercises:
+- id: lcs
+  title: Longest common subsequence
+  difficulty: 5
+  prompt: 'To show what changed, Git first finds what stayed the same: the **longest common subsequence** (LCS) of the old and new lines, the longest list of lines that appear in both **in the same order** (not necessarily next to each other). Write `lcs_table(a, b)`: a table `t` with `len(a) + 1` rows and `len(b) + 1` columns where `t[i][j]` is the length of the LCS of `a[i:]` and `b[j:]`; the last row and last column are all 0; fill the rest from the bottom right: if `a[i] == b[j]` then `t[i][j] = 1 + t[i+1][j+1]`, otherwise the larger of `t[i+1][j]` and `t[i][j+1]`. Write `lcs_length(a, b)`: the length (the top-left cell). Write `lcs(a, b)`: the subsequence itself: walk from `(0, 0)`: if `a[i] == b[j]` take that line and move diagonally; otherwise move down (`i + 1`) if `t[i+1][j] >= t[i][j+1]`, else right (`j + 1`).'
+  starter: |-
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        pass
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        pass
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        pass
+  tests:
+  - name: the table
+    code: |
+      t = lcs_table(list("ab"), list("ab"))
+      assert t == [[2, 1, 0], [1, 1, 0], [0, 0, 0]]
+      t2 = lcs_table(list("abc"), list("xbz"))
+      assert t2 == [[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]] or t2[0][0] == 1
+      assert lcs_table([], ["x"]) == [[0, 0]] and lcs_table([], []) == [[0]]
+  - name: length
+    code: |
+      assert lcs_length(list("ABCBDAB"), list("BDCABA")) == 4 and lcs_length(list("abc"), list("abc")) == 3 and lcs_length(list("abc"), list("xyz")) == 0 and lcs_length([], list("abc")) == 0
+      assert lcs_length(["a", "b", "c", "d"], ["b", "d"]) == 2
+  - name: the sequence
+    code: |
+      s = lcs(list("ABCBDAB"), list("BDCABA"))
+      assert len(s) == 4 and s == list("BDAB") or len(s) == 4
+      assert lcs(["a", "b", "c"], ["a", "b", "c"]) == ["a", "b", "c"] and lcs(["a"], ["b"]) == [] and lcs([], ["a"]) == []
+      assert lcs(["x", "a", "y", "b"], ["a", "b", "z"]) == ["a", "b"]
+      def sub(small, big):
+          it = iter(big)
+          return all(c in it for c in small)
+      s2 = lcs(list("kitten"), list("sitting"))
+      assert len(s2) == 4 and sub(s2, "kitten") and sub(s2, "sitting")
+  hints:
+  - A table filled from the bottom right means every cell can look at its right and lower neighbours.
+  solution: |
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+  explanation: Tools that compare files, from `diff` to the version history on GitHub, are built on this table.
+- id: diff
+  title: Writing a diff
+  difficulty: 5
+  prompt: 'The **diff** of two files is the list of operations that turns one into the other. `lcs_table` is given. Write `diff_lines(a, b)`: the list of operations `(tag, line)` where tag `"="` keeps a line, `"-"` deletes a line of `a` and `"+"` inserts a line of `b`. Walk from `(0, 0)` with the table: if `a[i] == b[j]` emit `"="` and move diagonally; otherwise if `t[i+1][j] >= t[i][j+1]` emit `"-"` for `a[i]` and move down, else emit `"+"` for `b[j]` and move right. When one list is used up, emit the rest of the other (deletions for `a`, insertions for `b`). Write `format_diff(ops)`: print it the way Git does: for each operation a string made of a **space** for `"="` (or the tag `"-"`/`"+"`) directly followed by the line. Write `diff_stats(ops)`: `(insertions, deletions)`.'
+  starter: |-
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        pass
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        pass
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        pass
+  tests:
+  - name: simple changes
+    code: |
+      assert diff_lines(["a", "b", "c"], ["a", "B", "c"]) == [("=", "a"), ("-", "b"), ("+", "B"), ("=", "c")]
+      assert diff_lines(["a", "b"], ["a", "b", "c"]) == [("=", "a"), ("=", "b"), ("+", "c")]
+      assert diff_lines(["a", "b", "c"], ["a", "c"]) == [("=", "a"), ("-", "b"), ("=", "c")]
+      assert diff_lines([], ["x", "y"]) == [("+", "x"), ("+", "y")] and diff_lines(["x"], []) == [("-", "x")] and diff_lines([], []) == [] and diff_lines(["s"], ["s"]) == [("=", "s")]
+  - name: a bigger change
+    code: |
+      old = ["def f(x):", "    return x", "", "print(f(1))"]
+      new = ["def f(x):", "    y = x * 2", "    return y", "", "print(f(1))", "print(f(2))"]
+      ops = diff_lines(old, new)
+      assert ops == [("=", "def f(x):"), ("-", "    return x"), ("+", "    y = x * 2"), ("+", "    return y"), ("=", ""), ("=", "print(f(1))"), ("+", "print(f(2))")]
+  - name: format and stats
+    code: |
+      ops = [("=", "a"), ("-", "b"), ("+", "B"), ("+", "B2"), ("=", "c")]
+      assert format_diff(ops) == [" a", "-b", "+B", "+B2", " c"] and format_diff([]) == []
+      assert diff_stats(ops) == (2, 1) and diff_stats([]) == (0, 0) and diff_stats([("=", "x")]) == (0, 0)
+  hints:
+  - Keep two pointers, i into a and j into b.
+  solution: |
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+  explanation: The red and green lines on GitHub are this list of operations drawn in colour.
+- id: patch
+  title: Applying and undoing patches
+  difficulty: 5
+  prompt: 'A diff is also a **patch**: instructions you can apply to the old file to get the new one. `lcs_table` and `diff_lines` are given. Write `apply_patch(a, ops)`: rebuild the **new** list of lines from the old list `a` and the operations. Go through the operations with a pointer `i` into `a`: `"="` and `"-"` must **match** `a[i]` (otherwise `ValueError("patch does not apply")`) and advance the pointer; `"="` and `"+"` add their line to the result. After the last operation the pointer must be at the end of `a`, otherwise `ValueError("patch does not apply")`. Write `reverse_patch(ops)`: the patch that **undoes** a patch: swap every `"+"` for `"-"` and every `"-"` for `"+"`, keeping the order and the `"="` lines.'
+  starter: |-
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+
+
+    def apply_patch(a, ops):
+        """Apply a diff: rebuild the NEW list of lines from the old list `a` and the operations. Go through the operations with a pointer i into `a`: "=" and "-" must match a[i] (otherwise ValueError('patch does not apply')) and move the pointer on; "=" and "+" add their line to the result. After the last operation the pointer must be at the end of `a`, otherwise ValueError('patch does not apply')."""
+        pass
+
+
+    def reverse_patch(ops):
+        """The patch that undoes a patch: swap every "+" for a "-" and every "-" for a "+", keeping the order and the "=" lines."""
+        pass
+  tests:
+  - name: applying
+    code: |
+      a = ["a", "b", "c"]
+      b = ["a", "B", "c", "d"]
+      ops = diff_lines(a, b)
+      assert apply_patch(a, ops) == b and apply_patch([], diff_lines([], ["x"])) == ["x"] and apply_patch(["x"], diff_lines(["x"], [])) == []
+  - name: undoing
+    code: |
+      a = ["one", "two", "three"]
+      b = ["one", "2", "three", "four"]
+      ops = diff_lines(a, b)
+      rev = reverse_patch(ops)
+      assert apply_patch(b, rev) == a and reverse_patch(rev) == ops and reverse_patch([("=", "x"), ("+", "y")]) == [("=", "x"), ("-", "y")]
+  - name: patches that do not fit
+    code: |
+      ops = [("=", "a"), ("-", "b"), ("+", "B")]
+      for bad in (["a", "x"], ["a"], ["x", "b"], ["a", "b", "extra"]):
+          try:
+              apply_patch(bad, ops)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "patch does not apply" in str(e)
+      assert apply_patch(["a", "b"], ops) == ["a", "B"]
+  hints:
+  - A patch only makes sense for the exact old text it was made from.
+  solution: |
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+
+
+    def apply_patch(a, ops):
+        """Apply a diff: rebuild the NEW list of lines from the old list `a` and the operations. Go through the operations with a pointer i into `a`: "=" and "-" must match a[i] (otherwise ValueError('patch does not apply')) and move the pointer on; "=" and "+" add their line to the result. After the last operation the pointer must be at the end of `a`, otherwise ValueError('patch does not apply')."""
+        i = 0
+        out = []
+        for tag, line in ops:
+            if tag in ("=", "-"):
+                if i >= len(a) or a[i] != line:
+                    raise ValueError("patch does not apply")
+                i += 1
+            if tag in ("=", "+"):
+                out.append(line)
+        if i != len(a):
+            raise ValueError("patch does not apply")
+        return out
+
+
+    def reverse_patch(ops):
+        """The patch that undoes a patch: swap every "+" for a "-" and every "-" for a "+", keeping the order and the "=" lines."""
+        swap = {"+": "-", "-": "+", "=": "="}
+        return [(swap[t], line) for t, line in ops]
+  explanation: 'This is why a patch can fail to apply: the file it was meant for has changed in the meantime.'
+- id: folders
+  title: Diffing folders
+  difficulty: 4
+  prompt: 'Real changes touch many files. `lcs_table`, `diff_lines` and `diff_stats` are given. Write `split_lines(text)`: the lines of a text without their line ends (`text.splitlines()`), an empty text has no lines. Write `diff_folders(old, new)`: a dict `{path: ops}` for every path whose **text changed**, including added files (diffed against no lines) and deleted files (diffed against no lines); unchanged files are left out. Write `summary(old, new)`: the one-line summary of `git diff --stat`: `"<n> file(s) changed, <i> insertion(s)(+), <d> deletion(s)(-)"`: use `file` for 1 and `files` otherwise, and likewise `insertion`/`insertions` and `deletion`/`deletions`; **leave out** the insertions part if there are none and the deletions part if there are none; with no changed file at all return `"no changes"`.'
+  starter: |-
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+
+
+    def split_lines(text):
+        """The lines of a text without their line ends (text.splitlines()); an empty text has no lines."""
+        pass
+
+
+    def diff_folders(old, new):
+        """Diff two folders (dicts {path: text}). Return a dict {path: ops} for every path whose text changed, including added files (diffed against no lines) and deleted files (diffed against no lines); unchanged files are left out. Use diff_lines on split_lines."""
+        pass
+
+
+    def summary(old, new):
+        """The one-line summary of `git diff --stat`: '<n> file(s) changed, <i> insertion(s)(+), <d> deletion(s)(-)'. Use 'file' for 1 and 'files' otherwise, 'insertion' for 1 and 'insertions' otherwise, 'deletion' for 1 and 'deletions' otherwise; leave out the insertions part if there are none and the deletions part if there are none. With no changed file at all return 'no changes'."""
+        pass
+  tests:
+  - name: which files changed
+    code: |
+      old = {"a.txt": "1\n2\n", "b.txt": "same\n", "c.txt": "gone\n"}
+      new = {"a.txt": "1\n2\n3\n", "b.txt": "same\n", "d.txt": "new\n"}
+      d = diff_folders(old, new)
+      assert sorted(d) == ["a.txt", "c.txt", "d.txt"]
+      assert d["a.txt"] == [("=", "1"), ("=", "2"), ("+", "3")] and d["c.txt"] == [("-", "gone")] and d["d.txt"] == [("+", "new")]
+      assert diff_folders(old, old) == {} and diff_folders({}, {}) == {} and split_lines("") == [] and split_lines("a\nb\n") == ["a", "b"]
+  - name: summary line
+    code: |
+      old = {"a.txt": "1\n2\n", "b.txt": "same\n", "c.txt": "gone\n"}
+      new = {"a.txt": "1\n2\n3\n", "b.txt": "same\n", "d.txt": "new\n"}
+      assert summary(old, new) == "3 files changed, 2 insertions(+), 1 deletion(-)"
+      assert summary({"a": "1\n"}, {"a": "2\n"}) == "1 file changed, 1 insertion(+), 1 deletion(-)"
+      assert summary({}, {"a": "x\n"}) == "1 file changed, 1 insertion(+)" and summary({"a": "x\ny\n"}, {}) == "1 file changed, 2 deletions(-)"
+      assert summary(old, old) == "no changes" and summary({}, {}) == "no changes"
+  hints:
+  - An added file is diffed against an empty list of lines.
+  solution: |
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+
+
+    def split_lines(text):
+        """The lines of a text without their line ends (text.splitlines()); an empty text has no lines."""
+        return text.splitlines()
+
+
+    def diff_folders(old, new):
+        """Diff two folders (dicts {path: text}). Return a dict {path: ops} for every path whose text changed, including added files (diffed against no lines) and deleted files (diffed against no lines); unchanged files are left out. Use diff_lines on split_lines."""
+        out = {}
+        for path in sorted(set(old) | set(new)):
+            a = split_lines(old[path]) if path in old else []
+            b = split_lines(new[path]) if path in new else []
+            if old.get(path) != new.get(path):
+                out[path] = diff_lines(a, b)
+        return out
+
+
+    def summary(old, new):
+        """The one-line summary of `git diff --stat`: '<n> file(s) changed, <i> insertion(s)(+), <d> deletion(s)(-)'. Use 'file' for 1 and 'files' otherwise, 'insertion' for 1 and 'insertions' otherwise, 'deletion' for 1 and 'deletions' otherwise; leave out the insertions part if there are none and the deletions part if there are none. With no changed file at all return 'no changes'."""
+        changes = diff_folders(old, new)
+        if not changes:
+            return "no changes"
+        ins = sum(diff_stats(ops)[0] for ops in changes.values())
+        dele = sum(diff_stats(ops)[1] for ops in changes.values())
+        n = len(changes)
+        parts = ["%d file%s changed" % (n, "" if n == 1 else "s")]
+        if ins:
+            parts.append("%d insertion%s(+)" % (ins, "" if ins == 1 else "s"))
+        if dele:
+            parts.append("%d deletion%s(-)" % (dele, "" if dele == 1 else "s"))
+        return ", ".join(parts)
+  explanation: That final line of a git diff --stat tells you at a glance how big a change is.
+- id: blame
+  title: 'Capstone: who wrote this line?'
+  difficulty: 5
+  prompt: '`git blame` tells you which commit last changed each line of a file. All the diff helpers are given, and so is `history`, a list of file versions, oldest first, each a **list of lines**. Write `blame(history)`: return a list with one entry per line of the **newest** version: the **index** (0-based) of the version in which that line was last added. Walk the versions from the first: for version 0 every line has index 0; for each later version diff the previous lines against the new ones: lines kept (`"="`) keep their earlier owner, inserted lines (`"+"`) belong to the new version. Write `blame_report(history, authors)`: `authors` is a list with one author per version; return one string per line: `"<author>: <line>"`. Write `lines_changed_by(history, authors)`: a dict `{author: number of lines in the newest version that they last changed}`.'
+  starter: |-
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+
+
+    def blame(history):
+        """One entry per line of the NEWEST version: the index of the version in which that line was last added or changed. An empty history gives an empty list."""
+        pass
+
+
+    def blame_report(history, authors):
+        """One string per line of the newest version: '<author of the version that last changed it>: <line>'."""
+        pass
+
+
+    def lines_changed_by(history, authors):
+        """A dict {author: number of lines of the newest version that this author last changed}; authors with no such line are left out."""
+        pass
+  tests:
+  - name: owners of lines
+    code: |
+      v0 = ["a", "b", "c"]
+      v1 = ["a", "B", "c"]
+      v2 = ["a", "B", "c", "d"]
+      assert blame([v0]) == [0, 0, 0] and blame([v0, v1]) == [0, 1, 0] and blame([v0, v1, v2]) == [0, 1, 0, 2] and blame([]) == []
+      assert blame([["x"], []]) == [] and blame([[], ["n"]]) == [1]
+      assert blame([v0, v0, v0]) == [0, 0, 0]
+  - name: blame report
+    code: |
+      v0 = ["print(1)"]
+      v1 = ["print(1)", "print(2)"]
+      v2 = ["import os", "print(1)", "print(2)"]
+      assert blame_report([v0, v1, v2], ["Ada", "Bo", "Cy"]) == ["Cy: import os", "Ada: print(1)", "Bo: print(2)"]
+      assert blame_report([v0], ["Ada"]) == ["Ada: print(1)"]
+  - name: who wrote how much
+    code: |
+      v0 = ["1", "2", "3", "4"]
+      v1 = ["1", "two", "3", "4", "5"]
+      v2 = ["1", "two", "3"]
+      assert lines_changed_by([v0, v1, v2], ["Ada", "Bo", "Cy"]) == {"Ada": 2, "Bo": 1}
+      assert lines_changed_by([v0, v1], ["Ada", "Bo"]) == {"Ada": 3, "Bo": 2} and lines_changed_by([["a"]], ["Z"]) == {"Z": 1}
+  hints:
+  - Track an owner for each line and update the list after every diff.
+  solution: |
+    def lcs_table(a, b):
+        """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+        t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+        for i in range(len(a) - 1, -1, -1):
+            for j in range(len(b) - 1, -1, -1):
+                if a[i] == b[j]:
+                    t[i][j] = 1 + t[i + 1][j + 1]
+                else:
+                    t[i][j] = max(t[i + 1][j], t[i][j + 1])
+        return t
+
+
+    def lcs_length(a, b):
+        """The length of the longest common subsequence of the two lists."""
+        return lcs_table(a, b)[0][0]
+
+
+    def lcs(a, b):
+        """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        out = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                out.append(a[i])
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                i += 1
+            else:
+                j += 1
+        return out
+
+
+    def diff_lines(a, b):
+        """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+        t = lcs_table(a, b)
+        i = j = 0
+        ops = []
+        while i < len(a) and j < len(b):
+            if a[i] == b[j]:
+                ops.append(("=", a[i]))
+                i += 1
+                j += 1
+            elif t[i + 1][j] >= t[i][j + 1]:
+                ops.append(("-", a[i]))
+                i += 1
+            else:
+                ops.append(("+", b[j]))
+                j += 1
+        while i < len(a):
+            ops.append(("-", a[i]))
+            i += 1
+        while j < len(b):
+            ops.append(("+", b[j]))
+            j += 1
+        return ops
+
+
+    def format_diff(ops):
+        """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+        return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+    def diff_stats(ops):
+        """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+        return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+
+
+    def blame(history):
+        """One entry per line of the NEWEST version: the index of the version in which that line was last added or changed. An empty history gives an empty list."""
+        if not history:
+            return []
+        owners = [0] * len(history[0])
+        for v in range(1, len(history)):
+            new_owners = []
+            i = 0
+            for tag, line in diff_lines(history[v - 1], history[v]):
+                if tag == "=":
+                    new_owners.append(owners[i])
+                    i += 1
+                elif tag == "-":
+                    i += 1
+                else:
+                    new_owners.append(v)
+            owners = new_owners
+        return owners
+
+
+    def blame_report(history, authors):
+        """One string per line of the newest version: '<author of the version that last changed it>: <line>'."""
+        return [authors[o] + ": " + line for o, line in zip(blame(history), history[-1])]
+
+
+    def lines_changed_by(history, authors):
+        """A dict {author: number of lines of the newest version that this author last changed}; authors with no such line are left out."""
+        counts = {}
+        for o in blame(history):
+            counts[authors[o]] = counts.get(authors[o], 0) + 1
+        return counts
+  explanation: 'Blame is not about blaming people: it finds the commit whose message explains why a line exists.'
+commonMistakes:
+- title: Comparing line by line by position
+  explanation: One inserted line would make everything look changed.
+- title: Forgetting that a diff depends on both versions
+  explanation: A patch only fits its original text.
+- title: Ignoring whitespace changes
+  explanation: Spaces and tabs count as changes unless told otherwise.
+- title: Reading only the green lines
+  explanation: Deleted lines matter as much.
+- title: Committing huge diffs
+  explanation: Reviewers cannot understand a thousand changed lines at once.
+summary:
+- A diff compares two snapshots; Git does not store edits.
+- The longest common subsequence finds the unchanged lines.
+- A diff is a list of keep, delete and insert operations.
+- Patches can be applied and reversed.
+- Blame finds the commit that last changed each line.
+next: u28-merge
+quiz:
+- type: mcq
+  question: What does a diff compute?
+  options:
+  - The operations that turn one text into another
+  - The size of a repo
+  - The author
+  - The hash
+  answer: 0
+  explanation: Keep, delete, insert.
+- type: mcq
+  question: What is the longest common subsequence?
+  options:
+  - The longest list of lines found in both texts in the same order
+  - The longest line
+  - The newest line
+  - The first line
+  answer: 0
+  explanation: The unchanged part.
+- type: mcq
+  question: Why compare using the LCS instead of line by line?
+  options:
+  - An inserted line would otherwise make all later lines look changed
+  - It is shorter code
+  - It is required by GitHub
+  - It is random
+  answer: 0
+  explanation: It finds the shift.
+- type: mcq
+  question: What undoes a patch?
+  options:
+  - Swapping insertions and deletions
+  - Deleting the file
+  - Adding it again
+  - Renaming it
+  answer: 0
+  explanation: It is its own inverse.
+- type: mcq
+  question: What does git blame show?
+  options:
+  - The commit that last changed each line
+  - Who is at fault
+  - The remote
+  - The size
+  answer: 0
+  explanation: A tool for understanding.
+- type: mcq
+  question: What makes a patch fail to apply?
+  options:
+  - The lines no longer match the text it was made from
+  - It is too short
+  - It has no author
+  - It is a comment
+  answer: 0
+  explanation: The base has changed.
+- type: code
+  question: Write `count_changes(ops)` returning the number of operations whose tag is not "=".
+  starter: |
+    def count_changes(ops):
+        pass
+  tests:
+  - name: changes
+    code: |
+      assert count_changes([("=", "a"), ("-", "b"), ("+", "c")]) == 2 and count_changes([]) == 0 and count_changes([("=", "x")]) == 0
+  solution: |
+    def count_changes(ops):
+        return sum(1 for tag, _ in ops if tag != "=")

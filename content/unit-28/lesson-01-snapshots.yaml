@@ -1,0 +1,1191 @@
+id: u28-snapshots
+title: Snapshots, Hashes and Commits
+minutes: 100
+objective: 'Understand what Git really is by building its core: a store of objects named by the hash of their content, trees that record folders, and commits that link snapshots into a history. You will meet the real commands (`git init`, `git add`, `git commit`) and then build the machinery behind them yourself.'
+outcomes:
+- Explain why version control exists
+- Compute Git-style content hashes
+- Build an object store with blobs, trees and commits
+- Read history back from a commit
+- Describe what `git add` and `git commit` do
+sections:
+- heading: Why version control?
+  body: |-
+    Imagine writing an essay and saving copies: `essay.doc`, `essay-final.doc`, `essay-final-REAL.doc`, `essay-final-REAL-2.doc`. Which one is newest? What changed between them? Who wrote which part? **Version control** solves this. It remembers every saved state of your project, lets you go back to any of them, compares them, and lets several people work at once without overwriting each other. Nearly every software team in the world uses it, and the most popular tool is **Git**.
+
+    Two words you will see everywhere. A **repository** (or "repo") is a project folder together with its complete history. A **commit** is one saved moment in that history: a snapshot of all your files plus a short message saying why you saved it. A good history reads like a diary of the project.
+
+    In a terminal the first steps look like this. You do not need to run them now; the rest of this unit builds the same ideas in Python so that you understand what happens inside.
+
+    ```bash
+    git init                      # start a repository in the current folder
+    git add notes.txt             # choose what goes into the next snapshot
+    git commit -m "Add notes"     # save the snapshot with a message
+    git log                       # list the history
+    ```
+
+    > **Note:** Git is not GitHub. **Git** is the program on your computer. **GitHub** is a website that stores Git repositories online so that people can share and review them. You can use Git without GitHub, but not the other way round.
+- heading: 'Hashes: naming things by their content'
+  body: |-
+    Git's central trick is to name every piece of data by a **hash** of its content. A **hash function** turns any text into a short, fixed-length "fingerprint" (Git uses **SHA-1**, which gives 40 hexadecimal characters such as `ce013625030ba8dba906f756967f9e9ca394464a`). Two properties matter. The same text always gives the same hash. And even a tiny change gives a completely different, unpredictable hash.
+
+    So the name of a file's contents is also a check that it has not changed. Git stores a file's contents as a **blob** (a "binary large object", just a bag of bytes) in an **object store**: a big dictionary from hash to content. If two files, or two versions of a file, have identical content they share one blob, so unchanged files cost nothing.
+
+    A folder is stored as a **tree**: a list of `name  hash` lines, one per file, where each hash is that file's blob (or a smaller tree for a sub-folder). The tree's own hash depends on every hash inside it, so one changed letter anywhere changes the hash of the whole folder. A tree is therefore a complete **snapshot**.
+- heading: Commits form a chain
+  body: |-
+    A **commit** is a small object holding four things: the hash of a tree (what the project looked like), the hashes of its **parent** commits (what came just before), the author and time, and the message. Because each commit contains its parent's hash, and the parent's hash depends on everything before it, the whole history is **tamper-evident**: changing an old commit would change its hash, and then every later hash too. History is a chain, or more generally a **graph**, of commits pointing backwards.
+
+    This is why Git is fast: it never stores lists of edits. It stores complete snapshots, but shares every unchanged file, so a snapshot only adds the files that changed.
+
+    A **branch** is nothing more than a label that points at one commit, and `HEAD` is the label that says where you are now. When you commit, Git makes the new commit with your current one as its parent and then moves your branch label forward. In the next lessons you will build branches, comparing, merging and sharing on top of the little store you build here.
+
+    > **Key idea:** Everything in Git is an object named by the hash of its content: blobs hold files, trees hold folders, commits hold snapshots and history. The rest is labels that point at commits.
+examples:
+- title: Hashing
+  intro: Real Git hashes, and the avalanche effect.
+  code: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+    store = {}
+    print("hash of 'hello\\n':", hash_object("hello\n"))
+    print("short:", short_hash(hash_object("hello\n")))
+    print("same text, same hash:", hash_object("abc") == hash_object("abc"))
+    print("one letter changed:", short_hash(hash_object("abc")), short_hash(hash_object("abd")))
+  output: |
+    hash of 'hello\n': ce013625030ba8dba906f756967f9e9ca394464a
+    short: ce01362
+    same text, same hash: True
+    one letter changed: f2ba8f8 d4a5aa5
+  lines:
+  - line: 92
+    note: Real Git prints this same hash for a file containing hello.
+  - line: 93
+    note: Hashes are usually shown shortened.
+  - line: 94
+    note: Same content, same name.
+  - line: 95
+    note: A one-letter change gives an unrelated hash.
+- title: A tiny repository
+  intro: Two commits, their parent link and the files that changed.
+  code: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+
+    repo = new_repo()
+    c1 = commit_snapshot(repo, {"app.py": "print('v1')\n", "README": "hi\n"}, "first version", "Ada")
+    c2 = commit_snapshot(repo, {"app.py": "print('v2')\n", "README": "hi\n"}, "change the app", "Ada")
+    print("commit 1:", short_hash(c1), "| commit 2:", short_hash(c2))
+    print("parent of commit 2 is commit 1:", read_commit(repo["store"], c2)["parents"] == [c1])
+    print("objects stored:", len(repo["store"]))
+    print("changes:", file_changes(snapshot_of(repo, c1), snapshot_of(repo, c2)))
+    print(repo["store"][c2][1])
+  output: |
+    commit 1: f61c94f | commit 2: ffe99dd
+    parent of commit 2 is commit 1: True
+    objects stored: 7
+    changes: {'added': [], 'modified': ['app.py'], 'deleted': []}
+    tree e4beffc478abfbc008a86e9ab2be06619fd2d290
+    parent f61c94f4d4aa755f1b2d32fd7acd32dfb9ea59e9
+    author Ada 2
+
+    change the app
+  lines:
+  - line: 123
+    note: The first commit has no parent.
+  - line: 124
+    note: The second commit points back to the first.
+  - line: 126
+    note: The chain is made of hashes.
+  - line: 127
+    note: 'Unchanged files are shared: README is stored once.'
+  - line: 128
+    note: Only the app changed.
+  - line: 129
+    note: This is the raw commit object.
+playground:
+  prompt: Hash any text and compare two hashes.
+  code: |
+    import hashlib
+    text = 'hello\n'.encode()
+    print(hashlib.sha1(b'blob ' + str(len(text)).encode() + b'\0' + text).hexdigest())
+exercises:
+- id: hashes
+  title: Content hashes
+  difficulty: 3
+  prompt: 'Git names everything by a **hash** of its content. Write `hash_object(text, kind="blob")`: build the bytes `kind + " " + length + a zero byte + the content` (the length is the number of **bytes** of the UTF-8 text) and return their **SHA-1** as 40 lowercase hexadecimal characters (`hashlib.sha1(...).hexdigest()`). Write `short_hash(h, n=7)`: the first `n` characters of a hash. For the text `"hello\n"` real Git prints `ce013625030ba8dba906f756967f9e9ca394464a`, so you can check yourself against the real thing.'
+  starter: |-
+    import hashlib
+
+
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        pass
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        pass
+  tests:
+  - name: real git values
+    code: |
+      assert hash_object("hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"
+      assert hash_object("") == "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+      assert hash_object("hello") == "b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0"
+  - name: same and different
+    code: |
+      assert hash_object("a") == hash_object("a") and hash_object("a") != hash_object("b") and hash_object("a", "tree") != hash_object("a", "blob")
+      assert len(hash_object("anything")) == 40 and all(c in "0123456789abcdef" for c in hash_object("x"))
+      assert hash_object("héllo") != hash_object("hello")
+  - name: short hashes
+    code: |
+      h = hash_object("hello\n")
+      assert short_hash(h) == "ce01362" and short_hash(h, 4) == "ce01" and short_hash(h, 40) == h and short_hash("abc") == "abc"
+  hints:
+  - The header is built from the length of the ENCODED bytes, so accented letters count more than once.
+  - hashlib.sha1(data).hexdigest() gives the 40 characters.
+  solution: |
+    import hashlib
+
+
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+  explanation: The same content always has the same name, and a tiny change gives a completely different one.
+- id: store
+  title: The object store
+  difficulty: 4
+  prompt: 'Git keeps everything in an **object store**, a dict `{hash: (kind, text)}`. The helper `hash_object` is given. Write `store_object(store, kind, text)`: save the object under its hash and return the hash; saving the same content twice must not create a second entry. Write `read_object(store, h)`: return `(kind, text)`; `ValueError("unknown object")` if the hash is missing. Write `find_by_prefix(store, prefix)`: people type only the start of a hash; return the **full** hash that starts with the prefix. Raise `ValueError("prefix too short")` for fewer than 4 characters, then `ValueError("unknown object")` if nothing matches, then `ValueError("ambiguous prefix")` if more than one matches (check in that order).'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        pass
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        pass
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        pass
+  tests:
+  - name: storing and reading
+    code: |
+      s = {}
+      h = store_object(s, "blob", "hello\n")
+      assert h == "ce013625030ba8dba906f756967f9e9ca394464a" and s == {h: ("blob", "hello\n")}
+      assert store_object(s, "blob", "hello\n") == h and len(s) == 1
+      h2 = store_object(s, "blob", "bye\n")
+      assert len(s) == 2 and read_object(s, h2) == ("blob", "bye\n") and read_object(s, h) == ("blob", "hello\n")
+      try:
+          read_object(s, "0" * 40)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown object" in str(e)
+  - name: prefixes
+    code: |
+      s = {}
+      h = store_object(s, "blob", "hello\n")
+      assert find_by_prefix(s, "ce0136") == h and find_by_prefix(s, h) == h
+      for bad, msg in (("ce0", "prefix too short"), ("ffff", "unknown object"), ("", "prefix too short")):
+          try:
+              find_by_prefix(s, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+      s2 = {"abcd" + "1" * 36: ("blob", "x"), "abcd" + "2" * 36: ("blob", "y"), "ab99" + "0" * 36: ("blob", "z")}
+      assert find_by_prefix(s2, "abcd1") == "abcd" + "1" * 36 and find_by_prefix(s2, "ab99") == "ab99" + "0" * 36
+      try:
+          find_by_prefix(s2, "abcd")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "ambiguous prefix" in str(e)
+  hints:
+  - Saving under the same key twice naturally replaces the old entry with an equal one.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+  explanation: 'The store never holds two copies of the same content: that saves space and makes comparing cheap.'
+- id: trees
+  title: 'Trees: snapshots of folders'
+  difficulty: 5
+  prompt: 'A **tree** records a whole folder. The helpers `hash_object`, `store_object` and `read_object` are given. Write `make_tree(store, files)`: `files` is a dict `{path: text}`; save every file as a `"blob"` object, then build the tree text with one line `path hash` per file, **sorted by path** and joined with newlines (no newline at the end), save it as a `"tree"` object and return its hash. The order in which files were added to the dict must not matter. Write `read_tree(store, h)`, the reverse: return the dict `{path: text}` of a tree (split each line at the **last** space, then read the blob).'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        pass
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        pass
+  tests:
+  - name: building
+    code: |
+      s = {}
+      t = make_tree(s, {"b.txt": "two\n", "a.txt": "one\n"})
+      kind, text = s[t]
+      assert kind == "tree" and text == "a.txt " + hash_object("one\n") + "\nb.txt " + hash_object("two\n")
+      assert make_tree({}, {}) == hash_object("", "tree")
+      assert sum(1 for v in s.values() if v[0] == "blob") == 2
+  - name: order does not matter
+    code: |
+      s = {}
+      a = make_tree(s, {"x": "1", "y": "2", "z": "3"})
+      b = make_tree(s, {"z": "3", "x": "1", "y": "2"})
+      c = make_tree(s, {"x": "1", "y": "2", "z": "4"})
+      assert a == b and a != c
+      d = make_tree(s, {"x": "same", "y": "same"})
+      assert sum(1 for v in s.values() if v == ("blob", "same")) == 1
+  - name: reading back
+    code: |
+      s = {}
+      files = {"README.md": "# Hi\n", "src/app.py": "print(1)\n", "notes with spaces.txt": "ok"}
+      t = make_tree(s, files)
+      assert read_tree(s, t) == files and read_tree(s, make_tree(s, {})) == {}
+  hints:
+  - Sort the paths before you build the lines so that the result never depends on dict order.
+  - Use line.rsplit(" ", 1) so that spaces inside a path do not break the split.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+  explanation: Because a tree hash depends on every file's hash, changing one letter anywhere changes the hash of the whole folder.
+- id: commits
+  title: Commits
+  difficulty: 5
+  prompt: 'A **commit** points at a tree (the snapshot) and at its **parent** commits (its history). The earlier helpers are given. Write `make_commit(store, tree, parents, message, author, time)`: build the text with these lines in order: `tree <tree hash>`, one `parent <hash>` line per parent, `author <author> <time>`, an **empty line**, then the message; join with newlines, save it as a `"commit"` object and return its hash. Write `read_commit(store, h)`: parse it back into a dict `{"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}`. The author line is `author <name> <time>`: the time is the **last** word and the name is everything before it. The message is everything after the first empty line. `ValueError("not a commit")` if the object is of another kind.'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        pass
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        pass
+  tests:
+  - name: a first commit
+    code: |
+      s = {}
+      t = make_tree(s, {"a": "1"})
+      c = make_commit(s, t, [], "Add a", "Ada", 5)
+      assert s[c] == ("commit", "tree " + t + "\nauthor Ada 5\n\nAdd a")
+      info = read_commit(s, c)
+      assert info == {"tree": t, "parents": [], "author": "Ada", "time": 5, "message": "Add a"}
+  - name: parents and history
+    code: |
+      s = {}
+      t1 = make_tree(s, {"a": "1"})
+      t2 = make_tree(s, {"a": "2"})
+      c1 = make_commit(s, t1, [], "one", "Ada Lovelace", 1)
+      c2 = make_commit(s, t2, [c1], "two\n\nmore lines", "Ada Lovelace", 2)
+      i2 = read_commit(s, c2)
+      assert i2["parents"] == [c1] and i2["author"] == "Ada Lovelace" and i2["time"] == 2 and i2["message"] == "two\n\nmore lines"
+      c3 = make_commit(s, t2, [c1, c2], "merge", "Bo", 3)
+      assert read_commit(s, c3)["parents"] == [c1, c2]
+      assert c1 != c2 and make_commit(s, t1, [], "one", "Ada Lovelace", 1) == c1 and make_commit(s, t1, [], "one", "Ada Lovelace", 2) != c1
+  - name: errors
+    code: |
+      s = {}
+      t = make_tree(s, {"a": "1"})
+      try:
+          read_commit(s, t)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "not a commit" in str(e)
+      try:
+          read_commit(s, "0" * 40)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown object" in str(e)
+  hints:
+  - Build a list of lines, then join them with newline characters.
+  - text.split("\n\n", 1) separates the header from the message.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+  explanation: A commit's hash covers its tree, its parents, its author and its message, so history cannot be changed without changing every later hash.
+- id: repo
+  title: 'Capstone: a tiny repository'
+  difficulty: 5
+  prompt: 'Put the pieces together. All the helpers of this lesson are given. Write `new_repo()`: return `{"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}` (`branches` maps a branch name to the hash of its newest commit, `head` is the name of the branch you are on and `clock` is a counter that gives commits a time). Write `commit_snapshot(repo, files, message, author)`: add 1 to `repo["clock"]` and use it as the commit time, save the tree, make the commit (its only parent is the branch''s current newest commit, if there is one), move the **current branch** to the new commit and return its hash. Write `snapshot_of(repo, commit_hash)`: the dict of all files in that commit. Write `file_changes(old, new)`: compare two folders and return `{"added": [...], "modified": [...], "deleted": [...]}`, each a sorted list of paths.'
+  starter: |-
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        pass
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        pass
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        pass
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        pass
+  tests:
+  - name: committing
+    code: |
+      r = new_repo()
+      assert r == {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+      c1 = commit_snapshot(r, {"a.txt": "one\n"}, "first", "Ada")
+      c2 = commit_snapshot(r, {"a.txt": "one\ntwo\n", "b.txt": "b\n"}, "second", "Ada")
+      assert r["branches"]["main"] == c2 and r["clock"] == 2
+      i1, i2 = read_commit(r["store"], c1), read_commit(r["store"], c2)
+      assert i1["parents"] == [] and i2["parents"] == [c1] and i1["time"] == 1 and i2["time"] == 2 and i2["message"] == "second"
+  - name: going back in time
+    code: |
+      r = new_repo()
+      c1 = commit_snapshot(r, {"a.txt": "one\n"}, "first", "Ada")
+      c2 = commit_snapshot(r, {"a.txt": "changed\n", "b.txt": "b\n"}, "second", "Ada")
+      assert snapshot_of(r, c1) == {"a.txt": "one\n"} and snapshot_of(r, c2) == {"a.txt": "changed\n", "b.txt": "b\n"}
+      n = len(r["store"])
+      c3 = commit_snapshot(r, {"a.txt": "one\n"}, "revert by hand", "Bo")
+      assert c3 != c1 and snapshot_of(r, c3) == snapshot_of(r, c1) and len(r["store"]) == n + 1
+  - name: what changed
+    code: |
+      old = {"a": "1", "b": "2", "c": "3"}
+      new = {"a": "1", "b": "two", "d": "4", "e": "5"}
+      assert file_changes(old, new) == {"added": ["d", "e"], "modified": ["b"], "deleted": ["c"]}
+      assert file_changes({}, {}) == {"added": [], "modified": [], "deleted": []} and file_changes(old, old) == {"added": [], "modified": [], "deleted": []}
+      assert file_changes({"z": "1"}, {}) == {"added": [], "modified": [], "deleted": ["z"]}
+  hints:
+  - A commit on a repo whose branch is still None has no parents.
+  solution: |
+    import hashlib
+
+
+    def hash_object(text, kind="blob"):
+        """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+        data = text.encode("utf-8")
+        header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+        return hashlib.sha1(header + data).hexdigest()
+
+
+    def short_hash(h, n=7):
+        """The first n characters of a hash: how people write hashes in practice."""
+        return h[:n]
+
+
+    def store_object(store, kind, text):
+        """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+        h = hash_object(text, kind)
+        store[h] = (kind, text)
+        return h
+
+
+    def read_object(store, h):
+        """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+        if h not in store:
+            raise ValueError("unknown object")
+        return store[h]
+
+
+    def find_by_prefix(store, prefix):
+        """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+        if len(prefix) < 4:
+            raise ValueError("prefix too short")
+        found = [h for h in store if h.startswith(prefix)]
+        if not found:
+            raise ValueError("unknown object")
+        if len(found) > 1:
+            raise ValueError("ambiguous prefix")
+        return found[0]
+
+
+    def make_tree(store, files):
+        """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+        lines = []
+        for path in sorted(files):
+            h = store_object(store, "blob", files[path])
+            lines.append(path + " " + h)
+        return store_object(store, "tree", "\n".join(lines))
+
+
+    def read_tree(store, h):
+        """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+        kind, text = read_object(store, h)
+        files = {}
+        for line in text.split("\n"):
+            if line:
+                path, blob = line.rsplit(" ", 1)
+                files[path] = read_object(store, blob)[1]
+        return files
+
+
+    def make_commit(store, tree, parents, message, author, time):
+        """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+        lines = ["tree " + tree]
+        for p in parents:
+            lines.append("parent " + p)
+        lines.append("author " + author + " " + str(time))
+        lines.append("")
+        lines.append(message)
+        return store_object(store, "commit", "\n".join(lines))
+
+
+    def read_commit(store, h):
+        """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+        kind, text = read_object(store, h)
+        if kind != "commit":
+            raise ValueError("not a commit")
+        head, message = text.split("\n\n", 1)
+        info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+        for line in head.split("\n"):
+            key, value = line.split(" ", 1)
+            if key == "tree":
+                info["tree"] = value
+            elif key == "parent":
+                info["parents"].append(value)
+            elif key == "author":
+                name, when = value.rsplit(" ", 1)
+                info["author"], info["time"] = name, int(when)
+        return info
+
+
+
+
+    def new_repo():
+        """A REPOSITORY holds everything: return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}. `branches` maps a branch name to the hash of its newest commit (None while it has none), `head` is the name of the branch you are on and `clock` is a counter that gives commits a time."""
+        return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0}
+
+
+    def commit_snapshot(repo, files, message, author):
+        """Save a new commit of the whole folder `files` on the current branch. Add 1 to repo["clock"] and use it as the commit time; save the tree with make_tree and make the commit (its only parent is the branch's current newest commit, if there is one); move the branch to the new commit and return its hash."""
+        repo["clock"] += 1
+        tree = make_tree(repo["store"], files)
+        tip = repo["branches"][repo["head"]]
+        parents = [tip] if tip else []
+        h = make_commit(repo["store"], tree, parents, message, author, repo["clock"])
+        repo["branches"][repo["head"]] = h
+        return h
+
+
+    def snapshot_of(repo, commit_hash):
+        """The dict {path: text} of all files as they were in that commit."""
+        info = read_commit(repo["store"], commit_hash)
+        return read_tree(repo["store"], info["tree"])
+
+
+    def file_changes(old, new):
+        """Compare two folders (dicts {path: text}). Return {"added": [...], "modified": [...], "deleted": [...]}: each a sorted list of paths that are only in `new`, in both but with different text, or only in `old`."""
+        return {
+            "added": sorted(p for p in new if p not in old),
+            "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+            "deleted": sorted(p for p in old if p not in new),
+        }
+  explanation: 'This is how Git works: not a list of edits, but a chain of complete snapshots that share unchanged files.'
+commonMistakes:
+- title: Thinking Git and GitHub are the same
+  explanation: Git runs on your computer; GitHub is a website that hosts repositories.
+- title: Believing Git stores edits
+  explanation: It stores snapshots and shares unchanged files.
+- title: Writing commit messages like 'stuff'
+  explanation: A message should say what changed and why.
+- title: Hashing text instead of bytes
+  explanation: Hashes are computed over bytes, so accented letters count as several bytes.
+- title: Committing everything in one huge commit
+  explanation: Small, focused commits are easier to understand and undo.
+summary:
+- Version control remembers every state of a project.
+- Git names objects by a hash of their content.
+- Blobs hold files, trees hold folders, commits hold snapshots and parents.
+- History is a chain of commits each pointing to its parent.
+- Git is the tool; GitHub is a hosting website.
+next: u28-branches
+quiz:
+- type: mcq
+  question: What is a commit?
+  options:
+  - A saved snapshot of the project with a message and a link to its parent
+  - A copy of one file
+  - A branch name
+  - A website
+  answer: 0
+  explanation: It is the unit of history.
+- type: mcq
+  question: What happens to a hash when the content changes by one letter?
+  options:
+  - It becomes completely different
+  - It changes by one digit
+  - It stays the same
+  - It gets shorter
+  answer: 0
+  explanation: That is the avalanche effect.
+- type: mcq
+  question: What does a tree object record?
+  options:
+  - 'A folder: names and hashes of its files'
+  - One line of code
+  - The author
+  - The remote
+  answer: 0
+  explanation: A tree is a snapshot of a folder.
+- type: mcq
+  question: Why does an unchanged file take no extra space in a new commit?
+  options:
+  - Identical content has the same hash, so the blob is shared
+  - Git compresses it to nothing
+  - It is deleted
+  - It is moved to GitHub
+  answer: 0
+  explanation: Content addressing.
+- type: mcq
+  question: What is the difference between Git and GitHub?
+  options:
+  - Git is the tool; GitHub hosts repositories online
+  - They are the same
+  - Git is a website
+  - GitHub is a programming language
+  answer: 0
+  explanation: You can use Git alone.
+- type: mcq
+  question: Why can an old commit not be changed secretly?
+  options:
+  - Its hash would change, and so would all later hashes
+  - Git forbids it with a password
+  - Commits are encrypted
+  - It is saved on a disk
+  answer: 0
+  explanation: Parents are part of a commit's hash.
+- type: code
+  question: Write `commit_message_ok(message)` that returns True if the first line of a commit message (before the first newline) is between 3 and 50 characters long after `strip()` and does not end with a full stop.
+  starter: |
+    def commit_message_ok(message):
+        pass
+  tests:
+  - name: messages
+    code: |
+      assert commit_message_ok("Add login page") is True and commit_message_ok("Fix") is True and commit_message_ok("ab") is False and commit_message_ok("Done.") is False
+      assert commit_message_ok("x" * 51) is False and commit_message_ok("x" * 50) is True and commit_message_ok("Add page\n\nLong body that is fine.") is True and commit_message_ok("   ") is False
+  solution: |
+    def commit_message_ok(message):
+        first = message.split("\n")[0].strip()
+        return 3 <= len(first) <= 50 and not first.endswith(".")

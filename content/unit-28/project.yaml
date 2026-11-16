@@ -1,0 +1,906 @@
+title: Mini Git
+language: python
+brief: 'Build your own version control system. Using the content-addressed object store, trees and commits
+  from Lesson 1 (given), the diff algorithm of Lesson 3 and the three-way line merge of Lesson 4 (both
+  given), you write the commands that make it a usable tool: `commit`, `log`, branches, a safe `switch`,
+  `status`, finding the merge base, `merge` (fast-forward, true merge and conflict), `diff_commits` and
+  `push` with the fast-forward rule. When all tests pass you have rebuilt the core of Git.'
+steps:
+- title: Commits and history
+  body: Write `new_repo`, `commit` and `log`. A commit has the old tip as its only parent and moves the
+    current branch.
+- title: Branches and status
+  body: Write `create_branch`, `switch` (which refuses to lose uncommitted work) and `status`.
+- title: Comparing
+  body: Write `diff_commits` using the given diff, producing the lines a pull request would show.
+- title: Merging
+  body: Write `merge_base` and `merge`. A fast-forward only moves the label; a real merge makes a commit
+    with two parents; a conflict changes nothing.
+- title: Sharing
+  body: 'Write `push`: send the missing objects and refuse any push that is not a fast-forward.'
+checklist:
+- text: Makes commits and a log
+  test: committing and the log
+- text: Creates and switches branches
+  test: branches and switching
+- text: Reports status and protects uncommitted work
+  test: status and safe switching
+- text: Shows diffs between commits
+  test: diffs between commits
+- text: Finds the merge base
+  test: the merge base
+- text: Fast-forwards when possible
+  test: fast-forward and up-to-date
+- text: Makes a three-way merge commit
+  test: a three-way merge
+- text: Stops on conflicts without changing anything
+  test: a conflict
+- text: Pushes new objects only
+  test: pushing
+- text: Rejects pushes that are not fast-forwards
+  test: a rejected push
+starter: |-
+  import hashlib
+
+
+  def hash_object(text, kind="blob"):
+      """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+      data = text.encode("utf-8")
+      header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+      return hashlib.sha1(header + data).hexdigest()
+
+
+  def short_hash(h, n=7):
+      """The first n characters of a hash: how people write hashes in practice."""
+      return h[:n]
+
+
+  def store_object(store, kind, text):
+      """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+      h = hash_object(text, kind)
+      store[h] = (kind, text)
+      return h
+
+
+  def read_object(store, h):
+      """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+      if h not in store:
+          raise ValueError("unknown object")
+      return store[h]
+
+
+  def find_by_prefix(store, prefix):
+      """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+      if len(prefix) < 4:
+          raise ValueError("prefix too short")
+      found = [h for h in store if h.startswith(prefix)]
+      if not found:
+          raise ValueError("unknown object")
+      if len(found) > 1:
+          raise ValueError("ambiguous prefix")
+      return found[0]
+
+
+  def make_tree(store, files):
+      """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+      lines = []
+      for path in sorted(files):
+          h = store_object(store, "blob", files[path])
+          lines.append(path + " " + h)
+      return store_object(store, "tree", "\n".join(lines))
+
+
+  def read_tree(store, h):
+      """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+      kind, text = read_object(store, h)
+      files = {}
+      for line in text.split("\n"):
+          if line:
+              path, blob = line.rsplit(" ", 1)
+              files[path] = read_object(store, blob)[1]
+      return files
+
+
+  def make_commit(store, tree, parents, message, author, time):
+      """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+      lines = ["tree " + tree]
+      for p in parents:
+          lines.append("parent " + p)
+      lines.append("author " + author + " " + str(time))
+      lines.append("")
+      lines.append(message)
+      return store_object(store, "commit", "\n".join(lines))
+
+
+  def read_commit(store, h):
+      """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+      kind, text = read_object(store, h)
+      if kind != "commit":
+          raise ValueError("not a commit")
+      head, message = text.split("\n\n", 1)
+      info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+      for line in head.split("\n"):
+          key, value = line.split(" ", 1)
+          if key == "tree":
+              info["tree"] = value
+          elif key == "parent":
+              info["parents"].append(value)
+          elif key == "author":
+              name, when = value.rsplit(" ", 1)
+              info["author"], info["time"] = name, int(when)
+      return info
+
+
+  def lcs_table(a, b):
+      """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+      t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+      for i in range(len(a) - 1, -1, -1):
+          for j in range(len(b) - 1, -1, -1):
+              if a[i] == b[j]:
+                  t[i][j] = 1 + t[i + 1][j + 1]
+              else:
+                  t[i][j] = max(t[i + 1][j], t[i][j + 1])
+      return t
+
+
+  def lcs_length(a, b):
+      """The length of the longest common subsequence of the two lists."""
+      return lcs_table(a, b)[0][0]
+
+
+  def lcs(a, b):
+      """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+      t = lcs_table(a, b)
+      i = j = 0
+      out = []
+      while i < len(a) and j < len(b):
+          if a[i] == b[j]:
+              out.append(a[i])
+              i += 1
+              j += 1
+          elif t[i + 1][j] >= t[i][j + 1]:
+              i += 1
+          else:
+              j += 1
+      return out
+
+
+  def diff_lines(a, b):
+      """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+      t = lcs_table(a, b)
+      i = j = 0
+      ops = []
+      while i < len(a) and j < len(b):
+          if a[i] == b[j]:
+              ops.append(("=", a[i]))
+              i += 1
+              j += 1
+          elif t[i + 1][j] >= t[i][j + 1]:
+              ops.append(("-", a[i]))
+              i += 1
+          else:
+              ops.append(("+", b[j]))
+              j += 1
+      while i < len(a):
+          ops.append(("-", a[i]))
+          i += 1
+      while j < len(b):
+          ops.append(("+", b[j]))
+          j += 1
+      return ops
+
+
+  def format_diff(ops):
+      """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+      return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+  def diff_stats(ops):
+      """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+      return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+  def split_lines(text):
+      """The lines of a text without their line ends (text.splitlines()); an empty text has no lines."""
+      return text.splitlines()
+
+
+  def ancestors(store, h):
+      """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+      seen = set()
+      todo = [h]
+      while todo:
+          c = todo.pop()
+          if c not in seen:
+              seen.add(c)
+              todo.extend(read_commit(store, c)["parents"])
+      return seen
+
+
+  def merge_lines(base, ours, theirs):
+      """THREE-WAY MERGE of lists of lines. `base` is the common ancestor, `ours` and `theirs` are the two changed versions. Use diff_lines(base, other) to record, for each side, which base lines were deleted and which lines were inserted before each base position (an insertion that comes after the "-" of base line i belongs to position i + 1; position len(base) means the end). Then build the result by going through the positions i = 0 .. len(base): first the inserted lines of position i: if both sides inserted the same lines use them once, if only one side inserted lines use those, if both inserted DIFFERENT lines write a CONFLICT: the line '<<<<<<< ours', our lines, '=======', their lines, '>>>>>>> theirs'. Then (for i < len(base)) keep base[i] unless at least one side deleted it. Return (merged lines, True if there was a conflict)."""
+      def changes(other):
+          ins = {i: [] for i in range(len(base) + 1)}
+          deleted = set()
+          i = 0
+          for tag, line in diff_lines(base, other):
+              if tag == "+":
+                  ins[i].append(line)
+              elif tag == "-":
+                  deleted.add(i)
+                  i += 1
+              else:
+                  i += 1
+          return ins, deleted
+
+      o_ins, o_del = changes(ours)
+      t_ins, t_del = changes(theirs)
+      out, conflict = [], False
+      for i in range(len(base) + 1):
+          a, b = o_ins[i], t_ins[i]
+          if a == b or not b:
+              out.extend(a)
+          elif not a:
+              out.extend(b)
+          else:
+              conflict = True
+              out.append("<<<<<<< ours")
+              out.extend(a)
+              out.append("=======")
+              out.extend(b)
+              out.append(">>>>>>> theirs")
+          if i < len(base) and i not in o_del and i not in t_del:
+              out.append(base[i])
+      return out, conflict
+
+
+  def merge_files(base, ours, theirs):
+      """Merge three folders (dicts {path: text}); a path missing from a dict means the file does not exist there. For every path in any of them: if ours and theirs are equal take that (None means the file is gone); else if ours equals base take theirs; else if theirs equals base take ours; otherwise both changed it differently: if one side deleted the file and the other changed it, that is a conflict and the changed version is kept; if both have text, merge_lines on split_lines (an absent base counts as no lines) and join the result with newlines plus a final newline (an empty result is ''); a conflict from merge_lines is a conflict too. Return (merged folder, sorted list of conflicting paths). Deleted files are left out of the folder."""
+      out, conflicts = {}, []
+      for path in sorted(set(base) | set(ours) | set(theirs)):
+          b, o, t = base.get(path), ours.get(path), theirs.get(path)
+          if o == t:
+              result = o
+          elif o == b:
+              result = t
+          elif t == b:
+              result = o
+          elif o is None or t is None:
+              result = o if o is not None else t
+              conflicts.append(path)
+          else:
+              lines, bad = merge_lines(split_lines(b) if b is not None else [], split_lines(o), split_lines(t))
+              result = "\n".join(lines) + "\n" if lines else ""
+              if bad:
+                  conflicts.append(path)
+          if result is not None:
+              out[path] = result
+      return out, conflicts
+
+
+  def snapshot_of(repo, commit_hash):
+      """The dict {path: text} of all files in a commit."""
+      info = read_commit(repo["store"], commit_hash)
+      return read_tree(repo["store"], info["tree"])
+
+
+  def file_changes(old, new):
+      """{"added": [...], "modified": [...], "deleted": [...]}: sorted paths that are only in new, differ, or are only in old."""
+      return {
+          "added": sorted(p for p in new if p not in old),
+          "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+          "deleted": sorted(p for p in old if p not in new),
+      }
+
+
+  def new_repo():
+      """An empty repository: {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0, "tracking": {}}."""
+      pass
+
+
+  def commit(repo, files, message, author):
+      """Save a commit of the whole folder `files` on the current branch: add 1 to the clock and use it as the commit time, save the tree, make the commit (the parent is the branch's current newest commit, if any), move the branch to it and return its hash."""
+      pass
+
+
+  def log(repo, branch=None):
+      """What `git log --oneline` prints: for a branch (default: the current one) follow the FIRST parent from its tip and return one string per commit, newest first: the 7-character short hash, a space and the first line of the message. ValueError('no such branch') for an unknown branch; an empty list for a branch without commits."""
+      pass
+
+
+  def create_branch(repo, name):
+      """Make a branch at the current branch's newest commit (it does not switch). ValueError('branch exists') if taken (check first), ValueError('no commits yet') if there is no commit."""
+      pass
+
+
+  def switch(repo, name, working=None):
+      """Make `name` the current branch and return the dict of files at its tip (an empty dict if it has no commit). ValueError('no such branch') if it does not exist. If `working` (the folder you are editing) is given and differs from the current tip's files raise ValueError('uncommitted changes') FIRST, before anything else."""
+      pass
+
+
+  def status(repo, working):
+      """Compare the working folder with the files of the current branch's newest commit (an empty folder if it has none): return file_changes(tip files, working)."""
+      pass
+
+
+  def merge_base(store, a, b):
+      """The best common ancestor of commits a and b (a commit is its own ancestor): among the common ancestors drop every one that is a proper ancestor of another common one; of the rest return the one with the latest commit time (ties: larger hash). None if there is none."""
+      pass
+
+
+  def merge(repo, other, author):
+      """Merge branch `other` into the current branch. ValueError('no such branch'); ValueError('nothing to merge') if either branch has no commit. If the other tip is already in the current history return {"kind": "up-to-date", "commit": current tip, "conflicts": []}. If the current tip is in the other's history move the branch to the other tip and return {"kind": "fast-forward", "commit": other tip, "conflicts": []}. Otherwise use merge_files on the snapshots of (merge base, current tip, other tip). On conflicts change nothing and return {"kind": "conflict", "commit": None, "conflicts": [paths], "files": merged folder}. Else add 1 to the clock, commit the merged tree with TWO parents (current tip, other tip) and the message "Merge branch 'NAME'", move the branch and return {"kind": "merge", "commit": hash, "conflicts": []}."""
+      pass
+
+
+  def diff_commits(repo, a, b):
+      """The changes from commit a to commit b as a list of text lines. For every path whose text differs (sorted by path; a path missing on one side counts as no lines) add the line 'diff ' + path and then format each operation of diff_lines(old lines, new lines): '+' + line for an insertion, '-' + line for a deletion and ' ' + line for an unchanged line. Use split_lines. No changes give an empty list."""
+      pass
+
+
+  def push(local, remote, branch):
+      """Send a branch to another repository. ValueError('no such branch') if the local branch does not exist; ValueError('nothing to push') if it has no commit. If the remote already has the branch its tip must be in the history of the local tip, otherwise ValueError('rejected: not a fast-forward'). Then copy every object (commits, trees, blobs: reachable from the tip) that the remote store lacks, move the remote branch to the tip and return the number of objects copied."""
+      pass
+tests:
+- name: committing and the log
+  code: |
+    r = new_repo()
+    assert r == {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0, "tracking": {}} and log(r) == []
+    c1 = commit(r, {"a.txt": "one\n"}, "First commit\n\nmore text", "Ada")
+    c2 = commit(r, {"a.txt": "one\ntwo\n"}, "Add line two", "Ada")
+    assert r["branches"]["main"] == c2 and r["clock"] == 2
+    assert read_commit(r["store"], c2)["parents"] == [c1] and read_commit(r["store"], c1)["parents"] == [] and read_commit(r["store"], c2)["time"] == 2
+    assert log(r) == [c2[:7] + " Add line two", c1[:7] + " First commit"] and log(r, "main") == log(r)
+    try:
+        log(r, "nope")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "no such branch" in str(e)
+- name: branches and switching
+  code: |
+    r = new_repo()
+    try:
+        create_branch(r, "x")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "no commits yet" in str(e)
+    c1 = commit(r, {"a": "1\n"}, "one", "Ada")
+    create_branch(r, "feature")
+    assert r["branches"]["feature"] == c1 and r["head"] == "main"
+    assert switch(r, "feature") == {"a": "1\n"} and r["head"] == "feature"
+    c2 = commit(r, {"a": "1\n", "f": "f\n"}, "feature work", "Bo")
+    assert r["branches"]["feature"] == c2 and r["branches"]["main"] == c1 and log(r, "main") == [c1[:7] + " one"] and len(log(r)) == 2
+    assert switch(r, "main") == {"a": "1\n"}
+    for fn, msg in ((lambda: create_branch(r, "feature"), "branch exists"), (lambda: switch(r, "nope"), "no such branch")):
+        try:
+            fn()
+            raise AssertionError("accepted")
+        except ValueError as e:
+            assert msg in str(e)
+    r["branches"]["empty"] = None
+    assert switch(r, "empty") == {}
+- name: status and safe switching
+  code: |
+    r = new_repo()
+    assert status(r, {}) == {"added": [], "modified": [], "deleted": []} and status(r, {"x": "1"}) == {"added": ["x"], "modified": [], "deleted": []}
+    commit(r, {"a": "1\n", "b": "2\n"}, "one", "Ada")
+    create_branch(r, "other")
+    assert status(r, {"a": "1\n", "b": "2\n"}) == {"added": [], "modified": [], "deleted": []}
+    assert status(r, {"a": "changed\n", "c": "new\n"}) == {"added": ["c"], "modified": ["a"], "deleted": ["b"]}
+    try:
+        switch(r, "other", {"a": "changed\n", "b": "2\n"})
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "uncommitted changes" in str(e)
+    try:
+        switch(r, "nope", {"a": "changed\n"})
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "uncommitted changes" in str(e)
+    assert r["head"] == "main" and switch(r, "other", {"a": "1\n", "b": "2\n"}) == {"a": "1\n", "b": "2\n"} and r["head"] == "other"
+- name: diffs between commits
+  code: |
+    r = new_repo()
+    c1 = commit(r, {"a.txt": "one\ntwo\nthree\n", "gone.txt": "bye\n"}, "first", "Ada")
+    c2 = commit(r, {"a.txt": "one\n2\nthree\nfour\n", "new.txt": "hi\n"}, "second", "Ada")
+    assert diff_commits(r, c1, c2) == ["diff a.txt", " one", "-two", "+2", " three", "+four", "diff gone.txt", "-bye", "diff new.txt", "+hi"]
+    assert diff_commits(r, c1, c1) == [] and diff_commits(r, c2, c1)[:3] == ["diff a.txt", " one", "-2"]
+- name: the merge base
+  code: |
+    r = new_repo()
+    c1 = commit(r, {"a": "1\n"}, "base", "Ada")
+    create_branch(r, "side")
+    c2 = commit(r, {"a": "1\n", "m": "m\n"}, "main", "Ada")
+    switch(r, "side")
+    c3 = commit(r, {"a": "1\n", "s": "s\n"}, "side", "Bo")
+    s = r["store"]
+    assert merge_base(s, c2, c3) == c1 and merge_base(s, c3, c2) == c1 and merge_base(s, c1, c3) == c1 and merge_base(s, c3, c3) == c3
+    c4 = commit(r, {"a": "1\n", "s": "s2\n"}, "side 2", "Bo")
+    assert merge_base(s, c2, c4) == c1 and merge_base(s, c3, c4) == c3
+    other = new_repo()
+    x = commit(other, {"z": "z"}, "unrelated", "Cy")
+    s.update(other["store"])
+    assert merge_base(s, c2, x) is None
+- name: fast-forward and up-to-date
+  code: |
+    r = new_repo()
+    c1 = commit(r, {"a": "1\n"}, "one", "Ada")
+    create_branch(r, "feature")
+    switch(r, "feature")
+    c2 = commit(r, {"a": "1\n", "f": "f\n"}, "feature", "Bo")
+    switch(r, "main")
+    assert merge(r, "main", "Ada") == {"kind": "up-to-date", "commit": c1, "conflicts": []}
+    res = merge(r, "feature", "Ada")
+    assert res == {"kind": "fast-forward", "commit": c2, "conflicts": []} and r["branches"]["main"] == c2 and r["clock"] == 2
+    assert merge(r, "feature", "Ada")["kind"] == "up-to-date"
+    for name, msg in (("zzz", "no such branch"),):
+        try:
+            merge(r, name, "Ada")
+            raise AssertionError("accepted")
+        except ValueError as e:
+            assert msg in str(e)
+    r["branches"]["empty"] = None
+    try:
+        merge(r, "empty", "Ada")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "nothing to merge" in str(e)
+- name: a three-way merge
+  code: |
+    r = new_repo()
+    c1 = commit(r, {"a.txt": "1\n2\n3\n", "keep": "k\n"}, "base", "Ada")
+    create_branch(r, "feature")
+    c2 = commit(r, {"a.txt": "ONE\n2\n3\n", "keep": "k\n"}, "main edits line 1", "Ada")
+    switch(r, "feature")
+    c3 = commit(r, {"a.txt": "1\n2\nTHREE\n", "keep": "k\n", "new.txt": "n\n"}, "feature edits line 3", "Bo")
+    switch(r, "main")
+    res = merge(r, "feature", "Ada")
+    assert res["kind"] == "merge" and res["conflicts"] == [] and r["branches"]["main"] == res["commit"] and r["branches"]["feature"] == c3
+    info = read_commit(r["store"], res["commit"])
+    assert info["parents"] == [c2, c3] and info["message"] == "Merge branch 'feature'" and info["author"] == "Ada" and info["time"] == r["clock"] == 4
+    assert snapshot_of(r, res["commit"]) == {"a.txt": "ONE\n2\nTHREE\n", "keep": "k\n", "new.txt": "n\n"}
+    assert merge(r, "feature", "Ada")["kind"] == "up-to-date"
+- name: a conflict
+  code: |
+    r = new_repo()
+    c1 = commit(r, {"a.txt": "1\n2\n"}, "base", "Ada")
+    create_branch(r, "feature")
+    c2 = commit(r, {"a.txt": "1\nmain\n"}, "main edit", "Ada")
+    switch(r, "feature")
+    c3 = commit(r, {"a.txt": "1\nfeature\n"}, "feature edit", "Bo")
+    switch(r, "main")
+    n, clock = len(r["store"]), r["clock"]
+    res = merge(r, "feature", "Ada")
+    assert res["kind"] == "conflict" and res["commit"] is None and res["conflicts"] == ["a.txt"]
+    assert res["files"] == {"a.txt": "1\n<<<<<<< ours\nmain\n=======\nfeature\n>>>>>>> theirs\n"}
+    assert len(r["store"]) == n and r["clock"] == clock and r["branches"]["main"] == c2
+- name: pushing
+  code: |
+    remote = new_repo()
+    local = new_repo()
+    c1 = commit(local, {"a": "1\n"}, "one", "Ada")
+    c2 = commit(local, {"a": "1\n", "b": "2\n"}, "two", "Ada")
+    assert push(local, remote, "main") == 6 and remote["branches"]["main"] == c2 and remote["store"] == local["store"]
+    assert push(local, remote, "main") == 0
+    c3 = commit(local, {"a": "1\n", "b": "2\n", "c": "3\n"}, "three", "Ada")
+    assert push(local, remote, "main") == 3 and remote["branches"]["main"] == c3
+    for name, msg in (("zzz", "no such branch"),):
+        try:
+            push(local, remote, name)
+            raise AssertionError("accepted")
+        except ValueError as e:
+            assert msg in str(e)
+    local["branches"]["empty"] = None
+    try:
+        push(local, remote, "empty")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "nothing to push" in str(e)
+- name: a rejected push
+  code: |
+    remote = new_repo()
+    a = new_repo()
+    commit(a, {"x": "1\n"}, "start", "Ada")
+    push(a, remote, "main")
+    b = {"store": dict(remote["store"]), "branches": dict(remote["branches"]), "head": "main", "clock": 1, "tracking": {}}
+    commit(a, {"x": "A\n"}, "from a", "Ada")
+    commit(b, {"x": "B\n"}, "from b", "Bo")
+    push(a, remote, "main")
+    tip = remote["branches"]["main"]
+    try:
+        push(b, remote, "main")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "rejected: not a fast-forward" in str(e)
+    assert remote["branches"]["main"] == tip
+    c = new_repo()
+    commit(c, {"y": "1\n"}, "unrelated", "Cy")
+    try:
+        push(c, remote, "main")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "rejected" in str(e)
+solution: |
+  import hashlib
+
+
+  def hash_object(text, kind="blob"):
+      """Git names every stored thing by a HASH of its content. Real Git builds the bytes `kind + " " + length + a zero byte + the content` (the length is the number of BYTES of the UTF-8 text) and returns their SHA-1 as 40 lowercase hexadecimal characters. Return that string."""
+      data = text.encode("utf-8")
+      header = (kind + " " + str(len(data))).encode("utf-8") + b"\0"
+      return hashlib.sha1(header + data).hexdigest()
+
+
+  def short_hash(h, n=7):
+      """The first n characters of a hash: how people write hashes in practice."""
+      return h[:n]
+
+
+  def store_object(store, kind, text):
+      """The OBJECT STORE is a dict {hash: (kind, text)}. Hash the object with hash_object(text, kind), save it in the store and return the hash. Saving the same content twice must not create a second entry."""
+      h = hash_object(text, kind)
+      store[h] = (kind, text)
+      return h
+
+
+  def read_object(store, h):
+      """Return the (kind, text) saved under the hash h. ValueError('unknown object') if it is missing."""
+      if h not in store:
+          raise ValueError("unknown object")
+      return store[h]
+
+
+  def find_by_prefix(store, prefix):
+      """People type only the start of a hash. Return the FULL hash in the store that starts with the prefix. ValueError('prefix too short') if the prefix has fewer than 4 characters, ValueError('unknown object') if nothing matches and ValueError('ambiguous prefix') if more than one hash matches. (Check them in that order.)"""
+      if len(prefix) < 4:
+          raise ValueError("prefix too short")
+      found = [h for h in store if h.startswith(prefix)]
+      if not found:
+          raise ValueError("unknown object")
+      if len(found) > 1:
+          raise ValueError("ambiguous prefix")
+      return found[0]
+
+
+  def make_tree(store, files):
+      """A TREE records a whole folder. `files` is a dict {path: text}. Save every file as a "blob" object, then build the tree text: one line `path hash` per file, sorted by path, joined with newlines (no newline at the end). Save it as a "tree" object and return its hash. The order in which files were added to the dict must not matter. An empty dict gives an empty tree text."""
+      lines = []
+      for path in sorted(files):
+          h = store_object(store, "blob", files[path])
+          lines.append(path + " " + h)
+      return store_object(store, "tree", "\n".join(lines))
+
+
+  def read_tree(store, h):
+      """The reverse of make_tree: return the dict {path: text} of the tree object h. (A tree line is `path hash`; split it at the LAST space, then read the blob.)"""
+      kind, text = read_object(store, h)
+      files = {}
+      for line in text.split("\n"):
+          if line:
+              path, blob = line.rsplit(" ", 1)
+              files[path] = read_object(store, blob)[1]
+      return files
+
+
+  def make_commit(store, tree, parents, message, author, time):
+      """A COMMIT points at a tree (the snapshot) and at its parent commits (its history). Build the text with these lines, in order: `tree <tree hash>`, then one `parent <hash>` line per parent, then `author <author> <time>`, then an empty line, then the message. Join with newlines, save it as a "commit" object and return its hash."""
+      lines = ["tree " + tree]
+      for p in parents:
+          lines.append("parent " + p)
+      lines.append("author " + author + " " + str(time))
+      lines.append("")
+      lines.append(message)
+      return store_object(store, "commit", "\n".join(lines))
+
+
+  def read_commit(store, h):
+      """Parse a commit object back into a dict {"tree": hash, "parents": [hashes], "author": name, "time": int, "message": text}. (The author line is `author <name> <time>`: the time is the last word and the name is everything before it. The message is everything after the first empty line.) ValueError('not a commit') if the object is of another kind."""
+      kind, text = read_object(store, h)
+      if kind != "commit":
+          raise ValueError("not a commit")
+      head, message = text.split("\n\n", 1)
+      info = {"tree": None, "parents": [], "author": "", "time": 0, "message": message}
+      for line in head.split("\n"):
+          key, value = line.split(" ", 1)
+          if key == "tree":
+              info["tree"] = value
+          elif key == "parent":
+              info["parents"].append(value)
+          elif key == "author":
+              name, when = value.rsplit(" ", 1)
+              info["author"], info["time"] = name, int(when)
+      return info
+
+
+  def lcs_table(a, b):
+      """The LONGEST COMMON SUBSEQUENCE (LCS) of two lists of lines is the longest list of lines that appear in both, in the same order (not necessarily next to each other). Build a table t with len(a) + 1 rows and len(b) + 1 columns where t[i][j] is the length of the LCS of a[i:] and b[j:]. The last row and last column are all 0; fill the rest from the bottom right: if a[i] == b[j] then t[i][j] = 1 + t[i+1][j+1], otherwise the larger of t[i+1][j] and t[i][j+1]."""
+      t = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+      for i in range(len(a) - 1, -1, -1):
+          for j in range(len(b) - 1, -1, -1):
+              if a[i] == b[j]:
+                  t[i][j] = 1 + t[i + 1][j + 1]
+              else:
+                  t[i][j] = max(t[i + 1][j], t[i][j + 1])
+      return t
+
+
+  def lcs_length(a, b):
+      """The length of the longest common subsequence of the two lists."""
+      return lcs_table(a, b)[0][0]
+
+
+  def lcs(a, b):
+      """The longest common subsequence itself as a list. Walk through the table from (0, 0): if a[i] == b[j] take that line and move diagonally; otherwise move down (i + 1) if t[i+1][j] >= t[i][j+1], else right (j + 1)."""
+      t = lcs_table(a, b)
+      i = j = 0
+      out = []
+      while i < len(a) and j < len(b):
+          if a[i] == b[j]:
+              out.append(a[i])
+              i += 1
+              j += 1
+          elif t[i + 1][j] >= t[i][j + 1]:
+              i += 1
+          else:
+              j += 1
+      return out
+
+
+  def diff_lines(a, b):
+      """The DIFF of two lists of lines: the list of operations (tag, line) that turns a into b, where tag "=" keeps a line, "-" deletes a line of a and "+" inserts a line of b. Use the table of lcs_table and walk from (0, 0): if a[i] == b[j] emit "=" and move diagonally; otherwise if t[i+1][j] >= t[i][j+1] emit "-" for a[i] and move down, else emit "+" for b[j] and move right. When one list is used up, emit the rest of the other (deletions for a, insertions for b)."""
+      t = lcs_table(a, b)
+      i = j = 0
+      ops = []
+      while i < len(a) and j < len(b):
+          if a[i] == b[j]:
+              ops.append(("=", a[i]))
+              i += 1
+              j += 1
+          elif t[i + 1][j] >= t[i][j + 1]:
+              ops.append(("-", a[i]))
+              i += 1
+          else:
+              ops.append(("+", b[j]))
+              j += 1
+      while i < len(a):
+          ops.append(("-", a[i]))
+          i += 1
+      while j < len(b):
+          ops.append(("+", b[j]))
+          j += 1
+      return ops
+
+
+  def format_diff(ops):
+      """Print the diff the way Git does: one string per operation: a space for "=", "-" or "+", directly followed by the line."""
+      return [(" " if tag == "=" else tag) + line for tag, line in ops]
+
+
+  def diff_stats(ops):
+      """Return (insertions, deletions): how many "+" and how many "-" operations there are."""
+      return (sum(1 for t, _ in ops if t == "+"), sum(1 for t, _ in ops if t == "-"))
+
+
+  def split_lines(text):
+      """The lines of a text without their line ends (text.splitlines()); an empty text has no lines."""
+      return text.splitlines()
+
+
+  def ancestors(store, h):
+      """The set of commit hashes reachable from h by following ALL parents, including h itself."""
+      seen = set()
+      todo = [h]
+      while todo:
+          c = todo.pop()
+          if c not in seen:
+              seen.add(c)
+              todo.extend(read_commit(store, c)["parents"])
+      return seen
+
+
+  def merge_lines(base, ours, theirs):
+      """THREE-WAY MERGE of lists of lines. `base` is the common ancestor, `ours` and `theirs` are the two changed versions. Use diff_lines(base, other) to record, for each side, which base lines were deleted and which lines were inserted before each base position (an insertion that comes after the "-" of base line i belongs to position i + 1; position len(base) means the end). Then build the result by going through the positions i = 0 .. len(base): first the inserted lines of position i: if both sides inserted the same lines use them once, if only one side inserted lines use those, if both inserted DIFFERENT lines write a CONFLICT: the line '<<<<<<< ours', our lines, '=======', their lines, '>>>>>>> theirs'. Then (for i < len(base)) keep base[i] unless at least one side deleted it. Return (merged lines, True if there was a conflict)."""
+      def changes(other):
+          ins = {i: [] for i in range(len(base) + 1)}
+          deleted = set()
+          i = 0
+          for tag, line in diff_lines(base, other):
+              if tag == "+":
+                  ins[i].append(line)
+              elif tag == "-":
+                  deleted.add(i)
+                  i += 1
+              else:
+                  i += 1
+          return ins, deleted
+
+      o_ins, o_del = changes(ours)
+      t_ins, t_del = changes(theirs)
+      out, conflict = [], False
+      for i in range(len(base) + 1):
+          a, b = o_ins[i], t_ins[i]
+          if a == b or not b:
+              out.extend(a)
+          elif not a:
+              out.extend(b)
+          else:
+              conflict = True
+              out.append("<<<<<<< ours")
+              out.extend(a)
+              out.append("=======")
+              out.extend(b)
+              out.append(">>>>>>> theirs")
+          if i < len(base) and i not in o_del and i not in t_del:
+              out.append(base[i])
+      return out, conflict
+
+
+  def merge_files(base, ours, theirs):
+      """Merge three folders (dicts {path: text}); a path missing from a dict means the file does not exist there. For every path in any of them: if ours and theirs are equal take that (None means the file is gone); else if ours equals base take theirs; else if theirs equals base take ours; otherwise both changed it differently: if one side deleted the file and the other changed it, that is a conflict and the changed version is kept; if both have text, merge_lines on split_lines (an absent base counts as no lines) and join the result with newlines plus a final newline (an empty result is ''); a conflict from merge_lines is a conflict too. Return (merged folder, sorted list of conflicting paths). Deleted files are left out of the folder."""
+      out, conflicts = {}, []
+      for path in sorted(set(base) | set(ours) | set(theirs)):
+          b, o, t = base.get(path), ours.get(path), theirs.get(path)
+          if o == t:
+              result = o
+          elif o == b:
+              result = t
+          elif t == b:
+              result = o
+          elif o is None or t is None:
+              result = o if o is not None else t
+              conflicts.append(path)
+          else:
+              lines, bad = merge_lines(split_lines(b) if b is not None else [], split_lines(o), split_lines(t))
+              result = "\n".join(lines) + "\n" if lines else ""
+              if bad:
+                  conflicts.append(path)
+          if result is not None:
+              out[path] = result
+      return out, conflicts
+
+
+  def snapshot_of(repo, commit_hash):
+      """The dict {path: text} of all files in a commit."""
+      info = read_commit(repo["store"], commit_hash)
+      return read_tree(repo["store"], info["tree"])
+
+
+  def file_changes(old, new):
+      """{"added": [...], "modified": [...], "deleted": [...]}: sorted paths that are only in new, differ, or are only in old."""
+      return {
+          "added": sorted(p for p in new if p not in old),
+          "modified": sorted(p for p in new if p in old and new[p] != old[p]),
+          "deleted": sorted(p for p in old if p not in new),
+      }
+
+
+  def new_repo():
+      """An empty repository: {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0, "tracking": {}}."""
+      return {"store": {}, "branches": {"main": None}, "head": "main", "clock": 0, "tracking": {}}
+
+
+  def commit(repo, files, message, author):
+      """Save a commit of the whole folder `files` on the current branch: add 1 to the clock and use it as the commit time, save the tree, make the commit (the parent is the branch's current newest commit, if any), move the branch to it and return its hash."""
+      repo["clock"] += 1
+      tree = make_tree(repo["store"], files)
+      tip = repo["branches"][repo["head"]]
+      h = make_commit(repo["store"], tree, [tip] if tip else [], message, author, repo["clock"])
+      repo["branches"][repo["head"]] = h
+      return h
+
+
+  def log(repo, branch=None):
+      """What `git log --oneline` prints: for a branch (default: the current one) follow the FIRST parent from its tip and return one string per commit, newest first: the 7-character short hash, a space and the first line of the message. ValueError('no such branch') for an unknown branch; an empty list for a branch without commits."""
+      name = branch if branch is not None else repo["head"]
+      if name not in repo["branches"]:
+          raise ValueError("no such branch")
+      h = repo["branches"][name]
+      lines = []
+      while h:
+          info = read_commit(repo["store"], h)
+          lines.append(short_hash(h) + " " + info["message"].split("\n")[0])
+          h = info["parents"][0] if info["parents"] else None
+      return lines
+
+
+  def create_branch(repo, name):
+      """Make a branch at the current branch's newest commit (it does not switch). ValueError('branch exists') if taken (check first), ValueError('no commits yet') if there is no commit."""
+      if name in repo["branches"]:
+          raise ValueError("branch exists")
+      tip = repo["branches"][repo["head"]]
+      if tip is None:
+          raise ValueError("no commits yet")
+      repo["branches"][name] = tip
+
+
+  def switch(repo, name, working=None):
+      """Make `name` the current branch and return the dict of files at its tip (an empty dict if it has no commit). ValueError('no such branch') if it does not exist. If `working` (the folder you are editing) is given and differs from the current tip's files raise ValueError('uncommitted changes') FIRST, before anything else."""
+      if working is not None and status(repo, working) != {"added": [], "modified": [], "deleted": []}:
+          raise ValueError("uncommitted changes")
+      if name not in repo["branches"]:
+          raise ValueError("no such branch")
+      repo["head"] = name
+      tip = repo["branches"][name]
+      return snapshot_of(repo, tip) if tip else {}
+
+
+  def status(repo, working):
+      """Compare the working folder with the files of the current branch's newest commit (an empty folder if it has none): return file_changes(tip files, working)."""
+      tip = repo["branches"][repo["head"]]
+      return file_changes(snapshot_of(repo, tip) if tip else {}, working)
+
+
+  def merge_base(store, a, b):
+      """The best common ancestor of commits a and b (a commit is its own ancestor): among the common ancestors drop every one that is a proper ancestor of another common one; of the rest return the one with the latest commit time (ties: larger hash). None if there is none."""
+      common = ancestors(store, a) & ancestors(store, b)
+      best = [c for c in common if not any(c != d and c in ancestors(store, d) for d in common)]
+      if not best:
+          return None
+      return max(best, key=lambda c: (read_commit(store, c)["time"], c))
+
+
+  def merge(repo, other, author):
+      """Merge branch `other` into the current branch. ValueError('no such branch'); ValueError('nothing to merge') if either branch has no commit. If the other tip is already in the current history return {"kind": "up-to-date", "commit": current tip, "conflicts": []}. If the current tip is in the other's history move the branch to the other tip and return {"kind": "fast-forward", "commit": other tip, "conflicts": []}. Otherwise use merge_files on the snapshots of (merge base, current tip, other tip). On conflicts change nothing and return {"kind": "conflict", "commit": None, "conflicts": [paths], "files": merged folder}. Else add 1 to the clock, commit the merged tree with TWO parents (current tip, other tip) and the message "Merge branch 'NAME'", move the branch and return {"kind": "merge", "commit": hash, "conflicts": []}."""
+      if other not in repo["branches"]:
+          raise ValueError("no such branch")
+      ours, theirs = repo["branches"][repo["head"]], repo["branches"][other]
+      if ours is None or theirs is None:
+          raise ValueError("nothing to merge")
+      store = repo["store"]
+      if theirs in ancestors(store, ours):
+          return {"kind": "up-to-date", "commit": ours, "conflicts": []}
+      if ours in ancestors(store, theirs):
+          repo["branches"][repo["head"]] = theirs
+          return {"kind": "fast-forward", "commit": theirs, "conflicts": []}
+      base = merge_base(store, ours, theirs)
+      files, conflicts = merge_files(snapshot_of(repo, base) if base else {}, snapshot_of(repo, ours), snapshot_of(repo, theirs))
+      if conflicts:
+          return {"kind": "conflict", "commit": None, "conflicts": conflicts, "files": files}
+      repo["clock"] += 1
+      h = make_commit(store, make_tree(store, files), [ours, theirs], "Merge branch '" + other + "'", author, repo["clock"])
+      repo["branches"][repo["head"]] = h
+      return {"kind": "merge", "commit": h, "conflicts": []}
+
+
+  def diff_commits(repo, a, b):
+      """The changes from commit a to commit b as a list of text lines. For every path whose text differs (sorted by path; a path missing on one side counts as no lines) add the line 'diff ' + path and then format each operation of diff_lines(old lines, new lines): '+' + line for an insertion, '-' + line for a deletion and ' ' + line for an unchanged line. Use split_lines. No changes give an empty list."""
+      old, new = snapshot_of(repo, a), snapshot_of(repo, b)
+      out = []
+      for path in sorted(set(old) | set(new)):
+          if old.get(path) == new.get(path):
+              continue
+          out.append("diff " + path)
+          ops = diff_lines(split_lines(old[path]) if path in old else [], split_lines(new[path]) if path in new else [])
+          for tag, line in ops:
+              out.append((" " if tag == "=" else tag) + line)
+      return out
+
+
+  def push(local, remote, branch):
+      """Send a branch to another repository. ValueError('no such branch') if the local branch does not exist; ValueError('nothing to push') if it has no commit. If the remote already has the branch its tip must be in the history of the local tip, otherwise ValueError('rejected: not a fast-forward'). Then copy every object (commits, trees, blobs: reachable from the tip) that the remote store lacks, move the remote branch to the tip and return the number of objects copied."""
+      if branch not in local["branches"]:
+          raise ValueError("no such branch")
+      tip = local["branches"][branch]
+      if tip is None:
+          raise ValueError("nothing to push")
+      old = remote["branches"].get(branch)
+      if old is not None and (old not in local["store"] or old not in ancestors(local["store"], tip)):
+          raise ValueError("rejected: not a fast-forward")
+      needed = set()
+      for c in ancestors(local["store"], tip):
+          needed.add(c)
+          tree = read_commit(local["store"], c)["tree"]
+          needed.add(tree)
+          for line in local["store"][tree][1].split("\n"):
+              if line:
+                  needed.add(line.rsplit(" ", 1)[1])
+      n = 0
+      for h in sorted(needed):
+          if h not in remote["store"]:
+              remote["store"][h] = local["store"][h]
+              n += 1
+      remote["branches"][branch] = tip
+      return n
+stretch: Add `tag(repo, name)` and a `describe` that says how many commits a tag is behind, implement
+  `rebase` with cherry-picking, store files in chunks so that big files with small edits share storage,
+  or write a `bisect` that uses your `log`.

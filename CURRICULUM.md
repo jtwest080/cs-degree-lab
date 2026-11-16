@@ -33,8 +33,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 25 | Database Internals (Version 2) | ✅ Complete (Phase 25) | 7 | 35 | Mini Database (typed tables, keys, indexes, planner, SELECT/UPDATE/DELETE, transactions with rollback) |
 | 26 | Computer Graphics (Version 2, elective) | ✅ Complete (Phase 26) | 7 | 35 | Mini 3D Renderer (rotation, perspective, normals and lighting, back-face culling, depth-buffered triangle fill, shaded cube) |
 | 27 | Human-Computer Interaction (Version 2, elective) | ✅ Complete (Phase 27) | 7 | 35 | Mini UI Toolkit (text layout, drawing, hit testing, keyboard focus, undo/redo state, accessibility audit, event session) |
+| 28 | Git and GitHub (Version 2, practice unit) | ✅ Complete (Phase 29) | 7 | 35 | Mini Git (commits, log, branches, safe switch, status, diff, merge base, fast-forward / three-way merge / conflicts, push with the fast-forward rule) |
 
-Totals: 223 lessons, 1068 practice exercises, 223 lesson quizzes (1338 multiple-choice questions + 223 coding questions), 27 unit projects, 2147 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 230 lessons, 1103 practice exercises, 230 lesson quizzes (1380 multiple-choice questions + 230 coding questions), 28 unit projects, 2192 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -624,6 +625,22 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 - `content/reading.yaml`: 33 books, papers, articles, courses and tools tied to units (`after`), with a free-online flag and a "why read this". Learners tick items off on the **Reading** page (progress key `reading`).
 - Components: `src/components/Capstones.jsx` (list and detail) and `src/components/Reading.jsx`; routes `#/capstones`, `#/capstones/<id>` and `#/reading`.
 
+## Unit 28: Git and GitHub (Version 2, practice unit) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 28.1 Snapshots, Hashes and Commits | `u28-snapshots` | SHA-1 content hashes (matching real Git), object store, trees, commits with parents, a tiny repository |
+| 28.2 Branches and History | `u28-branches` | log, branches as labels, HEAD, ancestors and ranges, status, safe switching, ahead/behind |
+| 28.3 Diff and Patch | `u28-diff` | longest common subsequence, line diff, apply and reverse patches, folder diffs and `--stat`, blame |
+| 28.4 Merging and Conflicts | `u28-merge` | merge base, fast-forward vs merge, three-way line merge, folder merge, conflict markers and resolving |
+| 28.5 Remotes, Push, Pull and Pull Requests | `u28-remote` | objects to send, clone, fetch, push (fast-forward rule), pull, sync status, pull-request reviews |
+| 28.6 Everyday Git Workflow | `u28-workflow` | .gitignore matching, cherry-pick, revert, reset, bisect, rebase, conventional commits, semantic versions, changelogs |
+| 28.7 Teamwork: Reviews, Issues and Automation | `u28-collab` | CODEOWNERS, pull-request checks, issue triage and search, branch hygiene, CI pipelines (topological sort) |
+
+**Project: Mini Git.** Learners write `new_repo`, `commit`, `log`, `create_branch`, `switch`, `status`, `merge_base`, `merge`, `diff_commits` and `push` (hashing, objects, trees, commits, diff and the line merge are given).
+
+Note: the lessons teach the real commands in text blocks (`git init`, `git switch -c`, `git merge`, `git push`, and so on) and build the same machinery in Python so that nothing is magic. Practice units (28-31) are about real-world skills; later units can assume Git vocabulary.
+
 ## Plan for remaining units (to refine before each phase)
 
 Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction (electives) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
@@ -663,3 +680,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 26 (2026-11-15):** Version 2 continues. Complete Unit 26 Computer Graphics elective (7 lessons, 35 exercises, 7 quizzes, Mini 3D Renderer project, 90 glossary terms). No framework changes; all Python.
 - **Phase 27 (2026-11-15):** Version 2 continues. Complete Unit 27 Human-Computer Interaction elective (7 lessons, 35 exercises, 7 quizzes, Mini UI Toolkit project, 62 glossary terms). No framework changes; all Python.
 - **Phase 28 (2026-11-15):** Version 2 continues. Added the Capstones page (8 open-ended projects with self-graded rubrics and reflection notes) and the Reading page (33 items with read tracking). Framework change: two new pages, routes, nav links and progress keys.
+- **Phase 29 (2026-11-16):** Practice units begin (Jaden's approved additions). Complete Unit 28 Git and GitHub (7 lessons, 35 exercises, 7 quizzes, Mini Git project, 45 glossary terms). No framework changes; all Python.
