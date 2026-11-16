@@ -59,3 +59,32 @@ export function lessonTitleForCard(card) {
   const l = lessonById[card.lessonId];
   return l ? `${l.number} ${l.title}` : '';
 }
+
+/** How many cards sit in each box (box 0 = new or recently missed, last box = well known). */
+export function boxCounts(s) {
+  const counts = Array(INTERVALS_DAYS.length).fill(0);
+  const ids = new Set(allCards().map((c) => c.cardId));
+  for (const [id, v] of Object.entries(s.srs)) if (ids.has(id)) counts[Math.min(v.box, counts.length - 1)]++;
+  return counts;
+}
+
+/** Cards due now, within a day, and within a week. */
+export function forecast(s, now = Date.now()) {
+  const ids = new Set(allCards().map((c) => c.cardId));
+  const out = { due: 0, tomorrow: 0, week: 0 };
+  for (const [id, v] of Object.entries(s.srs)) {
+    if (!ids.has(id)) continue;
+    const wait = v.due - now;
+    if (wait <= 0) out.due++;
+    else if (wait <= DAY) out.tomorrow++;
+    else if (wait <= 7 * DAY) out.week++;
+  }
+  return out;
+}
+
+/** How many different cards were reviewed since midnight. */
+export function reviewedToday(s) {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  return Object.values(s.srs).filter((v) => v.last && v.last >= start.getTime()).length;
+}
