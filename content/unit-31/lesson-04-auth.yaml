@@ -1,0 +1,649 @@
+id: u31-auth
+title: Authentication, Sessions and Access
+minutes: 110
+objective: Understand how a site knows who you are and what you may do. You will build signed tokens, one-time codes (TOTP), sessions with expiry, role-based permissions and a login that locks out guessers.
+outcomes:
+- Distinguish authentication from authorisation
+- Explain tokens, sessions and cookies
+- Explain how two-factor codes work
+- Design roles with least privilege
+- Limit guessing attacks
+sections:
+- heading: Who are you, and what may you do?
+  body: |-
+    **Authentication** proves **who** you are (a password, a code, a key). **Authorisation** decides **what** you may do. Many bugs confuse the two: a user who is logged in is not allowed to open every record.
+
+    Proof comes from **factors**: something you **know** (password), something you **have** (phone, hardware key) and something you **are** (fingerprint). **Multi-factor authentication** (**MFA**) combines two or more, so a stolen password alone is not enough. **Passkeys** (public-key credentials kept on your device) go further: there is no password to steal or phish.
+
+    Authorisation follows the **principle of least privilege**: give each account only the rights it needs. **Role-based access control** (**RBAC**) groups permissions into roles (viewer, editor, admin) and gives people roles. Check permissions on the **server** for every request: hiding a button is not security.
+- heading: Staying logged in
+  body: |-
+    HTTP has no memory: every request is separate. After login the server gives your browser a **session token**, a long random value stored in a **cookie** and sent with each request. The server looks the token up (a **session**) to find the user. Good practice: make the token random and long (use the `secrets` module, never `random`), send it only over **HTTPS** (`Secure` cookie), keep it away from scripts (`HttpOnly`), limit cross-site sending (`SameSite`), give it an **expiry**, replace it at login (so an attacker cannot **fix** it beforehand) and delete it on logout.
+
+    An alternative is a **signed token** (**JWT**): the server puts the data (user, expiry) in the token and signs it with a secret; later it only checks the signature and needs no lookup. The data is readable by anyone, only protected from change; and a signed token cannot easily be **revoked** before it expires, so keep expiry short.
+
+    **One-time codes** (**TOTP**) come from a secret shared once when you scan the QR code. Phone and server each compute `HMAC(secret, time // 30)` and cut it down to six digits, so both see the same code without sending it.
+
+    **Defending the login**: slow password hashes (lesson 1), a **lockout** or growing delay after failures, the **same message** for wrong name and wrong password (so attackers cannot find which names exist), and alerts for unusual logins. A related attack is **CSRF** (cross-site request forgery): another site makes your browser send a request while you are logged in; defences are `SameSite` cookies and secret **CSRF tokens** in forms.
+examples:
+- title: A signed token
+  intro: Create, check and forge tokens.
+  code: |
+    def sign_token(payload, secret):
+        """Make a signed token (like a simple JWT). Turn the payload dict into JSON text with json.dumps(payload, sort_keys=True, separators=(',', ':')), encode it as UTF-8 and then as URL-safe base64 (base64.urlsafe_b64encode) with the '=' padding removed. The token is that text, a '.', and the HMAC-SHA256 (hex) of that text (as UTF-8) using the secret (UTF-8 text) as key."""
+        import base64, hashlib, hmac, json
+        body = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+        tag = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+        return body + "." + tag
+
+
+    def verify_token(token, secret, now):
+        """Check a token made by sign_token and return its payload dict. ValueError('malformed') unless the token has exactly one '.'; ValueError('bad signature') if the tag does not match (compare with hmac.compare_digest, and check the signature BEFORE reading the body); then decode the body (add back the '=' padding, base64 and JSON; any failure is ValueError('malformed')). If the payload is not a dict or has an 'exp' (expiry time in seconds) that is NOT greater than `now`, raise ValueError('expired'). A payload without 'exp' never expires."""
+        import base64, hashlib, hmac, json
+        parts = token.split(".")
+        if len(parts) != 2:
+            raise ValueError("malformed")
+        body, tag = parts
+        good = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good.encode(), tag.encode()):
+            raise ValueError("bad signature")
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+        except Exception:
+            raise ValueError("malformed")
+        if not isinstance(payload, dict):
+            raise ValueError("malformed")
+        if "exp" in payload and not payload["exp"] > now:
+            raise ValueError("expired")
+        return payload
+
+    token = sign_token({"user": "ada", "role": "student", "exp": 5000}, "server-secret")
+    print(token[:40] + "...")
+    print(verify_token(token, "server-secret", 1000))
+    forged = sign_token({"user": "ada", "role": "admin", "exp": 5000}, "attackers-guess")
+    for tok, now in ((token, 6000), (forged, 1000)):
+        try:
+            verify_token(tok, "server-secret", now)
+        except ValueError as e:
+            print("refused:", e)
+  output: |
+    eyJleHAiOjUwMDAsInJvbGUiOiJzdHVkZW50Iiwi...
+    {'exp': 5000, 'role': 'student', 'user': 'ada'}
+    refused: expired
+    refused: bad signature
+  lines:
+  - line: 30
+    note: The first part is the readable (base64) payload.
+  - line: 31
+    note: 'Valid: the data comes back.'
+  - line: 33
+    note: Late and forged tokens are refused.
+- title: One-time codes and roles
+  intro: The RFC test codes, and permissions that inherit through roles.
+  code: |
+    def hotp(secret, counter, digits=6):
+        """The one-time code of RFC 4226 (HOTP). `secret` is bytes. Compute HMAC-SHA1 of the counter written as 8 bytes big-endian (counter.to_bytes(8, 'big')) with the secret as key. DYNAMIC TRUNCATION: take the last 4 bits of the digest as an offset, read the 4 bytes from that offset as a big-endian number and clear its top bit (& 0x7fffffff). The code is that number modulo 10 ** digits, written with leading zeros up to `digits` characters. The first codes for the secret b'12345678901234567890' are 755224, 287082, 359152, 969429 ..."""
+        import hashlib, hmac
+        digest = hmac.new(secret, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+        offset = digest[-1] & 0x0F
+        number = int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF
+        return str(number % 10 ** digits).zfill(digits)
+
+
+    def totp(secret, time_seconds, step=30, digits=6):
+        """Time-based codes (RFC 6238): the counter is the number of whole `step` seconds since 1970 (time_seconds // step); the code is hotp(secret, counter, digits)."""
+        return hotp(secret, int(time_seconds) // step, digits)
+
+
+    def verify_totp(secret, code, time_seconds, window=1):
+        """Accept a code typed by the user. Clocks differ a little, so accept the code of the current step and of `window` steps before and after (default 1: 30 seconds either way). Compare as text with hmac.compare_digest; return True or False. A negative step counter is never tried."""
+        import hmac
+        base = int(time_seconds) // 30
+        for c in range(base - window, base + window + 1):
+            if c >= 0 and hmac.compare_digest(hotp(secret, c).encode(), str(code).encode()):
+                return True
+        return False
+
+
+    def permissions_of(role_defs, role):
+        """Role-based access control. `role_defs` is a dict {role: {"perms": [permission texts], "inherits": [roles]}} (both keys optional). Return the sorted list of all permissions of the role, including those of the roles it inherits from, at any depth. Roles may inherit in a circle: do not loop forever. ValueError('unknown role NAME') for a role (also an inherited one) that is not defined."""
+        seen, perms = set(), set()
+
+        def walk(name):
+            if name in seen:
+                return
+            if name not in role_defs:
+                raise ValueError("unknown role " + name)
+            seen.add(name)
+            perms.update(role_defs[name].get("perms", []))
+            for parent in role_defs[name].get("inherits", []):
+                walk(parent)
+
+        walk(role)
+        return sorted(perms)
+
+
+    def can(role_defs, roles, permission):
+        """May someone with these roles do `permission`? Collect the permissions of ALL the roles first (permissions_of; an unknown role raises ValueError as above, even if an earlier role already grants the permission). Return True if any of them is exactly the permission, or is a WILDCARD: '*' allows everything, and 'files:*' allows every permission that starts with 'files:'. No roles means False."""
+        granted = [p for role in roles for p in permissions_of(role_defs, role)]
+        return any(p == permission or p == "*" or (p.endswith(":*") and permission.startswith(p[:-1])) for p in granted)
+
+    secret = b"12345678901234567890"
+    for t in (0, 29, 30, 59, 60):
+        print(t, totp(secret, t))
+    print(verify_totp(secret, "287082", 75), verify_totp(secret, "287082", 200))
+    defs = {"viewer": {"perms": ["files:read"]}, "editor": {"perms": ["files:write"], "inherits": ["viewer"]}, "admin": {"perms": ["users:*"], "inherits": ["editor"]}}
+    print(permissions_of(defs, "admin"))
+    print(can(defs, ["editor"], "files:read"), can(defs, ["editor"], "users:delete"), can(defs, ["admin"], "users:delete"))
+  output: |
+    0 755224
+    29 755224
+    30 287082
+    59 287082
+    60 359152
+    True False
+    ['files:read', 'files:write', 'users:*']
+    True False True
+  lines:
+  - line: 49
+    note: The code is the same inside a 30-second step.
+  - line: 51
+    note: Accepted in the next step, refused much later.
+  - line: 53
+    note: Permissions inherited from the editor and the viewer.
+  - line: 54
+    note: The editor cannot delete users; the admin can.
+playground:
+  prompt: Make a random session token the safe way.
+  code: |
+    import secrets
+    token = secrets.token_hex(16)
+    print(len(token))
+exercises:
+- id: token
+  title: Signed tokens
+  difficulty: 5
+  prompt: 'After login a server must recognise you on later requests without asking for the password again. One way is a **signed token** (like a **JWT**, JSON Web Token): data plus a **signature** that only the server can make. Write `sign_token(payload, secret)`: turn the payload dict into JSON text with `json.dumps(payload, sort_keys=True, separators=(",", ":"))`, encode it as UTF-8 and then as URL-safe base64 (`base64.urlsafe_b64encode`) with the `=` padding **removed**. The token is that text, a `"."`, and the HMAC-SHA256 (hex) of that text (as UTF-8) using the secret (UTF-8) as key. Write `verify_token(token, secret, now)`: `ValueError("malformed")` unless the token has exactly one `"."`; `ValueError("bad signature")` if the tag does not match (compare with `hmac.compare_digest`, and check the signature **before** reading the body); then decode the body (add the `=` padding back, base64 and JSON; any failure is `ValueError("malformed")`). If the payload is not a dict, that is `"malformed"`; if it has an `"exp"` (expiry time in seconds) that is **not greater** than `now`, raise `ValueError("expired")`. A payload without `"exp"` never expires. Return the payload dict.'
+  starter: |-
+    def sign_token(payload, secret):
+        """Make a signed token (like a simple JWT). Turn the payload dict into JSON text with json.dumps(payload, sort_keys=True, separators=(',', ':')), encode it as UTF-8 and then as URL-safe base64 (base64.urlsafe_b64encode) with the '=' padding removed. The token is that text, a '.', and the HMAC-SHA256 (hex) of that text (as UTF-8) using the secret (UTF-8 text) as key."""
+        pass
+
+
+    def verify_token(token, secret, now):
+        """Check a token made by sign_token and return its payload dict. ValueError('malformed') unless the token has exactly one '.'; ValueError('bad signature') if the tag does not match (compare with hmac.compare_digest, and check the signature BEFORE reading the body); then decode the body (add back the '=' padding, base64 and JSON; any failure is ValueError('malformed')). If the payload is not a dict or has an 'exp' (expiry time in seconds) that is NOT greater than `now`, raise ValueError('expired'). A payload without 'exp' never expires."""
+        pass
+  tests:
+  - name: making and checking
+    code: |
+      t = sign_token({"user": "ada", "exp": 2000}, "s3cret")
+      body, tag = t.split(".")
+      assert "=" not in body and len(tag) == 64 and sign_token({"exp": 2000, "user": "ada"}, "s3cret") == t and sign_token({"user": "ada", "exp": 2000}, "other") != t
+      assert verify_token(t, "s3cret", 1999) == {"user": "ada", "exp": 2000} and verify_token(sign_token({"role": "admin"}, "k"), "k", 10 ** 12) == {"role": "admin"} and verify_token(sign_token({}, "k"), "k", 0) == {}
+      assert verify_token(sign_token({"n": "é✓", "list": [1, 2]}, "k"), "k", 0) == {"n": "é✓", "list": [1, 2]}
+  - name: rejecting bad tokens
+    code: |
+      t = sign_token({"user": "ada", "exp": 2000}, "s3cret")
+      body, tag = t.split(".")
+      import base64, json, hmac, hashlib
+      forged_body = base64.urlsafe_b64encode(json.dumps({"user": "admin", "exp": 2000}, sort_keys=True, separators=(",", ":")).encode()).decode().rstrip("=")
+      cases = [(forged_body + "." + tag, "bad signature"), (t, "expired"), (body + "." + tag[:-1] + ("0" if tag[-1] != "0" else "1"), "bad signature"), ("nodot", "malformed"), ("a.b.c", "malformed"), ("", "malformed")]
+      for tok, msg in cases:
+          try:
+              verify_token(tok, "s3cret", 2000 if msg == "expired" else 100)
+              raise AssertionError("accepted " + tok)
+          except ValueError as e:
+              assert msg in str(e), (tok, str(e))
+      try:
+          verify_token(t, "wrong", 100)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "bad signature" in str(e)
+      def signed(raw):
+          b = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+          return b + "." + hmac.new(b"k", b.encode(), hashlib.sha256).hexdigest()
+      for raw in (b"not json", b"[1, 2]", b"\xff\xfe", b"123"):
+          try:
+              verify_token(signed(raw), "k", 0)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "malformed" in str(e)
+  hints:
+  - Sign the exact text of the body, and verify the signature before decoding it.
+  - (-len(body)) % 4 gives the padding that was removed.
+  solution: |
+    def sign_token(payload, secret):
+        """Make a signed token (like a simple JWT). Turn the payload dict into JSON text with json.dumps(payload, sort_keys=True, separators=(',', ':')), encode it as UTF-8 and then as URL-safe base64 (base64.urlsafe_b64encode) with the '=' padding removed. The token is that text, a '.', and the HMAC-SHA256 (hex) of that text (as UTF-8) using the secret (UTF-8 text) as key."""
+        import base64, hashlib, hmac, json
+        body = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+        tag = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+        return body + "." + tag
+
+
+    def verify_token(token, secret, now):
+        """Check a token made by sign_token and return its payload dict. ValueError('malformed') unless the token has exactly one '.'; ValueError('bad signature') if the tag does not match (compare with hmac.compare_digest, and check the signature BEFORE reading the body); then decode the body (add back the '=' padding, base64 and JSON; any failure is ValueError('malformed')). If the payload is not a dict or has an 'exp' (expiry time in seconds) that is NOT greater than `now`, raise ValueError('expired'). A payload without 'exp' never expires."""
+        import base64, hashlib, hmac, json
+        parts = token.split(".")
+        if len(parts) != 2:
+            raise ValueError("malformed")
+        body, tag = parts
+        good = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good.encode(), tag.encode()):
+            raise ValueError("bad signature")
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+        except Exception:
+            raise ValueError("malformed")
+        if not isinstance(payload, dict):
+            raise ValueError("malformed")
+        if "exp" in payload and not payload["exp"] > now:
+            raise ValueError("expired")
+        return payload
+  explanation: Anyone can read a JWT (it is only encoded), so never put secrets in it. The signature only proves it was not changed.
+- id: totp
+  title: One-time codes
+  difficulty: 5
+  prompt: '**Two-factor authentication** adds something you **have** (your phone) to something you **know** (your password). The phone app shows a **TOTP**: a six-digit code that changes every 30 seconds and that the server can compute too, because both know a **shared secret**. Write `hotp(secret, counter, digits=6)`, the code of **RFC 4226** (`secret` is `bytes`): compute HMAC-SHA1 of the counter written as 8 bytes big-endian (`counter.to_bytes(8, "big")`) with the secret as key. **Dynamic truncation**: take the last 4 bits of the digest as an `offset`, read the 4 bytes from that offset as a big-endian number and clear its top bit (`& 0x7fffffff`). The code is that number modulo `10 ** digits`, written with leading zeros (`zfill`). For the secret `b"12345678901234567890"` the first codes are 755224, 287082, 359152, 969429. Write `totp(secret, time_seconds, step=30, digits=6)`: the counter is the number of whole `step` seconds since 1970 (`time_seconds // step`). Write `verify_totp(secret, code, time_seconds, window=1)`: accept the code of the current 30-second step and of `window` steps before and after; compare as text with `hmac.compare_digest`; return `True` or `False`. A negative step counter is never tried.'
+  starter: |-
+    def hotp(secret, counter, digits=6):
+        """The one-time code of RFC 4226 (HOTP). `secret` is bytes. Compute HMAC-SHA1 of the counter written as 8 bytes big-endian (counter.to_bytes(8, 'big')) with the secret as key. DYNAMIC TRUNCATION: take the last 4 bits of the digest as an offset, read the 4 bytes from that offset as a big-endian number and clear its top bit (& 0x7fffffff). The code is that number modulo 10 ** digits, written with leading zeros up to `digits` characters. The first codes for the secret b'12345678901234567890' are 755224, 287082, 359152, 969429 ..."""
+        pass
+
+
+    def totp(secret, time_seconds, step=30, digits=6):
+        """Time-based codes (RFC 6238): the counter is the number of whole `step` seconds since 1970 (time_seconds // step); the code is hotp(secret, counter, digits)."""
+        pass
+
+
+    def verify_totp(secret, code, time_seconds, window=1):
+        """Accept a code typed by the user. Clocks differ a little, so accept the code of the current step and of `window` steps before and after (default 1: 30 seconds either way). Compare as text with hmac.compare_digest; return True or False. A negative step counter is never tried."""
+        pass
+  tests:
+  - name: the standard test values
+    code: |
+      secret = b"12345678901234567890"
+      assert [hotp(secret, i) for i in range(10)] == ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"]
+      assert totp(secret, 59, 30, 8) == "94287082" and totp(secret, 1111111109, 30, 8) == "07081804" and totp(secret, 1111111111, 30, 8) == "14050471" and totp(secret, 1234567890, 30, 8) == "89005924" and totp(secret, 2000000000, 30, 8) == "69279037"
+      assert totp(secret, 59) == "287082" and totp(secret, 0) == "755224" and totp(secret, 29.9) == "755224" and totp(secret, 30) == "287082" and len(hotp(b"k", 7)) == 6 and len(hotp(b"k", 7, 8)) == 8 and totp(secret, 60, step=60) == "287082"
+  - name: checking codes
+    code: |
+      secret = b"12345678901234567890"
+      assert verify_totp(secret, "287082", 59) is True and verify_totp(secret, "287082", 30) is True and verify_totp(secret, "755224", 59) is True and verify_totp(secret, 287082, 59) is True
+      assert verify_totp(secret, "359152", 59) is True and verify_totp(secret, "969429", 59) is False and verify_totp(secret, "000000", 59) is False and verify_totp(secret, "", 59) is False
+      assert verify_totp(secret, "359152", 59, window=0) is False and verify_totp(secret, "287082", 59, window=0) is True and verify_totp(secret, "969429", 59, window=2) is True and verify_totp(secret, "755224", 5, window=1) is True
+      assert verify_totp(secret, "x", 10) is False and verify_totp(b"other", "755224", 5) is False
+  hints:
+  - Use int.from_bytes(digest[offset:offset+4], 'big') & 0x7fffffff.
+  - The codes of the RFC test values are a perfect check for your code.
+  solution: |
+    def hotp(secret, counter, digits=6):
+        """The one-time code of RFC 4226 (HOTP). `secret` is bytes. Compute HMAC-SHA1 of the counter written as 8 bytes big-endian (counter.to_bytes(8, 'big')) with the secret as key. DYNAMIC TRUNCATION: take the last 4 bits of the digest as an offset, read the 4 bytes from that offset as a big-endian number and clear its top bit (& 0x7fffffff). The code is that number modulo 10 ** digits, written with leading zeros up to `digits` characters. The first codes for the secret b'12345678901234567890' are 755224, 287082, 359152, 969429 ..."""
+        import hashlib, hmac
+        digest = hmac.new(secret, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+        offset = digest[-1] & 0x0F
+        number = int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF
+        return str(number % 10 ** digits).zfill(digits)
+
+
+    def totp(secret, time_seconds, step=30, digits=6):
+        """Time-based codes (RFC 6238): the counter is the number of whole `step` seconds since 1970 (time_seconds // step); the code is hotp(secret, counter, digits)."""
+        return hotp(secret, int(time_seconds) // step, digits)
+
+
+    def verify_totp(secret, code, time_seconds, window=1):
+        """Accept a code typed by the user. Clocks differ a little, so accept the code of the current step and of `window` steps before and after (default 1: 30 seconds either way). Compare as text with hmac.compare_digest; return True or False. A negative step counter is never tried."""
+        import hmac
+        base = int(time_seconds) // 30
+        for c in range(base - window, base + window + 1):
+            if c >= 0 and hmac.compare_digest(hotp(secret, c).encode(), str(code).encode()):
+                return True
+        return False
+  explanation: Because the code depends on a secret and the time, a stolen password alone is not enough. Phishing sites can still forward a code in real time, so hardware keys (FIDO2) are stronger.
+- id: session
+  title: Sessions
+  difficulty: 4
+  prompt: 'A **session** is the server''s memory of a logged-in visitor, found by a random **session token** kept in a cookie. `store` is a dict `{token: {"user": name, "expires": time}}`. Write `new_session(store, user, now, ttl, rng)`: make the token from the random generator: `"%032x" % rng.getrandbits(128)` (32 hex characters; real systems use the `secrets` module), store `{"user": user, "expires": now + ttl}` and return the token. Write `get_session(store, token, now, ttl=None)`: return the user name, or `None` if the token is unknown or the session has expired (`expires <= now`); an expired session is also **removed** from the store. If `ttl` is given and the session is valid, **extend** it (**sliding expiration**): set `expires` to `now + ttl`. Write `end_session(store, token=None, user=None)`: log out. With a token remove that one session. With `user` (and no token) remove **all** sessions of that user. Return how many sessions were removed. If both are given only the token is used.'
+  starter: |-
+    def new_session(store, user, now, ttl, rng):
+        """Start a session. `store` is a dict {token: {"user": name, "expires": time}}. Make the token from the random generator: '%032x' % rng.getrandbits(128) (32 hex characters; in real systems use the secrets module). Store {"user": user, "expires": now + ttl} and return the token."""
+        pass
+
+
+    def get_session(store, token, now, ttl=None):
+        """Look a token up. Return the user name, or None if the token is unknown or the session has expired (expires <= now); an expired session is also REMOVED from the store. If ttl is given and the session is valid, extend it (SLIDING EXPIRATION): set expires to now + ttl."""
+        pass
+
+
+    def end_session(store, token=None, user=None):
+        """Log out. With a token remove that one session. With user (and no token) remove ALL sessions of that user (log out everywhere). Return how many sessions were removed. Give both and only the token is used."""
+        pass
+  tests:
+  - name: starting and finding
+    code: |
+      import random
+      rng = random.Random(1)
+      store = {}
+      t1 = new_session(store, "ada", 1000, 600, rng)
+      t2 = new_session(store, "bo", 1000, 60, rng)
+      assert len(t1) == 32 and t1 != t2 and all(c in "0123456789abcdef" for c in t1) and store[t1] == {"user": "ada", "expires": 1600} and store[t2]["expires"] == 1060
+      assert get_session(store, t1, 1599) == "ada" and get_session(store, t1, 1600) is None and t1 not in store and get_session(store, "nope", 0) is None and get_session(store, t2, 1059) == "bo" and get_session(store, t2, 1060) is None and store == {}
+      assert new_session({}, "x", 0, 5, random.Random(1)) == t1
+  - name: sliding and logging out
+    code: |
+      import random
+      rng = random.Random(7)
+      store = {}
+      t = new_session(store, "ada", 0, 100, rng)
+      assert get_session(store, t, 90, ttl=100) == "ada" and store[t]["expires"] == 190 and get_session(store, t, 150) == "ada" and store[t]["expires"] == 190 and get_session(store, t, 189, ttl=50) == "ada" and store[t]["expires"] == 239
+      assert get_session(store, t, 239, ttl=50) is None and store == {}
+      a1 = new_session(store, "ada", 0, 100, rng)
+      a2 = new_session(store, "ada", 0, 100, rng)
+      b1 = new_session(store, "bo", 0, 100, rng)
+      assert end_session(store, token=a1) == 1 and end_session(store, token=a1) == 0 and a2 in store and end_session(store, user="ada") == 1 and list(store) == [b1] and end_session(store, user="nobody") == 0 and end_session(store, token=b1, user="ada") == 1 and store == {}
+  hints:
+  - Use dict.get and pop; an expired session must be deleted when it is found.
+  - With a token given, ignore the user argument.
+  solution: |
+    def new_session(store, user, now, ttl, rng):
+        """Start a session. `store` is a dict {token: {"user": name, "expires": time}}. Make the token from the random generator: '%032x' % rng.getrandbits(128) (32 hex characters; in real systems use the secrets module). Store {"user": user, "expires": now + ttl} and return the token."""
+        token = "%032x" % rng.getrandbits(128)
+        store[token] = {"user": user, "expires": now + ttl}
+        return token
+
+
+    def get_session(store, token, now, ttl=None):
+        """Look a token up. Return the user name, or None if the token is unknown or the session has expired (expires <= now); an expired session is also REMOVED from the store. If ttl is given and the session is valid, extend it (SLIDING EXPIRATION): set expires to now + ttl."""
+        info = store.get(token)
+        if info is None:
+            return None
+        if info["expires"] <= now:
+            del store[token]
+            return None
+        if ttl is not None:
+            info["expires"] = now + ttl
+        return info["user"]
+
+
+    def end_session(store, token=None, user=None):
+        """Log out. With a token remove that one session. With user (and no token) remove ALL sessions of that user (log out everywhere). Return how many sessions were removed. Give both and only the token is used."""
+        if token is not None:
+            return 1 if store.pop(token, None) is not None else 0
+        doomed = [t for t, info in store.items() if info["user"] == user]
+        for t in doomed:
+            del store[t]
+        return len(doomed)
+  explanation: Session tokens must be unpredictable (use the secrets module), sent only over HTTPS, kept in an HttpOnly cookie and replaced after login to stop session fixation.
+- id: rbac
+  title: Roles and permissions
+  difficulty: 5
+  prompt: '**Authorisation** decides what a logged-in person may do (**authentication** only proves who they are). **Role-based access control** (**RBAC**) gives permissions to roles and roles to people. `role_defs` is a dict `{role: {"perms": [permission texts], "inherits": [roles]}}` (both keys optional). Write `permissions_of(role_defs, role)`: return the sorted list of all permissions of the role, including those of the roles it inherits from, at any depth. Roles may inherit in a circle: do not loop forever. `ValueError("unknown role NAME")` for a role (also an inherited one) that is not defined. Write `can(role_defs, roles, permission)`: collect the permissions of **all** the `roles` first (an unknown role raises the same `ValueError`, even if an earlier role already grants the permission); return `True` if any of them is exactly the permission, or is a **wildcard**: `"*"` allows everything and `"files:*"` allows every permission that starts with `"files:"`. No roles means `False`.'
+  starter: |-
+    def permissions_of(role_defs, role):
+        """Role-based access control. `role_defs` is a dict {role: {"perms": [permission texts], "inherits": [roles]}} (both keys optional). Return the sorted list of all permissions of the role, including those of the roles it inherits from, at any depth. Roles may inherit in a circle: do not loop forever. ValueError('unknown role NAME') for a role (also an inherited one) that is not defined."""
+        pass
+
+
+    def can(role_defs, roles, permission):
+        """May someone with these roles do `permission`? Collect the permissions of ALL the roles first (permissions_of; an unknown role raises ValueError as above, even if an earlier role already grants the permission). Return True if any of them is exactly the permission, or is a WILDCARD: '*' allows everything, and 'files:*' allows every permission that starts with 'files:'. No roles means False."""
+        pass
+  tests:
+  - name: inheritance
+    code: |
+      defs = {"viewer": {"perms": ["files:read"]}, "editor": {"perms": ["files:write"], "inherits": ["viewer"]}, "admin": {"perms": ["users:manage"], "inherits": ["editor"]}, "empty": {}}
+      assert permissions_of(defs, "viewer") == ["files:read"] and permissions_of(defs, "editor") == ["files:read", "files:write"] and permissions_of(defs, "admin") == ["files:read", "files:write", "users:manage"] and permissions_of(defs, "empty") == []
+      loop = {"a": {"perms": ["x"], "inherits": ["b"]}, "b": {"perms": ["y"], "inherits": ["a"]}}
+      assert permissions_of(loop, "a") == ["x", "y"] and permissions_of(loop, "b") == ["x", "y"]
+      for bad, d in (("ghost", defs), ("c", {"c": {"inherits": ["missing"]}})):
+          try:
+              permissions_of(d, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "unknown role" in str(e)
+  - name: checking permissions
+    code: |
+      defs = {"viewer": {"perms": ["files:read"]}, "editor": {"perms": ["files:write"], "inherits": ["viewer"]}, "root": {"perms": ["*"]}, "filemaster": {"perms": ["files:*"]}, "tester": {"perms": ["billing:read"]}}
+      assert can(defs, ["viewer"], "files:read") is True and can(defs, ["viewer"], "files:write") is False and can(defs, ["editor"], "files:read") is True and can(defs, ["editor"], "files:write") is True and can(defs, ["editor"], "users:manage") is False
+      assert can(defs, ["root"], "anything:at-all") is True and can(defs, ["filemaster"], "files:delete") is True and can(defs, ["filemaster"], "filesystem") is False and can(defs, ["filemaster"], "users:manage") is False and can(defs, [], "files:read") is False
+      assert can(defs, ["viewer", "tester"], "billing:read") is True and can(defs, ["viewer", "tester"], "billing:write") is False and can(defs, ["viewer", "filemaster"], "files:erase") is True
+      try:
+          can(defs, ["viewer", "ghost"], "files:read")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown role ghost" in str(e)
+  hints:
+  - Walk the roles with a recursive helper and a set of roles already seen.
+  - '''files:*'' matches permissions that start with ''files:'' (the text without its star).'
+  solution: |
+    def permissions_of(role_defs, role):
+        """Role-based access control. `role_defs` is a dict {role: {"perms": [permission texts], "inherits": [roles]}} (both keys optional). Return the sorted list of all permissions of the role, including those of the roles it inherits from, at any depth. Roles may inherit in a circle: do not loop forever. ValueError('unknown role NAME') for a role (also an inherited one) that is not defined."""
+        seen, perms = set(), set()
+
+        def walk(name):
+            if name in seen:
+                return
+            if name not in role_defs:
+                raise ValueError("unknown role " + name)
+            seen.add(name)
+            perms.update(role_defs[name].get("perms", []))
+            for parent in role_defs[name].get("inherits", []):
+                walk(parent)
+
+        walk(role)
+        return sorted(perms)
+
+
+    def can(role_defs, roles, permission):
+        """May someone with these roles do `permission`? Collect the permissions of ALL the roles first (permissions_of; an unknown role raises ValueError as above, even if an earlier role already grants the permission). Return True if any of them is exactly the permission, or is a WILDCARD: '*' allows everything, and 'files:*' allows every permission that starts with 'files:'. No roles means False."""
+        granted = [p for role in roles for p in permissions_of(role_defs, role)]
+        return any(p == permission or p == "*" or (p.endswith(":*") and permission.startswith(p[:-1])) for p in granted)
+  explanation: Give every account the least privilege that it needs. A bug in an account with few permissions does little damage.
+- id: lockout
+  title: 'Capstone: a login with lockout'
+  difficulty: 5
+  prompt: 'Online guessing is stopped by limiting attempts. `hash_password`, `verify_password` and their imports are given. Write `make_login(users, max_failures, lockout_seconds, clock)`. `users` is a dict `{name: record made by hash_password}`. Return `login(name, password)` that gives one of three texts. Keep per **name** a count of failures in a row and the time of the lockout. If the name is **locked** (the lockout started less than `lockout_seconds` ago) return `"locked"` **without** checking the password (a correct password does not help while locked). Otherwise check the password with `verify_password`: for a known name with the right password reset the count and return `"ok"`. For a wrong password **or an unknown name** add one failure (count unknown names too, so that nobody can tell which names exist), return `"bad credentials"`, and when the count reaches `max_failures` start the lockout at `clock()` (the count resets to 0 when the lockout begins). An expired lockout is simply over. Never reveal whether the name or the password was wrong.'
+  starter: |-
+    def hash_password(password, salt_hex, iterations):
+        """Store a password safely with PBKDF2. Use hashlib.pbkdf2_hmac('sha256', password bytes (UTF-8), bytes.fromhex(salt_hex), iterations) and return the text 'pbkdf2$ITERATIONS$SALT$HASH' where SALT is salt_hex as given and HASH the result as hexadecimal. ValueError('iterations must be positive') if iterations < 1 and ValueError('salt must be hex') if salt_hex is not valid hexadecimal (an even number of hex digits, at least 8 digits)."""
+        import hashlib
+        if iterations < 1:
+            raise ValueError("iterations must be positive")
+        try:
+            salt = bytes.fromhex(salt_hex)
+        except ValueError:
+            raise ValueError("salt must be hex")
+        if len(salt) < 4:
+            raise ValueError("salt must be hex")
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return "pbkdf2$" + str(iterations) + "$" + salt_hex + "$" + digest.hex()
+
+
+    def verify_password(stored, attempt):
+        """Check an attempt against a stored text made by hash_password. Split it at '$' (ValueError('bad record') unless there are four parts and the first is 'pbkdf2' and the number is a positive whole number). Hash the attempt with the SAME salt and iterations and compare with hmac.compare_digest (a comparison whose time does not reveal how many characters matched). Return True or False."""
+        import hmac
+        parts = stored.split("$")
+        if len(parts) != 4 or parts[0] != "pbkdf2" or not parts[1].isdigit() or int(parts[1]) < 1:
+            raise ValueError("bad record")
+        again = hash_password(attempt, parts[2], int(parts[1]))
+        return hmac.compare_digest(again.encode(), stored.encode())
+
+
+
+
+    def make_login(users, max_failures, lockout_seconds, clock):
+        """A login function that resists guessing. `users` is a dict {name: record made by hash_password}. Return login(name, password) giving one of three texts. Keep per name a count of failures in a row and the time of the lockout. If the name is locked (the lockout started less than lockout_seconds ago) return 'locked' WITHOUT checking the password (a correct password does not help while locked). Otherwise check the password with verify_password: for a known name with the right password reset the count and return 'ok'. For a wrong password OR an unknown name add one failure (count unknown names too, so that nobody can tell which names exist), return 'bad credentials', and when the count reaches max_failures start the lockout at clock() (the count resets to 0 when the lockout begins). An expired lockout is simply over. Never reveal in the text whether the name or the password was wrong."""
+        pass
+  tests:
+  - name: normal use
+    code: |
+      now = [0.0]
+      users = {"ada": hash_password("correct horse", "a1b2c3d4", 10), "bo": hash_password("hunter2hunter2", "e5f60718", 10)}
+      login = make_login(users, 3, 60, lambda: now[0])
+      assert login("ada", "correct horse") == "ok" and login("ada", "wrong") == "bad credentials" and login("ada", "correct horse") == "ok" and login("bo", "hunter2hunter2") == "ok" and login("nobody", "x") == "bad credentials"
+      assert login("ada", "") == "bad credentials" and login("bo", "Hunter2hunter2") == "bad credentials"
+  - name: lockout
+    code: |
+      now = [100.0]
+      users = {"ada": hash_password("correct horse", "a1b2c3d4", 10)}
+      login = make_login(users, 3, 60, lambda: now[0])
+      assert [login("ada", "x"), login("ada", "y"), login("ada", "z")] == ["bad credentials"] * 3
+      assert login("ada", "correct horse") == "locked" and login("ada", "x") == "locked"
+      now[0] = 159.9
+      assert login("ada", "correct horse") == "locked"
+      now[0] = 160.0
+      assert login("ada", "correct horse") == "ok"
+      for i in range(2):
+          login("ada", "bad")
+      assert login("ada", "correct horse") == "ok"
+      for i in range(3):
+          assert login("ada", "bad") == "bad credentials"
+      now[0] = 170.0
+      assert login("ada", "correct horse") == "locked"
+      now[0] = 230.0
+      assert login("ada", "x") == "bad credentials" and login("ada", "correct horse") == "ok"
+  - name: no user enumeration
+    code: |
+      now = [0.0]
+      users = {"ada": hash_password("pw-ada-12345", "a1b2c3d4", 10)}
+      login = make_login(users, 2, 30, lambda: now[0])
+      results = [login("ghost", "x"), login("ghost", "y"), login("ghost", "z")]
+      assert results == ["bad credentials", "bad credentials", "locked"]
+      assert login("ada", "bad") == "bad credentials" and login("ada", "pw-ada-12345") == "ok"
+      other = make_login(users, 2, 30, lambda: now[0])
+      assert other("ada", "x") == "bad credentials" and other("ada", "y") == "bad credentials" and other("ada", "pw-ada-12345") == "locked" and login("ada", "pw-ada-12345") == "ok"
+  hints:
+  - Keep a small dict of state per name, created on first use (also for unknown names).
+  - Start the lockout by recording the time and resetting the failure count.
+  solution: |
+    def hash_password(password, salt_hex, iterations):
+        """Store a password safely with PBKDF2. Use hashlib.pbkdf2_hmac('sha256', password bytes (UTF-8), bytes.fromhex(salt_hex), iterations) and return the text 'pbkdf2$ITERATIONS$SALT$HASH' where SALT is salt_hex as given and HASH the result as hexadecimal. ValueError('iterations must be positive') if iterations < 1 and ValueError('salt must be hex') if salt_hex is not valid hexadecimal (an even number of hex digits, at least 8 digits)."""
+        import hashlib
+        if iterations < 1:
+            raise ValueError("iterations must be positive")
+        try:
+            salt = bytes.fromhex(salt_hex)
+        except ValueError:
+            raise ValueError("salt must be hex")
+        if len(salt) < 4:
+            raise ValueError("salt must be hex")
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return "pbkdf2$" + str(iterations) + "$" + salt_hex + "$" + digest.hex()
+
+
+    def verify_password(stored, attempt):
+        """Check an attempt against a stored text made by hash_password. Split it at '$' (ValueError('bad record') unless there are four parts and the first is 'pbkdf2' and the number is a positive whole number). Hash the attempt with the SAME salt and iterations and compare with hmac.compare_digest (a comparison whose time does not reveal how many characters matched). Return True or False."""
+        import hmac
+        parts = stored.split("$")
+        if len(parts) != 4 or parts[0] != "pbkdf2" or not parts[1].isdigit() or int(parts[1]) < 1:
+            raise ValueError("bad record")
+        again = hash_password(attempt, parts[2], int(parts[1]))
+        return hmac.compare_digest(again.encode(), stored.encode())
+
+
+
+
+    def make_login(users, max_failures, lockout_seconds, clock):
+        """A login function that resists guessing. `users` is a dict {name: record made by hash_password}. Return login(name, password) giving one of three texts. Keep per name a count of failures in a row and the time of the lockout. If the name is locked (the lockout started less than lockout_seconds ago) return 'locked' WITHOUT checking the password (a correct password does not help while locked). Otherwise check the password with verify_password: for a known name with the right password reset the count and return 'ok'. For a wrong password OR an unknown name add one failure (count unknown names too, so that nobody can tell which names exist), return 'bad credentials', and when the count reaches max_failures start the lockout at clock() (the count resets to 0 when the lockout begins). An expired lockout is simply over. Never reveal in the text whether the name or the password was wrong."""
+        state = {}
+
+        def login(name, password):
+            now = clock()
+            st = state.setdefault(name, {"fails": 0, "locked_at": None})
+            if st["locked_at"] is not None:
+                if now - st["locked_at"] < lockout_seconds:
+                    return "locked"
+                st["locked_at"] = None
+            if name in users and verify_password(users[name], password):
+                st["fails"] = 0
+                return "ok"
+            st["fails"] += 1
+            if st["fails"] >= max_failures:
+                st["fails"], st["locked_at"] = 0, now
+            return "bad credentials"
+
+        return login
+  explanation: Lockouts can be abused to lock out other people (a denial of service), so real systems add delays, CAPTCHAs, per-address limits and alerts as well.
+commonMistakes:
+- title: Checking permissions only in the interface
+  explanation: The server must check every request.
+- title: Using random instead of secrets for tokens
+  explanation: random is predictable.
+- title: Putting secrets in a JWT
+  explanation: Anyone can read the payload.
+- title: Telling which of name or password was wrong
+  explanation: It lets attackers find valid names.
+- title: Never expiring sessions
+  explanation: A stolen token would work forever.
+summary:
+- Authentication is who you are; authorisation is what you may do.
+- Sessions use a random token in a cookie; signed tokens carry signed data.
+- TOTP codes come from a shared secret and the time.
+- RBAC with least privilege limits damage.
+- 'Limit guessing: slow hashes, lockouts and uniform messages.'
+next: u31-web
+quiz:
+- type: mcq
+  question: What is authorisation?
+  options:
+  - Deciding what a user may do
+  - Proving who the user is
+  - Encrypting a password
+  - Making a backup
+  answer: 0
+  explanation: Rights.
+- type: mcq
+  question: Why can a JWT payload not hold secrets?
+  options:
+  - It is only encoded and signed, so anyone can read it
+  - It is too small
+  - It is encrypted twice
+  - It expires
+  answer: 0
+  explanation: Signed, not secret.
+- type: mcq
+  question: What makes TOTP codes change?
+  options:
+  - The time step
+  - A random server
+  - A new password
+  - The IP address
+  answer: 0
+  explanation: counter = time // 30.
+- type: mcq
+  question: What is least privilege?
+  options:
+  - Giving only the permissions needed
+  - Giving everyone admin rights
+  - Removing all users
+  - Logging nothing
+  answer: 0
+  explanation: Minimise power.
+- type: mcq
+  question: What does the HttpOnly cookie flag do?
+  options:
+  - Hides the cookie from JavaScript
+  - Encrypts the cookie
+  - Makes it last longer
+  - Sends it twice
+  answer: 0
+  explanation: Limits XSS theft.
+- type: mcq
+  question: Why return the same error for a wrong name and a wrong password?
+  options:
+  - So attackers cannot learn which names exist
+  - It is shorter
+  - It is faster
+  - No reason
+  answer: 0
+  explanation: No enumeration.
+- type: code
+  question: 'Write `has_expired(expires, now)` returning True when the session is over: when `expires <= now`.'
+  starter: |
+    def has_expired(expires, now):
+        pass
+  tests:
+  - name: expired
+    code: |
+      assert has_expired(100, 100) is True and has_expired(100, 99) is False and has_expired(100, 101) is True
+  solution: |
+    def has_expired(expires, now):
+        return expires <= now

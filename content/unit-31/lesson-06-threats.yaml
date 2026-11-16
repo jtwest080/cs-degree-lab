@@ -1,0 +1,630 @@
+id: u31-threats
+title: Threat Modelling and Defence in Practice
+minutes: 110
+objective: 'Learn to think about security as a whole: find threats with STRIDE, rank risks, keep dependencies updated, scan for leaked secrets and read logs to catch attacks. This lesson ties the unit together.'
+outcomes:
+- Use STRIDE to find threats
+- Rank risks by likelihood and impact
+- Explain supply-chain risk and dependency scanning
+- Find leaked secrets
+- Detect brute force and spraying in logs
+sections:
+- heading: Find the threats first
+  body: |-
+    Security work starts with a question: **what are we protecting, from whom, and how might they get at it?** Drawing a **data-flow diagram** (users, programs, stores of data and the arrows between them) shows the **trust boundaries**, the places where data moves between parts with different levels of trust. These are where attacks happen.
+
+    For each arrow or box ask the six **STRIDE** questions: Can someone **spoof** an identity? **Tamper** with data? **Repudiate** (deny doing something, because nothing was logged)? Cause **information disclosure**? Cause **denial of service**? Gain **elevated privilege**? The answers become a list of **threats**, each with a **mitigation** (a defence) from this unit: hashing and slow password storage, encryption and MACs, input escaping and placeholders, sessions, roles and lockouts, headers and TLS.
+
+    You cannot fix everything, so you **rank** by **risk** = likelihood × impact and decide for each item: **mitigate** it, **avoid** it (drop the feature), **transfer** it (insurance, or let a specialist service handle it) or **accept** it, in writing. Remember **defence in depth**: layers, so that one failure is not the end, and **least privilege**, so that a break-in has limited reach.
+- heading: Supply chain, secrets and monitoring
+  body: |-
+    **Supply chain.** Your program is mostly other people's code. A known bug in a library (a **CVE**, Common Vulnerabilities and Exposures entry, with a **severity** from the **CVSS** score) is a hole in your program. Keep a list of dependencies (a **software bill of materials**, SBOM), **pin** versions, **update** regularly with tests as a safety net, and run a dependency scanner. Beware **typosquatting** (a malicious package named almost like a popular one) and install only from sources you trust.
+
+    **Secrets.** Passwords, keys and tokens do not belong in code or in repositories. Keep them in environment variables or a **secrets manager**, give each its own **least-privilege** key, **rotate** them regularly, and scan for leaks (secret scanners look for known formats and for high-**entropy** random strings). If one leaks, **revoke** it at once.
+
+    **Detect and respond.** Prevention fails sometimes, so keep **logs** (what happened, when, from where, but never passwords), watch for patterns (many failures from one address is **brute force**; one address trying many accounts with few passwords each is **password spraying**; a success right after failures suggests a break-in) and have an **incident response** plan: contain, investigate, fix, recover, and learn. Keep **backups** and test restoring them.
+
+    > **Warning:** Learning how attacks work is for defending. Only test systems you own or have written permission to test. Security researchers follow **responsible disclosure**: report a flaw privately to the owner and give time to fix it.
+examples:
+- title: Threats, risks and dependencies
+  intro: Classify threats, rank four risks and scan two libraries against two advisories.
+  code: |
+    STRIDE = ["Spoofing", "Tampering", "Repudiation", "Information disclosure", "Denial of service", "Elevation of privilege"]
+
+
+    def stride_categories(threat, keywords):
+        """Threat modelling with STRIDE: six kinds of threat. `keywords` is a dict {category: list of key words or phrases}. Return the list of categories (in the order of the STRIDE list above) for which at least one keyword occurs in the threat text as a WHOLE WORD or phrase (use re.search with \\b around re.escape(keyword); ignore upper and lower case). A category missing from the dict has no keywords. No match gives an empty list."""
+        import re
+        text = threat.lower()
+        found = []
+        for category in STRIDE:
+            for k in keywords.get(category, []):
+                if re.search(r"\b" + re.escape(k.lower()) + r"\b", text):
+                    found.append(category)
+                    break
+        return found
+
+
+    def risk_score(likelihood, impact):
+        """The classic RISK = LIKELIHOOD x IMPACT, each rated from 1 (lowest) to 5 (highest). ValueError('rating must be 1 to 5') unless both are whole numbers in that range (bool is not accepted). Return the product."""
+        for v in (likelihood, impact):
+            if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 5:
+                raise ValueError("rating must be 1 to 5")
+        return likelihood * impact
+
+
+    def risk_level(score):
+        """Name the score: 'low' for 1 to 4, 'medium' for 5 to 9, 'high' for 10 to 16 and 'critical' for 17 to 25. ValueError('bad score') for anything else."""
+        if not isinstance(score, int) or not 1 <= score <= 25:
+            raise ValueError("bad score")
+        return "low" if score <= 4 else "medium" if score <= 9 else "high" if score <= 16 else "critical"
+
+
+    def rank_risks(risks):
+        """`risks` is a dict {name: (likelihood, impact)}. Return the list of (name, score, level) sorted with the highest score first and, for equal scores, by name (alphabetical). Bad ratings raise the ValueError of risk_score."""
+        rows = [(name, risk_score(l, i)) for name, (l, i) in risks.items()]
+        rows.sort(key=lambda r: (-r[1], r[0]))
+        return [(name, score, risk_level(score)) for name, score in rows]
+
+
+    def compare_versions(a, b):
+        """Compare two version texts such as '1.10.2' and '1.9'. Split at '.', every part must be a whole number (ValueError('bad version') otherwise, also for an empty text). A missing part counts as 0 ('1.2' equals '1.2.0'). Compare number by number (so 1.10 is newer than 1.9). Return -1 if a is older, 0 if equal, 1 if a is newer."""
+        def parts(v):
+            p = v.split(".")
+            if not all(x.isdigit() for x in p):
+                raise ValueError("bad version")
+            return [int(x) for x in p]
+        pa, pb = parts(a), parts(b)
+        n = max(len(pa), len(pb))
+        pa, pb = pa + [0] * (n - len(pa)), pb + [0] * (n - len(pb))
+        return (pa > pb) - (pa < pb)
+
+
+    def version_matches(version, spec):
+        """Does `version` satisfy the specification `spec`? The spec is one or more clauses separated by commas, each an operator followed by a version: '<1.4.2', '>=1.0,<1.4.2', '==2.0'. The operators are <, <=, >, >= and == (ignore blanks around parts). ALL clauses must hold (check every clause for validity first). ValueError('bad spec') for an empty clause or an unknown operator."""
+        ops = ["<=", ">=", "==", "<", ">"]
+        clauses = []
+        for clause in spec.split(","):
+            clause = clause.strip()
+            op = next((o for o in ops if clause.startswith(o)), None)
+            if op is None or not clause[len(op):].strip():
+                raise ValueError("bad spec")
+            clauses.append((op, clause[len(op):].strip()))
+        for op, target in clauses:
+            c = compare_versions(version, target)
+            ok = {"<": c < 0, "<=": c <= 0, ">": c > 0, ">=": c >= 0, "==": c == 0}[op]
+            if not ok:
+                return False
+        return True
+
+
+    def scan_dependencies(deps, advisories):
+        """Every program depends on libraries, and libraries have known vulnerabilities (listed in advisories such as CVE entries). `deps` is a dict {package: installed version}; `advisories` a list of dicts {'id': text, 'package': name, 'affected': spec (as for version_matches), 'severity': 'low'/'medium'/'high'/'critical'}. Return the list of (id, package, version, severity) for every advisory whose package is installed in a version that matches the affected spec, sorted with the most severe first (critical, high, medium, low) and then by id."""
+        order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        hits = []
+        for adv in advisories:
+            v = deps.get(adv["package"])
+            if v is not None and version_matches(v, adv["affected"]):
+                hits.append((adv["id"], adv["package"], v, adv["severity"]))
+        hits.sort(key=lambda h: (order[h[3]], h[0]))
+        return hits
+
+    kw = {"Spoofing": ["impersonate", "fake"], "Tampering": ["modify", "change"], "Information disclosure": ["leak", "expose"], "Denial of service": ["flood", "crash"]}
+    for threat in ("An attacker can impersonate a teacher", "Anyone can modify the grades table", "Exam answers leak through the log files"):
+        print(threat, "->", stride_categories(threat, kw))
+    risks = {"phishing": (5, 4), "sql injection": (3, 5), "lost laptop": (3, 3), "ddos": (2, 4)}
+    for row in rank_risks(risks):
+        print(row)
+    deps = {"requests": "2.19.0", "flask": "2.3.1"}
+    adv = [{"id": "CVE-A", "package": "requests", "affected": "<2.20.0", "severity": "high"}, {"id": "CVE-B", "package": "flask", "affected": "<2.3.0", "severity": "critical"}]
+    print(scan_dependencies(deps, adv))
+  output: |
+    An attacker can impersonate a teacher -> ['Spoofing']
+    Anyone can modify the grades table -> ['Tampering']
+    Exam answers leak through the log files -> ['Information disclosure']
+    ('phishing', 20, 'critical')
+    ('sql injection', 15, 'high')
+    ('lost laptop', 9, 'medium')
+    ('ddos', 8, 'medium')
+    [('CVE-A', 'requests', '2.19.0', 'high')]
+  lines:
+  - line: 82
+    note: Keywords decide which of the six questions apply.
+  - line: 85
+    note: Phishing is the biggest risk here.
+  - line: 89
+    note: Only the old requests version is affected; flask 2.3.1 is already fixed.
+- title: Secrets and logs
+  intro: Find a leaked key and a password in code, then read a login log.
+  code: |
+    def shannon_entropy(text):
+        """The SHANNON ENTROPY of the text in bits per character: the sum over the different characters of -p * log2(p), where p is the share of that character (use math.log2). The empty text has entropy 0.0. Random secrets have a high entropy (about 4 or more); ordinary words and repeated text have a low one."""
+        import math
+        if not text:
+            return 0.0
+        n = len(text)
+        return -sum((c / n) * math.log2(c / n) for c in (text.count(ch) for ch in set(text)))
+
+
+    def find_secrets(text):
+        """A SECRET SCANNER finds passwords and keys that were pasted into code. Go through the text line by line (numbers start at 1) and return the sorted list of (line number, kind) pairs, each kind at most once per line. The kinds: 'aws key' for AKIA followed by 16 upper-case letters or digits; 'private key' for a '-----BEGIN ' ... 'PRIVATE KEY-----' marker; 'hardcoded password' for a word password, passwd, secret, token or api_key / api-key / apikey (any case) followed by optional blanks, ':' or '=', optional blanks and a quoted value of at least 6 characters without blanks (single or double quotes); and 'high entropy string' for a run of at least 24 characters from A-Z a-z 0-9 + / = _ - whose shannon_entropy is at least 4.0."""
+        import re
+        patterns = [("aws key", re.compile(r"AKIA[0-9A-Z]{16}")), ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")), ("hardcoded password", re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*['\"][^'\"\s]{6,}['\"]"))]
+        token = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+        found = set()
+        for number, line in enumerate(text.splitlines(), 1):
+            for kind, pattern in patterns:
+                if pattern.search(line):
+                    found.add((number, kind))
+            if any(shannon_entropy(t) >= 4.0 for t in token.findall(line)):
+                found.add((number, "high entropy string"))
+        return sorted(found)
+
+
+    def analyze_log(lines, threshold, window, min_users):
+        """Read a login log. Each line is 'SECONDS IP USER RESULT' (four words; RESULT is OK or FAIL); skip lines that are malformed (not four words, SECONDS not a whole number, RESULT anything else). Handle the events in the order of their time (stable for equal times). Return a dict of three sorted lists of IP addresses: 'bruteforce' = addresses with at least `threshold` FAIL events inside some window of `window` seconds (last time minus first time <= window); 'spraying' = addresses with FAIL events against at least `min_users` DIFFERENT user names (any time); 'compromised' = addresses with an OK event AFTER (or at the same time, later in the sorted order) they had become a 'bruteforce' address, that is after the failure that completed the threshold."""
+        events = []
+        for line in lines:
+            w = line.split()
+            if len(w) != 4 or not w[0].isdigit() or w[3] not in ("OK", "FAIL"):
+                continue
+            events.append((int(w[0]), w[1], w[2], w[3]))
+        events.sort(key=lambda e: e[0])
+        recent, users, flagged, compromised = {}, {}, set(), set()
+        for t, ip, user, result in events:
+            if result == "FAIL":
+                users.setdefault(ip, set()).add(user)
+                times = recent.setdefault(ip, [])
+                times.append(t)
+                while t - times[0] > window:
+                    times.pop(0)
+                if len(times) >= threshold:
+                    flagged.add(ip)
+            elif ip in flagged:
+                compromised.add(ip)
+        spraying = sorted(ip for ip, u in users.items() if len(u) >= min_users)
+        return {"bruteforce": sorted(flagged), "spraying": spraying, "compromised": sorted(compromised)}
+
+    code = 'import boto3\nkey = "AKIAIOSFODNN7EXAMPLE"\npassword = "hunter2hunter2"\nprint("hello")\n'
+    print(find_secrets(code))
+    print(round(shannon_entropy("correct horse battery staple"), 2), round(shannon_entropy("wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY"), 2))
+    log = ["100 1.1.1.1 ada FAIL", "101 1.1.1.1 ada FAIL", "102 1.1.1.1 ada FAIL", "103 1.1.1.1 ada OK", "200 2.2.2.2 ada FAIL", "201 2.2.2.2 bo FAIL", "202 2.2.2.2 cy FAIL", "300 3.3.3.3 di OK"]
+    print(analyze_log(log, 3, 10, 3))
+  output: |
+    [(2, 'aws key'), (3, 'hardcoded password')]
+    3.49 4.71
+    {'bruteforce': ['1.1.1.1', '2.2.2.2'], 'spraying': ['2.2.2.2'], 'compromised': ['1.1.1.1']}
+  lines:
+  - line: 50
+    note: The key on line 2 and the password on line 3.
+  - line: 51
+    note: Random text has a higher entropy than words.
+  - line: 53
+    note: One address guessed its way in; another tried three different accounts.
+playground:
+  prompt: Measure how random a string looks.
+  code: |
+    import math
+    text = 'abcdefgh'
+    p = 1 / 8
+    print(round(-8 * p * math.log2(p), 2))
+exercises:
+- id: stride
+  title: Thinking like an attacker
+  difficulty: 3
+  prompt: '**Threat modelling** means asking, before attackers do, *what can go wrong?* A popular checklist is **STRIDE**: **S**poofing (pretending to be someone), **T**ampering (changing data), **R**epudiation (denying an action), **I**nformation disclosure (leaks), **D**enial of service (making it unavailable) and **E**levation of privilege (gaining rights). The list `STRIDE` is given. Write `stride_categories(threat, keywords)`: `keywords` is a dict `{category: list of key words or phrases}`. Return the list of categories (in the order of `STRIDE`) for which at least one keyword occurs in the threat text as a **whole word or phrase** (use `re.search` with `\\b` around `re.escape(keyword)`; ignore upper and lower case). A category missing from the dict has no keywords. No match gives an empty list.'
+  starter: |-
+    STRIDE = ["Spoofing", "Tampering", "Repudiation", "Information disclosure", "Denial of service", "Elevation of privilege"]
+
+
+    def stride_categories(threat, keywords):
+        """Threat modelling with STRIDE: six kinds of threat. `keywords` is a dict {category: list of key words or phrases}. Return the list of categories (in the order of the STRIDE list above) for which at least one keyword occurs in the threat text as a WHOLE WORD or phrase (use re.search with \\b around re.escape(keyword); ignore upper and lower case). A category missing from the dict has no keywords. No match gives an empty list."""
+        pass
+  tests:
+  - name: matching
+    code: |
+      kw = {"Spoofing": ["impersonate", "fake login"], "Tampering": ["modify", "alter"], "Repudiation": ["deny", "no log"], "Information disclosure": ["leak", "expose"], "Denial of service": ["flood", "crash"], "Elevation of privilege": ["admin", "escalate"]}
+      assert stride_categories("An attacker can impersonate a teacher", kw) == ["Spoofing"] and stride_categories("The server can crash when flooded with requests", kw) == ["Denial of service"] and stride_categories("Users can deny sending the order because there is no log", kw) == ["Repudiation"]
+      assert stride_categories("A user can leak data and then escalate to admin", kw) == ["Information disclosure", "Elevation of privilege"] and stride_categories("Attacker may MODIFY prices and Impersonate the shop", kw) == ["Spoofing", "Tampering"] and stride_categories("Nothing to see", kw) == [] and stride_categories("", kw) == []
+  - name: whole words
+    code: |
+      kw = {"Tampering": ["alter", "change log"], "Denial of service": ["flood"], "Spoofing": ["fake login"]}
+      assert stride_categories("Alteration of files", kw) == [] and stride_categories("alter", kw) == ["Tampering"] and stride_categories("A fake login page", kw) == ["Spoofing"] and stride_categories("fake logins", kw) == [] and stride_categories("a flood!", kw) == ["Denial of service"] and stride_categories("floodgate", kw) == []
+      assert stride_categories("alter flood fake login", kw) == ["Spoofing", "Tampering", "Denial of service"] and stride_categories("anything", {}) == []
+  hints:
+  - Loop over STRIDE in order so that the result is already sorted.
+  - re.escape protects special characters inside the keyword.
+  solution: |
+    STRIDE = ["Spoofing", "Tampering", "Repudiation", "Information disclosure", "Denial of service", "Elevation of privilege"]
+
+
+    def stride_categories(threat, keywords):
+        """Threat modelling with STRIDE: six kinds of threat. `keywords` is a dict {category: list of key words or phrases}. Return the list of categories (in the order of the STRIDE list above) for which at least one keyword occurs in the threat text as a WHOLE WORD or phrase (use re.search with \\b around re.escape(keyword); ignore upper and lower case). A category missing from the dict has no keywords. No match gives an empty list."""
+        import re
+        text = threat.lower()
+        found = []
+        for category in STRIDE:
+            for k in keywords.get(category, []):
+                if re.search(r"\b" + re.escape(k.lower()) + r"\b", text):
+                    found.append(category)
+                    break
+        return found
+  explanation: 'Run STRIDE on every arrow of a data-flow diagram: each place where data crosses a boundary is a place to ask the six questions.'
+- id: risk
+  title: Ranking risks
+  difficulty: 3
+  prompt: 'You cannot fix everything, so you rank risks. The classic score is **likelihood × impact**, each rated from 1 (lowest) to 5 (highest). Write `risk_score(likelihood, impact)`: `ValueError("rating must be 1 to 5")` unless both are whole numbers in that range (a `bool` is not accepted); return the product. Write `risk_level(score)`: `"low"` for 1 to 4, `"medium"` for 5 to 9, `"high"` for 10 to 16 and `"critical"` for 17 to 25; `ValueError("bad score")` for anything else. Write `rank_risks(risks)`: `risks` is a dict `{name: (likelihood, impact)}`. Return the list of `(name, score, level)` sorted with the **highest score first** and, for equal scores, by name (alphabetical). Bad ratings raise the `ValueError` of `risk_score`.'
+  starter: |-
+    def risk_score(likelihood, impact):
+        """The classic RISK = LIKELIHOOD x IMPACT, each rated from 1 (lowest) to 5 (highest). ValueError('rating must be 1 to 5') unless both are whole numbers in that range (bool is not accepted). Return the product."""
+        pass
+
+
+    def risk_level(score):
+        """Name the score: 'low' for 1 to 4, 'medium' for 5 to 9, 'high' for 10 to 16 and 'critical' for 17 to 25. ValueError('bad score') for anything else."""
+        pass
+
+
+    def rank_risks(risks):
+        """`risks` is a dict {name: (likelihood, impact)}. Return the list of (name, score, level) sorted with the highest score first and, for equal scores, by name (alphabetical). Bad ratings raise the ValueError of risk_score."""
+        pass
+  tests:
+  - name: scores and levels
+    code: |
+      assert risk_score(1, 1) == 1 and risk_score(5, 5) == 25 and risk_score(3, 4) == 12 and risk_score(2, 5) == 10
+      for l, i in ((0, 3), (3, 6), (2.5, 3), ("2", 3), (True, 3), (3, None), (-1, 2)):
+          try:
+              risk_score(l, i)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "rating must be 1 to 5" in str(e)
+      assert [risk_level(s) for s in (1, 4, 5, 9, 10, 16, 17, 25)] == ["low", "low", "medium", "medium", "high", "high", "critical", "critical"]
+      for bad in (0, 26, -3, 2.5, "x"):
+          try:
+              risk_level(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad score" in str(e)
+  - name: ranking
+    code: |
+      risks = {"phishing": (5, 4), "sql injection": (3, 5), "lost laptop": (3, 3), "ddos": (2, 4), "insider": (1, 5), "typo squatting": (2, 4)}
+      assert rank_risks(risks) == [("phishing", 20, "critical"), ("sql injection", 15, "high"), ("lost laptop", 9, "medium"), ("ddos", 8, "medium"), ("typo squatting", 8, "medium"), ("insider", 5, "medium")]
+      assert rank_risks({}) == [] and rank_risks({"a": (1, 1)}) == [("a", 1, "low")] and rank_risks({"b": (2, 2), "a": (4, 1)}) == [("a", 4, "low"), ("b", 4, "low")]
+      try:
+          rank_risks({"x": (9, 1)})
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "rating must be 1 to 5" in str(e)
+  hints:
+  - Sort with a key of (-score, name).
+  - Build the level from the score with risk_level.
+  solution: |
+    def risk_score(likelihood, impact):
+        """The classic RISK = LIKELIHOOD x IMPACT, each rated from 1 (lowest) to 5 (highest). ValueError('rating must be 1 to 5') unless both are whole numbers in that range (bool is not accepted). Return the product."""
+        for v in (likelihood, impact):
+            if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 5:
+                raise ValueError("rating must be 1 to 5")
+        return likelihood * impact
+
+
+    def risk_level(score):
+        """Name the score: 'low' for 1 to 4, 'medium' for 5 to 9, 'high' for 10 to 16 and 'critical' for 17 to 25. ValueError('bad score') for anything else."""
+        if not isinstance(score, int) or not 1 <= score <= 25:
+            raise ValueError("bad score")
+        return "low" if score <= 4 else "medium" if score <= 9 else "high" if score <= 16 else "critical"
+
+
+    def rank_risks(risks):
+        """`risks` is a dict {name: (likelihood, impact)}. Return the list of (name, score, level) sorted with the highest score first and, for equal scores, by name (alphabetical). Bad ratings raise the ValueError of risk_score."""
+        rows = [(name, risk_score(l, i)) for name, (l, i) in risks.items()]
+        rows.sort(key=lambda r: (-r[1], r[0]))
+        return [(name, score, risk_level(score)) for name, score in rows]
+  explanation: 'The result is a plan, not a number: decide for each risk whether to reduce it, avoid it, transfer it (insurance) or accept it.'
+- id: deps
+  title: Vulnerable dependencies
+  difficulty: 5
+  prompt: 'Modern programs are mostly **other people''s code**, and libraries have known vulnerabilities, published with ids such as `CVE-2021-44228` (Log4Shell). Keeping dependencies **updated** is one of the most effective defences. Write `compare_versions(a, b)`: compare two version texts such as `"1.10.2"` and `"1.9"`. Split at `"."`; every part must be a whole number (`ValueError("bad version")` otherwise, also for an empty text). A missing part counts as 0 (`"1.2"` equals `"1.2.0"`). Compare number by number (so 1.10 is newer than 1.9). Return `-1` if `a` is older, `0` if equal, `1` if newer. Write `version_matches(version, spec)`: the spec is one or more clauses separated by commas, each an operator followed by a version: `"<1.4.2"`, `">=1.0,<1.4.2"`, `"==2.0"`. The operators are `<`, `<=`, `>`, `>=`, `==` (ignore blanks around the parts). **All** clauses must hold. `ValueError("bad spec")` for an empty clause or an unknown operator. Write `scan_dependencies(deps, advisories)`: `deps` is a dict `{package: installed version}`; `advisories` a list of dicts `{"id": text, "package": name, "affected": spec, "severity": "low"/"medium"/"high"/"critical"}`. Return the list of `(id, package, version, severity)` for every advisory whose package is installed in a version that matches the affected spec, sorted with the **most severe first** (critical, high, medium, low) and then by id.'
+  starter: |-
+    def compare_versions(a, b):
+        """Compare two version texts such as '1.10.2' and '1.9'. Split at '.', every part must be a whole number (ValueError('bad version') otherwise, also for an empty text). A missing part counts as 0 ('1.2' equals '1.2.0'). Compare number by number (so 1.10 is newer than 1.9). Return -1 if a is older, 0 if equal, 1 if a is newer."""
+        pass
+
+
+    def version_matches(version, spec):
+        """Does `version` satisfy the specification `spec`? The spec is one or more clauses separated by commas, each an operator followed by a version: '<1.4.2', '>=1.0,<1.4.2', '==2.0'. The operators are <, <=, >, >= and == (ignore blanks around parts). ALL clauses must hold (check every clause for validity first). ValueError('bad spec') for an empty clause or an unknown operator."""
+        pass
+
+
+    def scan_dependencies(deps, advisories):
+        """Every program depends on libraries, and libraries have known vulnerabilities (listed in advisories such as CVE entries). `deps` is a dict {package: installed version}; `advisories` a list of dicts {'id': text, 'package': name, 'affected': spec (as for version_matches), 'severity': 'low'/'medium'/'high'/'critical'}. Return the list of (id, package, version, severity) for every advisory whose package is installed in a version that matches the affected spec, sorted with the most severe first (critical, high, medium, low) and then by id."""
+        pass
+  tests:
+  - name: versions
+    code: |
+      assert compare_versions("1.2.3", "1.2.3") == 0 and compare_versions("1.10", "1.9") == 1 and compare_versions("1.9", "1.10") == -1 and compare_versions("1.2", "1.2.0") == 0 and compare_versions("2", "1.99.99") == 1 and compare_versions("1.0.0.1", "1.0") == 1 and compare_versions("0.9", "1.0") == -1 and compare_versions("10", "9") == 1
+      for bad in ("", "1..2", "1.x", "v1.2", "1.2.", "-1"):
+          try:
+              compare_versions(bad, "1.0")
+              raise AssertionError("accepted " + bad)
+          except ValueError as e:
+              assert "bad version" in str(e)
+  - name: specs
+    code: |
+      assert version_matches("1.2.0", "<1.4.2") and not version_matches("1.4.2", "<1.4.2") and version_matches("1.4.2", "<=1.4.2") and version_matches("2.0", ">1.9") and not version_matches("2.0", ">2.0.0") and version_matches("2.0", ">=2") and version_matches("1.2", "==1.2.0") and not version_matches("1.3", "==1.2")
+      assert version_matches("1.2", ">=1.0,<1.4.2") and not version_matches("0.9", ">=1.0,<1.4.2") and not version_matches("1.4.2", ">=1.0,<1.4.2") and version_matches("1.2", " >= 1.0 , < 1.4.2 ") and version_matches("3.0", ">1, >2, >=3")
+      for bad in ("", "1.2", "=1.2", "!=1.2", "<", "<1.0,", ">=1.0,,<2", "~1.2"):
+          try:
+              version_matches("1.0", bad)
+              raise AssertionError("accepted " + repr(bad))
+          except ValueError as e:
+              assert "bad spec" in str(e)
+  - name: scanning
+    code: |
+      deps = {"requests": "2.19.0", "flask": "2.3.1", "left-pad": "1.0.0", "pillow": "9.0.0"}
+      adv = [{"id": "CVE-1", "package": "requests", "affected": "<2.20.0", "severity": "high"}, {"id": "CVE-2", "package": "flask", "affected": ">=2.0,<2.3.0", "severity": "critical"}, {"id": "CVE-3", "package": "pillow", "affected": "<9.0.1", "severity": "critical"}, {"id": "CVE-4", "package": "left-pad", "affected": "==1.0.0", "severity": "low"}, {"id": "CVE-5", "package": "django", "affected": "<9", "severity": "high"}, {"id": "CVE-0", "package": "requests", "affected": ">=2.0,<2.19.1", "severity": "high"}]
+      assert scan_dependencies(deps, adv) == [("CVE-3", "pillow", "9.0.0", "critical"), ("CVE-0", "requests", "2.19.0", "high"), ("CVE-1", "requests", "2.19.0", "high"), ("CVE-4", "left-pad", "1.0.0", "low")]
+      assert scan_dependencies({}, adv) == [] and scan_dependencies(deps, []) == [] and scan_dependencies({"flask": "2.3.0"}, adv) == []
+  hints:
+  - Turn each version into a list of numbers and pad with zeros before comparing.
+  - Try the two-character operators first, so that <= is not read as <.
+  solution: |
+    def compare_versions(a, b):
+        """Compare two version texts such as '1.10.2' and '1.9'. Split at '.', every part must be a whole number (ValueError('bad version') otherwise, also for an empty text). A missing part counts as 0 ('1.2' equals '1.2.0'). Compare number by number (so 1.10 is newer than 1.9). Return -1 if a is older, 0 if equal, 1 if a is newer."""
+        def parts(v):
+            p = v.split(".")
+            if not all(x.isdigit() for x in p):
+                raise ValueError("bad version")
+            return [int(x) for x in p]
+        pa, pb = parts(a), parts(b)
+        n = max(len(pa), len(pb))
+        pa, pb = pa + [0] * (n - len(pa)), pb + [0] * (n - len(pb))
+        return (pa > pb) - (pa < pb)
+
+
+    def version_matches(version, spec):
+        """Does `version` satisfy the specification `spec`? The spec is one or more clauses separated by commas, each an operator followed by a version: '<1.4.2', '>=1.0,<1.4.2', '==2.0'. The operators are <, <=, >, >= and == (ignore blanks around parts). ALL clauses must hold (check every clause for validity first). ValueError('bad spec') for an empty clause or an unknown operator."""
+        ops = ["<=", ">=", "==", "<", ">"]
+        clauses = []
+        for clause in spec.split(","):
+            clause = clause.strip()
+            op = next((o for o in ops if clause.startswith(o)), None)
+            if op is None or not clause[len(op):].strip():
+                raise ValueError("bad spec")
+            clauses.append((op, clause[len(op):].strip()))
+        for op, target in clauses:
+            c = compare_versions(version, target)
+            ok = {"<": c < 0, "<=": c <= 0, ">": c > 0, ">=": c >= 0, "==": c == 0}[op]
+            if not ok:
+                return False
+        return True
+
+
+    def scan_dependencies(deps, advisories):
+        """Every program depends on libraries, and libraries have known vulnerabilities (listed in advisories such as CVE entries). `deps` is a dict {package: installed version}; `advisories` a list of dicts {'id': text, 'package': name, 'affected': spec (as for version_matches), 'severity': 'low'/'medium'/'high'/'critical'}. Return the list of (id, package, version, severity) for every advisory whose package is installed in a version that matches the affected spec, sorted with the most severe first (critical, high, medium, low) and then by id."""
+        order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        hits = []
+        for adv in advisories:
+            v = deps.get(adv["package"])
+            if v is not None and version_matches(v, adv["affected"]):
+                hits.append((adv["id"], adv["package"], v, adv["severity"]))
+        hits.sort(key=lambda h: (order[h[3]], h[0]))
+        return hits
+  explanation: Tools such as pip-audit, npm audit and GitHub Dependabot do exactly this against public advisory databases and can open the update for you.
+- id: secrets
+  title: Finding secrets in code
+  difficulty: 5
+  prompt: 'Developers sometimes paste passwords, API keys or private keys into code and then publish it, and bots find them within minutes. A **secret scanner** looks for them. Write `shannon_entropy(text)`: the **Shannon entropy** of the text in bits per character: the sum over the different characters of `-p * log2(p)`, where `p` is the share of that character (use `math.log2`). The empty text has entropy `0.0`. Random secrets have a high entropy (about 4 or more); ordinary words and repeated text have a low one. Write `find_secrets(text)`: go through the text line by line (numbers start at 1) and return the sorted list of `(line number, kind)` pairs, each kind at most once per line. The kinds: `"aws key"` for `AKIA` followed by 16 upper-case letters or digits; `"private key"` for a `-----BEGIN ` ... `PRIVATE KEY-----` marker; `"hardcoded password"` for one of the words `password`, `passwd`, `secret`, `token`, or `api_key` / `api-key` / `apikey` (any case) followed by optional blanks, `:` or `=`, optional blanks and a quoted value of **at least 6 characters** without blanks (single or double quotes); and `"high entropy string"` for a run of at least 24 characters from `A-Z a-z 0-9 + / = _ -` whose `shannon_entropy` is at least `4.0`.'
+  starter: |-
+    def shannon_entropy(text):
+        """The SHANNON ENTROPY of the text in bits per character: the sum over the different characters of -p * log2(p), where p is the share of that character (use math.log2). The empty text has entropy 0.0. Random secrets have a high entropy (about 4 or more); ordinary words and repeated text have a low one."""
+        pass
+
+
+    def find_secrets(text):
+        """A SECRET SCANNER finds passwords and keys that were pasted into code. Go through the text line by line (numbers start at 1) and return the sorted list of (line number, kind) pairs, each kind at most once per line. The kinds: 'aws key' for AKIA followed by 16 upper-case letters or digits; 'private key' for a '-----BEGIN ' ... 'PRIVATE KEY-----' marker; 'hardcoded password' for a word password, passwd, secret, token or api_key / api-key / apikey (any case) followed by optional blanks, ':' or '=', optional blanks and a quoted value of at least 6 characters without blanks (single or double quotes); and 'high entropy string' for a run of at least 24 characters from A-Z a-z 0-9 + / = _ - whose shannon_entropy is at least 4.0."""
+        pass
+  tests:
+  - name: entropy
+    code: |
+      assert shannon_entropy("") == 0.0 and shannon_entropy("aaaa") == 0.0 and abs(shannon_entropy("ab") - 1.0) < 1e-12 and abs(shannon_entropy("abcd") - 2.0) < 1e-12 and abs(shannon_entropy("aabb") - 1.0) < 1e-12 and abs(shannon_entropy("aaab") - 0.8112781244591328) < 1e-9
+      assert shannon_entropy("correcthorsebatterystaple") < 4.0 and shannon_entropy("wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY") > 4.0 and shannon_entropy("x" * 50) == 0.0
+  - name: kinds of secret
+    code: |
+      code = """import os
+      aws = "AKIAIOSFODNN7EXAMPLE"
+      password = "hunter2hunter2"
+      db_password: 'short'
+      API_KEY = "abcdef123456"
+      pw = os.environ["PASSWORD"]
+      -----BEGIN RSA PRIVATE KEY-----
+      token = 'a b c d e f g'
+      blob = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY"
+      words = "correcthorsebatterystaplecorrecthorse"
+      Secret : "abcdef"
+      api-key="123456"
+      """
+      assert find_secrets(code) == [(2, "aws key"), (3, "hardcoded password"), (5, "hardcoded password"), (7, "private key"), (9, "high entropy string"), (11, "hardcoded password"), (12, "hardcoded password")]
+      assert find_secrets("") == [] and find_secrets("nothing here\njust code") == []
+  - name: one line, several kinds
+    code: |
+      line = 'secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY"  # AKIAABCDEFGHIJKLMNOP'
+      assert find_secrets(line) == [(1, "aws key"), (1, "hardcoded password"), (1, "high entropy string")]
+      assert find_secrets("-----BEGIN PRIVATE KEY-----") == [(1, "private key")] and find_secrets("-----BEGIN OPENSSH PRIVATE KEY-----") == [(1, "private key")] and find_secrets("-----BEGIN CERTIFICATE-----") == []
+      assert find_secrets("AKIA1234") == [] and find_secrets("AKIAIOSFODNN7EXAMPLE AKIAIOSFODNN7EXAMPLF") == [(1, "aws key")] and find_secrets("token=abcdefg") == [] and find_secrets("TOKEN='abcdefg'") == [(1, "hardcoded password")]
+  hints:
+  - Use one regular expression per kind and a set to avoid duplicates.
+  - Check every long run of key characters with shannon_entropy.
+  solution: |
+    def shannon_entropy(text):
+        """The SHANNON ENTROPY of the text in bits per character: the sum over the different characters of -p * log2(p), where p is the share of that character (use math.log2). The empty text has entropy 0.0. Random secrets have a high entropy (about 4 or more); ordinary words and repeated text have a low one."""
+        import math
+        if not text:
+            return 0.0
+        n = len(text)
+        return -sum((c / n) * math.log2(c / n) for c in (text.count(ch) for ch in set(text)))
+
+
+    def find_secrets(text):
+        """A SECRET SCANNER finds passwords and keys that were pasted into code. Go through the text line by line (numbers start at 1) and return the sorted list of (line number, kind) pairs, each kind at most once per line. The kinds: 'aws key' for AKIA followed by 16 upper-case letters or digits; 'private key' for a '-----BEGIN ' ... 'PRIVATE KEY-----' marker; 'hardcoded password' for a word password, passwd, secret, token or api_key / api-key / apikey (any case) followed by optional blanks, ':' or '=', optional blanks and a quoted value of at least 6 characters without blanks (single or double quotes); and 'high entropy string' for a run of at least 24 characters from A-Z a-z 0-9 + / = _ - whose shannon_entropy is at least 4.0."""
+        import re
+        patterns = [("aws key", re.compile(r"AKIA[0-9A-Z]{16}")), ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")), ("hardcoded password", re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*['\"][^'\"\s]{6,}['\"]"))]
+        token = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+        found = set()
+        for number, line in enumerate(text.splitlines(), 1):
+            for kind, pattern in patterns:
+                if pattern.search(line):
+                    found.add((number, kind))
+            if any(shannon_entropy(t) >= 4.0 for t in token.findall(line)):
+                found.add((number, "high entropy string"))
+        return sorted(found)
+  explanation: 'If a secret ever reaches a public repository, assume it is stolen: revoke it and make a new one. Removing it from the code does not remove it from history.'
+- id: log
+  title: 'Capstone: reading a login log'
+  difficulty: 5
+  prompt: 'Detection is the other half of security: you need **logs** and someone (or something) to read them. Write `analyze_log(lines, threshold, window, min_users)`. Each line is `"SECONDS IP USER RESULT"` (four words; `RESULT` is `OK` or `FAIL`); skip lines that are malformed (not four words, `SECONDS` not a whole number, `RESULT` anything else). Handle the events in the order of their time (stable for equal times). Return a dict of three **sorted** lists of IP addresses: `"bruteforce"` = addresses with at least `threshold` `FAIL` events inside some window of `window` seconds (last time minus first time `<= window`); `"spraying"` = addresses with `FAIL` events against at least `min_users` **different** user names (any time); `"compromised"` = addresses with an `OK` event **after** they had become a bruteforce address, that is after the failure that completed the threshold (in the sorted event order).'
+  starter: |-
+    def analyze_log(lines, threshold, window, min_users):
+        """Read a login log. Each line is 'SECONDS IP USER RESULT' (four words; RESULT is OK or FAIL); skip lines that are malformed (not four words, SECONDS not a whole number, RESULT anything else). Handle the events in the order of their time (stable for equal times). Return a dict of three sorted lists of IP addresses: 'bruteforce' = addresses with at least `threshold` FAIL events inside some window of `window` seconds (last time minus first time <= window); 'spraying' = addresses with FAIL events against at least `min_users` DIFFERENT user names (any time); 'compromised' = addresses with an OK event AFTER (or at the same time, later in the sorted order) they had become a 'bruteforce' address, that is after the failure that completed the threshold."""
+        pass
+  tests:
+  - name: brute force
+    code: |
+      log = ["100 1.1.1.1 ada FAIL", "101 1.1.1.1 ada FAIL", "102 1.1.1.1 ada FAIL", "500 2.2.2.2 bo FAIL", "900 2.2.2.2 bo FAIL", "1300 2.2.2.2 bo FAIL", "105 3.3.3.3 cy OK"]
+      r = analyze_log(log, 3, 10, 3)
+      assert r == {"bruteforce": ["1.1.1.1"], "spraying": [], "compromised": []}
+      assert analyze_log(log, 3, 800, 3)["bruteforce"] == ["1.1.1.1", "2.2.2.2"] and analyze_log(log, 3, 1, 3)["bruteforce"] == [] and analyze_log(log, 2, 1, 3)["bruteforce"] == ["1.1.1.1"] and analyze_log([], 3, 10, 3) == {"bruteforce": [], "spraying": [], "compromised": []}
+  - name: spraying and compromise
+    code: |
+      log = ["10 9.9.9.9 ada FAIL", "11 9.9.9.9 bo FAIL", "12 9.9.9.9 cy FAIL", "13 9.9.9.9 di FAIL", "50 8.8.8.8 ada FAIL", "51 8.8.8.8 ada FAIL", "52 8.8.8.8 ada FAIL", "53 8.8.8.8 ada OK", "20 7.7.7.7 ada OK", "21 7.7.7.7 ada FAIL", "22 7.7.7.7 ada FAIL", "23 7.7.7.7 ada FAIL", "1000 7.7.7.7 ada OK"]
+      r = analyze_log(log, 3, 5, 3)
+      assert r == {"bruteforce": ["7.7.7.7", "8.8.8.8", "9.9.9.9"], "spraying": ["9.9.9.9"], "compromised": ["7.7.7.7", "8.8.8.8"]}
+      r2 = analyze_log(log, 5, 5, 5)
+      assert r2 == {"bruteforce": [], "spraying": [], "compromised": []}
+      assert analyze_log(log, 3, 5, 4)["spraying"] == ["9.9.9.9"] and analyze_log(log, 3, 5, 5)["spraying"] == []
+  - name: messy input
+    code: |
+      log = ["bad line", "10 1.1.1.1 ada FAIL", "x 1.1.1.1 ada FAIL", "11 1.1.1.1 ada FAIL extra", "12 1.1.1.1 ada MAYBE", "", "-5 1.1.1.1 ada FAIL", "10 1.1.1.1 ada FAIL", "10 1.1.1.1 bo FAIL"]
+      assert analyze_log(log, 3, 0, 2) == {"bruteforce": ["1.1.1.1"], "spraying": ["1.1.1.1"], "compromised": []}
+      unordered = ["30 5.5.5.5 a FAIL", "10 5.5.5.5 a FAIL", "20 5.5.5.5 a FAIL", "25 5.5.5.5 a OK", "35 5.5.5.5 a OK"]
+      assert analyze_log(unordered, 3, 20, 2) == {"bruteforce": ["5.5.5.5"], "spraying": [], "compromised": ["5.5.5.5"]} and analyze_log(unordered, 3, 19, 2)["bruteforce"] == []
+  hints:
+  - Sort the events by time first, then walk through them once.
+  - Keep for each address the times of its recent failures and drop the ones outside the window.
+  solution: |
+    def analyze_log(lines, threshold, window, min_users):
+        """Read a login log. Each line is 'SECONDS IP USER RESULT' (four words; RESULT is OK or FAIL); skip lines that are malformed (not four words, SECONDS not a whole number, RESULT anything else). Handle the events in the order of their time (stable for equal times). Return a dict of three sorted lists of IP addresses: 'bruteforce' = addresses with at least `threshold` FAIL events inside some window of `window` seconds (last time minus first time <= window); 'spraying' = addresses with FAIL events against at least `min_users` DIFFERENT user names (any time); 'compromised' = addresses with an OK event AFTER (or at the same time, later in the sorted order) they had become a 'bruteforce' address, that is after the failure that completed the threshold."""
+        events = []
+        for line in lines:
+            w = line.split()
+            if len(w) != 4 or not w[0].isdigit() or w[3] not in ("OK", "FAIL"):
+                continue
+            events.append((int(w[0]), w[1], w[2], w[3]))
+        events.sort(key=lambda e: e[0])
+        recent, users, flagged, compromised = {}, {}, set(), set()
+        for t, ip, user, result in events:
+            if result == "FAIL":
+                users.setdefault(ip, set()).add(user)
+                times = recent.setdefault(ip, [])
+                times.append(t)
+                while t - times[0] > window:
+                    times.pop(0)
+                if len(times) >= threshold:
+                    flagged.add(ip)
+            elif ip in flagged:
+                compromised.add(ip)
+        spraying = sorted(ip for ip, u in users.items() if len(u) >= min_users)
+        return {"bruteforce": sorted(flagged), "spraying": spraying, "compromised": sorted(compromised)}
+  explanation: Security teams run this kind of rule all day over millions of lines and send alerts when something fires. Combine it with the rate limits and lockouts of lesson 4.
+commonMistakes:
+- title: Treating security as a final step
+  explanation: Design for it from the start.
+- title: Never updating dependencies
+  explanation: Known holes stay open.
+- title: Committing secrets to Git
+  explanation: History keeps them forever.
+- title: Logging passwords or tokens
+  explanation: Logs are read by many people.
+- title: No plan for an incident
+  explanation: Panic costs more than preparation.
+summary:
+- 'Threat modelling: what can go wrong at each trust boundary (STRIDE).'
+- Risk = likelihood × impact; mitigate, avoid, transfer or accept.
+- Keep dependencies updated and scanned.
+- Keep secrets out of code; revoke leaked ones.
+- Log, monitor and have an incident plan.
+next: u31-project
+quiz:
+- type: mcq
+  question: What does the S in STRIDE stand for?
+  options:
+  - Spoofing
+  - Speed
+  - Storage
+  - Signing
+  answer: 0
+  explanation: Pretending to be someone.
+- type: mcq
+  question: How is risk scored here?
+  options:
+  - Likelihood times impact
+  - Impact plus cost
+  - Time divided by money
+  - Severity only
+  answer: 0
+  explanation: L x I.
+- type: mcq
+  question: What is password spraying?
+  options:
+  - Trying a few common passwords against many accounts
+  - Trying many passwords on one account
+  - Stealing a hash
+  - Breaking encryption
+  answer: 0
+  explanation: Avoids lockouts.
+- type: mcq
+  question: What should you do when a secret is leaked?
+  options:
+  - Revoke it and make a new one
+  - Delete the file
+  - Ignore it
+  - Rename the repository
+  answer: 0
+  explanation: Assume it is stolen.
+- type: mcq
+  question: What is a CVE?
+  options:
+  - A public id for a known vulnerability
+  - A kind of cipher
+  - A password rule
+  - A backup tool
+  answer: 0
+  explanation: Common Vulnerabilities and Exposures.
+- type: mcq
+  question: What is responsible disclosure?
+  options:
+  - Reporting a flaw privately and giving time to fix it
+  - Publishing it at once
+  - Selling it
+  - Hiding it
+  answer: 0
+  explanation: Tell the owner first.
+- type: code
+  question: Write `severity_rank(severity)` returning 0 for 'critical', 1 for 'high', 2 for 'medium', 3 for 'low' (so that sorting by it puts the worst first); raise `ValueError('unknown severity')` for anything else.
+  starter: |
+    def severity_rank(severity):
+        pass
+  tests:
+  - name: rank
+    code: |
+      assert [severity_rank(s) for s in ("critical", "high", "medium", "low")] == [0, 1, 2, 3]
+      try:
+          severity_rank("urgent")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "unknown severity" in str(e)
+  solution: |
+    def severity_rank(severity):
+        order = ["critical", "high", "medium", "low"]
+        if severity not in order:
+            raise ValueError("unknown severity")
+        return order.index(severity)

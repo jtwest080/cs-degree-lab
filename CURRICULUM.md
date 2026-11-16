@@ -36,8 +36,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 28 | Git and GitHub (Version 2, practice unit) | ✅ Complete (Phase 29) | 7 | 35 | Mini Git (commits, log, branches, safe switch, status, diff, merge base, fast-forward / three-way merge / conflicts, push with the fast-forward rule) |
 | 29 | Command Line (Version 2, practice unit) | ✅ Complete (Phase 30) | 6 | 30 | Mini Shell (prompt, quote-aware expansion of variables, braces and wildcards, cd/ls/cat/mkdir/cp/mv/rm and text commands, pipes and redirection, ; && ||, variables, history, scripts) |
 | 30 | Testing and Debugging (Version 2, practice unit) | ✅ Complete (Phase 31) | 6 | 30 | Mini Test Lab (discover tests, fixtures, loading code, line coverage by tracing, mutation scoring, full report with exit code) |
+| 31 | Security Basics (Version 2, practice unit) | ✅ Complete (Phase 32) | 6 | 30 | Mini Security Toolkit (registration and login, token and role checks, safe pages and queries, project scanning, site audit, log alerts, risk summary) |
 
-Totals: 242 lessons, 1163 practice exercises, 242 lesson quizzes (1452 multiple-choice questions + 242 coding questions), 30 unit projects, 2271 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 248 lessons, 1193 practice exercises, 248 lesson quizzes (1488 multiple-choice questions + 248 coding questions), 31 unit projects, 2309 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -673,6 +674,21 @@ Can assume: absolute/relative paths, pipes, redirection, exit status, wildcards,
 
 Can assume: assertions, fixtures, mocks and injection, coverage and mutants, debugging method, logging, validation, rate limiting. Next: Unit 31 Security Basics.
 
+## Unit 31: Security Basics (Version 2, practice unit) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 31.1 Hashing and Passwords | `u31-hash` | SHA-256 and the avalanche effect, salted PBKDF2 records, brute-force cost, password policy, dictionary attacks |
+| 31.2 Encryption and Signatures | `u31-crypto` | Caesar and frequency analysis, XOR, modular arithmetic, textbook RSA, encrypt-then-MAC |
+| 31.3 Injection Attacks | `u31-injection` | HTML escaping, SQL placeholders and allow-lists (on a pretend SQL engine), path traversal, shell quoting, open redirects |
+| 31.4 Authentication and Access Control | `u31-auth` | signed tokens, HOTP/TOTP, sessions, role-based access control, lockouts |
+| 31.5 Web Security | `u31-web` | cookie attributes, same-origin and CORS, security headers, certificate host names, response grades |
+| 31.6 Threat Modelling and Defence | `u31-threats` | STRIDE, risk scoring, dependency versions and advisories, secret scanning with entropy, log analysis |
+
+**Project: Mini Security Toolkit.** Learners write `register`, `login`, `authorize`, `render_page`, `search_users`, `scan_project`, `audit_site`, `alerts` and `top_risks` (all the lesson tools are given). Note: Pyodide has no `sqlite3` offline, so lesson 3 and the project use a small pure-Python SQL engine (`make_db`).
+
+Can assume: hashing and salting, symmetric and public-key basics, injection and its defences, tokens and roles, cookies and headers, threat modelling and scanning. Next: the AI-assisted coding unit.
+
 ## Plan for remaining units (to refine before each phase)
 
 Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction (electives) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
@@ -715,3 +731,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 29 (2026-11-16):** Practice units begin (Jaden's approved additions). Complete Unit 28 Git and GitHub (7 lessons, 35 exercises, 7 quizzes, Mini Git project, 45 glossary terms). No framework changes; all Python.
 - **Phase 30 (2026-11-16):** Complete Unit 29 Command Line (6 lessons, 30 exercises, 6 quizzes, Mini Shell project, 45 glossary terms). No framework changes; all Python.
 - **Phase 31 (2026-11-16):** Complete Unit 30 Testing and Debugging (6 lessons, 30 exercises, 6 quizzes, Mini Test Lab project, 34 glossary terms). No framework changes; all Python.
+- **Phase 32 (2026-11-16):** Complete Unit 31 Security Basics (6 lessons, 30 exercises, 6 quizzes, Mini Security Toolkit project, 38 new glossary terms). No framework changes; all Python (SQL is a small pure-Python engine because Pyodide has no sqlite3).

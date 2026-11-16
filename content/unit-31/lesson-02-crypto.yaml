@@ -1,0 +1,735 @@
+id: u31-crypto
+title: Encryption and Authentication
+minutes: 110
+objective: Understand how data is kept secret and how changes are detected. You will break the Caesar cipher, build a stream cipher with XOR, do the modular arithmetic behind public-key cryptography, make a toy RSA key and combine encryption with a MAC.
+outcomes:
+- Explain symmetric and public-key encryption
+- Break a simple substitution cipher
+- Use modular exponentiation and inverses
+- Explain why a MAC is needed as well as encryption
+sections:
+- heading: Ciphers and keys
+  body: |-
+    **Encryption** turns readable data (**plaintext**) into unreadable data (**ciphertext**) with a **key**; **decryption** reverses it with the key. A good system follows **Kerckhoffs's principle**: everything about the method is public and only the key is secret.
+
+    **Symmetric** encryption uses the **same key** to encrypt and decrypt: **AES** is the standard. It is fast, but both sides must somehow share the key. Simple old ciphers show why strength matters: the **Caesar cipher** (shift letters) has only 25 keys and also falls to **frequency analysis** (in English `e` is the most common letter), and **XOR** with a short repeating key is easily broken, and **reusing** a key is fatal.
+
+    Never invent your own cryptography. Use well-tested libraries and the standard algorithms; the building blocks here are for understanding.
+- heading: Public-key cryptography
+  body: |-
+    **Asymmetric** (**public-key**) cryptography uses a **pair** of keys. Anyone may know the **public key** and use it to encrypt a message that only the owner of the **private key** can read. Run the other way, the owner's private key makes a **digital signature** that anyone can check with the public key.
+
+    **RSA** builds on **modular arithmetic** (remainders). Multiplying two big primes `p * q` is easy; finding `p` and `q` from the product is believed to be very hard. The key facts: `m ** e % n` is quick with **square and multiply**, and a **modular inverse** (found with the extended Euclidean algorithm) gives the private exponent. **Diffie-Hellman** lets two people agree on a shared secret over an open line: each sends `g ** secret % p`, and both then compute the same `g ** (a * b) % p`.
+
+    Public-key operations are slow, so real systems (**TLS**, which protects every `https` page) use them only to agree on a symmetric key, then switch to fast AES. Certificates tie a public key to a website's name, signed by an authority that your browser trusts.
+- heading: 'Integrity: hashes, MACs and signatures'
+  body: |-
+    Encryption alone hides a message but does not stop someone from changing the ciphertext (**tampering**). To detect changes, add a **message authentication code** (**MAC**): a fingerprint computed from the message *and a secret key* (**HMAC** uses SHA-256 inside). Only someone who knows the key can compute a valid tag. The receiver checks the tag first and **refuses** anything that does not match; this order, **encrypt-then-MAC**, is the safe one. Use constant-time comparison for the check.
+
+    Summary of tools: a **hash** detects accidental changes; a **MAC** detects changes by anyone without the key; a **signature** also proves *who* sent it and cannot be denied. Modern systems use authenticated encryption (AES-GCM or ChaCha20-Poly1305) which does encryption and MAC in one step.
+examples:
+- title: Old ciphers and XOR
+  intro: Break a Caesar cipher by counting letters and hide a message with XOR.
+  code: |
+    def caesar(text, shift):
+        """The Caesar cipher: move every LETTER `shift` places along the alphabet, wrapping around (z + 1 gives a). Keep the case; digits, spaces and punctuation stay. A negative shift or one larger than 25 also works (use % 26)."""
+        out = []
+        for ch in text:
+            if "a" <= ch <= "z":
+                out.append(chr((ord(ch) - 97 + shift) % 26 + 97))
+            elif "A" <= ch <= "Z":
+                out.append(chr((ord(ch) - 65 + shift) % 26 + 65))
+            else:
+                out.append(ch)
+        return "".join(out)
+
+
+    def break_caesar(ciphertext):
+        """Break the cipher without the key by FREQUENCY ANALYSIS. Try every shift from 0 to 25 to decrypt (caesar(ciphertext, -shift)) and score each result by counting its letters that are in 'etaoinshr' (ignoring case). Return (best shift, decrypted text); on a tie take the smallest shift."""
+        best = None
+        for shift in range(26):
+            plain = caesar(ciphertext, -shift)
+            score = sum(1 for c in plain.lower() if c in "etaoinshr")
+            if best is None or score > best[0]:
+                best = (score, shift, plain)
+        return best[1], best[2]
+
+
+    def xor_encrypt(text, key):
+        """A simple stream cipher. Turn the text into UTF-8 bytes, XOR each byte with the next byte of the key (the key text as UTF-8 bytes, repeated over and over) and return the result as lower-case hexadecimal. ValueError('empty key') if the key is empty."""
+        if not key:
+            raise ValueError("empty key")
+        data, k = text.encode("utf-8"), key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).hex()
+
+
+    def xor_decrypt(hex_text, key):
+        """Undo xor_encrypt: read the hexadecimal, XOR with the repeated key and decode as UTF-8. ValueError('empty key') for an empty key and ValueError('bad hex') if the text is not valid hexadecimal."""
+        if not key:
+            raise ValueError("empty key")
+        try:
+            data = bytes.fromhex(hex_text)
+        except ValueError:
+            raise ValueError("bad hex")
+        k = key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).decode("utf-8")
+
+    secret = caesar("Meet at the old bridge at midnight and bring the documents", 9)
+    print(secret)
+    print(break_caesar(secret))
+    hidden = xor_encrypt("launch codes", "k3y")
+    print(hidden)
+    print(xor_decrypt(hidden, "k3y"))
+  output: |
+    Vnnc jc cqn xum karmpn jc vrmwrpqc jwm karwp cqn mxldvnwcb
+    (9, 'Meet at the old bridge at midnight and bring the documents')
+    07520c0550114b50160f560a
+    launch codes
+  lines:
+  - line: 45
+    note: The text is unreadable but the letter pattern is intact.
+  - line: 46
+    note: Frequency analysis finds the shift and the text.
+  - line: 48
+    note: Hexadecimal bytes.
+  - line: 49
+    note: The same key restores the text.
+- title: RSA, key agreement and sealing
+  intro: A textbook key pair, Diffie-Hellman with tiny numbers and tamper detection.
+  code: |
+    def mod_pow(base, exp, mod):
+        """base ** exp % mod without computing the huge power: SQUARE AND MULTIPLY. Keep a result (start 1) and walk through the bits of exp from the lowest: when the bit is 1 multiply the result by base (mod mod); then square base (mod mod). ValueError('bad parameters') if mod < 1 or exp < 0. The answer for mod == 1 is 0. (Do not use the three-argument pow.)"""
+        if mod < 1 or exp < 0:
+            raise ValueError("bad parameters")
+        result, base = 1 % mod, base % mod
+        while exp:
+            if exp & 1:
+                result = result * base % mod
+            base = base * base % mod
+            exp >>= 1
+        return result
+
+
+    def mod_inverse(a, m):
+        """The number x with 0 <= x < m and a * x % m == 1 (the MODULAR INVERSE), found with the extended Euclidean algorithm. ValueError('no inverse') when gcd(a, m) is not 1 or m < 2."""
+        if m < 2:
+            raise ValueError("no inverse")
+        old_r, r, old_s, s = a % m, m, 1, 0
+        while r:
+            q = old_r // r
+            old_r, r = r, old_r - q * r
+            old_s, s = s, old_s - q * s
+        if old_r != 1:
+            raise ValueError("no inverse")
+        return old_s % m
+
+
+    def make_rsa(p, q, e):
+        """Make a toy RSA key from two primes p and q (not checked) and a public exponent e. n = p * q and phi = (p - 1) * (q - 1). ValueError('bad exponent') unless 1 < e < phi and gcd(e, phi) == 1 (use math.gcd). The private exponent d is the modular inverse of e modulo phi. Return {'n': n, 'e': e, 'd': d}."""
+        import math
+        n, phi = p * q, (p - 1) * (q - 1)
+        if not 1 < e < phi or math.gcd(e, phi) != 1:
+            raise ValueError("bad exponent")
+        return {"n": n, "e": e, "d": mod_inverse(e, phi)}
+
+
+    def rsa_encrypt(m, n, e):
+        """Encrypt the whole number m with the PUBLIC key (n, e): m ** e % n using mod_pow. ValueError('message too large') unless 0 <= m < n."""
+        if not 0 <= m < n:
+            raise ValueError("message too large")
+        return mod_pow(m, e, n)
+
+
+    def rsa_decrypt(c, n, d):
+        """Decrypt c with the PRIVATE exponent: c ** d % n using mod_pow. ValueError('message too large') unless 0 <= c < n."""
+        if not 0 <= c < n:
+            raise ValueError("message too large")
+        return mod_pow(c, d, n)
+
+
+    def seal(plaintext, enc_key, mac_key):
+        """ENCRYPT-THEN-MAC. Encrypt the text with xor_encrypt and the enc_key. Compute the tag: the hexadecimal HMAC-SHA256 of the ciphertext hex text (as UTF-8) with the mac_key (UTF-8), using the hmac module. Return ciphertext_hex + ':' + tag. A MAC (message authentication code) proves that the message was not changed and that the sender knew the key."""
+        import hmac, hashlib
+        cipher = xor_encrypt(plaintext, enc_key)
+        tag = hmac.new(mac_key.encode("utf-8"), cipher.encode("utf-8"), hashlib.sha256).hexdigest()
+        return cipher + ":" + tag
+
+
+    def open_sealed(sealed, enc_key, mac_key):
+        """The opposite of seal. ValueError('bad format') unless the text has exactly one ':'. Recompute the tag of the ciphertext part and compare with the given tag using hmac.compare_digest: ValueError('tampered') if they differ. ONLY THEN decrypt (xor_decrypt) and return the text. (Check before decrypting: never act on data that fails the check.)"""
+        import hmac, hashlib
+        parts = sealed.split(":")
+        if len(parts) != 2:
+            raise ValueError("bad format")
+        cipher, tag = parts
+        good = hmac.new(mac_key.encode("utf-8"), cipher.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good.encode(), tag.encode()):
+            raise ValueError("tampered")
+        return xor_decrypt(cipher, enc_key)
+
+
+    def xor_encrypt(text, key):
+        """A simple stream cipher. Turn the text into UTF-8 bytes, XOR each byte with the next byte of the key (the key text as UTF-8 bytes, repeated over and over) and return the result as lower-case hexadecimal. ValueError('empty key') if the key is empty."""
+        if not key:
+            raise ValueError("empty key")
+        data, k = text.encode("utf-8"), key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).hex()
+
+
+    def xor_decrypt(hex_text, key):
+        """Undo xor_encrypt: read the hexadecimal, XOR with the repeated key and decode as UTF-8. ValueError('empty key') for an empty key and ValueError('bad hex') if the text is not valid hexadecimal."""
+        if not key:
+            raise ValueError("empty key")
+        try:
+            data = bytes.fromhex(hex_text)
+        except ValueError:
+            raise ValueError("bad hex")
+        k = key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).decode("utf-8")
+
+    key = make_rsa(61, 53, 17)
+    print(key)
+    cipher = rsa_encrypt(65, key["n"], key["e"])
+    print("encrypted:", cipher, "decrypted:", rsa_decrypt(cipher, key["n"], key["d"]))
+    p, g = 23, 5
+    a, b = 6, 15
+    A, B = mod_pow(g, a, p), mod_pow(g, b, p)
+    print("public values:", A, B, "shared secrets:", mod_pow(B, a, p), mod_pow(A, b, p))
+    sealed = seal("pay Bo 10", "enc", "mac")
+    print(open_sealed(sealed, "enc", "mac"))
+    altered = "00" + sealed[2:]
+    try:
+        open_sealed(altered, "enc", "mac")
+    except ValueError as e:
+        print("error:", e)
+  output: |
+    {'n': 3233, 'e': 17, 'd': 2753}
+    encrypted: 2790 decrypted: 65
+    public values: 8 19 shared secrets: 2 2
+    pay Bo 10
+    error: tampered
+  lines:
+  - line: 92
+    note: The classic textbook key.
+  - line: 94
+    note: Public key encrypts, private key decrypts.
+  - line: 98
+    note: Both sides compute the same shared secret without sending it.
+  - line: 100
+    note: A good message opens.
+  - line: 105
+    note: A changed message is refused.
+playground:
+  prompt: Try the standard library's HMAC.
+  code: |
+    import hmac, hashlib
+    print(hmac.new(b'key', b'message', hashlib.sha256).hexdigest()[:16])
+exercises:
+- id: caesar
+  title: The Caesar cipher
+  difficulty: 3
+  prompt: 'The oldest cipher: move every letter a fixed number of places along the alphabet. Write `caesar(text, shift)`: shift every **letter**, wrapping around (`z` + 1 gives `a`), keep upper/lower case, and leave digits, spaces and punctuation alone. Negative shifts and shifts above 25 also work (use `% 26`). Then write `break_caesar(ciphertext)`: break it without the key by **frequency analysis**. Try every shift from 0 to 25 to decrypt (`caesar(ciphertext, -shift)`) and score each result by counting its letters that are in `"etaoinshr"` (ignoring case). Return `(best shift, decrypted text)`; on a tie take the smallest shift.'
+  starter: |-
+    def caesar(text, shift):
+        """The Caesar cipher: move every LETTER `shift` places along the alphabet, wrapping around (z + 1 gives a). Keep the case; digits, spaces and punctuation stay. A negative shift or one larger than 25 also works (use % 26)."""
+        pass
+
+
+    def break_caesar(ciphertext):
+        """Break the cipher without the key by FREQUENCY ANALYSIS. Try every shift from 0 to 25 to decrypt (caesar(ciphertext, -shift)) and score each result by counting its letters that are in 'etaoinshr' (ignoring case). Return (best shift, decrypted text); on a tie take the smallest shift."""
+        pass
+  tests:
+  - name: shifting
+    code: |
+      assert caesar("abc xyz", 3) == "def abc" and caesar("Hello, World!", 13) == "Uryyb, Jbeyq!" and caesar("Uryyb, Jbeyq!", 13) == "Hello, World!" and caesar("abc", 0) == "abc" and caesar("abc", 26) == "abc" and caesar("abc", -1) == "zab" and caesar("Zz 9!", 1) == "Aa 9!" and caesar("", 5) == "" and caesar("abc", 29) == "def"
+      assert caesar(caesar("Attack at dawn", 7), -7) == "Attack at dawn"
+  - name: breaking it
+    code: |
+      secret = caesar("The enemy attacks at dawn from the north, so hold the line and send reinforcements", 11)
+      assert secret != "The enemy attacks at dawn from the north, so hold the line and send reinforcements"
+      shift, plain = break_caesar(secret)
+      assert shift == 11 and plain == "The enemy attacks at dawn from the north, so hold the line and send reinforcements"
+      for s in (1, 5, 19, 25):
+          text = "Meet me at the station at noon and bring the train tickets, there is no time to waste"
+          assert break_caesar(caesar(text, s)) == (s, text)
+      assert break_caesar("") == (0, "")
+  hints:
+  - Use ord and chr with an offset of 97 (a) or 65 (A).
+  - Decrypting with the right shift gives the text with the most common English letters.
+  solution: |
+    def caesar(text, shift):
+        """The Caesar cipher: move every LETTER `shift` places along the alphabet, wrapping around (z + 1 gives a). Keep the case; digits, spaces and punctuation stay. A negative shift or one larger than 25 also works (use % 26)."""
+        out = []
+        for ch in text:
+            if "a" <= ch <= "z":
+                out.append(chr((ord(ch) - 97 + shift) % 26 + 97))
+            elif "A" <= ch <= "Z":
+                out.append(chr((ord(ch) - 65 + shift) % 26 + 65))
+            else:
+                out.append(ch)
+        return "".join(out)
+
+
+    def break_caesar(ciphertext):
+        """Break the cipher without the key by FREQUENCY ANALYSIS. Try every shift from 0 to 25 to decrypt (caesar(ciphertext, -shift)) and score each result by counting its letters that are in 'etaoinshr' (ignoring case). Return (best shift, decrypted text); on a tie take the smallest shift."""
+        best = None
+        for shift in range(26):
+            plain = caesar(ciphertext, -shift)
+            score = sum(1 for c in plain.lower() if c in "etaoinshr")
+            if best is None or score > best[0]:
+                best = (score, shift, plain)
+        return best[1], best[2]
+  explanation: 'Only 25 keys: a computer breaks it instantly. Frequency analysis also breaks any cipher that maps each letter to one other letter.'
+- id: xor
+  title: A stream cipher
+  difficulty: 4
+  prompt: 'Real ciphers combine the message with a **keystream**. The simplest way is **XOR** (exclusive or): `a ^ b` flips the bits of `a` where `b` has ones, and XOR with the same value again undoes it. Write `xor_encrypt(text, key)`: turn the text into UTF-8 bytes, XOR each byte with the next byte of the key (the key as UTF-8 bytes, **repeated** over and over) and return the result as lower-case hexadecimal. `ValueError("empty key")` if the key is empty. Write `xor_decrypt(hex_text, key)`: read the hexadecimal, XOR with the repeated key and decode as UTF-8. `ValueError("empty key")` for an empty key and `ValueError("bad hex")` if the text is not valid hexadecimal.'
+  starter: |-
+    def xor_encrypt(text, key):
+        """A simple stream cipher. Turn the text into UTF-8 bytes, XOR each byte with the next byte of the key (the key text as UTF-8 bytes, repeated over and over) and return the result as lower-case hexadecimal. ValueError('empty key') if the key is empty."""
+        pass
+
+
+    def xor_decrypt(hex_text, key):
+        """Undo xor_encrypt: read the hexadecimal, XOR with the repeated key and decode as UTF-8. ValueError('empty key') for an empty key and ValueError('bad hex') if the text is not valid hexadecimal."""
+        pass
+  tests:
+  - name: round trip
+    code: |
+      assert xor_encrypt("A", "A") == "00" and xor_encrypt("abc", "k") == bytes([ord(c) ^ ord("k") for c in "abc"]).hex() and xor_encrypt("", "key") == "" and xor_encrypt("Hi", "ab") == "290b"
+      for text, key in (("attack at dawn", "lemon"), ("héllo wörld", "k"), ("short", "a much longer key than the message"), ("", "x")):
+          assert xor_decrypt(xor_encrypt(text, key), key) == text
+      assert xor_encrypt("hello", "k") != xor_encrypt("hello", "j") and len(xor_encrypt("hello", "k")) == 10
+  - name: errors and weakness
+    code: |
+      for fn, args in ((xor_encrypt, ("x", "")), (xor_decrypt, ("00", ""))):
+          try:
+              fn(*args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "empty key" in str(e)
+      for bad in ("zz", "abc", "0g"):
+          try:
+              xor_decrypt(bad, "k")
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad hex" in str(e)
+      a, b = xor_encrypt("secret one", "key"), xor_encrypt("secret two", "key")
+      x = bytes(p ^ q for p, q in zip(bytes.fromhex(a), bytes.fromhex(b)))
+      assert x == bytes(p ^ q for p, q in zip(b"secret one", b"secret two"))
+  hints:
+  - bytes([...]) and .hex() / bytes.fromhex() convert between bytes and hex text.
+  - key[i % len(key)] repeats the key.
+  solution: |
+    def xor_encrypt(text, key):
+        """A simple stream cipher. Turn the text into UTF-8 bytes, XOR each byte with the next byte of the key (the key text as UTF-8 bytes, repeated over and over) and return the result as lower-case hexadecimal. ValueError('empty key') if the key is empty."""
+        if not key:
+            raise ValueError("empty key")
+        data, k = text.encode("utf-8"), key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).hex()
+
+
+    def xor_decrypt(hex_text, key):
+        """Undo xor_encrypt: read the hexadecimal, XOR with the repeated key and decode as UTF-8. ValueError('empty key') for an empty key and ValueError('bad hex') if the text is not valid hexadecimal."""
+        if not key:
+            raise ValueError("empty key")
+        try:
+            data = bytes.fromhex(hex_text)
+        except ValueError:
+            raise ValueError("bad hex")
+        k = key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).decode("utf-8")
+  explanation: 'Reusing a key with XOR is fatal: XOR of two ciphertexts equals XOR of the two messages, with the key gone. That is why a key must be used only once (the one-time pad) or replaced by a long unpredictable keystream.'
+- id: modmath
+  title: Modular arithmetic
+  difficulty: 5
+  prompt: 'Public-key cryptography is built on arithmetic with remainders. Write `mod_pow(base, exp, mod)`: `base ** exp % mod` **without** computing the huge power, by **square and multiply**: keep a `result` (start at 1); walk through the bits of `exp` from the lowest: when the bit is 1 multiply the result by `base` (mod `mod`); then square `base` (mod `mod`). `ValueError("bad parameters")` if `mod < 1` or `exp < 0`. The answer for `mod == 1` is `0`. Do not use the three-argument `pow`. Write `mod_inverse(a, m)`: the number `x` with `0 <= x < m` and `a * x % m == 1`, found with the **extended Euclidean algorithm**. `ValueError("no inverse")` when `gcd(a, m)` is not 1 or `m < 2`.'
+  starter: |-
+    def mod_pow(base, exp, mod):
+        """base ** exp % mod without computing the huge power: SQUARE AND MULTIPLY. Keep a result (start 1) and walk through the bits of exp from the lowest: when the bit is 1 multiply the result by base (mod mod); then square base (mod mod). ValueError('bad parameters') if mod < 1 or exp < 0. The answer for mod == 1 is 0. (Do not use the three-argument pow.)"""
+        pass
+
+
+    def mod_inverse(a, m):
+        """The number x with 0 <= x < m and a * x % m == 1 (the MODULAR INVERSE), found with the extended Euclidean algorithm. ValueError('no inverse') when gcd(a, m) is not 1 or m < 2."""
+        pass
+  tests:
+  - name: powers
+    code: |
+      assert mod_pow(2, 10, 1000) == 24 and mod_pow(3, 0, 7) == 1 and mod_pow(0, 5, 7) == 0 and mod_pow(5, 3, 1) == 0 and mod_pow(7, 1, 100) == 7 and mod_pow(4, 13, 497) == 445 and mod_pow(-2, 3, 5) == 2
+      assert mod_pow(2, 1000, 1000007) == pow(2, 1000, 1000007) and mod_pow(123456789, 987654321, 1000000007) == pow(123456789, 987654321, 1000000007) and mod_pow(10, 10 ** 18, 97) == pow(10, 10 ** 18, 97)
+      for args in ((2, 3, 0), (2, -1, 5)):
+          try:
+              mod_pow(*args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad parameters" in str(e)
+  - name: inverses
+    code: |
+      assert mod_inverse(3, 7) == 5 and mod_inverse(17, 3120) == 2753 and mod_inverse(1, 5) == 1 and mod_inverse(10, 17) == 12 and mod_inverse(-3, 7) == 2 and mod_inverse(8, 15) == 2
+      for a in range(1, 25):
+          if a not in (5, 10, 15, 20):
+              assert a * mod_inverse(a, 25) % 25 == 1
+      for a, m in ((4, 8), (6, 9), (0, 5), (5, 25), (3, 1), (3, 0)):
+          try:
+              mod_inverse(a, m)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "no inverse" in str(e)
+  hints:
+  - Square and multiply needs only about log2(exp) steps.
+  - Track the coefficient of a in the extended Euclid loop.
+  solution: |
+    def mod_pow(base, exp, mod):
+        """base ** exp % mod without computing the huge power: SQUARE AND MULTIPLY. Keep a result (start 1) and walk through the bits of exp from the lowest: when the bit is 1 multiply the result by base (mod mod); then square base (mod mod). ValueError('bad parameters') if mod < 1 or exp < 0. The answer for mod == 1 is 0. (Do not use the three-argument pow.)"""
+        if mod < 1 or exp < 0:
+            raise ValueError("bad parameters")
+        result, base = 1 % mod, base % mod
+        while exp:
+            if exp & 1:
+                result = result * base % mod
+            base = base * base % mod
+            exp >>= 1
+        return result
+
+
+    def mod_inverse(a, m):
+        """The number x with 0 <= x < m and a * x % m == 1 (the MODULAR INVERSE), found with the extended Euclidean algorithm. ValueError('no inverse') when gcd(a, m) is not 1 or m < 2."""
+        if m < 2:
+            raise ValueError("no inverse")
+        old_r, r, old_s, s = a % m, m, 1, 0
+        while r:
+            q = old_r // r
+            old_r, r = r, old_r - q * r
+            old_s, s = s, old_s - q * s
+        if old_r != 1:
+            raise ValueError("no inverse")
+        return old_s % m
+  explanation: Modular exponentiation is easy; going backwards (the discrete logarithm) and factoring large numbers are believed to be hard. That gap is the foundation of public-key cryptography.
+- id: rsa
+  title: Toy RSA
+  difficulty: 5
+  prompt: '**RSA** uses two keys: a **public** key anyone can use to encrypt, and a **private** key that only the owner can use to decrypt. `mod_pow` and `mod_inverse` are given. Write `make_rsa(p, q, e)`: from two primes `p` and `q` (not checked) and a public exponent `e`: `n = p * q` and `phi = (p - 1) * (q - 1)`. `ValueError("bad exponent")` unless `1 < e < phi` and `gcd(e, phi) == 1` (use `math.gcd`). The private exponent `d` is the modular inverse of `e` modulo `phi`. Return `{"n": n, "e": e, "d": d}`. Write `rsa_encrypt(m, n, e)`: `m ** e % n` using `mod_pow` (`ValueError("message too large")` unless `0 <= m < n`), and `rsa_decrypt(c, n, d)`: `c ** d % n` (same check for `c`). Real keys use primes with hundreds of digits.'
+  starter: |-
+    def mod_pow(base, exp, mod):
+        """base ** exp % mod without computing the huge power: SQUARE AND MULTIPLY. Keep a result (start 1) and walk through the bits of exp from the lowest: when the bit is 1 multiply the result by base (mod mod); then square base (mod mod). ValueError('bad parameters') if mod < 1 or exp < 0. The answer for mod == 1 is 0. (Do not use the three-argument pow.)"""
+        if mod < 1 or exp < 0:
+            raise ValueError("bad parameters")
+        result, base = 1 % mod, base % mod
+        while exp:
+            if exp & 1:
+                result = result * base % mod
+            base = base * base % mod
+            exp >>= 1
+        return result
+
+
+    def mod_inverse(a, m):
+        """The number x with 0 <= x < m and a * x % m == 1 (the MODULAR INVERSE), found with the extended Euclidean algorithm. ValueError('no inverse') when gcd(a, m) is not 1 or m < 2."""
+        if m < 2:
+            raise ValueError("no inverse")
+        old_r, r, old_s, s = a % m, m, 1, 0
+        while r:
+            q = old_r // r
+            old_r, r = r, old_r - q * r
+            old_s, s = s, old_s - q * s
+        if old_r != 1:
+            raise ValueError("no inverse")
+        return old_s % m
+
+
+
+
+    def make_rsa(p, q, e):
+        """Make a toy RSA key from two primes p and q (not checked) and a public exponent e. n = p * q and phi = (p - 1) * (q - 1). ValueError('bad exponent') unless 1 < e < phi and gcd(e, phi) == 1 (use math.gcd). The private exponent d is the modular inverse of e modulo phi. Return {'n': n, 'e': e, 'd': d}."""
+        pass
+
+
+    def rsa_encrypt(m, n, e):
+        """Encrypt the whole number m with the PUBLIC key (n, e): m ** e % n using mod_pow. ValueError('message too large') unless 0 <= m < n."""
+        pass
+
+
+    def rsa_decrypt(c, n, d):
+        """Decrypt c with the PRIVATE exponent: c ** d % n using mod_pow. ValueError('message too large') unless 0 <= c < n."""
+        pass
+  tests:
+  - name: the textbook key
+    code: |
+      key = make_rsa(61, 53, 17)
+      assert key == {"n": 3233, "e": 17, "d": 2753}
+      assert rsa_encrypt(65, 3233, 17) == 2790 and rsa_decrypt(2790, 3233, 2753) == 65
+      for m in (0, 1, 2, 123, 3232):
+          assert rsa_decrypt(rsa_encrypt(m, key["n"], key["e"]), key["n"], key["d"]) == m
+      k2 = make_rsa(1009, 1013, 65537 % ((1009 - 1) * (1013 - 1)))
+      assert all(rsa_decrypt(rsa_encrypt(m, k2["n"], k2["e"]), k2["n"], k2["d"]) == m for m in (2, 99999, 1021116))
+  - name: errors and signing
+    code: |
+      for p, q, e in ((61, 53, 1), (61, 53, 2), (61, 53, 3120), (61, 53, 4000), (61, 53, 0)):
+          try:
+              make_rsa(p, q, e)
+              raise AssertionError("accepted")
+          except ValueError as err:
+              assert "bad exponent" in str(err)
+      key = make_rsa(61, 53, 17)
+      for fn, args in ((rsa_encrypt, (3233, 3233, 17)), (rsa_encrypt, (-1, 3233, 17)), (rsa_decrypt, (3233, 3233, 2753)), (rsa_decrypt, (-5, 3233, 2753))):
+          try:
+              fn(*args)
+              raise AssertionError("accepted")
+          except ValueError as err:
+              assert "message too large" in str(err)
+      sig = rsa_decrypt(1234, key["n"], key["d"])
+      assert rsa_encrypt(sig, key["n"], key["e"]) == 1234
+  hints:
+  - phi = (p - 1)(q - 1) and d is the inverse of e modulo phi.
+  - Encrypting and decrypting are the same operation with different exponents.
+  solution: |
+    def mod_pow(base, exp, mod):
+        """base ** exp % mod without computing the huge power: SQUARE AND MULTIPLY. Keep a result (start 1) and walk through the bits of exp from the lowest: when the bit is 1 multiply the result by base (mod mod); then square base (mod mod). ValueError('bad parameters') if mod < 1 or exp < 0. The answer for mod == 1 is 0. (Do not use the three-argument pow.)"""
+        if mod < 1 or exp < 0:
+            raise ValueError("bad parameters")
+        result, base = 1 % mod, base % mod
+        while exp:
+            if exp & 1:
+                result = result * base % mod
+            base = base * base % mod
+            exp >>= 1
+        return result
+
+
+    def mod_inverse(a, m):
+        """The number x with 0 <= x < m and a * x % m == 1 (the MODULAR INVERSE), found with the extended Euclidean algorithm. ValueError('no inverse') when gcd(a, m) is not 1 or m < 2."""
+        if m < 2:
+            raise ValueError("no inverse")
+        old_r, r, old_s, s = a % m, m, 1, 0
+        while r:
+            q = old_r // r
+            old_r, r = r, old_r - q * r
+            old_s, s = s, old_s - q * s
+        if old_r != 1:
+            raise ValueError("no inverse")
+        return old_s % m
+
+
+
+
+    def make_rsa(p, q, e):
+        """Make a toy RSA key from two primes p and q (not checked) and a public exponent e. n = p * q and phi = (p - 1) * (q - 1). ValueError('bad exponent') unless 1 < e < phi and gcd(e, phi) == 1 (use math.gcd). The private exponent d is the modular inverse of e modulo phi. Return {'n': n, 'e': e, 'd': d}."""
+        import math
+        n, phi = p * q, (p - 1) * (q - 1)
+        if not 1 < e < phi or math.gcd(e, phi) != 1:
+            raise ValueError("bad exponent")
+        return {"n": n, "e": e, "d": mod_inverse(e, phi)}
+
+
+    def rsa_encrypt(m, n, e):
+        """Encrypt the whole number m with the PUBLIC key (n, e): m ** e % n using mod_pow. ValueError('message too large') unless 0 <= m < n."""
+        if not 0 <= m < n:
+            raise ValueError("message too large")
+        return mod_pow(m, e, n)
+
+
+    def rsa_decrypt(c, n, d):
+        """Decrypt c with the PRIVATE exponent: c ** d % n using mod_pow. ValueError('message too large') unless 0 <= c < n."""
+        if not 0 <= c < n:
+            raise ValueError("message too large")
+        return mod_pow(c, d, n)
+  explanation: 'Run the private operation first and the public one second and you have a digital signature: only the key owner could have produced it, and anyone can check it.'
+- id: seal
+  title: 'Capstone: encrypt and authenticate'
+  difficulty: 5
+  prompt: 'Encryption hides a message; it does not stop someone **changing** it. A **message authentication code** (**MAC**) proves that the message came from someone who knows the key and was not altered. `xor_encrypt` and `xor_decrypt` are given. Write `seal(plaintext, enc_key, mac_key)`, **encrypt-then-MAC**: encrypt the text with `xor_encrypt` and the `enc_key`. Compute the **tag**: the hexadecimal HMAC-SHA256 of the ciphertext hex **text** (as UTF-8) with the `mac_key` (as UTF-8), using the `hmac` module. Return `ciphertext_hex + ":" + tag`. Write `open_sealed(sealed, enc_key, mac_key)`: `ValueError("bad format")` unless the text has exactly one `":"`. Recompute the tag of the ciphertext part and compare it with the given tag using `hmac.compare_digest`: `ValueError("tampered")` if they differ. **Only then** decrypt and return the text. (Check before decrypting: never act on data that fails the check.)'
+  starter: |-
+    def xor_encrypt(text, key):
+        """A simple stream cipher. Turn the text into UTF-8 bytes, XOR each byte with the next byte of the key (the key text as UTF-8 bytes, repeated over and over) and return the result as lower-case hexadecimal. ValueError('empty key') if the key is empty."""
+        if not key:
+            raise ValueError("empty key")
+        data, k = text.encode("utf-8"), key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).hex()
+
+
+    def xor_decrypt(hex_text, key):
+        """Undo xor_encrypt: read the hexadecimal, XOR with the repeated key and decode as UTF-8. ValueError('empty key') for an empty key and ValueError('bad hex') if the text is not valid hexadecimal."""
+        if not key:
+            raise ValueError("empty key")
+        try:
+            data = bytes.fromhex(hex_text)
+        except ValueError:
+            raise ValueError("bad hex")
+        k = key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).decode("utf-8")
+
+
+
+
+    def seal(plaintext, enc_key, mac_key):
+        """ENCRYPT-THEN-MAC. Encrypt the text with xor_encrypt and the enc_key. Compute the tag: the hexadecimal HMAC-SHA256 of the ciphertext hex text (as UTF-8) with the mac_key (UTF-8), using the hmac module. Return ciphertext_hex + ':' + tag. A MAC (message authentication code) proves that the message was not changed and that the sender knew the key."""
+        pass
+
+
+    def open_sealed(sealed, enc_key, mac_key):
+        """The opposite of seal. ValueError('bad format') unless the text has exactly one ':'. Recompute the tag of the ciphertext part and compare with the given tag using hmac.compare_digest: ValueError('tampered') if they differ. ONLY THEN decrypt (xor_decrypt) and return the text. (Check before decrypting: never act on data that fails the check.)"""
+        pass
+  tests:
+  - name: sealing
+    code: |
+      import hmac, hashlib
+      s = seal("transfer 100 to Bo", "enckey", "mackey")
+      cipher, tag = s.split(":")
+      assert cipher == xor_encrypt("transfer 100 to Bo", "enckey") and tag == hmac.new(b"mackey", cipher.encode(), hashlib.sha256).hexdigest() and len(tag) == 64
+      assert open_sealed(s, "enckey", "mackey") == "transfer 100 to Bo" and open_sealed(seal("", "k", "m"), "k", "m") == "" and open_sealed(seal("héllo", "k", "m"), "k", "m") == "héllo"
+      assert seal("a", "x", "m") != seal("a", "y", "m") and seal("a", "k", "m1") != seal("a", "k", "m2") and seal("a", "k", "m") == seal("a", "k", "m")
+  - name: tampering
+    code: |
+      s = seal("transfer 100 to Bo", "enckey", "mackey")
+      cipher, tag = s.split(":")
+      flipped = cipher[:-2] + ("00" if cipher[-2:] != "00" else "01")
+      for bad in (flipped + ":" + tag, cipher + ":" + tag[:-1] + ("0" if tag[-1] != "0" else "1"), cipher + ":" + tag.upper() if tag != tag.upper() else cipher + ":x", cipher + ":"):
+          try:
+              open_sealed(bad, "enckey", "mackey")
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "tampered" in str(e)
+      try:
+          open_sealed(s, "enckey", "other key")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "tampered" in str(e)
+      for bad in ("", "nocolon", "a:b:c"):
+          try:
+              open_sealed(bad, "k", "m")
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "bad format" in str(e)
+      assert open_sealed(s, "wrongenc", "mackey") != "transfer 100 to Bo"
+  hints:
+  - The tag covers the ciphertext text, so check it before decrypting.
+  - hmac.new(key_bytes, message_bytes, hashlib.sha256).hexdigest()
+  solution: |
+    def xor_encrypt(text, key):
+        """A simple stream cipher. Turn the text into UTF-8 bytes, XOR each byte with the next byte of the key (the key text as UTF-8 bytes, repeated over and over) and return the result as lower-case hexadecimal. ValueError('empty key') if the key is empty."""
+        if not key:
+            raise ValueError("empty key")
+        data, k = text.encode("utf-8"), key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).hex()
+
+
+    def xor_decrypt(hex_text, key):
+        """Undo xor_encrypt: read the hexadecimal, XOR with the repeated key and decode as UTF-8. ValueError('empty key') for an empty key and ValueError('bad hex') if the text is not valid hexadecimal."""
+        if not key:
+            raise ValueError("empty key")
+        try:
+            data = bytes.fromhex(hex_text)
+        except ValueError:
+            raise ValueError("bad hex")
+        k = key.encode("utf-8")
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data)).decode("utf-8")
+
+
+
+
+    def seal(plaintext, enc_key, mac_key):
+        """ENCRYPT-THEN-MAC. Encrypt the text with xor_encrypt and the enc_key. Compute the tag: the hexadecimal HMAC-SHA256 of the ciphertext hex text (as UTF-8) with the mac_key (UTF-8), using the hmac module. Return ciphertext_hex + ':' + tag. A MAC (message authentication code) proves that the message was not changed and that the sender knew the key."""
+        import hmac, hashlib
+        cipher = xor_encrypt(plaintext, enc_key)
+        tag = hmac.new(mac_key.encode("utf-8"), cipher.encode("utf-8"), hashlib.sha256).hexdigest()
+        return cipher + ":" + tag
+
+
+    def open_sealed(sealed, enc_key, mac_key):
+        """The opposite of seal. ValueError('bad format') unless the text has exactly one ':'. Recompute the tag of the ciphertext part and compare with the given tag using hmac.compare_digest: ValueError('tampered') if they differ. ONLY THEN decrypt (xor_decrypt) and return the text. (Check before decrypting: never act on data that fails the check.)"""
+        import hmac, hashlib
+        parts = sealed.split(":")
+        if len(parts) != 2:
+            raise ValueError("bad format")
+        cipher, tag = parts
+        good = hmac.new(mac_key.encode("utf-8"), cipher.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good.encode(), tag.encode()):
+            raise ValueError("tampered")
+        return xor_decrypt(cipher, enc_key)
+  explanation: 'This is the shape of every secure channel: encrypt for secrecy, authenticate for integrity, and refuse anything that fails the check.'
+commonMistakes:
+- title: Inventing your own cipher
+  explanation: Homemade crypto is almost always breakable.
+- title: Reusing a key or nonce
+  explanation: It can reveal the messages.
+- title: Encrypting without authenticating
+  explanation: Attackers can change the ciphertext.
+- title: Hard-coding keys in the code
+  explanation: Anyone who reads the code has the key.
+- title: Confusing hashing with encryption
+  explanation: A hash cannot be reversed; encryption can.
+summary:
+- Symmetric encryption uses one shared key; public-key uses a pair.
+- Only the key should be secret, never the method.
+- RSA and Diffie-Hellman rest on modular arithmetic.
+- Encrypt for secrecy, MAC or sign for integrity.
+- Use standard libraries; never invent crypto.
+next: u31-injection
+quiz:
+- type: mcq
+  question: What is the main problem of symmetric encryption?
+  options:
+  - Both sides need the same secret key
+  - It is slow
+  - It cannot hide data
+  - It needs two keys
+  answer: 0
+  explanation: Key distribution.
+- type: mcq
+  question: What does a digital signature prove?
+  options:
+  - Who made it and that it was not changed
+  - That it is secret
+  - That it is long
+  - That it is compressed
+  answer: 0
+  explanation: Authenticity and integrity.
+- type: mcq
+  question: Why is encryption without a MAC risky?
+  options:
+  - Attackers can change the ciphertext undetected
+  - It is too slow
+  - It uses too much memory
+  - It cannot be decrypted
+  answer: 0
+  explanation: Tampering.
+- type: mcq
+  question: What is Kerckhoffs's principle?
+  options:
+  - Only the key should be secret
+  - Keep the algorithm secret
+  - Use short keys
+  - Reuse keys
+  answer: 0
+  explanation: Public design.
+- type: mcq
+  question: Which is hard for large numbers?
+  options:
+  - Factoring a product of two big primes
+  - Multiplying them
+  - Adding them
+  - Comparing them
+  answer: 0
+  explanation: RSA's hard problem.
+- type: mcq
+  question: What protects https pages?
+  options:
+  - TLS
+  - FTP
+  - HTML
+  - DNS
+  answer: 0
+  explanation: Transport Layer Security.
+- type: code
+  question: Write `shift_letter(ch, k)` returning the lower-case letter `ch` moved `k` places along the alphabet with wrapping (`shift_letter('z', 1)` is `'a'`).
+  starter: |
+    def shift_letter(ch, k):
+        pass
+  tests:
+  - name: shift
+    code: |
+      assert shift_letter("a", 3) == "d" and shift_letter("z", 1) == "a" and shift_letter("c", -3) == "z" and shift_letter("m", 26) == "m"
+  solution: |
+    def shift_letter(ch, k):
+        return chr((ord(ch) - 97 + k) % 26 + 97)

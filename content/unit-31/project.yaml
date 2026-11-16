@@ -1,0 +1,1312 @@
+title: Mini Security Toolkit
+language: python
+brief: 'Build the security layer of a small web service from the tools of this unit. Given to you (from
+  the lessons): password hashing and policy, signed tokens, role checks, HTML escaping, safe SQL, cookie
+  and header audits, risk ranking, version checks, secret finding and log analysis. Your job is to **combine**
+  them into the functions a real service needs: sign-up, login, authorization, safe pages, safe search,
+  project scanning, a site audit, alerts and a risk summary. Notice how every function is short, because
+  each defence is already a tested building block.'
+steps:
+- title: Accounts
+  body: 'Write `register` and `login`: check the username and password policy, store a slow salted hash,
+    and give the same error for an unknown user and a wrong password.'
+- title: Tokens and roles
+  body: 'Write `authorize`: verify the token (signature before content, expiry) and check the permission
+    of the role.'
+- title: Safe output and input
+  body: Write `render_page` (escape everything) and `search_users` (placeholders for values, an allow-list
+    for the sort column).
+- title: Scanning and auditing
+  body: Write `scan_project` and `audit_site` to find secrets, vulnerable libraries and header or cookie
+    problems, with a pass or fail verdict.
+- title: Detection
+  body: Write `alerts` and `top_risks`, then run the toolkit on a toy service of your own and read the
+    results like a security engineer.
+checklist:
+- text: Registers users with checks and a slow hash
+  test: registering
+- text: Logs in without leaking which part was wrong
+  test: logging in
+- text: Authorizes by token and role
+  test: authorizing
+- text: Renders pages with escaped content
+  test: rendering safely
+- text: Searches with placeholders and an allow-list
+  test: searching safely
+- text: Scans files and dependencies
+  test: scanning a project
+- text: Audits a whole site with a verdict
+  test: auditing a site
+- text: Raises alerts from a login log
+  test: raising alerts
+- text: Summarizes the top risks
+  test: the short list
+starter: |-
+  def hash_password(password, salt_hex, iterations):
+      """Store a password safely with PBKDF2. Use hashlib.pbkdf2_hmac('sha256', password bytes (UTF-8), bytes.fromhex(salt_hex), iterations) and return the text 'pbkdf2$ITERATIONS$SALT$HASH' where SALT is salt_hex as given and HASH the result as hexadecimal. ValueError('iterations must be positive') if iterations < 1 and ValueError('salt must be hex') if salt_hex is not valid hexadecimal (an even number of hex digits, at least 8 digits)."""
+      import hashlib
+      if iterations < 1:
+          raise ValueError("iterations must be positive")
+      try:
+          salt = bytes.fromhex(salt_hex)
+      except ValueError:
+          raise ValueError("salt must be hex")
+      if len(salt) < 4:
+          raise ValueError("salt must be hex")
+      digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+      return "pbkdf2$" + str(iterations) + "$" + salt_hex + "$" + digest.hex()
+
+
+  def verify_password(stored, attempt):
+      """Check an attempt against a stored text made by hash_password. Split it at '$' (ValueError('bad record') unless there are four parts and the first is 'pbkdf2' and the number is a positive whole number). Hash the attempt with the SAME salt and iterations and compare with hmac.compare_digest (a comparison whose time does not reveal how many characters matched). Return True or False."""
+      import hmac
+      parts = stored.split("$")
+      if len(parts) != 4 or parts[0] != "pbkdf2" or not parts[1].isdigit() or int(parts[1]) < 1:
+          raise ValueError("bad record")
+      again = hash_password(attempt, parts[2], int(parts[1]))
+      return hmac.compare_digest(again.encode(), stored.encode())
+
+
+  def password_problems(password, username, common):
+      """Check a password against a policy and return the list of problems (empty when it is fine), always in this order: 'too short' if shorter than 12 characters; 'needs a lower-case letter'; 'needs an upper-case letter'; 'needs a digit' (use str methods); 'contains the username' if username (not empty) occurs in the password ignoring case; 'is a common password' if the password in lower case is in the set `common`. (The length rule matters most: modern advice is long passphrases rather than strange symbols.)"""
+      problems = []
+      if len(password) < 12:
+          problems.append("too short")
+      if not any(c.islower() for c in password):
+          problems.append("needs a lower-case letter")
+      if not any(c.isupper() for c in password):
+          problems.append("needs an upper-case letter")
+      if not any(c.isdigit() for c in password):
+          problems.append("needs a digit")
+      if username and username.lower() in password.lower():
+          problems.append("contains the username")
+      if password.lower() in common:
+          problems.append("is a common password")
+      return problems
+
+
+  def sign_token(payload, secret):
+      """Make a signed token (like a simple JWT). Turn the payload dict into JSON text with json.dumps(payload, sort_keys=True, separators=(',', ':')), encode it as UTF-8 and then as URL-safe base64 (base64.urlsafe_b64encode) with the '=' padding removed. The token is that text, a '.', and the HMAC-SHA256 (hex) of that text (as UTF-8) using the secret (UTF-8 text) as key."""
+      import base64, hashlib, hmac, json
+      body = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+      tag = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+      return body + "." + tag
+
+
+  def verify_token(token, secret, now):
+      """Check a token made by sign_token and return its payload dict. ValueError('malformed') unless the token has exactly one '.'; ValueError('bad signature') if the tag does not match (compare with hmac.compare_digest, and check the signature BEFORE reading the body); then decode the body (add back the '=' padding, base64 and JSON; any failure is ValueError('malformed')). If the payload is not a dict or has an 'exp' (expiry time in seconds) that is NOT greater than `now`, raise ValueError('expired'). A payload without 'exp' never expires."""
+      import base64, hashlib, hmac, json
+      parts = token.split(".")
+      if len(parts) != 2:
+          raise ValueError("malformed")
+      body, tag = parts
+      good = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+      if not hmac.compare_digest(good.encode(), tag.encode()):
+          raise ValueError("bad signature")
+      try:
+          payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+      except Exception:
+          raise ValueError("malformed")
+      if not isinstance(payload, dict):
+          raise ValueError("malformed")
+      if "exp" in payload and not payload["exp"] > now:
+          raise ValueError("expired")
+      return payload
+
+
+  def permissions_of(role_defs, role):
+      """Role-based access control. `role_defs` is a dict {role: {"perms": [permission texts], "inherits": [roles]}} (both keys optional). Return the sorted list of all permissions of the role, including those of the roles it inherits from, at any depth. Roles may inherit in a circle: do not loop forever. ValueError('unknown role NAME') for a role (also an inherited one) that is not defined."""
+      seen, perms = set(), set()
+
+      def walk(name):
+          if name in seen:
+              return
+          if name not in role_defs:
+              raise ValueError("unknown role " + name)
+          seen.add(name)
+          perms.update(role_defs[name].get("perms", []))
+          for parent in role_defs[name].get("inherits", []):
+              walk(parent)
+
+      walk(role)
+      return sorted(perms)
+
+
+  def can(role_defs, roles, permission):
+      """May someone with these roles do `permission`? Collect the permissions of ALL the roles first (permissions_of; an unknown role raises ValueError as above, even if an earlier role already grants the permission). Return True if any of them is exactly the permission, or is a WILDCARD: '*' allows everything, and 'files:*' allows every permission that starts with 'files:'. No roles means False."""
+      granted = [p for role in roles for p in permissions_of(role_defs, role)]
+      return any(p == permission or p == "*" or (p.endswith(":*") and permission.startswith(p[:-1])) for p in granted)
+
+
+  def escape_html(text):
+      """Make text safe to put inside an HTML page. Replace & with &amp; FIRST, then < with &lt;, > with &gt;, the double quote with &quot; and the single quote with &#x27;. (Do the ampersand first, or you would escape your own entities.)"""
+      return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
+
+
+  def render_comment(name, text):
+      """The HTML for a comment: '<p><b>NAME</b>: TEXT</p>' where NAME and TEXT are both passed through escape_html. Line breaks in the text (\n) become '<br>' AFTER the escaping."""
+      return "<p><b>" + escape_html(name) + "</b>: " + escape_html(text).replace("\n", "<br>") + "</p>"
+
+
+  class Cursor:
+      """The result of a query."""
+      def __init__(self, rows):
+          self.rows = rows
+
+      def fetchall(self):
+          return list(self.rows)
+
+      def fetchone(self):
+          return self.rows[0] if self.rows else None
+
+      def __iter__(self):
+          return iter(self.rows)
+
+
+  def tokenize_sql(sql):
+      """Split SQL text into (kind, value) tokens. A quote starts a string; two quotes inside a string mean one quote. Anything unknown (such as ; or --) is a syntax error."""
+      tokens, i = [], 0
+      while i < len(sql):
+          c = sql[i]
+          if c.isspace():
+              i += 1
+          elif c == "'":
+              j, text = i + 1, ""
+              while True:
+                  if j >= len(sql):
+                      raise ValueError("syntax error: unterminated string")
+                  if sql[j] == "'":
+                      if j + 1 < len(sql) and sql[j + 1] == "'":
+                          text += "'"
+                          j += 2
+                          continue
+                      break
+                  text += sql[j]
+                  j += 1
+              tokens.append(("str", text))
+              i = j + 1
+          elif c.isalpha() or c == "_":
+              j = i
+              while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
+                  j += 1
+              tokens.append(("word", sql[i:j]))
+              i = j
+          elif c.isdigit():
+              j = i
+              while j < len(sql) and sql[j].isdigit():
+                  j += 1
+              tokens.append(("num", int(sql[i:j])))
+              i = j
+          elif sql[i:i + 2] in (">=", "<=", "!=", "<>"):
+              tokens.append(("op", sql[i:i + 2]))
+              i += 2
+          elif c in "=<>?,":
+              tokens.append(("op", c))
+              i += 1
+          else:
+              raise ValueError("syntax error near " + repr(c))
+      return tokens
+
+
+  class Conn:
+      """A tiny pretend database: one table `users` and a small part of SQL (SELECT columns FROM users [WHERE ...] [ORDER BY column [DESC]], with = != < <= > >= LIKE ... ESCAPE, AND, OR, strings, numbers and ? placeholders). Python's real sqlite3 module works the same way; this stand-in runs everywhere."""
+      COLUMNS = ["name", "age", "secret"]
+
+      def __init__(self, rows):
+          self.rows = rows
+
+      def execute(self, sql, params=()):
+          import re
+          tokens = tokenize_sql(sql)
+          values = list(params)
+          for k, (kind, value) in enumerate(tokens):
+              if (kind, value) == ("op", "?"):
+                  if not values:
+                      raise ValueError("wrong number of parameters")
+                  tokens[k] = ("val", values.pop(0))
+          if values:
+              raise ValueError("wrong number of parameters")
+          pos = [0]
+
+          def peek():
+              return tokens[pos[0]] if pos[0] < len(tokens) else (None, None)
+
+          def keyword(word):
+              kind, value = peek()
+              if kind == "word" and value.upper() == word:
+                  pos[0] += 1
+                  return True
+              return False
+
+          def need(word):
+              if not keyword(word):
+                  raise ValueError("syntax error: expected " + word)
+
+          def column():
+              kind, value = peek()
+              if kind != "word" or value.lower() not in self.COLUMNS:
+                  raise ValueError("no such column: " + str(value))
+              pos[0] += 1
+              return value.lower()
+
+          def operand():
+              kind, value = peek()
+              if kind in ("str", "num", "val"):
+                  pos[0] += 1
+                  return lambda row: value
+              name = column()
+              return lambda row: row[name]
+
+          def comparison():
+              left = operand()
+              kind, value = peek()
+              if kind == "word" and value.upper() == "LIKE":
+                  pos[0] += 1
+                  right = operand()
+                  esc = None
+                  if keyword("ESCAPE"):
+                      esc = operand()
+
+                  def like(row):
+                      pattern, e, out, i = right(row), (esc(row) if esc else None), "", 0
+                      while i < len(pattern):
+                          ch = pattern[i]
+                          if e and ch == e and i + 1 < len(pattern):
+                              out += re.escape(pattern[i + 1])
+                              i += 1
+                          elif ch == "%":
+                              out += ".*"
+                          elif ch == "_":
+                              out += "."
+                          else:
+                              out += re.escape(ch)
+                          i += 1
+                      return re.fullmatch(out, str(left(row)), re.I | re.S) is not None
+                  return like
+              if kind != "op" or value not in ("=", "!=", "<>", "<", "<=", ">", ">="):
+                  raise ValueError("syntax error: expected a comparison")
+              pos[0] += 1
+              right = operand()
+
+              def compare(row):
+                  a, b = left(row), right(row)
+                  try:
+                      return {"=": a == b, "!=": a != b, "<>": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[value]
+                  except TypeError:
+                      return False
+              return compare
+
+          def conjunction():
+              parts = [comparison()]
+              while keyword("AND"):
+                  parts.append(comparison())
+              return lambda row: all(p(row) for p in parts)
+
+          def expression():
+              parts = [conjunction()]
+              while keyword("OR"):
+                  parts.append(conjunction())
+              return lambda row: any(p(row) for p in parts)
+
+          need("SELECT")
+          chosen = [column()]
+          while peek() == ("op", ","):
+              pos[0] += 1
+              chosen.append(column())
+          need("FROM")
+          need("USERS")
+          test = expression() if keyword("WHERE") else (lambda row: True)
+          order, descending = None, False
+          if keyword("ORDER"):
+              need("BY")
+              order = column()
+              if keyword("DESC"):
+                  descending = True
+              else:
+                  keyword("ASC")
+          if pos[0] != len(tokens):
+              raise ValueError("syntax error near " + repr(peek()[1]))
+          rows = [r for r in self.rows if test(r)]
+          if order:
+              rows = sorted(rows, key=lambda r: r[order], reverse=descending)
+          return Cursor([tuple(r[c] for c in chosen) for r in rows])
+
+
+  def make_db():
+      """A small in-memory database for the examples: the table users has the columns name, age and secret."""
+      return Conn([{"name": n, "age": a, "secret": s} for n, a, s in [("ada", 36, "s1"), ("bo", 17, "s2"), ("cy", 52, "s3"), ("o'brien", 40, "s4")]])
+
+
+  def find_users(conn, name, min_age):
+      """Return the sorted list of the NAMES of users whose name equals `name` and whose age is at least min_age. Build the query with PLACEHOLDERS: conn.execute('SELECT name FROM users WHERE name = ? AND age >= ?', (name, min_age)). Never put the values into the SQL text with + or f-strings: that allows SQL INJECTION, where input such as x' OR '1'='1 changes the meaning of the query."""
+      rows = conn.execute("SELECT name FROM users WHERE name = ? AND age >= ?", (name, min_age)).fetchall()
+      return sorted(r[0] for r in rows)
+
+
+  def order_clause(column, allowed):
+      """Placeholders cannot be used for column names, so use an ALLOW-LIST. Return 'ORDER BY ' + column when the column is in the list `allowed`, otherwise raise ValueError('column not allowed'). The comparison is exact (case matters)."""
+      if column not in allowed:
+          raise ValueError("column not allowed")
+      return "ORDER BY " + column
+
+
+  def build_set_cookie(name, value, max_age=None, secure=True, http_only=True, same_site="Lax", path="/"):
+      """Build the text of a Set-Cookie header. Check first: the name must be non-empty and made only of letters, digits and the characters ! # $ % & ' * + - . ^ _ ` | ~ (ValueError('bad cookie')); the value must not contain a semicolon, comma, space, double quote, backslash or control character (below ' ') or DEL (ValueError('bad cookie')); same_site must be 'Strict', 'Lax' or 'None' (ValueError('bad same_site')); 'None' without secure is ValueError('SameSite=None needs Secure'); max_age must be None or a whole number of at least 0 (ValueError('bad max_age')). Then join with '; ' in this order: 'name=value', 'Max-Age=N' (only if given), 'Path=PATH', 'Secure' (if secure), 'HttpOnly' (if http_only), 'SameSite=VALUE'."""
+      allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~")
+      if not name or any(c not in allowed for c in name):
+          raise ValueError("bad cookie")
+      if any(c in ';, "\\' or ord(c) < 32 or ord(c) == 127 for c in value):
+          raise ValueError("bad cookie")
+      if same_site not in ("Strict", "Lax", "None"):
+          raise ValueError("bad same_site")
+      if same_site == "None" and not secure:
+          raise ValueError("SameSite=None needs Secure")
+      if max_age is not None and (not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0):
+          raise ValueError("bad max_age")
+      parts = [name + "=" + value]
+      if max_age is not None:
+          parts.append("Max-Age=" + str(max_age))
+      parts.append("Path=" + path)
+      if secure:
+          parts.append("Secure")
+      if http_only:
+          parts.append("HttpOnly")
+      parts.append("SameSite=" + same_site)
+      return "; ".join(parts)
+
+
+  def audit_cookie(header):
+      """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+      pieces = [p.strip() for p in header.split(";")]
+      name = pieces[0].split("=", 1)[0]
+      attrs = {}
+      for p in pieces[1:]:
+          key, _, val = p.partition("=")
+          attrs[key.strip().lower()] = val.strip()
+      problems = []
+      if "secure" not in attrs:
+          problems.append("missing Secure")
+      if "httponly" not in attrs:
+          problems.append("missing HttpOnly")
+      if "samesite" not in attrs:
+          problems.append("missing SameSite")
+      elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+          problems.append("SameSite=None needs Secure")
+      if name.startswith("__Host-") and ("secure" not in attrs or attrs.get("path") != "/" or "domain" in attrs):
+          problems.append("bad __Host- prefix")
+      return problems
+
+
+  def audit_headers(headers):
+      """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+      import re
+      h = {k.lower(): str(v) for k, v in headers.items()}
+      problems = []
+      if "strict-transport-security" not in h:
+          problems.append("missing Strict-Transport-Security")
+      else:
+          m = re.search(r"max-age=(\d+)", h["strict-transport-security"], re.I)
+          if not m or int(m.group(1)) < 15552000:
+              problems.append("Strict-Transport-Security max-age too short")
+      csp = h.get("content-security-policy")
+      if csp is None:
+          problems.append("missing Content-Security-Policy")
+      else:
+          if "unsafe-inline" in csp:
+              problems.append("CSP allows unsafe-inline")
+          if "unsafe-eval" in csp:
+              problems.append("CSP allows unsafe-eval")
+      if "x-content-type-options" not in h:
+          problems.append("missing X-Content-Type-Options")
+      elif h["x-content-type-options"].strip().lower() != "nosniff":
+          problems.append("X-Content-Type-Options should be nosniff")
+      if "x-frame-options" not in h and not (csp and "frame-ancestors" in csp):
+          problems.append("missing clickjacking protection")
+      if "referrer-policy" not in h:
+          problems.append("missing Referrer-Policy")
+      if "server" in h and any(c.isdigit() for c in h["server"]):
+          problems.append("Server header reveals version")
+      return problems
+
+
+  def audit_response(headers, set_cookies):
+      """Audit a whole HTTP response. `headers` is the dict of headers and `set_cookies` the list of Set-Cookie header texts. Return (problems, grade). The problems are first 'header: ' + each problem of audit_headers, then for every cookie in order 'cookie NAME: ' + each problem of audit_cookie (NAME is the part before the first '=' of the cookie). The grade is a letter by the number of problems: 0 gives 'A', 1 or 2 'B', 3 or 4 'C', 5 or 6 'D', more than 6 'F'."""
+      problems = ["header: " + p for p in audit_headers(headers)]
+      for cookie in set_cookies:
+          name = cookie.split("=", 1)[0].strip()
+          problems.extend("cookie " + name + ": " + p for p in audit_cookie(cookie))
+      n = len(problems)
+      grade = "A" if n == 0 else "B" if n <= 2 else "C" if n <= 4 else "D" if n <= 6 else "F"
+      return problems, grade
+
+
+  def risk_score(likelihood, impact):
+      """The classic RISK = LIKELIHOOD x IMPACT, each rated from 1 (lowest) to 5 (highest). ValueError('rating must be 1 to 5') unless both are whole numbers in that range (bool is not accepted). Return the product."""
+      for v in (likelihood, impact):
+          if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 5:
+              raise ValueError("rating must be 1 to 5")
+      return likelihood * impact
+
+
+  def risk_level(score):
+      """Name the score: 'low' for 1 to 4, 'medium' for 5 to 9, 'high' for 10 to 16 and 'critical' for 17 to 25. ValueError('bad score') for anything else."""
+      if not isinstance(score, int) or not 1 <= score <= 25:
+          raise ValueError("bad score")
+      return "low" if score <= 4 else "medium" if score <= 9 else "high" if score <= 16 else "critical"
+
+
+  def rank_risks(risks):
+      """`risks` is a dict {name: (likelihood, impact)}. Return the list of (name, score, level) sorted with the highest score first and, for equal scores, by name (alphabetical). Bad ratings raise the ValueError of risk_score."""
+      rows = [(name, risk_score(l, i)) for name, (l, i) in risks.items()]
+      rows.sort(key=lambda r: (-r[1], r[0]))
+      return [(name, score, risk_level(score)) for name, score in rows]
+
+
+  def compare_versions(a, b):
+      """Compare two version texts such as '1.10.2' and '1.9'. Split at '.', every part must be a whole number (ValueError('bad version') otherwise, also for an empty text). A missing part counts as 0 ('1.2' equals '1.2.0'). Compare number by number (so 1.10 is newer than 1.9). Return -1 if a is older, 0 if equal, 1 if a is newer."""
+      def parts(v):
+          p = v.split(".")
+          if not all(x.isdigit() for x in p):
+              raise ValueError("bad version")
+          return [int(x) for x in p]
+      pa, pb = parts(a), parts(b)
+      n = max(len(pa), len(pb))
+      pa, pb = pa + [0] * (n - len(pa)), pb + [0] * (n - len(pb))
+      return (pa > pb) - (pa < pb)
+
+
+  def version_matches(version, spec):
+      """Does `version` satisfy the specification `spec`? The spec is one or more clauses separated by commas, each an operator followed by a version: '<1.4.2', '>=1.0,<1.4.2', '==2.0'. The operators are <, <=, >, >= and == (ignore blanks around parts). ALL clauses must hold (check every clause for validity first). ValueError('bad spec') for an empty clause or an unknown operator."""
+      ops = ["<=", ">=", "==", "<", ">"]
+      clauses = []
+      for clause in spec.split(","):
+          clause = clause.strip()
+          op = next((o for o in ops if clause.startswith(o)), None)
+          if op is None or not clause[len(op):].strip():
+              raise ValueError("bad spec")
+          clauses.append((op, clause[len(op):].strip()))
+      for op, target in clauses:
+          c = compare_versions(version, target)
+          ok = {"<": c < 0, "<=": c <= 0, ">": c > 0, ">=": c >= 0, "==": c == 0}[op]
+          if not ok:
+              return False
+      return True
+
+
+  def scan_dependencies(deps, advisories):
+      """Every program depends on libraries, and libraries have known vulnerabilities (listed in advisories such as CVE entries). `deps` is a dict {package: installed version}; `advisories` a list of dicts {'id': text, 'package': name, 'affected': spec (as for version_matches), 'severity': 'low'/'medium'/'high'/'critical'}. Return the list of (id, package, version, severity) for every advisory whose package is installed in a version that matches the affected spec, sorted with the most severe first (critical, high, medium, low) and then by id."""
+      order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+      hits = []
+      for adv in advisories:
+          v = deps.get(adv["package"])
+          if v is not None and version_matches(v, adv["affected"]):
+              hits.append((adv["id"], adv["package"], v, adv["severity"]))
+      hits.sort(key=lambda h: (order[h[3]], h[0]))
+      return hits
+
+
+  def shannon_entropy(text):
+      """The SHANNON ENTROPY of the text in bits per character: the sum over the different characters of -p * log2(p), where p is the share of that character (use math.log2). The empty text has entropy 0.0. Random secrets have a high entropy (about 4 or more); ordinary words and repeated text have a low one."""
+      import math
+      if not text:
+          return 0.0
+      n = len(text)
+      return -sum((c / n) * math.log2(c / n) for c in (text.count(ch) for ch in set(text)))
+
+
+  def find_secrets(text):
+      """A SECRET SCANNER finds passwords and keys that were pasted into code. Go through the text line by line (numbers start at 1) and return the sorted list of (line number, kind) pairs, each kind at most once per line. The kinds: 'aws key' for AKIA followed by 16 upper-case letters or digits; 'private key' for a '-----BEGIN ' ... 'PRIVATE KEY-----' marker; 'hardcoded password' for a word password, passwd, secret, token or api_key / api-key / apikey (any case) followed by optional blanks, ':' or '=', optional blanks and a quoted value of at least 6 characters without blanks (single or double quotes); and 'high entropy string' for a run of at least 24 characters from A-Z a-z 0-9 + / = _ - whose shannon_entropy is at least 4.0."""
+      import re
+      patterns = [("aws key", re.compile(r"AKIA[0-9A-Z]{16}")), ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")), ("hardcoded password", re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*['\"][^'\"\s]{6,}['\"]"))]
+      token = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+      found = set()
+      for number, line in enumerate(text.splitlines(), 1):
+          for kind, pattern in patterns:
+              if pattern.search(line):
+                  found.add((number, kind))
+          if any(shannon_entropy(t) >= 4.0 for t in token.findall(line)):
+              found.add((number, "high entropy string"))
+      return sorted(found)
+
+
+  def analyze_log(lines, threshold, window, min_users):
+      """Read a login log. Each line is 'SECONDS IP USER RESULT' (four words; RESULT is OK or FAIL); skip lines that are malformed (not four words, SECONDS not a whole number, RESULT anything else). Handle the events in the order of their time (stable for equal times). Return a dict of three sorted lists of IP addresses: 'bruteforce' = addresses with at least `threshold` FAIL events inside some window of `window` seconds (last time minus first time <= window); 'spraying' = addresses with FAIL events against at least `min_users` DIFFERENT user names (any time); 'compromised' = addresses with an OK event AFTER (or at the same time, later in the sorted order) they had become a 'bruteforce' address, that is after the failure that completed the threshold."""
+      events = []
+      for line in lines:
+          w = line.split()
+          if len(w) != 4 or not w[0].isdigit() or w[3] not in ("OK", "FAIL"):
+              continue
+          events.append((int(w[0]), w[1], w[2], w[3]))
+      events.sort(key=lambda e: e[0])
+      recent, users, flagged, compromised = {}, {}, set(), set()
+      for t, ip, user, result in events:
+          if result == "FAIL":
+              users.setdefault(ip, set()).add(user)
+              times = recent.setdefault(ip, [])
+              times.append(t)
+              while t - times[0] > window:
+                  times.pop(0)
+              if len(times) >= threshold:
+                  flagged.add(ip)
+          elif ip in flagged:
+              compromised.add(ip)
+      spraying = sorted(ip for ip, u in users.items() if len(u) >= min_users)
+      return {"bruteforce": sorted(flagged), "spraying": spraying, "compromised": sorted(compromised)}
+
+
+  def register(accounts, username, password, salt_hex, common):
+      """Create an account. The username must be 3 to 20 characters, only lower-case letters, digits and underscores (ValueError('bad username')); ValueError('username taken') if it exists in the dict `accounts`. Check the password with password_problems(password, username, common): if there are problems raise ValueError('weak password: ' + the problems joined with ', '). Otherwise store accounts[username] = {'record': hash_password(password, salt_hex, 1000), 'role': 'user'} and return the record text. (Order of checks: username format, taken, password.)"""
+      pass
+
+
+  def login(accounts, username, password, secret, now):
+      """Log in and return a signed token. Unknown user and wrong password must look the SAME: ValueError('invalid credentials') for both (never tell an attacker which one it was). Use verify_password on the stored record. The token is sign_token({'sub': username, 'role': the role of the account, 'exp': now + 3600}, secret)."""
+      pass
+
+
+  def authorize(token, secret, now, role_defs, permission):
+      """May the holder of this token do `permission`? Check the token with verify_token (its ValueErrors pass through, so an expired or forged token is refused) and return can(role_defs, [the 'role' in the payload], permission)."""
+      pass
+
+
+  def render_page(title, comments):
+      """Build an HTML page for a list of (name, text) comments. The first line is '<h1>' + escape_html(title) + '</h1>'. Then one line per comment from render_comment(name, text). With no comments the second line is '<p><i>no comments</i></p>'. Join the lines with '\n'."""
+      pass
+
+
+  def search_users(conn, prefix, min_age, sort, allowed):
+      """Find users in the database of make_db whose NAME STARTS WITH the prefix and whose age is at least min_age; return the list of names. Build the SQL like this: 'SELECT name FROM users WHERE name LIKE ? ESCAPE ' + a backslash in quotes + ' AND age >= ? ' + order_clause(sort, allowed) (so a sort column that is not allowed raises ValueError('column not allowed') BEFORE anything runs). The prefix goes in as a PLACEHOLDER value: first escape the characters backslash, % and _ with a backslash (so that they match themselves, in this order) and add % at the end."""
+      pass
+
+
+  def scan_project(files, deps, advisories):
+      """Scan a project. `files` is a dict {file name: text}. Return {'secrets': list of (file, line, kind) for every find_secrets result, files in sorted name order and each file's results in line order, 'vulnerable': scan_dependencies(deps, advisories)}."""
+      pass
+
+
+  def audit_site(headers, set_cookies, files, deps, advisories):
+      """The security check of a whole site. Use audit_response and scan_project. Return a dict: 'problems' (the list from audit_response), 'grade' (its grade), 'secrets' (how many secrets were found), 'vulnerable' (how many vulnerable dependencies) and 'verdict': 'pass' only if the grade is 'A' or 'B', no secrets were found and no vulnerability is 'critical' or 'high'; otherwise 'fail'."""
+      pass
+
+
+  def alerts(log, threshold, window, min_users):
+      """Turn a login log into alert lines using analyze_log. The lines are 'ALERT compromised IP' for each compromised address first, then 'ALERT bruteforce IP' for each brute-force address that is NOT compromised, then 'ALERT spraying IP' for each spraying address (every list in the sorted order of analyze_log). Return the list; it is empty when all is quiet."""
+      pass
+
+
+  def top_risks(risks, limit):
+      """The short list for the boss. Use rank_risks and return the first `limit` entries as lines 'NAME: SCORE (LEVEL)', for example 'phishing: 20 (critical)'. A limit of 0 or less gives an empty list."""
+      pass
+tests:
+- name: registering
+  code: |
+    common = {"password1234", "letmein12345"}
+    accounts = {}
+    rec = register(accounts, "ada_99", "Correct Horse 42 battery", "a1b2c3d4e5f6", common)
+    assert rec.startswith("pbkdf2$1000$a1b2c3d4e5f6$") and accounts == {"ada_99": {"record": rec, "role": "user"}} and verify_password(rec, "Correct Horse 42 battery") and not verify_password(rec, "wrong")
+    def err(*args):
+        try:
+            register(*args)
+        except ValueError as e:
+            return str(e)
+        return "accepted"
+    assert err(accounts, "ada_99", "Another Good Pass 7", "a1b2c3d4", common) == "username taken"
+    for bad in ("ab", "Ada", "a b", "x" * 21, "", "ada-1", "ünï"):
+        assert err({}, bad, "Correct Horse 42 battery", "a1b2c3d4", common) == "bad username", bad
+    assert err({}, "bob", "short", "a1b2c3d4", common) == "weak password: too short, needs an upper-case letter, needs a digit"
+    assert err({}, "bob", "xBOBx Is Very Long 1", "a1b2c3d4", common) == "weak password: contains the username"
+    assert err({}, "carl", "Password1234", "a1b2c3d4", {"password1234"}) == "weak password: is a common password"
+    assert err({"x_x": {}}, "x_x", "short", "a1b2c3d4", common) == "username taken" and err({}, "ok_name", "Correct Horse 42 battery", "zz", common) == "salt must be hex" and accounts["ada_99"]["role"] == "user"
+- name: logging in
+  code: |
+    accounts = {}
+    register(accounts, "ada", "Correct Horse 42 battery", "a1b2c3d4e5f6", set())
+    register(accounts, "bob", "Another Good Pass 7 ok", "0a0b0c0d0e0f", set())
+    accounts["bob"]["role"] = "admin"
+    tok = login(accounts, "ada", "Correct Horse 42 battery", "s3cret", 1000)
+    assert verify_token(tok, "s3cret", 1000) == {"sub": "ada", "role": "user", "exp": 4600} and verify_token(login(accounts, "bob", "Another Good Pass 7 ok", "s3cret", 0), "s3cret", 5)["role"] == "admin"
+    msgs = []
+    for u, p in (("ada", "wrong"), ("nobody", "Correct Horse 42 battery"), ("", ""), ("ADA", "Correct Horse 42 battery")):
+        try:
+            login(accounts, u, p, "s3cret", 0)
+            raise AssertionError("accepted")
+        except ValueError as e:
+            msgs.append(str(e))
+    assert msgs == ["invalid credentials"] * 4
+    try:
+        verify_token(tok, "other", 1000)
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "bad signature" in str(e)
+- name: authorizing
+  code: |
+    roles = {"user": {"perms": ["posts:read", "posts:write"]}, "editor": {"inherits": ["user"], "perms": ["posts:delete"]}, "admin": {"perms": ["*"]}}
+    def make(role, now=0):
+        return sign_token({"sub": "x", "role": role, "exp": now + 3600}, "k")
+    assert authorize(make("user"), "k", 10, roles, "posts:read") is True and authorize(make("user"), "k", 10, roles, "posts:delete") is False and authorize(make("editor"), "k", 10, roles, "posts:write") is True and authorize(make("editor"), "k", 10, roles, "posts:delete") is True
+    assert authorize(make("admin"), "k", 10, roles, "users:ban") is True and authorize(make("user"), "k", 10, roles, "") is False
+    for tok, now, msg in ((make("admin"), 4000, "expired"), (make("admin") + "x", 10, "bad signature"), ("nodot", 10, "malformed"), (make("ghost"), 10, "unknown role ghost")):
+        try:
+            authorize(tok, "k", now, roles, "posts:read")
+            raise AssertionError("accepted " + msg)
+        except ValueError as e:
+            assert msg in str(e), (msg, str(e))
+    forged = sign_token({"sub": "x", "role": "admin", "exp": 99999}, "wrong-key")
+    try:
+        authorize(forged, "k", 10, roles, "posts:read")
+        raise AssertionError("forged token accepted")
+    except ValueError as e:
+        assert "bad signature" in str(e)
+- name: rendering safely
+  code: |
+    page = render_page("Tom & Jerry <3", [("ada", "Hello <script>alert(1)</script>"), ("bo\"", "line1\nline2 & more")])
+    assert page == "<h1>Tom &amp; Jerry &lt;3</h1>\n<p><b>ada</b>: Hello &lt;script&gt;alert(1)&lt;/script&gt;</p>\n<p><b>bo&quot;</b>: line1<br>line2 &amp; more</p>"
+    assert render_page("Empty", []) == "<h1>Empty</h1>\n<p><i>no comments</i></p>" and "<script" not in render_page("<script>", [("<script>", "<script>")]) and render_page("", [("a", "")]) == "<h1></h1>\n<p><b>a</b>: </p>"
+- name: searching safely
+  code: |
+    conn = make_db()
+    allowed = ["name", "age", "age DESC"]
+    assert search_users(conn, "", 0, "name", allowed) == ["ada", "bo", "cy", "o'brien"] and search_users(conn, "", 0, "age", allowed) == ["bo", "ada", "o'brien", "cy"] and search_users(conn, "", 0, "age DESC", allowed) == ["cy", "o'brien", "ada", "bo"]
+    assert search_users(conn, "a", 0, "name", allowed) == ["ada"] and search_users(conn, "", 36, "name", allowed) == ["ada", "cy", "o'brien"] and search_users(conn, "o'", 0, "name", allowed) == ["o'brien"] and search_users(conn, "zzz", 0, "name", allowed) == []
+    assert search_users(conn, "' OR '1'='1", 0, "name", allowed) == [] and search_users(conn, "%", 0, "name", allowed) == [] and search_users(conn, "_", 0, "name", allowed) == [] and search_users(conn, "\\", 0, "name", allowed) == []
+    for bad in ("name; DROP TABLE users", "secret", "NAME", ""):
+        try:
+            search_users(conn, "", 0, bad, allowed)
+            raise AssertionError("accepted " + bad)
+        except ValueError as e:
+            assert "column not allowed" in str(e)
+    assert len(conn.execute("SELECT name FROM users").fetchall()) == 4
+- name: scanning a project
+  code: |
+    files = {"settings.py": "DEBUG = True\npassword = 'hunter2hunter2'\nAWS = 'AKIAIOSFODNN7EXAMPLE'\n", "app.py": "print('hello')\n", "key.pem": "-----BEGIN PRIVATE KEY-----\nabc\n"}
+    deps = {"requests": "2.19.0", "flask": "2.3.1"}
+    adv = [{"id": "CVE-1", "package": "requests", "affected": "<2.20.0", "severity": "high"}, {"id": "CVE-2", "package": "flask", "affected": "<2.3.0", "severity": "critical"}]
+    r = scan_project(files, deps, adv)
+    assert r == {"secrets": [("key.pem", 1, "private key"), ("settings.py", 2, "hardcoded password"), ("settings.py", 3, "aws key")], "vulnerable": [("CVE-1", "requests", "2.19.0", "high")]}
+    assert scan_project({}, {}, []) == {"secrets": [], "vulnerable": []} and scan_project({"a.txt": "nothing"}, deps, []) == {"secrets": [], "vulnerable": []}
+- name: auditing a site
+  code: |
+    good = {"Strict-Transport-Security": "max-age=31536000", "Content-Security-Policy": "default-src 'self'", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"}
+    cookie = "sid=abc; Secure; HttpOnly; SameSite=Lax"
+    clean = {"app.py": "print(1)\n"}
+    adv = [{"id": "CVE-1", "package": "requests", "affected": "<2.20.0", "severity": "high"}, {"id": "CVE-9", "package": "pillow", "affected": "<9", "severity": "low"}]
+    r = audit_site(good, [cookie], clean, {"requests": "2.31.0"}, adv)
+    assert r == {"problems": [], "grade": "A", "secrets": 0, "vulnerable": 0, "verdict": "pass"}
+    r = audit_site(good, ["sid=abc; Secure; HttpOnly"], clean, {"requests": "2.31.0", "pillow": "8.0"}, adv)
+    assert r["problems"] == ["cookie sid: missing SameSite"] and r["grade"] == "B" and r["vulnerable"] == 1 and r["verdict"] == "pass"
+    r = audit_site(good, [cookie], clean, {"requests": "2.19.0"}, adv)
+    assert r["verdict"] == "fail" and r["vulnerable"] == 1 and r["grade"] == "A"
+    r = audit_site(good, [cookie], {"s.py": "token = 'abcdefghij'\n"}, {}, adv)
+    assert r["verdict"] == "fail" and r["secrets"] == 1
+    r = audit_site({}, ["sid=abc"], clean, {}, [])
+    assert r["grade"] == "F" and r["verdict"] == "fail" and len(r["problems"]) == 8 and r["problems"][0] == "header: missing Strict-Transport-Security"
+- name: raising alerts
+  code: |
+    log = ["100 1.1.1.1 ada FAIL", "101 1.1.1.1 ada FAIL", "102 1.1.1.1 ada FAIL", "103 1.1.1.1 ada OK", "200 2.2.2.2 ada FAIL", "201 2.2.2.2 bo FAIL", "202 2.2.2.2 cy FAIL", "203 2.2.2.2 di FAIL", "300 3.3.3.3 di OK", "400 4.4.4.4 al FAIL"]
+    assert alerts(log, 3, 10, 3) == ["ALERT compromised 1.1.1.1", "ALERT bruteforce 2.2.2.2", "ALERT spraying 2.2.2.2"]
+    assert alerts(log, 5, 10, 5) == [] and alerts([], 3, 10, 3) == [] and alerts(["junk"], 1, 1, 1) == []
+    assert alerts(log, 3, 10, 2) == ["ALERT compromised 1.1.1.1", "ALERT bruteforce 2.2.2.2", "ALERT spraying 2.2.2.2"] and alerts(log, 9, 10, 2) == ["ALERT spraying 2.2.2.2"]
+- name: the short list
+  code: |
+    risks = {"phishing": (5, 4), "sql injection": (3, 5), "lost laptop": (3, 3), "ddos": (2, 4), "insider": (1, 5)}
+    assert top_risks(risks, 2) == ["phishing: 20 (critical)", "sql injection: 15 (high)"] and top_risks(risks, 10) == ["phishing: 20 (critical)", "sql injection: 15 (high)", "lost laptop: 9 (medium)", "ddos: 8 (medium)", "insider: 5 (medium)"]
+    assert top_risks(risks, 0) == [] and top_risks(risks, -1) == [] and top_risks({}, 3) == []
+    try:
+        top_risks({"x": (0, 1)}, 1)
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "rating must be 1 to 5" in str(e)
+solution: |
+  def hash_password(password, salt_hex, iterations):
+      """Store a password safely with PBKDF2. Use hashlib.pbkdf2_hmac('sha256', password bytes (UTF-8), bytes.fromhex(salt_hex), iterations) and return the text 'pbkdf2$ITERATIONS$SALT$HASH' where SALT is salt_hex as given and HASH the result as hexadecimal. ValueError('iterations must be positive') if iterations < 1 and ValueError('salt must be hex') if salt_hex is not valid hexadecimal (an even number of hex digits, at least 8 digits)."""
+      import hashlib
+      if iterations < 1:
+          raise ValueError("iterations must be positive")
+      try:
+          salt = bytes.fromhex(salt_hex)
+      except ValueError:
+          raise ValueError("salt must be hex")
+      if len(salt) < 4:
+          raise ValueError("salt must be hex")
+      digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+      return "pbkdf2$" + str(iterations) + "$" + salt_hex + "$" + digest.hex()
+
+
+  def verify_password(stored, attempt):
+      """Check an attempt against a stored text made by hash_password. Split it at '$' (ValueError('bad record') unless there are four parts and the first is 'pbkdf2' and the number is a positive whole number). Hash the attempt with the SAME salt and iterations and compare with hmac.compare_digest (a comparison whose time does not reveal how many characters matched). Return True or False."""
+      import hmac
+      parts = stored.split("$")
+      if len(parts) != 4 or parts[0] != "pbkdf2" or not parts[1].isdigit() or int(parts[1]) < 1:
+          raise ValueError("bad record")
+      again = hash_password(attempt, parts[2], int(parts[1]))
+      return hmac.compare_digest(again.encode(), stored.encode())
+
+
+  def password_problems(password, username, common):
+      """Check a password against a policy and return the list of problems (empty when it is fine), always in this order: 'too short' if shorter than 12 characters; 'needs a lower-case letter'; 'needs an upper-case letter'; 'needs a digit' (use str methods); 'contains the username' if username (not empty) occurs in the password ignoring case; 'is a common password' if the password in lower case is in the set `common`. (The length rule matters most: modern advice is long passphrases rather than strange symbols.)"""
+      problems = []
+      if len(password) < 12:
+          problems.append("too short")
+      if not any(c.islower() for c in password):
+          problems.append("needs a lower-case letter")
+      if not any(c.isupper() for c in password):
+          problems.append("needs an upper-case letter")
+      if not any(c.isdigit() for c in password):
+          problems.append("needs a digit")
+      if username and username.lower() in password.lower():
+          problems.append("contains the username")
+      if password.lower() in common:
+          problems.append("is a common password")
+      return problems
+
+
+  def sign_token(payload, secret):
+      """Make a signed token (like a simple JWT). Turn the payload dict into JSON text with json.dumps(payload, sort_keys=True, separators=(',', ':')), encode it as UTF-8 and then as URL-safe base64 (base64.urlsafe_b64encode) with the '=' padding removed. The token is that text, a '.', and the HMAC-SHA256 (hex) of that text (as UTF-8) using the secret (UTF-8 text) as key."""
+      import base64, hashlib, hmac, json
+      body = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+      tag = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+      return body + "." + tag
+
+
+  def verify_token(token, secret, now):
+      """Check a token made by sign_token and return its payload dict. ValueError('malformed') unless the token has exactly one '.'; ValueError('bad signature') if the tag does not match (compare with hmac.compare_digest, and check the signature BEFORE reading the body); then decode the body (add back the '=' padding, base64 and JSON; any failure is ValueError('malformed')). If the payload is not a dict or has an 'exp' (expiry time in seconds) that is NOT greater than `now`, raise ValueError('expired'). A payload without 'exp' never expires."""
+      import base64, hashlib, hmac, json
+      parts = token.split(".")
+      if len(parts) != 2:
+          raise ValueError("malformed")
+      body, tag = parts
+      good = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+      if not hmac.compare_digest(good.encode(), tag.encode()):
+          raise ValueError("bad signature")
+      try:
+          payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+      except Exception:
+          raise ValueError("malformed")
+      if not isinstance(payload, dict):
+          raise ValueError("malformed")
+      if "exp" in payload and not payload["exp"] > now:
+          raise ValueError("expired")
+      return payload
+
+
+  def permissions_of(role_defs, role):
+      """Role-based access control. `role_defs` is a dict {role: {"perms": [permission texts], "inherits": [roles]}} (both keys optional). Return the sorted list of all permissions of the role, including those of the roles it inherits from, at any depth. Roles may inherit in a circle: do not loop forever. ValueError('unknown role NAME') for a role (also an inherited one) that is not defined."""
+      seen, perms = set(), set()
+
+      def walk(name):
+          if name in seen:
+              return
+          if name not in role_defs:
+              raise ValueError("unknown role " + name)
+          seen.add(name)
+          perms.update(role_defs[name].get("perms", []))
+          for parent in role_defs[name].get("inherits", []):
+              walk(parent)
+
+      walk(role)
+      return sorted(perms)
+
+
+  def can(role_defs, roles, permission):
+      """May someone with these roles do `permission`? Collect the permissions of ALL the roles first (permissions_of; an unknown role raises ValueError as above, even if an earlier role already grants the permission). Return True if any of them is exactly the permission, or is a WILDCARD: '*' allows everything, and 'files:*' allows every permission that starts with 'files:'. No roles means False."""
+      granted = [p for role in roles for p in permissions_of(role_defs, role)]
+      return any(p == permission or p == "*" or (p.endswith(":*") and permission.startswith(p[:-1])) for p in granted)
+
+
+  def escape_html(text):
+      """Make text safe to put inside an HTML page. Replace & with &amp; FIRST, then < with &lt;, > with &gt;, the double quote with &quot; and the single quote with &#x27;. (Do the ampersand first, or you would escape your own entities.)"""
+      return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
+
+
+  def render_comment(name, text):
+      """The HTML for a comment: '<p><b>NAME</b>: TEXT</p>' where NAME and TEXT are both passed through escape_html. Line breaks in the text (\n) become '<br>' AFTER the escaping."""
+      return "<p><b>" + escape_html(name) + "</b>: " + escape_html(text).replace("\n", "<br>") + "</p>"
+
+
+  class Cursor:
+      """The result of a query."""
+      def __init__(self, rows):
+          self.rows = rows
+
+      def fetchall(self):
+          return list(self.rows)
+
+      def fetchone(self):
+          return self.rows[0] if self.rows else None
+
+      def __iter__(self):
+          return iter(self.rows)
+
+
+  def tokenize_sql(sql):
+      """Split SQL text into (kind, value) tokens. A quote starts a string; two quotes inside a string mean one quote. Anything unknown (such as ; or --) is a syntax error."""
+      tokens, i = [], 0
+      while i < len(sql):
+          c = sql[i]
+          if c.isspace():
+              i += 1
+          elif c == "'":
+              j, text = i + 1, ""
+              while True:
+                  if j >= len(sql):
+                      raise ValueError("syntax error: unterminated string")
+                  if sql[j] == "'":
+                      if j + 1 < len(sql) and sql[j + 1] == "'":
+                          text += "'"
+                          j += 2
+                          continue
+                      break
+                  text += sql[j]
+                  j += 1
+              tokens.append(("str", text))
+              i = j + 1
+          elif c.isalpha() or c == "_":
+              j = i
+              while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
+                  j += 1
+              tokens.append(("word", sql[i:j]))
+              i = j
+          elif c.isdigit():
+              j = i
+              while j < len(sql) and sql[j].isdigit():
+                  j += 1
+              tokens.append(("num", int(sql[i:j])))
+              i = j
+          elif sql[i:i + 2] in (">=", "<=", "!=", "<>"):
+              tokens.append(("op", sql[i:i + 2]))
+              i += 2
+          elif c in "=<>?,":
+              tokens.append(("op", c))
+              i += 1
+          else:
+              raise ValueError("syntax error near " + repr(c))
+      return tokens
+
+
+  class Conn:
+      """A tiny pretend database: one table `users` and a small part of SQL (SELECT columns FROM users [WHERE ...] [ORDER BY column [DESC]], with = != < <= > >= LIKE ... ESCAPE, AND, OR, strings, numbers and ? placeholders). Python's real sqlite3 module works the same way; this stand-in runs everywhere."""
+      COLUMNS = ["name", "age", "secret"]
+
+      def __init__(self, rows):
+          self.rows = rows
+
+      def execute(self, sql, params=()):
+          import re
+          tokens = tokenize_sql(sql)
+          values = list(params)
+          for k, (kind, value) in enumerate(tokens):
+              if (kind, value) == ("op", "?"):
+                  if not values:
+                      raise ValueError("wrong number of parameters")
+                  tokens[k] = ("val", values.pop(0))
+          if values:
+              raise ValueError("wrong number of parameters")
+          pos = [0]
+
+          def peek():
+              return tokens[pos[0]] if pos[0] < len(tokens) else (None, None)
+
+          def keyword(word):
+              kind, value = peek()
+              if kind == "word" and value.upper() == word:
+                  pos[0] += 1
+                  return True
+              return False
+
+          def need(word):
+              if not keyword(word):
+                  raise ValueError("syntax error: expected " + word)
+
+          def column():
+              kind, value = peek()
+              if kind != "word" or value.lower() not in self.COLUMNS:
+                  raise ValueError("no such column: " + str(value))
+              pos[0] += 1
+              return value.lower()
+
+          def operand():
+              kind, value = peek()
+              if kind in ("str", "num", "val"):
+                  pos[0] += 1
+                  return lambda row: value
+              name = column()
+              return lambda row: row[name]
+
+          def comparison():
+              left = operand()
+              kind, value = peek()
+              if kind == "word" and value.upper() == "LIKE":
+                  pos[0] += 1
+                  right = operand()
+                  esc = None
+                  if keyword("ESCAPE"):
+                      esc = operand()
+
+                  def like(row):
+                      pattern, e, out, i = right(row), (esc(row) if esc else None), "", 0
+                      while i < len(pattern):
+                          ch = pattern[i]
+                          if e and ch == e and i + 1 < len(pattern):
+                              out += re.escape(pattern[i + 1])
+                              i += 1
+                          elif ch == "%":
+                              out += ".*"
+                          elif ch == "_":
+                              out += "."
+                          else:
+                              out += re.escape(ch)
+                          i += 1
+                      return re.fullmatch(out, str(left(row)), re.I | re.S) is not None
+                  return like
+              if kind != "op" or value not in ("=", "!=", "<>", "<", "<=", ">", ">="):
+                  raise ValueError("syntax error: expected a comparison")
+              pos[0] += 1
+              right = operand()
+
+              def compare(row):
+                  a, b = left(row), right(row)
+                  try:
+                      return {"=": a == b, "!=": a != b, "<>": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[value]
+                  except TypeError:
+                      return False
+              return compare
+
+          def conjunction():
+              parts = [comparison()]
+              while keyword("AND"):
+                  parts.append(comparison())
+              return lambda row: all(p(row) for p in parts)
+
+          def expression():
+              parts = [conjunction()]
+              while keyword("OR"):
+                  parts.append(conjunction())
+              return lambda row: any(p(row) for p in parts)
+
+          need("SELECT")
+          chosen = [column()]
+          while peek() == ("op", ","):
+              pos[0] += 1
+              chosen.append(column())
+          need("FROM")
+          need("USERS")
+          test = expression() if keyword("WHERE") else (lambda row: True)
+          order, descending = None, False
+          if keyword("ORDER"):
+              need("BY")
+              order = column()
+              if keyword("DESC"):
+                  descending = True
+              else:
+                  keyword("ASC")
+          if pos[0] != len(tokens):
+              raise ValueError("syntax error near " + repr(peek()[1]))
+          rows = [r for r in self.rows if test(r)]
+          if order:
+              rows = sorted(rows, key=lambda r: r[order], reverse=descending)
+          return Cursor([tuple(r[c] for c in chosen) for r in rows])
+
+
+  def make_db():
+      """A small in-memory database for the examples: the table users has the columns name, age and secret."""
+      return Conn([{"name": n, "age": a, "secret": s} for n, a, s in [("ada", 36, "s1"), ("bo", 17, "s2"), ("cy", 52, "s3"), ("o'brien", 40, "s4")]])
+
+
+  def find_users(conn, name, min_age):
+      """Return the sorted list of the NAMES of users whose name equals `name` and whose age is at least min_age. Build the query with PLACEHOLDERS: conn.execute('SELECT name FROM users WHERE name = ? AND age >= ?', (name, min_age)). Never put the values into the SQL text with + or f-strings: that allows SQL INJECTION, where input such as x' OR '1'='1 changes the meaning of the query."""
+      rows = conn.execute("SELECT name FROM users WHERE name = ? AND age >= ?", (name, min_age)).fetchall()
+      return sorted(r[0] for r in rows)
+
+
+  def order_clause(column, allowed):
+      """Placeholders cannot be used for column names, so use an ALLOW-LIST. Return 'ORDER BY ' + column when the column is in the list `allowed`, otherwise raise ValueError('column not allowed'). The comparison is exact (case matters)."""
+      if column not in allowed:
+          raise ValueError("column not allowed")
+      return "ORDER BY " + column
+
+
+  def build_set_cookie(name, value, max_age=None, secure=True, http_only=True, same_site="Lax", path="/"):
+      """Build the text of a Set-Cookie header. Check first: the name must be non-empty and made only of letters, digits and the characters ! # $ % & ' * + - . ^ _ ` | ~ (ValueError('bad cookie')); the value must not contain a semicolon, comma, space, double quote, backslash or control character (below ' ') or DEL (ValueError('bad cookie')); same_site must be 'Strict', 'Lax' or 'None' (ValueError('bad same_site')); 'None' without secure is ValueError('SameSite=None needs Secure'); max_age must be None or a whole number of at least 0 (ValueError('bad max_age')). Then join with '; ' in this order: 'name=value', 'Max-Age=N' (only if given), 'Path=PATH', 'Secure' (if secure), 'HttpOnly' (if http_only), 'SameSite=VALUE'."""
+      allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~")
+      if not name or any(c not in allowed for c in name):
+          raise ValueError("bad cookie")
+      if any(c in ';, "\\' or ord(c) < 32 or ord(c) == 127 for c in value):
+          raise ValueError("bad cookie")
+      if same_site not in ("Strict", "Lax", "None"):
+          raise ValueError("bad same_site")
+      if same_site == "None" and not secure:
+          raise ValueError("SameSite=None needs Secure")
+      if max_age is not None and (not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0):
+          raise ValueError("bad max_age")
+      parts = [name + "=" + value]
+      if max_age is not None:
+          parts.append("Max-Age=" + str(max_age))
+      parts.append("Path=" + path)
+      if secure:
+          parts.append("Secure")
+      if http_only:
+          parts.append("HttpOnly")
+      parts.append("SameSite=" + same_site)
+      return "; ".join(parts)
+
+
+  def audit_cookie(header):
+      """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+      pieces = [p.strip() for p in header.split(";")]
+      name = pieces[0].split("=", 1)[0]
+      attrs = {}
+      for p in pieces[1:]:
+          key, _, val = p.partition("=")
+          attrs[key.strip().lower()] = val.strip()
+      problems = []
+      if "secure" not in attrs:
+          problems.append("missing Secure")
+      if "httponly" not in attrs:
+          problems.append("missing HttpOnly")
+      if "samesite" not in attrs:
+          problems.append("missing SameSite")
+      elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+          problems.append("SameSite=None needs Secure")
+      if name.startswith("__Host-") and ("secure" not in attrs or attrs.get("path") != "/" or "domain" in attrs):
+          problems.append("bad __Host- prefix")
+      return problems
+
+
+  def audit_headers(headers):
+      """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+      import re
+      h = {k.lower(): str(v) for k, v in headers.items()}
+      problems = []
+      if "strict-transport-security" not in h:
+          problems.append("missing Strict-Transport-Security")
+      else:
+          m = re.search(r"max-age=(\d+)", h["strict-transport-security"], re.I)
+          if not m or int(m.group(1)) < 15552000:
+              problems.append("Strict-Transport-Security max-age too short")
+      csp = h.get("content-security-policy")
+      if csp is None:
+          problems.append("missing Content-Security-Policy")
+      else:
+          if "unsafe-inline" in csp:
+              problems.append("CSP allows unsafe-inline")
+          if "unsafe-eval" in csp:
+              problems.append("CSP allows unsafe-eval")
+      if "x-content-type-options" not in h:
+          problems.append("missing X-Content-Type-Options")
+      elif h["x-content-type-options"].strip().lower() != "nosniff":
+          problems.append("X-Content-Type-Options should be nosniff")
+      if "x-frame-options" not in h and not (csp and "frame-ancestors" in csp):
+          problems.append("missing clickjacking protection")
+      if "referrer-policy" not in h:
+          problems.append("missing Referrer-Policy")
+      if "server" in h and any(c.isdigit() for c in h["server"]):
+          problems.append("Server header reveals version")
+      return problems
+
+
+  def audit_response(headers, set_cookies):
+      """Audit a whole HTTP response. `headers` is the dict of headers and `set_cookies` the list of Set-Cookie header texts. Return (problems, grade). The problems are first 'header: ' + each problem of audit_headers, then for every cookie in order 'cookie NAME: ' + each problem of audit_cookie (NAME is the part before the first '=' of the cookie). The grade is a letter by the number of problems: 0 gives 'A', 1 or 2 'B', 3 or 4 'C', 5 or 6 'D', more than 6 'F'."""
+      problems = ["header: " + p for p in audit_headers(headers)]
+      for cookie in set_cookies:
+          name = cookie.split("=", 1)[0].strip()
+          problems.extend("cookie " + name + ": " + p for p in audit_cookie(cookie))
+      n = len(problems)
+      grade = "A" if n == 0 else "B" if n <= 2 else "C" if n <= 4 else "D" if n <= 6 else "F"
+      return problems, grade
+
+
+  def risk_score(likelihood, impact):
+      """The classic RISK = LIKELIHOOD x IMPACT, each rated from 1 (lowest) to 5 (highest). ValueError('rating must be 1 to 5') unless both are whole numbers in that range (bool is not accepted). Return the product."""
+      for v in (likelihood, impact):
+          if not isinstance(v, int) or isinstance(v, bool) or not 1 <= v <= 5:
+              raise ValueError("rating must be 1 to 5")
+      return likelihood * impact
+
+
+  def risk_level(score):
+      """Name the score: 'low' for 1 to 4, 'medium' for 5 to 9, 'high' for 10 to 16 and 'critical' for 17 to 25. ValueError('bad score') for anything else."""
+      if not isinstance(score, int) or not 1 <= score <= 25:
+          raise ValueError("bad score")
+      return "low" if score <= 4 else "medium" if score <= 9 else "high" if score <= 16 else "critical"
+
+
+  def rank_risks(risks):
+      """`risks` is a dict {name: (likelihood, impact)}. Return the list of (name, score, level) sorted with the highest score first and, for equal scores, by name (alphabetical). Bad ratings raise the ValueError of risk_score."""
+      rows = [(name, risk_score(l, i)) for name, (l, i) in risks.items()]
+      rows.sort(key=lambda r: (-r[1], r[0]))
+      return [(name, score, risk_level(score)) for name, score in rows]
+
+
+  def compare_versions(a, b):
+      """Compare two version texts such as '1.10.2' and '1.9'. Split at '.', every part must be a whole number (ValueError('bad version') otherwise, also for an empty text). A missing part counts as 0 ('1.2' equals '1.2.0'). Compare number by number (so 1.10 is newer than 1.9). Return -1 if a is older, 0 if equal, 1 if a is newer."""
+      def parts(v):
+          p = v.split(".")
+          if not all(x.isdigit() for x in p):
+              raise ValueError("bad version")
+          return [int(x) for x in p]
+      pa, pb = parts(a), parts(b)
+      n = max(len(pa), len(pb))
+      pa, pb = pa + [0] * (n - len(pa)), pb + [0] * (n - len(pb))
+      return (pa > pb) - (pa < pb)
+
+
+  def version_matches(version, spec):
+      """Does `version` satisfy the specification `spec`? The spec is one or more clauses separated by commas, each an operator followed by a version: '<1.4.2', '>=1.0,<1.4.2', '==2.0'. The operators are <, <=, >, >= and == (ignore blanks around parts). ALL clauses must hold (check every clause for validity first). ValueError('bad spec') for an empty clause or an unknown operator."""
+      ops = ["<=", ">=", "==", "<", ">"]
+      clauses = []
+      for clause in spec.split(","):
+          clause = clause.strip()
+          op = next((o for o in ops if clause.startswith(o)), None)
+          if op is None or not clause[len(op):].strip():
+              raise ValueError("bad spec")
+          clauses.append((op, clause[len(op):].strip()))
+      for op, target in clauses:
+          c = compare_versions(version, target)
+          ok = {"<": c < 0, "<=": c <= 0, ">": c > 0, ">=": c >= 0, "==": c == 0}[op]
+          if not ok:
+              return False
+      return True
+
+
+  def scan_dependencies(deps, advisories):
+      """Every program depends on libraries, and libraries have known vulnerabilities (listed in advisories such as CVE entries). `deps` is a dict {package: installed version}; `advisories` a list of dicts {'id': text, 'package': name, 'affected': spec (as for version_matches), 'severity': 'low'/'medium'/'high'/'critical'}. Return the list of (id, package, version, severity) for every advisory whose package is installed in a version that matches the affected spec, sorted with the most severe first (critical, high, medium, low) and then by id."""
+      order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+      hits = []
+      for adv in advisories:
+          v = deps.get(adv["package"])
+          if v is not None and version_matches(v, adv["affected"]):
+              hits.append((adv["id"], adv["package"], v, adv["severity"]))
+      hits.sort(key=lambda h: (order[h[3]], h[0]))
+      return hits
+
+
+  def shannon_entropy(text):
+      """The SHANNON ENTROPY of the text in bits per character: the sum over the different characters of -p * log2(p), where p is the share of that character (use math.log2). The empty text has entropy 0.0. Random secrets have a high entropy (about 4 or more); ordinary words and repeated text have a low one."""
+      import math
+      if not text:
+          return 0.0
+      n = len(text)
+      return -sum((c / n) * math.log2(c / n) for c in (text.count(ch) for ch in set(text)))
+
+
+  def find_secrets(text):
+      """A SECRET SCANNER finds passwords and keys that were pasted into code. Go through the text line by line (numbers start at 1) and return the sorted list of (line number, kind) pairs, each kind at most once per line. The kinds: 'aws key' for AKIA followed by 16 upper-case letters or digits; 'private key' for a '-----BEGIN ' ... 'PRIVATE KEY-----' marker; 'hardcoded password' for a word password, passwd, secret, token or api_key / api-key / apikey (any case) followed by optional blanks, ':' or '=', optional blanks and a quoted value of at least 6 characters without blanks (single or double quotes); and 'high entropy string' for a run of at least 24 characters from A-Z a-z 0-9 + / = _ - whose shannon_entropy is at least 4.0."""
+      import re
+      patterns = [("aws key", re.compile(r"AKIA[0-9A-Z]{16}")), ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")), ("hardcoded password", re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*['\"][^'\"\s]{6,}['\"]"))]
+      token = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+      found = set()
+      for number, line in enumerate(text.splitlines(), 1):
+          for kind, pattern in patterns:
+              if pattern.search(line):
+                  found.add((number, kind))
+          if any(shannon_entropy(t) >= 4.0 for t in token.findall(line)):
+              found.add((number, "high entropy string"))
+      return sorted(found)
+
+
+  def analyze_log(lines, threshold, window, min_users):
+      """Read a login log. Each line is 'SECONDS IP USER RESULT' (four words; RESULT is OK or FAIL); skip lines that are malformed (not four words, SECONDS not a whole number, RESULT anything else). Handle the events in the order of their time (stable for equal times). Return a dict of three sorted lists of IP addresses: 'bruteforce' = addresses with at least `threshold` FAIL events inside some window of `window` seconds (last time minus first time <= window); 'spraying' = addresses with FAIL events against at least `min_users` DIFFERENT user names (any time); 'compromised' = addresses with an OK event AFTER (or at the same time, later in the sorted order) they had become a 'bruteforce' address, that is after the failure that completed the threshold."""
+      events = []
+      for line in lines:
+          w = line.split()
+          if len(w) != 4 or not w[0].isdigit() or w[3] not in ("OK", "FAIL"):
+              continue
+          events.append((int(w[0]), w[1], w[2], w[3]))
+      events.sort(key=lambda e: e[0])
+      recent, users, flagged, compromised = {}, {}, set(), set()
+      for t, ip, user, result in events:
+          if result == "FAIL":
+              users.setdefault(ip, set()).add(user)
+              times = recent.setdefault(ip, [])
+              times.append(t)
+              while t - times[0] > window:
+                  times.pop(0)
+              if len(times) >= threshold:
+                  flagged.add(ip)
+          elif ip in flagged:
+              compromised.add(ip)
+      spraying = sorted(ip for ip, u in users.items() if len(u) >= min_users)
+      return {"bruteforce": sorted(flagged), "spraying": spraying, "compromised": sorted(compromised)}
+
+
+  def register(accounts, username, password, salt_hex, common):
+      """Create an account. The username must be 3 to 20 characters, only lower-case letters, digits and underscores (ValueError('bad username')); ValueError('username taken') if it exists in the dict `accounts`. Check the password with password_problems(password, username, common): if there are problems raise ValueError('weak password: ' + the problems joined with ', '). Otherwise store accounts[username] = {'record': hash_password(password, salt_hex, 1000), 'role': 'user'} and return the record text. (Order of checks: username format, taken, password.)"""
+      import re
+      if not re.fullmatch(r"[a-z0-9_]{3,20}", username):
+          raise ValueError("bad username")
+      if username in accounts:
+          raise ValueError("username taken")
+      problems = password_problems(password, username, common)
+      if problems:
+          raise ValueError("weak password: " + ", ".join(problems))
+      record = hash_password(password, salt_hex, 1000)
+      accounts[username] = {"record": record, "role": "user"}
+      return record
+
+
+  def login(accounts, username, password, secret, now):
+      """Log in and return a signed token. Unknown user and wrong password must look the SAME: ValueError('invalid credentials') for both (never tell an attacker which one it was). Use verify_password on the stored record. The token is sign_token({'sub': username, 'role': the role of the account, 'exp': now + 3600}, secret)."""
+      account = accounts.get(username)
+      if account is None or not verify_password(account["record"], password):
+          raise ValueError("invalid credentials")
+      return sign_token({"sub": username, "role": account["role"], "exp": now + 3600}, secret)
+
+
+  def authorize(token, secret, now, role_defs, permission):
+      """May the holder of this token do `permission`? Check the token with verify_token (its ValueErrors pass through, so an expired or forged token is refused) and return can(role_defs, [the 'role' in the payload], permission)."""
+      payload = verify_token(token, secret, now)
+      return can(role_defs, [payload["role"]], permission)
+
+
+  def render_page(title, comments):
+      """Build an HTML page for a list of (name, text) comments. The first line is '<h1>' + escape_html(title) + '</h1>'. Then one line per comment from render_comment(name, text). With no comments the second line is '<p><i>no comments</i></p>'. Join the lines with '\n'."""
+      lines = ["<h1>" + escape_html(title) + "</h1>"]
+      lines.extend(render_comment(name, text) for name, text in comments)
+      if not comments:
+          lines.append("<p><i>no comments</i></p>")
+      return "\n".join(lines)
+
+
+  def search_users(conn, prefix, min_age, sort, allowed):
+      """Find users in the database of make_db whose NAME STARTS WITH the prefix and whose age is at least min_age; return the list of names. Build the SQL like this: 'SELECT name FROM users WHERE name LIKE ? ESCAPE ' + a backslash in quotes + ' AND age >= ? ' + order_clause(sort, allowed) (so a sort column that is not allowed raises ValueError('column not allowed') BEFORE anything runs). The prefix goes in as a PLACEHOLDER value: first escape the characters backslash, % and _ with a backslash (so that they match themselves, in this order) and add % at the end."""
+      clause = order_clause(sort, allowed)
+      pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+      sql = "SELECT name FROM users WHERE name LIKE ? ESCAPE '\\' AND age >= ? " + clause
+      return [row[0] for row in conn.execute(sql, (pattern, min_age)).fetchall()]
+
+
+  def scan_project(files, deps, advisories):
+      """Scan a project. `files` is a dict {file name: text}. Return {'secrets': list of (file, line, kind) for every find_secrets result, files in sorted name order and each file's results in line order, 'vulnerable': scan_dependencies(deps, advisories)}."""
+      secrets = []
+      for name in sorted(files):
+          for line, kind in find_secrets(files[name]):
+              secrets.append((name, line, kind))
+      return {"secrets": secrets, "vulnerable": scan_dependencies(deps, advisories)}
+
+
+  def audit_site(headers, set_cookies, files, deps, advisories):
+      """The security check of a whole site. Use audit_response and scan_project. Return a dict: 'problems' (the list from audit_response), 'grade' (its grade), 'secrets' (how many secrets were found), 'vulnerable' (how many vulnerable dependencies) and 'verdict': 'pass' only if the grade is 'A' or 'B', no secrets were found and no vulnerability is 'critical' or 'high'; otherwise 'fail'."""
+      problems, grade = audit_response(headers, set_cookies)
+      scan = scan_project(files, deps, advisories)
+      serious = any(v[3] in ("critical", "high") for v in scan["vulnerable"])
+      ok = grade in ("A", "B") and not scan["secrets"] and not serious
+      return {"problems": problems, "grade": grade, "secrets": len(scan["secrets"]), "vulnerable": len(scan["vulnerable"]), "verdict": "pass" if ok else "fail"}
+
+
+  def alerts(log, threshold, window, min_users):
+      """Turn a login log into alert lines using analyze_log. The lines are 'ALERT compromised IP' for each compromised address first, then 'ALERT bruteforce IP' for each brute-force address that is NOT compromised, then 'ALERT spraying IP' for each spraying address (every list in the sorted order of analyze_log). Return the list; it is empty when all is quiet."""
+      found = analyze_log(log, threshold, window, min_users)
+      lines = ["ALERT compromised " + ip for ip in found["compromised"]]
+      lines += ["ALERT bruteforce " + ip for ip in found["bruteforce"] if ip not in found["compromised"]]
+      lines += ["ALERT spraying " + ip for ip in found["spraying"]]
+      return lines
+
+
+  def top_risks(risks, limit):
+      """The short list for the boss. Use rank_risks and return the first `limit` entries as lines 'NAME: SCORE (LEVEL)', for example 'phishing: 20 (critical)'. A limit of 0 or less gives an empty list."""
+      if limit <= 0:
+          return []
+      return [name + ": " + str(score) + " (" + level + ")" for name, score, level in rank_risks(risks)[:limit]]
+stretch: Add a lockout to `login` (lesson 4), password reset with a one-time token, two-factor codes with
+  `verify_totp`, a Content-Security-Policy builder, an `audit_site` that also checks TLS certificates,
+  a score that weights findings by severity, or write the STRIDE table for your own project.

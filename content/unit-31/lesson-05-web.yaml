@@ -1,0 +1,838 @@
+id: u31-web
+title: Web and Network Security
+minutes: 110
+objective: 'Learn how browsers and servers protect each other: cookies and their flags, the same-origin policy and CORS, security headers and TLS certificates. You will build and audit each piece and grade a whole response.'
+outcomes:
+- Set cookie flags correctly
+- Explain same-origin policy and CORS
+- Name the important security headers
+- Explain how a TLS certificate chain is checked
+- Audit a web response
+sections:
+- heading: The browser as a security guard
+  body: |-
+    Your browser runs code from many websites at once, so it enforces rules that keep them apart. The most important is the **same-origin policy**: a page may freely read responses only from its own **origin** (scheme + host name + port). `https://shop.com` cannot read your bank's pages in another tab. A server can relax this for chosen sites with **CORS** headers (`Access-Control-Allow-Origin`). Rules for CORS: list exact origins, never reflect whatever the request says, and never combine `*` with cookies.
+
+    **Cookies** carry your login, so their flags matter: `Secure` (HTTPS only), `HttpOnly` (invisible to scripts, which limits what an **XSS** bug can steal) and `SameSite` (`Lax` or `Strict` stops other sites from making your browser send the cookie, the heart of the defence against **CSRF**). The `__Host-` name prefix forces the strictest settings.
+- heading: Headers and HTTPS
+  body: |-
+    Servers turn browser protections on with **response headers**: **HSTS** tells the browser to use only HTTPS for this site for a long time, **CSP** limits where scripts may load from (a strong second defence against XSS), `X-Content-Type-Options: nosniff` stops guessing of file types, `X-Frame-Options` / `frame-ancestors` stop **clickjacking** (a page hidden in a frame so that you click something invisible), and `Referrer-Policy` limits what is leaked to other sites. Hide version numbers in `Server` headers.
+
+    **HTTPS** is HTTP over **TLS**. During the **handshake** the server sends its **certificate chain**: its own certificate (naming the site and holding its public key), the certificates of the **intermediate** authorities and a **root**. The browser checks that the name matches the address, that every certificate is within its dates, that each one is signed by the next, and that the root is in its built-in **trust store**. Then client and server agree on a fresh symmetric key (key exchange from lesson 2) and everything after is encrypted and authenticated. A **man-in-the-middle** attacker cannot pass the check without a certificate for the site, which is why certificate warnings must never be clicked away.
+
+    > **Tip:** Other everyday defences: keep software and dependencies **updated**, use a **firewall** to allow only needed ports, use **VPN** or SSH for admin access, and make **backups** that are tested and kept offline (the main defence against **ransomware**).
+examples:
+- title: Cookies, origins and headers
+  intro: Build a cookie, compare origins and answer a CORS request.
+  code: |
+    def build_set_cookie(name, value, max_age=None, secure=True, http_only=True, same_site="Lax", path="/"):
+        """Build the text of a Set-Cookie header. Check first: the name must be non-empty and made only of letters, digits and the characters ! # $ % & ' * + - . ^ _ ` | ~ (ValueError('bad cookie')); the value must not contain a semicolon, comma, space, double quote, backslash or control character (below ' ') or DEL (ValueError('bad cookie')); same_site must be 'Strict', 'Lax' or 'None' (ValueError('bad same_site')); 'None' without secure is ValueError('SameSite=None needs Secure'); max_age must be None or a whole number of at least 0 (ValueError('bad max_age')). Then join with '; ' in this order: 'name=value', 'Max-Age=N' (only if given), 'Path=PATH', 'Secure' (if secure), 'HttpOnly' (if http_only), 'SameSite=VALUE'."""
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~")
+        if not name or any(c not in allowed for c in name):
+            raise ValueError("bad cookie")
+        if any(c in ';, "\\' or ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("bad cookie")
+        if same_site not in ("Strict", "Lax", "None"):
+            raise ValueError("bad same_site")
+        if same_site == "None" and not secure:
+            raise ValueError("SameSite=None needs Secure")
+        if max_age is not None and (not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0):
+            raise ValueError("bad max_age")
+        parts = [name + "=" + value]
+        if max_age is not None:
+            parts.append("Max-Age=" + str(max_age))
+        parts.append("Path=" + path)
+        if secure:
+            parts.append("Secure")
+        if http_only:
+            parts.append("HttpOnly")
+        parts.append("SameSite=" + same_site)
+        return "; ".join(parts)
+
+
+    def audit_cookie(header):
+        """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+        pieces = [p.strip() for p in header.split(";")]
+        name = pieces[0].split("=", 1)[0]
+        attrs = {}
+        for p in pieces[1:]:
+            key, _, val = p.partition("=")
+            attrs[key.strip().lower()] = val.strip()
+        problems = []
+        if "secure" not in attrs:
+            problems.append("missing Secure")
+        if "httponly" not in attrs:
+            problems.append("missing HttpOnly")
+        if "samesite" not in attrs:
+            problems.append("missing SameSite")
+        elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+            problems.append("SameSite=None needs Secure")
+        if name.startswith("__Host-") and ("secure" not in attrs or attrs.get("path") != "/" or "domain" in attrs):
+            problems.append("bad __Host- prefix")
+        return problems
+
+
+    def same_origin(a, b):
+        """The SAME-ORIGIN POLICY lets a page read data only from its own origin: the same scheme, host name and port. Parse both URLs with urllib.parse.urlparse. Compare the scheme (lower case), the host name (urlparse(...).hostname, lower case) and the port (urlparse(...).port; a missing port means 80 for http and 443 for https). Return True only if all three are equal and the scheme is http or https; a URL without host name is never the same origin."""
+        from urllib.parse import urlparse
+        def key(url):
+            p = urlparse(url)
+            if p.scheme.lower() not in ("http", "https") or not p.hostname:
+                return None
+            return (p.scheme.lower(), p.hostname.lower(), p.port or (443 if p.scheme.lower() == "https" else 80))
+        ka, kb = key(a), key(b)
+        return ka is not None and ka == kb
+
+
+    def cors_headers(origin, allowed, credentials=False):
+        """Cross-origin resource sharing: a server can allow other origins to read its answers. `origin` is the Origin header of the request and `allowed` the list of origins the server trusts (exact text, such as 'https://app.example.com'; the entry '*' means everyone). ValueError('wildcard with credentials') if '*' is in allowed while credentials is True. If '*' is in allowed return {'Access-Control-Allow-Origin': '*'}. If the origin is in allowed return {'Access-Control-Allow-Origin': origin, 'Vary': 'Origin'} plus 'Access-Control-Allow-Credentials': 'true' when credentials is True. Otherwise return {} (no permission). Never reflect an origin that is not in the list."""
+        if "*" in allowed:
+            if credentials:
+                raise ValueError("wildcard with credentials")
+            return {"Access-Control-Allow-Origin": "*"}
+        if origin in allowed:
+            headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+            if credentials:
+                headers["Access-Control-Allow-Credentials"] = "true"
+            return headers
+        return {}
+
+
+    def audit_headers(headers):
+        """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+        import re
+        h = {k.lower(): str(v) for k, v in headers.items()}
+        problems = []
+        if "strict-transport-security" not in h:
+            problems.append("missing Strict-Transport-Security")
+        else:
+            m = re.search(r"max-age=(\d+)", h["strict-transport-security"], re.I)
+            if not m or int(m.group(1)) < 15552000:
+                problems.append("Strict-Transport-Security max-age too short")
+        csp = h.get("content-security-policy")
+        if csp is None:
+            problems.append("missing Content-Security-Policy")
+        else:
+            if "unsafe-inline" in csp:
+                problems.append("CSP allows unsafe-inline")
+            if "unsafe-eval" in csp:
+                problems.append("CSP allows unsafe-eval")
+        if "x-content-type-options" not in h:
+            problems.append("missing X-Content-Type-Options")
+        elif h["x-content-type-options"].strip().lower() != "nosniff":
+            problems.append("X-Content-Type-Options should be nosniff")
+        if "x-frame-options" not in h and not (csp and "frame-ancestors" in csp):
+            problems.append("missing clickjacking protection")
+        if "referrer-policy" not in h:
+            problems.append("missing Referrer-Policy")
+        if "server" in h and any(c.isdigit() for c in h["server"]):
+            problems.append("Server header reveals version")
+        return problems
+
+    print(build_set_cookie("sid", "r4nd0m", max_age=3600))
+    print(audit_cookie("theme=dark; Path=/"))
+    print(same_origin("https://example.com/a", "https://example.com:443/b"), same_origin("https://example.com", "https://example.com.evil.com"))
+    print(cors_headers("https://app.example.com", ["https://app.example.com"]))
+    print(cors_headers("https://evil.com", ["https://app.example.com"]))
+    print(audit_headers({"Content-Security-Policy": "default-src 'self' 'unsafe-inline'", "Server": "nginx/1.18"}))
+  output: |
+    sid=r4nd0m; Max-Age=3600; Path=/; Secure; HttpOnly; SameSite=Lax
+    ['missing Secure', 'missing HttpOnly', 'missing SameSite']
+    True False
+    {'Access-Control-Allow-Origin': 'https://app.example.com', 'Vary': 'Origin'}
+    {}
+    ['missing Strict-Transport-Security', 'CSP allows unsafe-inline', 'missing X-Content-Type-Options', 'missing clickjacking protection', 'missing Referrer-Policy', 'Server header reveals version']
+  lines:
+  - line: 105
+    note: All the protective flags are on.
+  - line: 106
+    note: The theme cookie has no flags.
+  - line: 107
+    note: The default port 443 is understood; a look-alike host is not the same origin.
+  - line: 108
+    note: The listed origin is allowed.
+  - line: 109
+    note: Unknown origins get nothing.
+  - line: 110
+    note: 'Six problems found: almost everything is missing.'
+- title: Certificates and an audit
+  intro: Check a chain for a wildcard certificate and grade a response.
+  code: |
+    def hostname_matches(pattern, host):
+        """Does a certificate name match the host? Compare in lower case. An exact match is fine. A WILDCARD pattern '*.example.com' matches exactly ONE extra label in front: 'a.example.com' yes, 'example.com' no, 'a.b.example.com' no. A '*' anywhere else in the pattern (or a lone '*') never matches."""
+        pattern, host = pattern.lower(), host.lower()
+        if "*" not in pattern:
+            return pattern == host
+        if not pattern.startswith("*.") or "*" in pattern[1:]:
+            return False
+        rest = pattern[1:]
+        return host.endswith(rest) and "." not in host[:-len(rest)] and len(host) > len(rest)
+
+
+    def validate_chain(chain, hostname, now, trusted):
+        """Check a TLS CERTIFICATE CHAIN the way a browser does. `chain` is a list of certificates, the website's first and the root last; each is a dict {'subject': name, 'issuer': name, 'not_before': time, 'not_after': time}. `trusted` is the set of issuer names the browser trusts. Return the list of problems in this order: 'empty chain' (and nothing else) for no certificates; 'hostname mismatch' unless hostname_matches(chain[0]['subject'], hostname); then for each certificate i in order 'cert I not yet valid' if now < not_before and 'cert I expired' if now > not_after; then for each i except the last 'cert I not issued by cert J' (J = i + 1) when its issuer is not the subject of the next certificate; and finally 'untrusted root' when the issuer of the LAST certificate is not in trusted."""
+        if not chain:
+            return ["empty chain"]
+        problems = []
+        if not hostname_matches(chain[0]["subject"], hostname):
+            problems.append("hostname mismatch")
+        for i, c in enumerate(chain):
+            if now < c["not_before"]:
+                problems.append("cert " + str(i) + " not yet valid")
+            if now > c["not_after"]:
+                problems.append("cert " + str(i) + " expired")
+        for i in range(len(chain) - 1):
+            if chain[i]["issuer"] != chain[i + 1]["subject"]:
+                problems.append("cert " + str(i) + " not issued by cert " + str(i + 1))
+        if chain[-1]["issuer"] not in trusted:
+            problems.append("untrusted root")
+        return problems
+
+
+    def build_set_cookie(name, value, max_age=None, secure=True, http_only=True, same_site="Lax", path="/"):
+        """Build the text of a Set-Cookie header. Check first: the name must be non-empty and made only of letters, digits and the characters ! # $ % & ' * + - . ^ _ ` | ~ (ValueError('bad cookie')); the value must not contain a semicolon, comma, space, double quote, backslash or control character (below ' ') or DEL (ValueError('bad cookie')); same_site must be 'Strict', 'Lax' or 'None' (ValueError('bad same_site')); 'None' without secure is ValueError('SameSite=None needs Secure'); max_age must be None or a whole number of at least 0 (ValueError('bad max_age')). Then join with '; ' in this order: 'name=value', 'Max-Age=N' (only if given), 'Path=PATH', 'Secure' (if secure), 'HttpOnly' (if http_only), 'SameSite=VALUE'."""
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~")
+        if not name or any(c not in allowed for c in name):
+            raise ValueError("bad cookie")
+        if any(c in ';, "\\' or ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("bad cookie")
+        if same_site not in ("Strict", "Lax", "None"):
+            raise ValueError("bad same_site")
+        if same_site == "None" and not secure:
+            raise ValueError("SameSite=None needs Secure")
+        if max_age is not None and (not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0):
+            raise ValueError("bad max_age")
+        parts = [name + "=" + value]
+        if max_age is not None:
+            parts.append("Max-Age=" + str(max_age))
+        parts.append("Path=" + path)
+        if secure:
+            parts.append("Secure")
+        if http_only:
+            parts.append("HttpOnly")
+        parts.append("SameSite=" + same_site)
+        return "; ".join(parts)
+
+
+    def audit_cookie(header):
+        """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+        pieces = [p.strip() for p in header.split(";")]
+        name = pieces[0].split("=", 1)[0]
+        attrs = {}
+        for p in pieces[1:]:
+            key, _, val = p.partition("=")
+            attrs[key.strip().lower()] = val.strip()
+        problems = []
+        if "secure" not in attrs:
+            problems.append("missing Secure")
+        if "httponly" not in attrs:
+            problems.append("missing HttpOnly")
+        if "samesite" not in attrs:
+            problems.append("missing SameSite")
+        elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+            problems.append("SameSite=None needs Secure")
+        if name.startswith("__Host-") and ("secure" not in attrs or attrs.get("path") != "/" or "domain" in attrs):
+            problems.append("bad __Host- prefix")
+        return problems
+
+
+    def audit_headers(headers):
+        """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+        import re
+        h = {k.lower(): str(v) for k, v in headers.items()}
+        problems = []
+        if "strict-transport-security" not in h:
+            problems.append("missing Strict-Transport-Security")
+        else:
+            m = re.search(r"max-age=(\d+)", h["strict-transport-security"], re.I)
+            if not m or int(m.group(1)) < 15552000:
+                problems.append("Strict-Transport-Security max-age too short")
+        csp = h.get("content-security-policy")
+        if csp is None:
+            problems.append("missing Content-Security-Policy")
+        else:
+            if "unsafe-inline" in csp:
+                problems.append("CSP allows unsafe-inline")
+            if "unsafe-eval" in csp:
+                problems.append("CSP allows unsafe-eval")
+        if "x-content-type-options" not in h:
+            problems.append("missing X-Content-Type-Options")
+        elif h["x-content-type-options"].strip().lower() != "nosniff":
+            problems.append("X-Content-Type-Options should be nosniff")
+        if "x-frame-options" not in h and not (csp and "frame-ancestors" in csp):
+            problems.append("missing clickjacking protection")
+        if "referrer-policy" not in h:
+            problems.append("missing Referrer-Policy")
+        if "server" in h and any(c.isdigit() for c in h["server"]):
+            problems.append("Server header reveals version")
+        return problems
+
+
+    def audit_response(headers, set_cookies):
+        """Audit a whole HTTP response. `headers` is the dict of headers and `set_cookies` the list of Set-Cookie header texts. Return (problems, grade). The problems are first 'header: ' + each problem of audit_headers, then for every cookie in order 'cookie NAME: ' + each problem of audit_cookie (NAME is the part before the first '=' of the cookie). The grade is a letter by the number of problems: 0 gives 'A', 1 or 2 'B', 3 or 4 'C', 5 or 6 'D', more than 6 'F'."""
+        problems = ["header: " + p for p in audit_headers(headers)]
+        for cookie in set_cookies:
+            name = cookie.split("=", 1)[0].strip()
+            problems.extend("cookie " + name + ": " + p for p in audit_cookie(cookie))
+        n = len(problems)
+        grade = "A" if n == 0 else "B" if n <= 2 else "C" if n <= 4 else "D" if n <= 6 else "F"
+        return problems, grade
+
+    leaf = {"subject": "*.example.com", "issuer": "Example CA", "not_before": 100, "not_after": 500}
+    mid = {"subject": "Example CA", "issuer": "Root CA", "not_before": 0, "not_after": 1000}
+    root = {"subject": "Root CA", "issuer": "Root CA", "not_before": 0, "not_after": 2000}
+    print(validate_chain([leaf, mid, root], "www.example.com", 200, {"Root CA"}))
+    print(validate_chain([leaf, mid, root], "example.com", 600, {"Root CA"}))
+    problems, grade = audit_response({"Strict-Transport-Security": "max-age=31536000", "Server": "Apache/2.4"}, ["sid=abc123; Path=/"])
+    print(grade)
+    for p in problems:
+        print("-", p)
+  output: |
+    []
+    ['hostname mismatch', 'cert 0 expired']
+    F
+    - header: missing Content-Security-Policy
+    - header: missing X-Content-Type-Options
+    - header: missing clickjacking protection
+    - header: missing Referrer-Policy
+    - header: Server header reveals version
+    - cookie sid: missing Secure
+    - cookie sid: missing HttpOnly
+    - cookie sid: missing SameSite
+  lines:
+  - line: 124
+    note: 'A good chain: no problems.'
+  - line: 125
+    note: The wildcard does not cover the bare domain, and the leaf has expired.
+  - line: 127
+    note: A letter for a quick overview.
+playground:
+  prompt: Parse a URL into the pieces that make up an origin.
+  code: |
+    from urllib.parse import urlparse
+    p = urlparse('https://Example.com:8443/path?x=1')
+    print(p.scheme, p.hostname, p.port)
+exercises:
+- id: cookie
+  title: Cookies
+  difficulty: 4
+  prompt: 'A **cookie** is a small piece of text the browser stores and sends back with every request to the same site; sessions depend on them. Three attributes protect them: **Secure** (only over HTTPS), **HttpOnly** (hidden from scripts, so XSS cannot steal it) and **SameSite** (limits sending with requests from other sites, which blocks most CSRF). Write `build_set_cookie(name, value, max_age=None, secure=True, http_only=True, same_site="Lax", path="/")`. Check first: the name must be non-empty and made only of letters, digits and the characters `! # $ % & '' * + - . ^ _ \` | ~` (`ValueError("bad cookie")`); the value must not contain a semicolon, comma, space, double quote, backslash or control character (below a space, or DEL) (`ValueError("bad cookie")`); `same_site` must be `"Strict"`, `"Lax"` or `"None"` (`ValueError("bad same_site")`); `"None"` without `secure` is `ValueError("SameSite=None needs Secure")`; `max_age` must be `None` or a whole number of at least 0 (`ValueError("bad max_age")`). Then join with `"; "` in this order: `name=value`, `Max-Age=N` (only if given), `Path=PATH`, `Secure` (if secure), `HttpOnly` (if http_only), `SameSite=VALUE`. Write `audit_cookie(header)`: check a Set-Cookie text and return the problems in this order: `"missing Secure"`, `"missing HttpOnly"`, `"missing SameSite"`, `"SameSite=None needs Secure"` (only when `SameSite=None` is present without Secure) and `"bad __Host- prefix"` when the cookie name starts with `__Host-` but the cookie lacks Secure, lacks `Path=/` or has a `Domain` attribute. Attribute names are not case sensitive; attributes are separated by `;` (strip blanks).'
+  starter: |-
+    def build_set_cookie(name, value, max_age=None, secure=True, http_only=True, same_site="Lax", path="/"):
+        """Build the text of a Set-Cookie header. Check first: the name must be non-empty and made only of letters, digits and the characters ! # $ % & ' * + - . ^ _ ` | ~ (ValueError('bad cookie')); the value must not contain a semicolon, comma, space, double quote, backslash or control character (below ' ') or DEL (ValueError('bad cookie')); same_site must be 'Strict', 'Lax' or 'None' (ValueError('bad same_site')); 'None' without secure is ValueError('SameSite=None needs Secure'); max_age must be None or a whole number of at least 0 (ValueError('bad max_age')). Then join with '; ' in this order: 'name=value', 'Max-Age=N' (only if given), 'Path=PATH', 'Secure' (if secure), 'HttpOnly' (if http_only), 'SameSite=VALUE'."""
+        pass
+
+
+    def audit_cookie(header):
+        """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+        pass
+  tests:
+  - name: building
+    code: |
+      assert build_set_cookie("sid", "abc123") == "sid=abc123; Path=/; Secure; HttpOnly; SameSite=Lax" and build_set_cookie("sid", "x", max_age=3600, same_site="Strict") == "sid=x; Max-Age=3600; Path=/; Secure; HttpOnly; SameSite=Strict"
+      assert build_set_cookie("t", "v", secure=False, http_only=False, same_site="Lax", path="/app", max_age=0) == "t=v; Max-Age=0; Path=/app; SameSite=Lax" and build_set_cookie("a", "", same_site="None") == "a=; Path=/; Secure; HttpOnly; SameSite=None" and build_set_cookie("__Host-id", "1") == "__Host-id=1; Path=/; Secure; HttpOnly; SameSite=Lax"
+  - name: refusing bad input
+    code: |
+      cases = [(("", "x"), "bad cookie"), (("na me", "x"), "bad cookie"), (("a=b", "x"), "bad cookie"), (("a;b", "x"), "bad cookie"), (("sid", "a;b"), "bad cookie"), (("sid", "a b"), "bad cookie"), (("sid", "a,b"), "bad cookie"), (("sid", 'a"b'), "bad cookie"), (("sid", "a\\b"), "bad cookie"), (("sid", "a\nb"), "bad cookie"), (("sid", "a\x7fb"), "bad cookie")]
+      for args, msg in cases:
+          try:
+              build_set_cookie(*args)
+              raise AssertionError("accepted " + repr(args))
+          except ValueError as e:
+              assert msg in str(e)
+      for kw, msg in (({"same_site": "Maybe"}, "bad same_site"), ({"same_site": "lax"}, "bad same_site"), ({"same_site": "None", "secure": False}, "SameSite=None needs Secure"), ({"max_age": -1}, "bad max_age"), ({"max_age": 1.5}, "bad max_age"), ({"max_age": "5"}, "bad max_age"), ({"max_age": True}, "bad max_age")):
+          try:
+              build_set_cookie("a", "b", **kw)
+              raise AssertionError("accepted " + repr(kw))
+          except ValueError as e:
+              assert msg in str(e)
+  - name: auditing
+    code: |
+      good = build_set_cookie("sid", "abc", max_age=100)
+      assert audit_cookie(good) == [] and audit_cookie("sid=abc; secure; httponly; samesite=strict") == [] and audit_cookie("sid=abc") == ["missing Secure", "missing HttpOnly", "missing SameSite"]
+      assert audit_cookie("sid=abc; Secure; HttpOnly") == ["missing SameSite"] and audit_cookie("sid=abc; HttpOnly; SameSite=None") == ["missing Secure", "SameSite=None needs Secure"] and audit_cookie("sid=abc; Secure; HttpOnly; SameSite=None") == []
+      assert audit_cookie("__Host-id=1; Secure; HttpOnly; SameSite=Lax; Path=/") == [] and audit_cookie("__Host-id=1; Secure; HttpOnly; SameSite=Lax; Path=/app") == ["bad __Host- prefix"] and audit_cookie("__Host-id=1; Secure; HttpOnly; SameSite=Lax; Path=/; Domain=example.com") == ["bad __Host- prefix"] and audit_cookie("__Host-id=1; HttpOnly; SameSite=Lax; Path=/") == ["missing Secure", "bad __Host- prefix"]
+      assert audit_cookie("a=b; Path=/; Max-Age=5") == ["missing Secure", "missing HttpOnly", "missing SameSite"]
+  hints:
+  - Check the inputs first, then assemble the pieces in the fixed order.
+  - Put the attributes into a dict with lower-case keys to make the audit easy.
+  solution: |
+    def build_set_cookie(name, value, max_age=None, secure=True, http_only=True, same_site="Lax", path="/"):
+        """Build the text of a Set-Cookie header. Check first: the name must be non-empty and made only of letters, digits and the characters ! # $ % & ' * + - . ^ _ ` | ~ (ValueError('bad cookie')); the value must not contain a semicolon, comma, space, double quote, backslash or control character (below ' ') or DEL (ValueError('bad cookie')); same_site must be 'Strict', 'Lax' or 'None' (ValueError('bad same_site')); 'None' without secure is ValueError('SameSite=None needs Secure'); max_age must be None or a whole number of at least 0 (ValueError('bad max_age')). Then join with '; ' in this order: 'name=value', 'Max-Age=N' (only if given), 'Path=PATH', 'Secure' (if secure), 'HttpOnly' (if http_only), 'SameSite=VALUE'."""
+        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~")
+        if not name or any(c not in allowed for c in name):
+            raise ValueError("bad cookie")
+        if any(c in ';, "\\' or ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("bad cookie")
+        if same_site not in ("Strict", "Lax", "None"):
+            raise ValueError("bad same_site")
+        if same_site == "None" and not secure:
+            raise ValueError("SameSite=None needs Secure")
+        if max_age is not None and (not isinstance(max_age, int) or isinstance(max_age, bool) or max_age < 0):
+            raise ValueError("bad max_age")
+        parts = [name + "=" + value]
+        if max_age is not None:
+            parts.append("Max-Age=" + str(max_age))
+        parts.append("Path=" + path)
+        if secure:
+            parts.append("Secure")
+        if http_only:
+            parts.append("HttpOnly")
+        parts.append("SameSite=" + same_site)
+        return "; ".join(parts)
+
+
+    def audit_cookie(header):
+        """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+        pieces = [p.strip() for p in header.split(";")]
+        name = pieces[0].split("=", 1)[0]
+        attrs = {}
+        for p in pieces[1:]:
+            key, _, val = p.partition("=")
+            attrs[key.strip().lower()] = val.strip()
+        problems = []
+        if "secure" not in attrs:
+            problems.append("missing Secure")
+        if "httponly" not in attrs:
+            problems.append("missing HttpOnly")
+        if "samesite" not in attrs:
+            problems.append("missing SameSite")
+        elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+            problems.append("SameSite=None needs Secure")
+        if name.startswith("__Host-") and ("secure" not in attrs or attrs.get("path") != "/" or "domain" in attrs):
+            problems.append("bad __Host- prefix")
+        return problems
+  explanation: 'Attributes protect the cookie only if the server sets them: a session cookie without HttpOnly is stolen by any XSS bug.'
+- id: origin
+  title: Same origin and CORS
+  difficulty: 5
+  prompt: 'Browsers keep websites apart with the **same-origin policy**: a page may read data only from its **own origin**, the same scheme, host name and port. Write `same_origin(a, b)`. Parse both URLs with `urllib.parse.urlparse`. Compare the scheme (lower case), the host name (`urlparse(...).hostname`, lower case) and the port (`urlparse(...).port`; a missing port means 80 for `http` and 443 for `https`). Return `True` only if all three are equal and the scheme is `http` or `https`; a URL without a host name is never the same origin. A server can **relax** the rule with **CORS** (cross-origin resource sharing) headers. Write `cors_headers(origin, allowed, credentials=False)`: `origin` is the `Origin` header of the request and `allowed` the list of origins the server trusts (exact text, such as `"https://app.example.com"`; the entry `"*"` means everyone). `ValueError("wildcard with credentials")` if `"*"` is in `allowed` while `credentials` is `True`. If `"*"` is in `allowed` return `{"Access-Control-Allow-Origin": "*"}`. If the origin is in `allowed` return `{"Access-Control-Allow-Origin": origin, "Vary": "Origin"}` plus `"Access-Control-Allow-Credentials": "true"` when `credentials` is `True`. Otherwise return `{}`. Never reflect an origin that is not in the list.'
+  starter: |-
+    def same_origin(a, b):
+        """The SAME-ORIGIN POLICY lets a page read data only from its own origin: the same scheme, host name and port. Parse both URLs with urllib.parse.urlparse. Compare the scheme (lower case), the host name (urlparse(...).hostname, lower case) and the port (urlparse(...).port; a missing port means 80 for http and 443 for https). Return True only if all three are equal and the scheme is http or https; a URL without host name is never the same origin."""
+        pass
+
+
+    def cors_headers(origin, allowed, credentials=False):
+        """Cross-origin resource sharing: a server can allow other origins to read its answers. `origin` is the Origin header of the request and `allowed` the list of origins the server trusts (exact text, such as 'https://app.example.com'; the entry '*' means everyone). ValueError('wildcard with credentials') if '*' is in allowed while credentials is True. If '*' is in allowed return {'Access-Control-Allow-Origin': '*'}. If the origin is in allowed return {'Access-Control-Allow-Origin': origin, 'Vary': 'Origin'} plus 'Access-Control-Allow-Credentials': 'true' when credentials is True. Otherwise return {} (no permission). Never reflect an origin that is not in the list."""
+        pass
+  tests:
+  - name: same origin
+    code: |
+      assert same_origin("https://example.com/a", "https://example.com/b?x=1") is True and same_origin("HTTPS://Example.COM", "https://example.com:443/") is True and same_origin("http://example.com", "http://example.com:80") is True
+      assert same_origin("https://example.com", "http://example.com") is False and same_origin("https://example.com", "https://www.example.com") is False and same_origin("https://example.com", "https://example.com:8443") is False and same_origin("https://a.example.com", "https://example.com") is False and same_origin("https://example.com.evil.com", "https://example.com") is False
+      assert same_origin("ftp://example.com", "ftp://example.com") is False and same_origin("/path", "/path") is False and same_origin("", "") is False and same_origin("https://user@example.com/", "https://example.com/") is True and same_origin("javascript:alert(1)", "javascript:alert(1)") is False
+  - name: cors
+    code: |
+      allowed = ["https://app.example.com", "https://admin.example.com"]
+      assert cors_headers("https://app.example.com", allowed) == {"Access-Control-Allow-Origin": "https://app.example.com", "Vary": "Origin"}
+      assert cors_headers("https://evil.com", allowed) == {} and cors_headers("https://app.example.com.evil.com", allowed) == {} and cors_headers("HTTPS://APP.EXAMPLE.COM", allowed) == {} and cors_headers("null", allowed) == {} and cors_headers("", allowed) == {} and cors_headers("https://app.example.com", []) == {}
+      assert cors_headers("https://admin.example.com", allowed, credentials=True) == {"Access-Control-Allow-Origin": "https://admin.example.com", "Vary": "Origin", "Access-Control-Allow-Credentials": "true"} and cors_headers("https://evil.com", allowed, credentials=True) == {}
+      assert cors_headers("https://anything.com", ["*"]) == {"Access-Control-Allow-Origin": "*"} and cors_headers("", ["https://a.com", "*"]) == {"Access-Control-Allow-Origin": "*"}
+      for o in ("https://x.com", "https://app.example.com"):
+          try:
+              cors_headers(o, ["*"], credentials=True)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "wildcard with credentials" in str(e)
+  hints:
+  - The default port depends on the scheme.
+  - Compare origins as exact text; never use startswith or endswith for them.
+  solution: |
+    def same_origin(a, b):
+        """The SAME-ORIGIN POLICY lets a page read data only from its own origin: the same scheme, host name and port. Parse both URLs with urllib.parse.urlparse. Compare the scheme (lower case), the host name (urlparse(...).hostname, lower case) and the port (urlparse(...).port; a missing port means 80 for http and 443 for https). Return True only if all three are equal and the scheme is http or https; a URL without host name is never the same origin."""
+        from urllib.parse import urlparse
+        def key(url):
+            p = urlparse(url)
+            if p.scheme.lower() not in ("http", "https") or not p.hostname:
+                return None
+            return (p.scheme.lower(), p.hostname.lower(), p.port or (443 if p.scheme.lower() == "https" else 80))
+        ka, kb = key(a), key(b)
+        return ka is not None and ka == kb
+
+
+    def cors_headers(origin, allowed, credentials=False):
+        """Cross-origin resource sharing: a server can allow other origins to read its answers. `origin` is the Origin header of the request and `allowed` the list of origins the server trusts (exact text, such as 'https://app.example.com'; the entry '*' means everyone). ValueError('wildcard with credentials') if '*' is in allowed while credentials is True. If '*' is in allowed return {'Access-Control-Allow-Origin': '*'}. If the origin is in allowed return {'Access-Control-Allow-Origin': origin, 'Vary': 'Origin'} plus 'Access-Control-Allow-Credentials': 'true' when credentials is True. Otherwise return {} (no permission). Never reflect an origin that is not in the list."""
+        if "*" in allowed:
+            if credentials:
+                raise ValueError("wildcard with credentials")
+            return {"Access-Control-Allow-Origin": "*"}
+        if origin in allowed:
+            headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+            if credentials:
+                headers["Access-Control-Allow-Credentials"] = "true"
+            return headers
+        return {}
+  explanation: 'The policy protects you: without it any page you visit could read your email in another tab. Treat every CORS rule as a hole in a wall.'
+- id: headers
+  title: Security headers
+  difficulty: 4
+  prompt: 'A server can switch on browser protections with **response headers**. **HSTS** (`Strict-Transport-Security`) forces HTTPS; **CSP** (`Content-Security-Policy`) says which scripts may run; `X-Content-Type-Options: nosniff` stops the browser guessing file types; `X-Frame-Options` or CSP `frame-ancestors` blocks **clickjacking** (your page hidden in a frame); `Referrer-Policy` limits what is leaked in the `Referer`. Write `audit_headers(headers)`. `headers` is a dict (names are **not** case sensitive). Return the list of problems in this order: (1) `"missing Strict-Transport-Security"` if absent, or `"Strict-Transport-Security max-age too short"` if its `max-age=N` is missing or below `15552000` (180 days); (2) `"missing Content-Security-Policy"` if absent, otherwise `"CSP allows unsafe-inline"` if that word occurs in it and then `"CSP allows unsafe-eval"` if that occurs; (3) `"missing X-Content-Type-Options"` if absent or `"X-Content-Type-Options should be nosniff"` if its value is anything but `nosniff` (ignoring case); (4) `"missing clickjacking protection"` when there is no `X-Frame-Options` header and no `frame-ancestors` in the Content-Security-Policy; (5) `"missing Referrer-Policy"`; (6) `"Server header reveals version"` if a `Server` header contains a digit.'
+  starter: |-
+    def audit_headers(headers):
+        """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+        pass
+  tests:
+  - name: a good response
+    code: |
+      good = {"Strict-Transport-Security": "max-age=31536000; includeSubDomains", "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Server": "nginx"}
+      assert audit_headers(good) == [] and audit_headers({k.lower(): v for k, v in good.items()}) == [] and audit_headers({k.upper(): v for k, v in good.items()}) == []
+      alt = dict(good, **{"X-Frame-Options": "DENY", "Content-Security-Policy": "default-src 'self'"})
+      assert audit_headers(alt) == []
+  - name: problems
+    code: |
+      assert audit_headers({}) == ["missing Strict-Transport-Security", "missing Content-Security-Policy", "missing X-Content-Type-Options", "missing clickjacking protection", "missing Referrer-Policy"]
+      h = {"strict-transport-security": "max-age=300", "content-security-policy": "script-src 'self' 'unsafe-inline' 'unsafe-eval'", "x-content-type-options": "sniff", "server": "Apache/2.4.1", "referrer-policy": "same-origin"}
+      assert audit_headers(h) == ["Strict-Transport-Security max-age too short", "CSP allows unsafe-inline", "CSP allows unsafe-eval", "X-Content-Type-Options should be nosniff", "missing clickjacking protection", "Server header reveals version"]
+      assert audit_headers({"Strict-Transport-Security": "includeSubDomains", "Content-Security-Policy": "default-src 'self'", "X-Content-Type-Options": "NOSNIFF", "X-Frame-Options": "SAMEORIGIN", "Referrer-Policy": "origin"}) == ["Strict-Transport-Security max-age too short"]
+      assert audit_headers({"Strict-Transport-Security": "max-age=15552000", "Content-Security-Policy": "default-src 'self'", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "origin", "Server": "cloudflare"}) == [] and audit_headers({"Strict-Transport-Security": "max-age=15551999", "Content-Security-Policy": "x", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "origin"}) == ["Strict-Transport-Security max-age too short"]
+  hints:
+  - Make a copy of the headers with lower-case names first.
+  - A regular expression finds max-age=NUMBER.
+  solution: |
+    def audit_headers(headers):
+        """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+        import re
+        h = {k.lower(): str(v) for k, v in headers.items()}
+        problems = []
+        if "strict-transport-security" not in h:
+            problems.append("missing Strict-Transport-Security")
+        else:
+            m = re.search(r"max-age=(\d+)", h["strict-transport-security"], re.I)
+            if not m or int(m.group(1)) < 15552000:
+                problems.append("Strict-Transport-Security max-age too short")
+        csp = h.get("content-security-policy")
+        if csp is None:
+            problems.append("missing Content-Security-Policy")
+        else:
+            if "unsafe-inline" in csp:
+                problems.append("CSP allows unsafe-inline")
+            if "unsafe-eval" in csp:
+                problems.append("CSP allows unsafe-eval")
+        if "x-content-type-options" not in h:
+            problems.append("missing X-Content-Type-Options")
+        elif h["x-content-type-options"].strip().lower() != "nosniff":
+            problems.append("X-Content-Type-Options should be nosniff")
+        if "x-frame-options" not in h and not (csp and "frame-ancestors" in csp):
+            problems.append("missing clickjacking protection")
+        if "referrer-policy" not in h:
+            problems.append("missing Referrer-Policy")
+        if "server" in h and any(c.isdigit() for c in h["server"]):
+            problems.append("Server header reveals version")
+        return problems
+  explanation: Tools such as securityheaders.com and Mozilla Observatory grade a site this way. Most of these headers cost one line of server configuration.
+- id: tls
+  title: Certificates
+  difficulty: 5
+  prompt: 'HTTPS proves that you are talking to the real site with a **certificate**: a signed statement ''this public key belongs to example.com'', issued by a **certificate authority** (CA) whose own certificate is signed by a higher one, up to a **root** that your browser already trusts. Write `hostname_matches(pattern, host)`: compare in lower case. An exact match is fine. A **wildcard** pattern `"*.example.com"` matches exactly **one** extra label in front: `a.example.com` yes, `example.com` no, `a.b.example.com` no. A `*` anywhere else in the pattern (or a lone `*`) never matches. Write `validate_chain(chain, hostname, now, trusted)`: `chain` is a list of certificates, the website''s first and the root last; each is a dict `{"subject": name, "issuer": name, "not_before": time, "not_after": time}`. `trusted` is the set of issuer names the browser trusts. Return the list of problems in this order: `"empty chain"` (and nothing else) for no certificates; `"hostname mismatch"` unless `hostname_matches(chain[0]["subject"], hostname)`; then for each certificate `i` in order `"cert I not yet valid"` if `now < not_before` and `"cert I expired"` if `now > not_after`; then for each `i` except the last `"cert I not issued by cert J"` (`J = i + 1`) when its issuer is not the subject of the next certificate; and finally `"untrusted root"` when the issuer of the **last** certificate is not in `trusted`.'
+  starter: |-
+    def hostname_matches(pattern, host):
+        """Does a certificate name match the host? Compare in lower case. An exact match is fine. A WILDCARD pattern '*.example.com' matches exactly ONE extra label in front: 'a.example.com' yes, 'example.com' no, 'a.b.example.com' no. A '*' anywhere else in the pattern (or a lone '*') never matches."""
+        pass
+
+
+    def validate_chain(chain, hostname, now, trusted):
+        """Check a TLS CERTIFICATE CHAIN the way a browser does. `chain` is a list of certificates, the website's first and the root last; each is a dict {'subject': name, 'issuer': name, 'not_before': time, 'not_after': time}. `trusted` is the set of issuer names the browser trusts. Return the list of problems in this order: 'empty chain' (and nothing else) for no certificates; 'hostname mismatch' unless hostname_matches(chain[0]['subject'], hostname); then for each certificate i in order 'cert I not yet valid' if now < not_before and 'cert I expired' if now > not_after; then for each i except the last 'cert I not issued by cert J' (J = i + 1) when its issuer is not the subject of the next certificate; and finally 'untrusted root' when the issuer of the LAST certificate is not in trusted."""
+        pass
+  tests:
+  - name: host names
+    code: |
+      assert hostname_matches("example.com", "example.com") and hostname_matches("Example.COM", "example.com") and hostname_matches("*.example.com", "www.example.com") and hostname_matches("*.example.com", "A.Example.com") and not hostname_matches("*.example.com", "example.com") and not hostname_matches("*.example.com", "a.b.example.com") and not hostname_matches("*.example.com", ".example.com") and not hostname_matches("*.example.com", "www.example.org") and not hostname_matches("*.example.com", "evilexample.com")
+      assert not hostname_matches("*", "anything") and not hostname_matches("w*.example.com", "www.example.com") and not hostname_matches("*.*.com", "a.b.com") and not hostname_matches("a.*.com", "a.b.com") and not hostname_matches("example.com", "www.example.com") and hostname_matches("*.co.uk", "x.co.uk")
+  - name: good and bad chains
+    code: |
+      leaf = {"subject": "www.example.com", "issuer": "Example CA", "not_before": 100, "not_after": 500}
+      mid = {"subject": "Example CA", "issuer": "Root CA", "not_before": 0, "not_after": 1000}
+      root = {"subject": "Root CA", "issuer": "Root CA", "not_before": 0, "not_after": 2000}
+      trusted = {"Root CA"}
+      assert validate_chain([leaf, mid, root], "www.example.com", 200, trusted) == [] and validate_chain([leaf, mid], "www.example.com", 200, trusted) == []
+      assert validate_chain([leaf, mid, root], "evil.com", 200, trusted) == ["hostname mismatch"] and validate_chain([leaf, mid, root], "www.example.com", 50, trusted) == ["cert 0 not yet valid"] and validate_chain([leaf, mid, root], "www.example.com", 600, trusted) == ["cert 0 expired"] and validate_chain([leaf, mid, root], "www.example.com", 1500, trusted) == ["cert 0 expired", "cert 1 expired"]
+      assert validate_chain([leaf, mid, root], "www.example.com", 200, set()) == ["untrusted root"] and validate_chain([leaf, root], "www.example.com", 200, trusted) == ["cert 0 not issued by cert 1"] and validate_chain([], "x", 0, trusted) == ["empty chain"]
+      selfsigned = {"subject": "www.example.com", "issuer": "www.example.com", "not_before": 0, "not_after": 9999}
+      assert validate_chain([selfsigned], "www.example.com", 5, trusted) == ["untrusted root"] and validate_chain([selfsigned], "other.com", 10000, trusted) == ["hostname mismatch", "cert 0 expired", "untrusted root"]
+  - name: several problems
+    code: |
+      leaf = {"subject": "*.example.com", "issuer": "Shady CA", "not_before": 100, "not_after": 500}
+      mid = {"subject": "Other CA", "issuer": "Root", "not_before": 300, "not_after": 400}
+      root = {"subject": "Root", "issuer": "Root", "not_before": 0, "not_after": 9000}
+      got = validate_chain([leaf, mid, root], "a.b.example.com", 450, {"Root"})
+      assert got == ["hostname mismatch", "cert 1 expired", "cert 0 not issued by cert 1"]
+      got = validate_chain([leaf, mid, root], "www.example.com", 50, set())
+      assert got == ["cert 0 not yet valid", "cert 1 not yet valid", "cert 0 not issued by cert 1", "untrusted root"]
+  hints:
+  - Collect the problems into one list and add them in the order of the description.
+  - 'A wildcard covers exactly one label: check that the part in front has no dot.'
+  solution: |
+    def hostname_matches(pattern, host):
+        """Does a certificate name match the host? Compare in lower case. An exact match is fine. A WILDCARD pattern '*.example.com' matches exactly ONE extra label in front: 'a.example.com' yes, 'example.com' no, 'a.b.example.com' no. A '*' anywhere else in the pattern (or a lone '*') never matches."""
+        pattern, host = pattern.lower(), host.lower()
+        if "*" not in pattern:
+            return pattern == host
+        if not pattern.startswith("*.") or "*" in pattern[1:]:
+            return False
+        rest = pattern[1:]
+        return host.endswith(rest) and "." not in host[:-len(rest)] and len(host) > len(rest)
+
+
+    def validate_chain(chain, hostname, now, trusted):
+        """Check a TLS CERTIFICATE CHAIN the way a browser does. `chain` is a list of certificates, the website's first and the root last; each is a dict {'subject': name, 'issuer': name, 'not_before': time, 'not_after': time}. `trusted` is the set of issuer names the browser trusts. Return the list of problems in this order: 'empty chain' (and nothing else) for no certificates; 'hostname mismatch' unless hostname_matches(chain[0]['subject'], hostname); then for each certificate i in order 'cert I not yet valid' if now < not_before and 'cert I expired' if now > not_after; then for each i except the last 'cert I not issued by cert J' (J = i + 1) when its issuer is not the subject of the next certificate; and finally 'untrusted root' when the issuer of the LAST certificate is not in trusted."""
+        if not chain:
+            return ["empty chain"]
+        problems = []
+        if not hostname_matches(chain[0]["subject"], hostname):
+            problems.append("hostname mismatch")
+        for i, c in enumerate(chain):
+            if now < c["not_before"]:
+                problems.append("cert " + str(i) + " not yet valid")
+            if now > c["not_after"]:
+                problems.append("cert " + str(i) + " expired")
+        for i in range(len(chain) - 1):
+            if chain[i]["issuer"] != chain[i + 1]["subject"]:
+                problems.append("cert " + str(i) + " not issued by cert " + str(i + 1))
+        if chain[-1]["issuer"] not in trusted:
+            problems.append("untrusted root")
+        return problems
+  explanation: A real browser also verifies each signature with the issuer's public key and checks revocation. Certificate transparency logs let anyone watch for certificates issued wrongly.
+- id: audit
+  title: 'Capstone: grading a response'
+  difficulty: 5
+  prompt: '`audit_headers` and `audit_cookie` are given. Write `audit_response(headers, set_cookies)`: audit a whole HTTP response. `headers` is the dict of headers and `set_cookies` the list of `Set-Cookie` header texts. Return `(problems, grade)`. The problems are first `"header: "` + each problem of `audit_headers`, then for every cookie in order `"cookie NAME: "` + each problem of `audit_cookie` (`NAME` is the part before the first `=` of the cookie text). The grade is a letter by the number of problems: 0 gives `"A"`, 1 or 2 `"B"`, 3 or 4 `"C"`, 5 or 6 `"D"`, more than 6 `"F"`.'
+  starter: |-
+    def build_set_cookie(*a):
+        pass
+
+
+    def audit_cookie(header):
+        """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+        pieces = [p.strip() for p in header.split(";")]
+        name = pieces[0].split("=", 1)[0]
+        attrs = {}
+        for p in pieces[1:]:
+            key, _, val = p.partition("=")
+            attrs[key.strip().lower()] = val.strip()
+        problems = []
+        if "secure" not in attrs:
+            problems.append("missing Secure")
+        if "httponly" not in attrs:
+            problems.append("missing HttpOnly")
+        if "samesite" not in attrs:
+            problems.append("missing SameSite")
+        elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+            problems.append("SameSite=None needs Secure")
+        if name.startswith("__Host-") and ("secure" not in attrs or attrs.get("path") != "/" or "domain" in attrs):
+            problems.append("bad __Host- prefix")
+        return problems
+
+
+    def audit_headers(headers):
+        """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+        import re
+        h = {k.lower(): str(v) for k, v in headers.items()}
+        problems = []
+        if "strict-transport-security" not in h:
+            problems.append("missing Strict-Transport-Security")
+        else:
+            m = re.search(r"max-age=(\d+)", h["strict-transport-security"], re.I)
+            if not m or int(m.group(1)) < 15552000:
+                problems.append("Strict-Transport-Security max-age too short")
+        csp = h.get("content-security-policy")
+        if csp is None:
+            problems.append("missing Content-Security-Policy")
+        else:
+            if "unsafe-inline" in csp:
+                problems.append("CSP allows unsafe-inline")
+            if "unsafe-eval" in csp:
+                problems.append("CSP allows unsafe-eval")
+        if "x-content-type-options" not in h:
+            problems.append("missing X-Content-Type-Options")
+        elif h["x-content-type-options"].strip().lower() != "nosniff":
+            problems.append("X-Content-Type-Options should be nosniff")
+        if "x-frame-options" not in h and not (csp and "frame-ancestors" in csp):
+            problems.append("missing clickjacking protection")
+        if "referrer-policy" not in h:
+            problems.append("missing Referrer-Policy")
+        if "server" in h and any(c.isdigit() for c in h["server"]):
+            problems.append("Server header reveals version")
+        return problems
+
+
+
+
+    def audit_response(headers, set_cookies):
+        """Audit a whole HTTP response. `headers` is the dict of headers and `set_cookies` the list of Set-Cookie header texts. Return (problems, grade). The problems are first 'header: ' + each problem of audit_headers, then for every cookie in order 'cookie NAME: ' + each problem of audit_cookie (NAME is the part before the first '=' of the cookie). The grade is a letter by the number of problems: 0 gives 'A', 1 or 2 'B', 3 or 4 'C', 5 or 6 'D', more than 6 'F'."""
+        pass
+  tests:
+  - name: grading
+    code: |
+      good_headers = {"Strict-Transport-Security": "max-age=31536000", "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer"}
+      assert audit_response(good_headers, ["sid=abc; Path=/; Secure; HttpOnly; SameSite=Lax"]) == ([], "A") and audit_response(good_headers, []) == ([], "A")
+      assert audit_response(dict(good_headers, Server="Apache/2.4"), []) == (["header: Server header reveals version"], "B")
+      p, g = audit_response(good_headers, ["theme=dark", "sid=abc; Secure; HttpOnly; SameSite=Lax"])
+      assert p == ["cookie theme: missing Secure", "cookie theme: missing HttpOnly", "cookie theme: missing SameSite"] and g == "C"
+  - name: a poor site
+    code: |
+      p, g = audit_response({}, [])
+      assert p == ["header: missing Strict-Transport-Security", "header: missing Content-Security-Policy", "header: missing X-Content-Type-Options", "header: missing clickjacking protection", "header: missing Referrer-Policy"] and g == "D"
+      p, g = audit_response({"Server": "IIS/10"}, ["a=1", "b=2; Secure"])
+      assert len(p) == 6 + 3 + 2 and g == "F" and p[5] == "header: Server header reveals version" and p[6:9] == ["cookie a: missing Secure", "cookie a: missing HttpOnly", "cookie a: missing SameSite"] and p[9:] == ["cookie b: missing HttpOnly", "cookie b: missing SameSite"]
+      four = {"Strict-Transport-Security": "max-age=1", "Content-Security-Policy": "unsafe-inline unsafe-eval frame-ancestors", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "x"}
+      assert audit_response(four, [])[0] == ["header: Strict-Transport-Security max-age too short", "header: CSP allows unsafe-inline", "header: CSP allows unsafe-eval"] and audit_response(four, [])[1] == "C"
+  hints:
+  - Prefix each problem with its source and keep the order.
+  - The cookie name is cookie.split('=', 1)[0].
+  solution: |
+    def build_set_cookie(*a):
+        pass
+
+
+    def audit_cookie(header):
+        """Check a Set-Cookie header text and return the list of problems, in this order: 'missing Secure', 'missing HttpOnly', 'missing SameSite', 'SameSite=None needs Secure' (only when SameSite=None is present without Secure), and 'bad __Host- prefix' when the cookie name starts with '__Host-' but the cookie lacks Secure, lacks 'Path=/' or has a Domain attribute. Attribute names are not case sensitive; attributes are separated by ';' (strip blanks)."""
+        pieces = [p.strip() for p in header.split(";")]
+        name = pieces[0].split("=", 1)[0]
+        attrs = {}
+        for p in pieces[1:]:
+            key, _, val = p.partition("=")
+            attrs[key.strip().lower()] = val.strip()
+        problems = []
+        if "secure" not in attrs:
+            problems.append("missing Secure")
+        if "httponly" not in attrs:
+            problems.append("missing HttpOnly")
+        if "samesite" not in attrs:
+            problems.append("missing SameSite")
+        elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+            problems.append("SameSite=None needs Secure")
+        if name.startswith("__Host-") and ("secure" not in attrs or attrs.get("path") != "/" or "domain" in attrs):
+            problems.append("bad __Host- prefix")
+        return problems
+
+
+    def audit_headers(headers):
+        """Check the security headers of an HTTP response. `headers` is a dict (names are not case sensitive). Return the list of problems in this order: (1) 'missing Strict-Transport-Security' if absent, or 'Strict-Transport-Security max-age too short' if its max-age=N is missing or below 15552000 (180 days); (2) 'missing Content-Security-Policy' if absent, otherwise 'CSP allows unsafe-inline' if that word occurs in it and then 'CSP allows unsafe-eval' if that occurs; (3) 'missing X-Content-Type-Options' if absent or 'X-Content-Type-Options should be nosniff' if its value is anything but nosniff (ignoring case); (4) 'missing clickjacking protection' when there is no X-Frame-Options header and no 'frame-ancestors' in the Content-Security-Policy; (5) 'missing Referrer-Policy'; (6) 'Server header reveals version' if a Server header contains a digit."""
+        import re
+        h = {k.lower(): str(v) for k, v in headers.items()}
+        problems = []
+        if "strict-transport-security" not in h:
+            problems.append("missing Strict-Transport-Security")
+        else:
+            m = re.search(r"max-age=(\d+)", h["strict-transport-security"], re.I)
+            if not m or int(m.group(1)) < 15552000:
+                problems.append("Strict-Transport-Security max-age too short")
+        csp = h.get("content-security-policy")
+        if csp is None:
+            problems.append("missing Content-Security-Policy")
+        else:
+            if "unsafe-inline" in csp:
+                problems.append("CSP allows unsafe-inline")
+            if "unsafe-eval" in csp:
+                problems.append("CSP allows unsafe-eval")
+        if "x-content-type-options" not in h:
+            problems.append("missing X-Content-Type-Options")
+        elif h["x-content-type-options"].strip().lower() != "nosniff":
+            problems.append("X-Content-Type-Options should be nosniff")
+        if "x-frame-options" not in h and not (csp and "frame-ancestors" in csp):
+            problems.append("missing clickjacking protection")
+        if "referrer-policy" not in h:
+            problems.append("missing Referrer-Policy")
+        if "server" in h and any(c.isdigit() for c in h["server"]):
+            problems.append("Server header reveals version")
+        return problems
+
+
+
+
+    def audit_response(headers, set_cookies):
+        """Audit a whole HTTP response. `headers` is the dict of headers and `set_cookies` the list of Set-Cookie header texts. Return (problems, grade). The problems are first 'header: ' + each problem of audit_headers, then for every cookie in order 'cookie NAME: ' + each problem of audit_cookie (NAME is the part before the first '=' of the cookie). The grade is a letter by the number of problems: 0 gives 'A', 1 or 2 'B', 3 or 4 'C', 5 or 6 'D', more than 6 'F'."""
+        problems = ["header: " + p for p in audit_headers(headers)]
+        for cookie in set_cookies:
+            name = cookie.split("=", 1)[0].strip()
+            problems.extend("cookie " + name + ": " + p for p in audit_cookie(cookie))
+        n = len(problems)
+        grade = "A" if n == 0 else "B" if n <= 2 else "C" if n <= 4 else "D" if n <= 6 else "F"
+        return problems, grade
+  explanation: A grade makes security visible to people who do not read headers, and gives a team a number to improve.
+commonMistakes:
+- title: Session cookies without HttpOnly and Secure
+  explanation: A script or an eavesdropper can take them.
+- title: Reflecting any Origin in CORS
+  explanation: It allows every site to read private data.
+- title: Using * with credentials
+  explanation: Browsers refuse it; do not work around it.
+- title: Ignoring certificate warnings
+  explanation: They are what stands between you and an attacker.
+- title: Matching origins with startswith
+  explanation: example.com.evil.com starts with example.com.
+summary:
+- Same-origin policy keeps sites apart; CORS relaxes it for listed origins.
+- 'Cookie flags: Secure, HttpOnly, SameSite.'
+- Security headers switch on browser protections.
+- A TLS certificate chain must match the name, be in date and end in a trusted root.
+- Audit your own site regularly.
+next: u31-threats
+quiz:
+- type: mcq
+  question: What makes two URLs the same origin?
+  options:
+  - Same scheme, host name and port
+  - Same path
+  - Same title
+  - Same IP only
+  answer: 0
+  explanation: Three parts.
+- type: mcq
+  question: What does the HttpOnly flag do?
+  options:
+  - Hides the cookie from JavaScript
+  - Forces HTTPS
+  - Limits the size
+  - Deletes it on exit
+  answer: 0
+  explanation: Limits XSS damage.
+- type: mcq
+  question: What is clickjacking?
+  options:
+  - Tricking a user into clicking a hidden framed page
+  - Stealing a mouse
+  - A DNS attack
+  - Guessing passwords
+  answer: 0
+  explanation: UI redress.
+- type: mcq
+  question: What does HSTS do?
+  options:
+  - Tells browsers to use only HTTPS for the site
+  - Encrypts cookies
+  - Blocks scripts
+  - Hashes passwords
+  answer: 0
+  explanation: Strict Transport Security.
+- type: mcq
+  question: Why check the whole certificate chain?
+  options:
+  - To make sure it leads to a trusted root
+  - To save time
+  - To find the IP
+  - To read the page
+  answer: 0
+  explanation: Chain of trust.
+- type: mcq
+  question: What is CSRF?
+  options:
+  - Making your browser send a request while you are logged in
+  - Stealing passwords by guessing
+  - Breaking encryption
+  - A DNS fault
+  answer: 0
+  explanation: Cross-site request forgery.
+- type: code
+  question: Write `is_https(url)` returning True when the URL starts with `https://` (ignoring case).
+  starter: |
+    def is_https(url):
+        pass
+  tests:
+  - name: https
+    code: |
+      assert is_https("https://example.com") is True and is_https("HTTPS://x.org/a") is True and is_https("http://example.com") is False and is_https("") is False and is_https("ftp://x") is False
+  solution: |
+    def is_https(url):
+        return url.lower().startswith("https://")

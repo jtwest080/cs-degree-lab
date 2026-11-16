@@ -1,0 +1,1030 @@
+id: u31-injection
+title: Injection and Untrusted Input
+minutes: 110
+objective: 'See how most real attacks work: **untrusted input** changes the meaning of a command. You will escape HTML, use SQL placeholders, confine file paths, quote shell arguments and check redirect targets.'
+outcomes:
+- Explain injection in one sentence
+- Prevent XSS with output escaping
+- Prevent SQL injection with placeholders
+- Stop path traversal and command injection
+- Avoid open redirects
+sections:
+- heading: One idea behind many bugs
+  body: |-
+    **Injection** happens when a program builds a command, query or page by gluing together text, and some of that text comes from an **untrusted** source (a form field, URL, file name, header). If the attacker's text contains characters that have a special meaning in the target language, the **data** becomes **code**.
+
+    The same bug appears under different names: **SQL injection** (data becomes SQL), **cross-site scripting** (**XSS**, data becomes JavaScript in someone's browser), **command injection** (data becomes shell commands), **path traversal** (`../` escapes a folder), **open redirect** (the data picks where you go). The cure is also the same: **keep data and code apart**.
+
+    1. Prefer APIs that take the data **separately** from the command: SQL placeholders, `subprocess.run([...])` without a shell, template engines that escape.
+    2. If you must build text, **escape or quote** for the exact target language (HTML escaping is different from shell quoting).
+    3. Check against an **allow-list** (what is permitted), not a block-list (what is forbidden): attackers find the case you forgot.
+    4. Validate the **final** form after decoding and normalising, not the text as typed.
+- heading: The classic attacks
+  body: |-
+    **SQL injection.** A query built as `"... WHERE name = '" + name + "'"` with the input `x' OR '1'='1` becomes `WHERE name = 'x' OR '1'='1'`, true for every row. Worse inputs end the statement and add `DROP TABLE`. With a **placeholder** (`WHERE name = ?` and the value passed separately) the database treats the whole input as a name. An **ORM** (object-relational mapper) normally does this for you.
+
+    **Cross-site scripting.** A comment `<script>...</script>` shown without escaping runs in every visitor's browser and can steal their session. Escape `& < > " '` when writing text into HTML; modern frameworks do it by default. A **Content Security Policy** header adds a second layer by telling the browser which scripts may run.
+
+    **Path traversal** reads files outside the intended folder. Normalise the path and check it is still **inside** the base folder. **Command injection** runs extra commands: avoid shells, or quote every argument. **Open redirects** let phishing links start on your trusted domain: only redirect to your own pages or an allow-list.
+
+    > **Tip:** Treat all input as hostile until it is checked, including data from your own database, other services and uploaded files.
+examples:
+- title: XSS and SQL injection
+  intro: A script in a comment, and a classic injection against a table of users.
+  code: |
+    def escape_html(text):
+        """Make text safe to put inside an HTML page. Replace & with &amp; FIRST, then < with &lt;, > with &gt;, the double quote with &quot; and the single quote with &#x27;. (Do the ampersand first, or you would escape your own entities.)"""
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
+
+
+    def render_comment(name, text):
+        """The HTML for a comment: '<p><b>NAME</b>: TEXT</p>' where NAME and TEXT are both passed through escape_html. Line breaks in the text (\n) become '<br>' AFTER the escaping."""
+        return "<p><b>" + escape_html(name) + "</b>: " + escape_html(text).replace("\n", "<br>") + "</p>"
+
+
+    class Cursor:
+        """The result of a query."""
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def __iter__(self):
+            return iter(self.rows)
+
+
+    def tokenize_sql(sql):
+        """Split SQL text into (kind, value) tokens. A quote starts a string; two quotes inside a string mean one quote. Anything unknown (such as ; or --) is a syntax error."""
+        tokens, i = [], 0
+        while i < len(sql):
+            c = sql[i]
+            if c.isspace():
+                i += 1
+            elif c == "'":
+                j, text = i + 1, ""
+                while True:
+                    if j >= len(sql):
+                        raise ValueError("syntax error: unterminated string")
+                    if sql[j] == "'":
+                        if j + 1 < len(sql) and sql[j + 1] == "'":
+                            text += "'"
+                            j += 2
+                            continue
+                        break
+                    text += sql[j]
+                    j += 1
+                tokens.append(("str", text))
+                i = j + 1
+            elif c.isalpha() or c == "_":
+                j = i
+                while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
+                    j += 1
+                tokens.append(("word", sql[i:j]))
+                i = j
+            elif c.isdigit():
+                j = i
+                while j < len(sql) and sql[j].isdigit():
+                    j += 1
+                tokens.append(("num", int(sql[i:j])))
+                i = j
+            elif sql[i:i + 2] in (">=", "<=", "!=", "<>"):
+                tokens.append(("op", sql[i:i + 2]))
+                i += 2
+            elif c in "=<>?,":
+                tokens.append(("op", c))
+                i += 1
+            else:
+                raise ValueError("syntax error near " + repr(c))
+        return tokens
+
+
+    class Conn:
+        """A tiny pretend database: one table `users` and a small part of SQL (SELECT columns FROM users [WHERE ...] [ORDER BY column [DESC]], with = != < <= > >= LIKE ... ESCAPE, AND, OR, strings, numbers and ? placeholders). Python's real sqlite3 module works the same way; this stand-in runs everywhere."""
+        COLUMNS = ["name", "age", "secret"]
+
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, sql, params=()):
+            import re
+            tokens = tokenize_sql(sql)
+            values = list(params)
+            for k, (kind, value) in enumerate(tokens):
+                if (kind, value) == ("op", "?"):
+                    if not values:
+                        raise ValueError("wrong number of parameters")
+                    tokens[k] = ("val", values.pop(0))
+            if values:
+                raise ValueError("wrong number of parameters")
+            pos = [0]
+
+            def peek():
+                return tokens[pos[0]] if pos[0] < len(tokens) else (None, None)
+
+            def keyword(word):
+                kind, value = peek()
+                if kind == "word" and value.upper() == word:
+                    pos[0] += 1
+                    return True
+                return False
+
+            def need(word):
+                if not keyword(word):
+                    raise ValueError("syntax error: expected " + word)
+
+            def column():
+                kind, value = peek()
+                if kind != "word" or value.lower() not in self.COLUMNS:
+                    raise ValueError("no such column: " + str(value))
+                pos[0] += 1
+                return value.lower()
+
+            def operand():
+                kind, value = peek()
+                if kind in ("str", "num", "val"):
+                    pos[0] += 1
+                    return lambda row: value
+                name = column()
+                return lambda row: row[name]
+
+            def comparison():
+                left = operand()
+                kind, value = peek()
+                if kind == "word" and value.upper() == "LIKE":
+                    pos[0] += 1
+                    right = operand()
+                    esc = None
+                    if keyword("ESCAPE"):
+                        esc = operand()
+
+                    def like(row):
+                        pattern, e, out, i = right(row), (esc(row) if esc else None), "", 0
+                        while i < len(pattern):
+                            ch = pattern[i]
+                            if e and ch == e and i + 1 < len(pattern):
+                                out += re.escape(pattern[i + 1])
+                                i += 1
+                            elif ch == "%":
+                                out += ".*"
+                            elif ch == "_":
+                                out += "."
+                            else:
+                                out += re.escape(ch)
+                            i += 1
+                        return re.fullmatch(out, str(left(row)), re.I | re.S) is not None
+                    return like
+                if kind != "op" or value not in ("=", "!=", "<>", "<", "<=", ">", ">="):
+                    raise ValueError("syntax error: expected a comparison")
+                pos[0] += 1
+                right = operand()
+
+                def compare(row):
+                    a, b = left(row), right(row)
+                    try:
+                        return {"=": a == b, "!=": a != b, "<>": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[value]
+                    except TypeError:
+                        return False
+                return compare
+
+            def conjunction():
+                parts = [comparison()]
+                while keyword("AND"):
+                    parts.append(comparison())
+                return lambda row: all(p(row) for p in parts)
+
+            def expression():
+                parts = [conjunction()]
+                while keyword("OR"):
+                    parts.append(conjunction())
+                return lambda row: any(p(row) for p in parts)
+
+            need("SELECT")
+            chosen = [column()]
+            while peek() == ("op", ","):
+                pos[0] += 1
+                chosen.append(column())
+            need("FROM")
+            need("USERS")
+            test = expression() if keyword("WHERE") else (lambda row: True)
+            order, descending = None, False
+            if keyword("ORDER"):
+                need("BY")
+                order = column()
+                if keyword("DESC"):
+                    descending = True
+                else:
+                    keyword("ASC")
+            if pos[0] != len(tokens):
+                raise ValueError("syntax error near " + repr(peek()[1]))
+            rows = [r for r in self.rows if test(r)]
+            if order:
+                rows = sorted(rows, key=lambda r: r[order], reverse=descending)
+            return Cursor([tuple(r[c] for c in chosen) for r in rows])
+
+
+    def make_db():
+        """A small in-memory database for the examples: the table users has the columns name, age and secret."""
+        return Conn([{"name": n, "age": a, "secret": s} for n, a, s in [("ada", 36, "s1"), ("bo", 17, "s2"), ("cy", 52, "s3"), ("o'brien", 40, "s4")]])
+
+
+    def find_users(conn, name, min_age):
+        """Return the sorted list of the NAMES of users whose name equals `name` and whose age is at least min_age. Build the query with PLACEHOLDERS: conn.execute('SELECT name FROM users WHERE name = ? AND age >= ?', (name, min_age)). Never put the values into the SQL text with + or f-strings: that allows SQL INJECTION, where input such as x' OR '1'='1 changes the meaning of the query."""
+        rows = conn.execute("SELECT name FROM users WHERE name = ? AND age >= ?", (name, min_age)).fetchall()
+        return sorted(r[0] for r in rows)
+
+
+    def order_clause(column, allowed):
+        """Placeholders cannot be used for column names, so use an ALLOW-LIST. Return 'ORDER BY ' + column when the column is in the list `allowed`, otherwise raise ValueError('column not allowed'). The comparison is exact (case matters)."""
+        if column not in allowed:
+            raise ValueError("column not allowed")
+        return "ORDER BY " + column
+
+    comment = "<script>alert('stolen cookies')</script>"
+    print(render_comment("Mallory", comment))
+    db = make_db()
+    attack = "x' OR '1'='1"
+    unsafe_sql = "SELECT name FROM users WHERE name = '" + attack + "'"
+    print(unsafe_sql)
+    print("unsafe query returns:", sorted(r[0] for r in db.execute(unsafe_sql)))
+    print("safe query returns:  ", find_users(db, attack, 0))
+  output: |
+    <p><b>Mallory</b>: &lt;script&gt;alert(&#x27;stolen cookies&#x27;)&lt;/script&gt;</p>
+    SELECT name FROM users WHERE name = 'x' OR '1'='1'
+    unsafe query returns: ['ada', 'bo', 'cy', "o'brien"]
+    safe query returns:   []
+  lines:
+  - line: 213
+    note: The script tag is shown as text, not run.
+  - line: 217
+    note: The quote ended the text and added a condition that is always true.
+  - line: 218
+    note: Every user, including the secret ones.
+  - line: 219
+    note: No user has that odd name.
+- title: Paths, commands and redirects
+  intro: Refuse the ../ trick, quote a hostile argument and check redirect targets.
+  code: |
+    def safe_join(base, user_path):
+        """Join a user-supplied path onto a base folder without allowing escape (PATH TRAVERSAL: ../../etc/passwd). Use posixpath. ValueError('bad path') if user_path contains a NUL character ('\x00') or starts with '/' (absolute) or a backslash. Otherwise normalise posixpath.join(base, user_path) with posixpath.normpath and make sure the result is the base itself or inside it (the result must equal normpath(base) or start with normpath(base) + '/'); if not raise ValueError('outside base'). Return the normalised path."""
+        import posixpath
+        if "\x00" in user_path or user_path.startswith("/") or user_path.startswith("\\"):
+            raise ValueError("bad path")
+        root = posixpath.normpath(base)
+        full = posixpath.normpath(posixpath.join(root, user_path))
+        if full != root and not full.startswith(root.rstrip("/") + "/"):
+            raise ValueError("outside base")
+        return full
+
+
+    def quote_arg(text):
+        """Make text safe as ONE argument for a Unix shell: wrap it in single quotes, and write every single quote inside it as '\\'' (end the quote, an escaped quote, start again). The empty text becomes ''. Example: it's -> 'it'\\''s'."""
+        return "'" + text.replace("'", "'\\''") + "'"
+
+
+    def build_command(program, args, allowed):
+        """Build a shell command line. The program must be in the list `allowed` (ValueError('program not allowed') otherwise: never run a program the user names). Return the program, then every argument made safe with quote_arg, joined with single spaces."""
+        if program not in allowed:
+            raise ValueError("program not allowed")
+        return " ".join([program] + [quote_arg(a) for a in args])
+
+
+    def safe_redirect(target, allowed_hosts):
+        """After login a site may send you to the page in a 'next' parameter. An attacker can try to send you to THEIR site (OPEN REDIRECT). Return target when it is safe and '/' otherwise. Safe means: (1) a path on this site: it starts with a single '/' and the second character is not '/' or a backslash, and the text has no control characters (characters below ' ', or a backslash anywhere); or (2) an absolute 'https' URL (scheme compared ignoring case) whose host name (urllib.parse.urlparse(target).hostname, which is lower case and ignores any user@ part) is exactly one of allowed_hosts (given in lower case). Anything else ('//evil.com', 'javascript:alert(1)', 'http://...', 'https://good.com.evil.com', '', ...) gives '/'."""
+        from urllib.parse import urlparse
+        if not target or any(ord(c) < 32 for c in target) or "\\" in target:
+            return "/"
+        if target.startswith("/"):
+            return target if not target.startswith("//") else "/"
+        parsed = urlparse(target)
+        if parsed.scheme.lower() == "https" and parsed.hostname in allowed_hosts:
+            return target
+        return "/"
+
+    for p in ("notes/a.txt", "../../etc/passwd", "/etc/passwd"):
+        try:
+            print(p, "->", safe_join("/srv/files", p))
+        except ValueError as e:
+            print(p, "->", "refused:", e)
+    print(build_command("ping", ["-c", "1", "x; rm -rf ~"], ["ping"]))
+    hosts = {"example.com"}
+    for t in ("/account", "//evil.com", "https://example.com/pay", "https://example.com@evil.com/"):
+        print(t, "->", safe_redirect(t, hosts))
+  output: |
+    notes/a.txt -> /srv/files/notes/a.txt
+    ../../etc/passwd -> refused: outside base
+    /etc/passwd -> refused: bad path
+    ping '-c' '1' 'x; rm -rf ~'
+    /account -> /account
+    //evil.com -> /
+    https://example.com/pay -> https://example.com/pay
+    https://example.com@evil.com/ -> /
+  lines:
+  - line: 37
+    note: Only the first path stays inside the base folder.
+  - line: 42
+    note: The hostile text is just one quoted argument.
+  - line: 44
+    note: Only local paths and allowed hosts pass.
+playground:
+  prompt: Use Python's own HTML escaping and shell quoting.
+  code: |
+    import html, shlex
+    print(html.escape('<b>"x"</b>'))
+    print(shlex.quote("it's"))
+exercises:
+- id: html
+  title: Escaping output
+  difficulty: 3
+  prompt: '**Cross-site scripting** (**XSS**) happens when a site puts user text into a page without **escaping**, so that a comment like `<script>steal()</script>` runs as code in other users'' browsers. The cure is to turn special characters into harmless **entities**. Write `escape_html(text)`: replace `&` with `&amp;` **first**, then `<` with `&lt;`, `>` with `&gt;`, the double quote with `&quot;` and the single quote with `&#x27;`. (Do the ampersand first, or you would escape your own entities.) Write `render_comment(name, text)`: the HTML `<p><b>NAME</b>: TEXT</p>` where `NAME` and `TEXT` are both passed through `escape_html`. Line breaks in the text (`\n`) become `<br>` **after** the escaping.'
+  starter: |-
+    def escape_html(text):
+        """Make text safe to put inside an HTML page. Replace & with &amp; FIRST, then < with &lt;, > with &gt;, the double quote with &quot; and the single quote with &#x27;. (Do the ampersand first, or you would escape your own entities.)"""
+        pass
+
+
+    def render_comment(name, text):
+        """The HTML for a comment: '<p><b>NAME</b>: TEXT</p>' where NAME and TEXT are both passed through escape_html. Line breaks in the text (\n) become '<br>' AFTER the escaping."""
+        pass
+  tests:
+  - name: escaping
+    code: |
+      assert escape_html("<b>hi</b>") == "&lt;b&gt;hi&lt;/b&gt;" and escape_html("a & b") == "a &amp; b" and escape_html("&lt;") == "&amp;lt;" and escape_html('say "hi"') == "say &quot;hi&quot;" and escape_html("it's") == "it&#x27;s" and escape_html("") == "" and escape_html("plain text 123") == "plain text 123"
+      assert escape_html("<img src=x onerror=alert(1)>") == "&lt;img src=x onerror=alert(1)&gt;" and escape_html("<script>alert('x')</script>") == "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;"
+  - name: comments
+    code: |
+      assert render_comment("Ada", "Nice!") == "<p><b>Ada</b>: Nice!</p>" and render_comment("<i>Bo</i>", "x < y") == "<p><b>&lt;i&gt;Bo&lt;/i&gt;</b>: x &lt; y</p>"
+      assert render_comment("Cy", "line one\nline two") == "<p><b>Cy</b>: line one<br>line two</p>" and render_comment("Di", "<script>x()</script>\n<b>") == "<p><b>Di</b>: &lt;script&gt;x()&lt;/script&gt;<br>&lt;b&gt;</p>" and render_comment("", "") == "<p><b></b>: </p>"
+      assert "<script" not in render_comment("<script>", "<script>")
+  hints:
+  - Replace the ampersand before the other characters.
+  - Insert the <br> tags last, because escaping would turn them into text.
+  solution: |
+    def escape_html(text):
+        """Make text safe to put inside an HTML page. Replace & with &amp; FIRST, then < with &lt;, > with &gt;, the double quote with &quot; and the single quote with &#x27;. (Do the ampersand first, or you would escape your own entities.)"""
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
+
+
+    def render_comment(name, text):
+        """The HTML for a comment: '<p><b>NAME</b>: TEXT</p>' where NAME and TEXT are both passed through escape_html. Line breaks in the text (\n) become '<br>' AFTER the escaping."""
+        return "<p><b>" + escape_html(name) + "</b>: " + escape_html(text).replace("\n", "<br>") + "</p>"
+  explanation: Modern frameworks (React, Django templates) escape by default; the dangerous moment is when you switch that off or build HTML text by hand.
+- id: sql
+  title: SQL injection
+  difficulty: 4
+  prompt: 'When a program builds a database query by gluing text together, user input can change the **meaning** of the query. This is **SQL injection**, among the most damaging web bugs. `make_db()` is given: a small pretend database with a `users` table (`name`, `age`, `secret`) that understands a small part of SQL (Python''s real `sqlite3` module works the same way, but this stand-in runs in every browser). Write `find_users(conn, name, min_age)`: return the sorted list of the **names** of users whose name equals `name` and whose age is at least `min_age`. Build the query with **placeholders**: `conn.execute("SELECT name FROM users WHERE name = ? AND age >= ?", (name, min_age))`. Never put the values into the SQL text with `+` or f-strings. Write `order_clause(column, allowed)`: placeholders cannot be used for column names, so use an **allow-list**: return `"ORDER BY " + column` when the column is in the list `allowed`, otherwise raise `ValueError("column not allowed")` (the comparison is exact: case matters).'
+  starter: |-
+    class Cursor:
+        """The result of a query."""
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def __iter__(self):
+            return iter(self.rows)
+
+
+    def tokenize_sql(sql):
+        """Split SQL text into (kind, value) tokens. A quote starts a string; two quotes inside a string mean one quote. Anything unknown (such as ; or --) is a syntax error."""
+        tokens, i = [], 0
+        while i < len(sql):
+            c = sql[i]
+            if c.isspace():
+                i += 1
+            elif c == "'":
+                j, text = i + 1, ""
+                while True:
+                    if j >= len(sql):
+                        raise ValueError("syntax error: unterminated string")
+                    if sql[j] == "'":
+                        if j + 1 < len(sql) and sql[j + 1] == "'":
+                            text += "'"
+                            j += 2
+                            continue
+                        break
+                    text += sql[j]
+                    j += 1
+                tokens.append(("str", text))
+                i = j + 1
+            elif c.isalpha() or c == "_":
+                j = i
+                while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
+                    j += 1
+                tokens.append(("word", sql[i:j]))
+                i = j
+            elif c.isdigit():
+                j = i
+                while j < len(sql) and sql[j].isdigit():
+                    j += 1
+                tokens.append(("num", int(sql[i:j])))
+                i = j
+            elif sql[i:i + 2] in (">=", "<=", "!=", "<>"):
+                tokens.append(("op", sql[i:i + 2]))
+                i += 2
+            elif c in "=<>?,":
+                tokens.append(("op", c))
+                i += 1
+            else:
+                raise ValueError("syntax error near " + repr(c))
+        return tokens
+
+
+    class Conn:
+        """A tiny pretend database: one table `users` and a small part of SQL (SELECT columns FROM users [WHERE ...] [ORDER BY column [DESC]], with = != < <= > >= LIKE ... ESCAPE, AND, OR, strings, numbers and ? placeholders). Python's real sqlite3 module works the same way; this stand-in runs everywhere."""
+        COLUMNS = ["name", "age", "secret"]
+
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, sql, params=()):
+            import re
+            tokens = tokenize_sql(sql)
+            values = list(params)
+            for k, (kind, value) in enumerate(tokens):
+                if (kind, value) == ("op", "?"):
+                    if not values:
+                        raise ValueError("wrong number of parameters")
+                    tokens[k] = ("val", values.pop(0))
+            if values:
+                raise ValueError("wrong number of parameters")
+            pos = [0]
+
+            def peek():
+                return tokens[pos[0]] if pos[0] < len(tokens) else (None, None)
+
+            def keyword(word):
+                kind, value = peek()
+                if kind == "word" and value.upper() == word:
+                    pos[0] += 1
+                    return True
+                return False
+
+            def need(word):
+                if not keyword(word):
+                    raise ValueError("syntax error: expected " + word)
+
+            def column():
+                kind, value = peek()
+                if kind != "word" or value.lower() not in self.COLUMNS:
+                    raise ValueError("no such column: " + str(value))
+                pos[0] += 1
+                return value.lower()
+
+            def operand():
+                kind, value = peek()
+                if kind in ("str", "num", "val"):
+                    pos[0] += 1
+                    return lambda row: value
+                name = column()
+                return lambda row: row[name]
+
+            def comparison():
+                left = operand()
+                kind, value = peek()
+                if kind == "word" and value.upper() == "LIKE":
+                    pos[0] += 1
+                    right = operand()
+                    esc = None
+                    if keyword("ESCAPE"):
+                        esc = operand()
+
+                    def like(row):
+                        pattern, e, out, i = right(row), (esc(row) if esc else None), "", 0
+                        while i < len(pattern):
+                            ch = pattern[i]
+                            if e and ch == e and i + 1 < len(pattern):
+                                out += re.escape(pattern[i + 1])
+                                i += 1
+                            elif ch == "%":
+                                out += ".*"
+                            elif ch == "_":
+                                out += "."
+                            else:
+                                out += re.escape(ch)
+                            i += 1
+                        return re.fullmatch(out, str(left(row)), re.I | re.S) is not None
+                    return like
+                if kind != "op" or value not in ("=", "!=", "<>", "<", "<=", ">", ">="):
+                    raise ValueError("syntax error: expected a comparison")
+                pos[0] += 1
+                right = operand()
+
+                def compare(row):
+                    a, b = left(row), right(row)
+                    try:
+                        return {"=": a == b, "!=": a != b, "<>": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[value]
+                    except TypeError:
+                        return False
+                return compare
+
+            def conjunction():
+                parts = [comparison()]
+                while keyword("AND"):
+                    parts.append(comparison())
+                return lambda row: all(p(row) for p in parts)
+
+            def expression():
+                parts = [conjunction()]
+                while keyword("OR"):
+                    parts.append(conjunction())
+                return lambda row: any(p(row) for p in parts)
+
+            need("SELECT")
+            chosen = [column()]
+            while peek() == ("op", ","):
+                pos[0] += 1
+                chosen.append(column())
+            need("FROM")
+            need("USERS")
+            test = expression() if keyword("WHERE") else (lambda row: True)
+            order, descending = None, False
+            if keyword("ORDER"):
+                need("BY")
+                order = column()
+                if keyword("DESC"):
+                    descending = True
+                else:
+                    keyword("ASC")
+            if pos[0] != len(tokens):
+                raise ValueError("syntax error near " + repr(peek()[1]))
+            rows = [r for r in self.rows if test(r)]
+            if order:
+                rows = sorted(rows, key=lambda r: r[order], reverse=descending)
+            return Cursor([tuple(r[c] for c in chosen) for r in rows])
+
+
+    def make_db():
+        """A small in-memory database for the examples: the table users has the columns name, age and secret."""
+        return Conn([{"name": n, "age": a, "secret": s} for n, a, s in [("ada", 36, "s1"), ("bo", 17, "s2"), ("cy", 52, "s3"), ("o'brien", 40, "s4")]])
+
+
+
+
+    def find_users(conn, name, min_age):
+        """Return the sorted list of the NAMES of users whose name equals `name` and whose age is at least min_age. Build the query with PLACEHOLDERS: conn.execute('SELECT name FROM users WHERE name = ? AND age >= ?', (name, min_age)). Never put the values into the SQL text with + or f-strings: that allows SQL INJECTION, where input such as x' OR '1'='1 changes the meaning of the query."""
+        pass
+
+
+    def order_clause(column, allowed):
+        """Placeholders cannot be used for column names, so use an ALLOW-LIST. Return 'ORDER BY ' + column when the column is in the list `allowed`, otherwise raise ValueError('column not allowed'). The comparison is exact (case matters)."""
+        pass
+  tests:
+  - name: safe lookups
+    code: |
+      db = make_db()
+      assert find_users(db, "ada", 0) == ["ada"] and find_users(db, "ada", 37) == [] and find_users(db, "bo", 17) == ["bo"] and find_users(db, "nobody", 0) == [] and find_users(db, "o'brien", 18) == ["o'brien"]
+      assert len(db.execute("SELECT name FROM users").fetchall()) == 4
+  - name: attacks fail
+    code: |
+      db = make_db()
+      for attack in ("x' OR '1'='1", "' OR 1=1 --", "ada' --", "ada'; DROP TABLE users; --", "%", "ada' UNION SELECT secret FROM users --"):
+          assert find_users(db, attack, 0) == []
+      assert len(db.execute("SELECT name FROM users").fetchall()) == 4
+      unsafe = "SELECT name FROM users WHERE name = '" + "x' OR '1'='1" + "'"
+      assert len(db.execute(unsafe).fetchall()) == 4
+  - name: order by
+    code: |
+      allowed = ["name", "age"]
+      assert order_clause("name", allowed) == "ORDER BY name" and order_clause("age", allowed) == "ORDER BY age"
+      for bad in ("secret", "Name", "name; DROP TABLE users", "", "name DESC", "1"):
+          try:
+              order_clause(bad, allowed)
+              raise AssertionError("accepted " + bad)
+          except ValueError as e:
+              assert "column not allowed" in str(e)
+      db = make_db()
+      rows = db.execute("SELECT name FROM users " + order_clause("age", allowed)).fetchall()
+      assert [r[0] for r in rows] == ["bo", "ada", "o'brien", "cy"]
+  hints:
+  - The ? marks are filled in by the database driver, which treats them as data, never as SQL.
+  - Column names cannot be parameters, so check them against a list.
+  solution: |
+    class Cursor:
+        """The result of a query."""
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def __iter__(self):
+            return iter(self.rows)
+
+
+    def tokenize_sql(sql):
+        """Split SQL text into (kind, value) tokens. A quote starts a string; two quotes inside a string mean one quote. Anything unknown (such as ; or --) is a syntax error."""
+        tokens, i = [], 0
+        while i < len(sql):
+            c = sql[i]
+            if c.isspace():
+                i += 1
+            elif c == "'":
+                j, text = i + 1, ""
+                while True:
+                    if j >= len(sql):
+                        raise ValueError("syntax error: unterminated string")
+                    if sql[j] == "'":
+                        if j + 1 < len(sql) and sql[j + 1] == "'":
+                            text += "'"
+                            j += 2
+                            continue
+                        break
+                    text += sql[j]
+                    j += 1
+                tokens.append(("str", text))
+                i = j + 1
+            elif c.isalpha() or c == "_":
+                j = i
+                while j < len(sql) and (sql[j].isalnum() or sql[j] == "_"):
+                    j += 1
+                tokens.append(("word", sql[i:j]))
+                i = j
+            elif c.isdigit():
+                j = i
+                while j < len(sql) and sql[j].isdigit():
+                    j += 1
+                tokens.append(("num", int(sql[i:j])))
+                i = j
+            elif sql[i:i + 2] in (">=", "<=", "!=", "<>"):
+                tokens.append(("op", sql[i:i + 2]))
+                i += 2
+            elif c in "=<>?,":
+                tokens.append(("op", c))
+                i += 1
+            else:
+                raise ValueError("syntax error near " + repr(c))
+        return tokens
+
+
+    class Conn:
+        """A tiny pretend database: one table `users` and a small part of SQL (SELECT columns FROM users [WHERE ...] [ORDER BY column [DESC]], with = != < <= > >= LIKE ... ESCAPE, AND, OR, strings, numbers and ? placeholders). Python's real sqlite3 module works the same way; this stand-in runs everywhere."""
+        COLUMNS = ["name", "age", "secret"]
+
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, sql, params=()):
+            import re
+            tokens = tokenize_sql(sql)
+            values = list(params)
+            for k, (kind, value) in enumerate(tokens):
+                if (kind, value) == ("op", "?"):
+                    if not values:
+                        raise ValueError("wrong number of parameters")
+                    tokens[k] = ("val", values.pop(0))
+            if values:
+                raise ValueError("wrong number of parameters")
+            pos = [0]
+
+            def peek():
+                return tokens[pos[0]] if pos[0] < len(tokens) else (None, None)
+
+            def keyword(word):
+                kind, value = peek()
+                if kind == "word" and value.upper() == word:
+                    pos[0] += 1
+                    return True
+                return False
+
+            def need(word):
+                if not keyword(word):
+                    raise ValueError("syntax error: expected " + word)
+
+            def column():
+                kind, value = peek()
+                if kind != "word" or value.lower() not in self.COLUMNS:
+                    raise ValueError("no such column: " + str(value))
+                pos[0] += 1
+                return value.lower()
+
+            def operand():
+                kind, value = peek()
+                if kind in ("str", "num", "val"):
+                    pos[0] += 1
+                    return lambda row: value
+                name = column()
+                return lambda row: row[name]
+
+            def comparison():
+                left = operand()
+                kind, value = peek()
+                if kind == "word" and value.upper() == "LIKE":
+                    pos[0] += 1
+                    right = operand()
+                    esc = None
+                    if keyword("ESCAPE"):
+                        esc = operand()
+
+                    def like(row):
+                        pattern, e, out, i = right(row), (esc(row) if esc else None), "", 0
+                        while i < len(pattern):
+                            ch = pattern[i]
+                            if e and ch == e and i + 1 < len(pattern):
+                                out += re.escape(pattern[i + 1])
+                                i += 1
+                            elif ch == "%":
+                                out += ".*"
+                            elif ch == "_":
+                                out += "."
+                            else:
+                                out += re.escape(ch)
+                            i += 1
+                        return re.fullmatch(out, str(left(row)), re.I | re.S) is not None
+                    return like
+                if kind != "op" or value not in ("=", "!=", "<>", "<", "<=", ">", ">="):
+                    raise ValueError("syntax error: expected a comparison")
+                pos[0] += 1
+                right = operand()
+
+                def compare(row):
+                    a, b = left(row), right(row)
+                    try:
+                        return {"=": a == b, "!=": a != b, "<>": a != b, "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[value]
+                    except TypeError:
+                        return False
+                return compare
+
+            def conjunction():
+                parts = [comparison()]
+                while keyword("AND"):
+                    parts.append(comparison())
+                return lambda row: all(p(row) for p in parts)
+
+            def expression():
+                parts = [conjunction()]
+                while keyword("OR"):
+                    parts.append(conjunction())
+                return lambda row: any(p(row) for p in parts)
+
+            need("SELECT")
+            chosen = [column()]
+            while peek() == ("op", ","):
+                pos[0] += 1
+                chosen.append(column())
+            need("FROM")
+            need("USERS")
+            test = expression() if keyword("WHERE") else (lambda row: True)
+            order, descending = None, False
+            if keyword("ORDER"):
+                need("BY")
+                order = column()
+                if keyword("DESC"):
+                    descending = True
+                else:
+                    keyword("ASC")
+            if pos[0] != len(tokens):
+                raise ValueError("syntax error near " + repr(peek()[1]))
+            rows = [r for r in self.rows if test(r)]
+            if order:
+                rows = sorted(rows, key=lambda r: r[order], reverse=descending)
+            return Cursor([tuple(r[c] for c in chosen) for r in rows])
+
+
+    def make_db():
+        """A small in-memory database for the examples: the table users has the columns name, age and secret."""
+        return Conn([{"name": n, "age": a, "secret": s} for n, a, s in [("ada", 36, "s1"), ("bo", 17, "s2"), ("cy", 52, "s3"), ("o'brien", 40, "s4")]])
+
+
+
+
+    def find_users(conn, name, min_age):
+        """Return the sorted list of the NAMES of users whose name equals `name` and whose age is at least min_age. Build the query with PLACEHOLDERS: conn.execute('SELECT name FROM users WHERE name = ? AND age >= ?', (name, min_age)). Never put the values into the SQL text with + or f-strings: that allows SQL INJECTION, where input such as x' OR '1'='1 changes the meaning of the query."""
+        rows = conn.execute("SELECT name FROM users WHERE name = ? AND age >= ?", (name, min_age)).fetchall()
+        return sorted(r[0] for r in rows)
+
+
+    def order_clause(column, allowed):
+        """Placeholders cannot be used for column names, so use an ALLOW-LIST. Return 'ORDER BY ' + column when the column is in the list `allowed`, otherwise raise ValueError('column not allowed'). The comparison is exact (case matters)."""
+        if column not in allowed:
+            raise ValueError("column not allowed")
+        return "ORDER BY " + column
+  explanation: The database never confuses the query with the data when they travel separately. This one habit prevents the whole class of bug.
+- id: path
+  title: Path traversal
+  difficulty: 4
+  prompt: If a program opens `base + user_filename`, a user can ask for `../../etc/passwd` and read files outside the folder (**path traversal**). Write `safe_join(base, user_path)` using `posixpath`. `ValueError("bad path")` if `user_path` contains a NUL character (`"\x00"`) or starts with `/` (absolute) or a backslash. Otherwise normalise `posixpath.join(base, user_path)` with `posixpath.normpath` and make sure the result is the base itself or **inside** it (the result must equal `normpath(base)` or start with `normpath(base) + "/"`); if not raise `ValueError("outside base")`. Return the normalised path.
+  starter: |-
+    def safe_join(base, user_path):
+        """Join a user-supplied path onto a base folder without allowing escape (PATH TRAVERSAL: ../../etc/passwd). Use posixpath. ValueError('bad path') if user_path contains a NUL character ('\x00') or starts with '/' (absolute) or a backslash. Otherwise normalise posixpath.join(base, user_path) with posixpath.normpath and make sure the result is the base itself or inside it (the result must equal normpath(base) or start with normpath(base) + '/'); if not raise ValueError('outside base'). Return the normalised path."""
+        pass
+  tests:
+  - name: allowed paths
+    code: |
+      assert safe_join("/srv/files", "report.txt") == "/srv/files/report.txt" and safe_join("/srv/files", "a/b/c.txt") == "/srv/files/a/b/c.txt" and safe_join("/srv/files/", "x") == "/srv/files/x" and safe_join("/srv/files", "") == "/srv/files" and safe_join("/srv/files", ".") == "/srv/files"
+      assert safe_join("/srv/files", "a/../b.txt") == "/srv/files/b.txt" and safe_join("/srv/files", "a/./b") == "/srv/files/a/b" and safe_join("/srv/files", "a//b") == "/srv/files/a/b" and safe_join("/srv/files", "..hidden") == "/srv/files/..hidden" and safe_join("/", "etc") == "/etc"
+  - name: attacks
+    code: |
+      for bad in ("../secret", "../../etc/passwd", "a/../../etc", "a/b/../../../x", "..", "../files2/x", "a/../.."):
+          try:
+              safe_join("/srv/files", bad)
+              raise AssertionError("accepted " + bad)
+          except ValueError as e:
+              assert "outside base" in str(e)
+      for bad in ("/etc/passwd", "\\windows\\system32", "ok\x00.txt", "/"):
+          try:
+              safe_join("/srv/files", bad)
+              raise AssertionError("accepted " + repr(bad))
+          except ValueError as e:
+              assert "bad path" in str(e)
+      try:
+          safe_join("/srv/files", "../files-evil/x")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "outside base" in str(e)
+  hints:
+  - Normalise first, then check that the result is still inside the base.
+  - Compare with base + '/' so that /srv/files-evil is not mistaken for /srv/files.
+  solution: |
+    def safe_join(base, user_path):
+        """Join a user-supplied path onto a base folder without allowing escape (PATH TRAVERSAL: ../../etc/passwd). Use posixpath. ValueError('bad path') if user_path contains a NUL character ('\x00') or starts with '/' (absolute) or a backslash. Otherwise normalise posixpath.join(base, user_path) with posixpath.normpath and make sure the result is the base itself or inside it (the result must equal normpath(base) or start with normpath(base) + '/'); if not raise ValueError('outside base'). Return the normalised path."""
+        import posixpath
+        if "\x00" in user_path or user_path.startswith("/") or user_path.startswith("\\"):
+            raise ValueError("bad path")
+        root = posixpath.normpath(base)
+        full = posixpath.normpath(posixpath.join(root, user_path))
+        if full != root and not full.startswith(root.rstrip("/") + "/"):
+            raise ValueError("outside base")
+        return full
+  explanation: 'Check the final, normalised path, not the text the user typed: attackers use encodings and tricks to disguise ..'
+- id: shell
+  title: Command injection
+  difficulty: 5
+  prompt: 'If a program builds a shell command from user input (`"ping " + host`), input such as `x; rm -rf ~` runs extra commands (**command injection**). The best cure is not to use a shell at all (pass a list of arguments to the program); when you must build a command line, **quote** every argument. Write `quote_arg(text)`: make text safe as **one** argument for a Unix shell: wrap it in single quotes, and write every single quote inside it as `''\''''` (end the quote, an escaped quote, start again). The empty text becomes `''''`. For example `it''s` becomes `''it''\''''s''`. Write `build_command(program, args, allowed)`: the program must be in the list `allowed` (`ValueError("program not allowed")` otherwise: never run a program the user names). Return the program, then every argument made safe with `quote_arg`, joined with single spaces.'
+  starter: |-
+    def quote_arg(text):
+        """Make text safe as ONE argument for a Unix shell: wrap it in single quotes, and write every single quote inside it as '\\'' (end the quote, an escaped quote, start again). The empty text becomes ''. Example: it's -> 'it'\\''s'."""
+        pass
+
+
+    def build_command(program, args, allowed):
+        """Build a shell command line. The program must be in the list `allowed` (ValueError('program not allowed') otherwise: never run a program the user names). Return the program, then every argument made safe with quote_arg, joined with single spaces."""
+        pass
+  tests:
+  - name: quoting
+    code: |
+      import shlex
+      assert quote_arg("hello") == "'hello'" and quote_arg("") == "''" and quote_arg("a b") == "'a b'" and quote_arg("it's") == "'it'\\''s'" and quote_arg("; rm -rf ~") == "'; rm -rf ~'" and quote_arg("$(whoami)") == "'$(whoami)'"
+      for text in ("plain", "with space", "it's", "''", "a;b|c&d", "$HOME `id` $(id)", "new\nline", "", "\"quoted\"", "back\\slash", "*.txt", "é"):
+          assert shlex.split(quote_arg(text)) == [text]
+  - name: commands
+    code: |
+      import shlex
+      allowed = ["ping", "convert"]
+      assert build_command("ping", ["-c", "1", "example.com"], allowed) == "ping '-c' '1' 'example.com'" and build_command("convert", [], allowed) == "convert"
+      evil = build_command("ping", ["x; rm -rf ~", "$(reboot)", "it's"], allowed)
+      assert shlex.split(evil) == ["ping", "x; rm -rf ~", "$(reboot)", "it's"]
+      for prog in ("rm", "ping; rm", "", "PING"):
+          try:
+              build_command(prog, [], allowed)
+              raise AssertionError("accepted " + prog)
+          except ValueError as e:
+              assert "program not allowed" in str(e)
+  hints:
+  - Single quotes switch off every special meaning except the single quote itself.
+  - 'Write each single quote as: close quote, backslash-quote, open quote.'
+  solution: |
+    def quote_arg(text):
+        """Make text safe as ONE argument for a Unix shell: wrap it in single quotes, and write every single quote inside it as '\\'' (end the quote, an escaped quote, start again). The empty text becomes ''. Example: it's -> 'it'\\''s'."""
+        return "'" + text.replace("'", "'\\''") + "'"
+
+
+    def build_command(program, args, allowed):
+        """Build a shell command line. The program must be in the list `allowed` (ValueError('program not allowed') otherwise: never run a program the user names). Return the program, then every argument made safe with quote_arg, joined with single spaces."""
+        if program not in allowed:
+            raise ValueError("program not allowed")
+        return " ".join([program] + [quote_arg(a) for a in args])
+  explanation: 'In Python prefer subprocess.run([program, arg1, arg2]) without shell=True: then no quoting is needed because no shell is involved.'
+- id: redirect
+  title: 'Capstone: safe redirects'
+  difficulty: 5
+  prompt: 'After login a site may send you to the page named in a `next` parameter. An attacker can try to send you to **their** site, which then looks like the real one (an **open redirect**). Write `safe_redirect(target, allowed_hosts)`: return `target` when it is safe and `"/"` otherwise. Safe means: (1) a path on this site: it starts with a single `/` (the second character is not `/` and there is no backslash anywhere) and the text has no control characters (characters below a space); or (2) an absolute `https` URL (scheme compared ignoring case) whose host name (`urllib.parse.urlparse(target).hostname`, which is lower case and ignores any `user@` part) is **exactly** one of `allowed_hosts` (given in lower case). Anything else (`//evil.com`, `javascript:alert(1)`, `http://...`, `https://good.com.evil.com`, the empty text, ...) gives `"/"`.'
+  starter: |-
+    def safe_redirect(target, allowed_hosts):
+        """After login a site may send you to the page in a 'next' parameter. An attacker can try to send you to THEIR site (OPEN REDIRECT). Return target when it is safe and '/' otherwise. Safe means: (1) a path on this site: it starts with a single '/' and the second character is not '/' or a backslash, and the text has no control characters (characters below ' ', or a backslash anywhere); or (2) an absolute 'https' URL (scheme compared ignoring case) whose host name (urllib.parse.urlparse(target).hostname, which is lower case and ignores any user@ part) is exactly one of allowed_hosts (given in lower case). Anything else ('//evil.com', 'javascript:alert(1)', 'http://...', 'https://good.com.evil.com', '', ...) gives '/'."""
+        pass
+  tests:
+  - name: safe targets
+    code: |
+      hosts = {"shop.example.com", "example.com"}
+      for ok in ("/", "/account", "/orders?id=5#top", "https://example.com/pay", "https://shop.example.com", "HTTPS://example.com/x", "https://EXAMPLE.com/x", "https://example.com:8443/x"):
+          assert safe_redirect(ok, hosts) == ok
+  - name: attacks
+    code: |
+      hosts = {"shop.example.com", "example.com"}
+      for bad in ("", "//evil.com", "//example.com", "/\\evil.com", "\\\\evil.com", "http://example.com/x", "https://evil.com", "https://example.com.evil.com", "https://evil.com/example.com", "https://example.com@evil.com/", "https://evil.com#@example.com", "javascript:alert(1)", "data:text/html,x", "ftp://example.com", "evil.com", "example.com/x", "/ok\r\nSet-Cookie: x=1", "/\tevil", " /x", "https://sub.example.com/", "https://", "https:///x"):
+          assert safe_redirect(bad, hosts) == "/", bad
+      assert safe_redirect("https://example.com", set()) == "/" and safe_redirect("/x", set()) == "/x"
+  hints:
+  - Check cheap rejections first (empty, control characters, backslash).
+  - hostname already removes user@ and the port, which defeats the @ trick.
+  solution: |
+    def safe_redirect(target, allowed_hosts):
+        """After login a site may send you to the page in a 'next' parameter. An attacker can try to send you to THEIR site (OPEN REDIRECT). Return target when it is safe and '/' otherwise. Safe means: (1) a path on this site: it starts with a single '/' and the second character is not '/' or a backslash, and the text has no control characters (characters below ' ', or a backslash anywhere); or (2) an absolute 'https' URL (scheme compared ignoring case) whose host name (urllib.parse.urlparse(target).hostname, which is lower case and ignores any user@ part) is exactly one of allowed_hosts (given in lower case). Anything else ('//evil.com', 'javascript:alert(1)', 'http://...', 'https://good.com.evil.com', '', ...) gives '/'."""
+        from urllib.parse import urlparse
+        if not target or any(ord(c) < 32 for c in target) or "\\" in target:
+            return "/"
+        if target.startswith("/"):
+            return target if not target.startswith("//") else "/"
+        parsed = urlparse(target)
+        if parsed.scheme.lower() == "https" and parsed.hostname in allowed_hosts:
+            return target
+        return "/"
+  explanation: 'Check with a parser, not with startswith: attackers know a dozen ways to write a URL that looks fine to a simple check.'
+commonMistakes:
+- title: Building SQL with + or f-strings
+  explanation: Always use placeholders.
+- title: Escaping for the wrong language
+  explanation: HTML, SQL and shell each need their own escaping.
+- title: Using a block-list
+  explanation: Attackers find the one case you missed.
+- title: Checking the input before decoding
+  explanation: Check the final, normalised form.
+- title: Trusting data from inside the system
+  explanation: It may have come from a user earlier.
+summary:
+- Injection turns data into code when text is glued together.
+- 'Keep data and code apart: placeholders, argument lists, escaping templates.'
+- Escape for the exact target language.
+- Use allow-lists and check the normalised result.
+- Treat all outside data as hostile.
+next: u31-auth
+quiz:
+- type: mcq
+  question: What is the best defence against SQL injection?
+  options:
+  - Placeholders (parameterised queries)
+  - Removing quotes
+  - Longer queries
+  - Hiding the table names
+  answer: 0
+  explanation: Data travels separately.
+- type: mcq
+  question: What is XSS?
+  options:
+  - User input running as script in other people's browsers
+  - A database attack
+  - A password attack
+  - A network cable fault
+  answer: 0
+  explanation: Cross-site scripting.
+- type: mcq
+  question: Why check a path after normalising it?
+  options:
+  - ../ tricks are resolved only then
+  - It is faster
+  - Paths are case sensitive
+  - No reason
+  answer: 0
+  explanation: Check the final form.
+- type: mcq
+  question: What is an open redirect?
+  options:
+  - A link that sends users to any site an attacker chooses
+  - A broken link
+  - A fast server
+  - A redirect inside the site
+  answer: 0
+  explanation: Phishing helper.
+- type: mcq
+  question: What is better than a block-list?
+  options:
+  - An allow-list
+  - A longer block-list
+  - No checks
+  - A comment
+  answer: 0
+  explanation: Permit only what you expect.
+- type: mcq
+  question: How do you avoid command injection in Python?
+  options:
+  - Pass a list of arguments without shell=True
+  - Use eval
+  - Use os.system
+  - Remove spaces
+  answer: 0
+  explanation: No shell, no injection.
+- type: code
+  question: Write `is_safe_filename(name)` returning True only if the name is not empty, has no `/` or backslash, no NUL character and is not `.` or `..`.
+  starter: |
+    def is_safe_filename(name):
+        pass
+  tests:
+  - name: filenames
+    code: |
+      assert is_safe_filename("report.txt") is True and is_safe_filename("") is False and is_safe_filename("a/b") is False and is_safe_filename("..") is False and is_safe_filename(".") is False and is_safe_filename("a\\b") is False and is_safe_filename("a\x00b") is False and is_safe_filename("...") is True
+  solution: |
+    def is_safe_filename(name):
+        if not name or name in (".", ".."):
+            return False
+        return not any(c in name for c in ("/", "\\", "\x00"))
