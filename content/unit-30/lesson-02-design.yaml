@@ -1,0 +1,590 @@
+id: u30-design
+title: Designing Good Tests
+minutes: 110
+objective: 'Learn how to **choose** tests that find bugs: boundary values, equivalence classes, table-driven tests, and property-based testing with random inputs and **shrinking**.'
+outcomes:
+- Choose boundary values
+- Group inputs into equivalence classes
+- Write table-driven tests
+- State properties and test them with random inputs
+- Explain shrinking
+sections:
+- heading: What to test
+  body: |-
+    You can never test every input, so the skill is choosing the few that are most likely to reveal a bug. Three ideas do most of the work.
+
+    **Boundary values.** Programs are most often wrong at the edges: `<` instead of `<=`, an empty list, the last item, zero. If a function accepts 1 to 50, test 0, 1, 2, 49, 50 and 51.
+
+    **Equivalence classes.** Inputs that the code treats the same way form a class. A ticket price function may have classes child, adult and senior; one or two examples from each class (plus the edges between classes) are enough. Also include the odd classes: empty, `None`, negative, huge, text with spaces or accents.
+
+    **Typical and error cases.** Test the normal case (the **happy path**), the edges, and the cases that should be **rejected**. A test list for any function should read like a checklist of those.
+
+    > **Tip:** When you find a bug, first write a test that fails because of it, then fix the code. The test stays as a regression test.
+- heading: Tables and properties
+  body: |-
+    A **table-driven test** keeps the cases as data: a list of inputs and expected outputs, plus one loop that checks them all. Adding a case is one line, and the failure message names the row. In `pytest` this is `@pytest.mark.parametrize`.
+
+    A **property-based test** checks a *rule* rather than examples. For sorting: the result has the same length, it is in order, and sorting it again changes nothing. The tool then generates hundreds of **random** inputs (with a **seed**, so a failure can be reproduced exactly) and looks for one that breaks the rule. When it finds one, it **shrinks** it: it removes parts again and again as long as the test still fails, until a small, readable **counterexample** is left such as `[1, 0]`.
+
+    Good properties often come in these kinds: **round trip** (decode(encode(x)) == x), **invariant** (length or sum is unchanged), **idempotent** (doing it twice equals doing it once), and **comparison with a slow but obviously correct version**.
+examples:
+- title: Boundaries, tables and classes
+  intro: Test a shipping-price function at its edges.
+  code: |
+    def compare(actual, expected):
+        """Compare two values like a test framework. Return '' when they are equal. Numbers (int or float) are equal when they differ by less than 1e-9. Two lists (or tuples) of the same length are compared item by item and the FIRST difference is reported as 'item I: ' followed by the message for the two items (so nested lists work, the index counts from 0); lists of different length give 'length: expected N but got M'. Anything else is compared with ==. The message for a difference is 'expected E but got A' using repr for both values (E is the expected value, A the actual)."""
+        nums = (int, float)
+        if isinstance(actual, nums) and isinstance(expected, nums) and not isinstance(actual, bool) and not isinstance(expected, bool):
+            return "" if abs(actual - expected) < 1e-9 else "expected " + repr(expected) + " but got " + repr(actual)
+        if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+            if len(actual) != len(expected):
+                return "length: expected " + str(len(expected)) + " but got " + str(len(actual))
+            for i, (a, e) in enumerate(zip(actual, expected)):
+                msg = compare(a, e)
+                if msg:
+                    return "item " + str(i) + ": " + msg
+            return ""
+        return "" if actual == expected else "expected " + repr(expected) + " but got " + repr(actual)
+
+
+    def assert_raises(func, args, exc_name):
+        """Check that func(*args) raises the exception called exc_name (given as TEXT, such as 'ValueError'); a subclass counts too (look at the names in type(err).__mro__). Return '' when it does, 'did not raise ' + exc_name when the call returns normally, and 'raised OTHER instead of ' + exc_name (OTHER is the class name) for an exception of another kind."""
+        try:
+            func(*args)
+        except Exception as err:
+            if exc_name in [c.__name__ for c in type(err).__mro__]:
+                return ""
+            return "raised " + type(err).__name__ + " instead of " + exc_name
+        return "did not raise " + exc_name
+
+
+    def boundary_values(lo, hi):
+        """Boundary value analysis for a function that accepts the whole numbers from lo to hi (both included). Return the sorted list, without duplicates, of the values on and next to each boundary: lo - 1, lo, lo + 1, hi - 1, hi and hi + 1. ValueError('empty range') when hi < lo."""
+        if hi < lo:
+            raise ValueError("empty range")
+        return sorted({lo - 1, lo, lo + 1, hi - 1, hi, hi + 1})
+
+
+    def pick_representatives(values, classify):
+        """Equivalence classes: `classify(value)` gives the NAME of the class a value belongs to. Return a dict {class name: [smallest value of that class, largest value of that class]} for the classes that occur in `values` (the list has ONE item when the smallest and the largest are the same value). The dict keys are in sorted order."""
+        groups = {}
+        for v in values:
+            groups.setdefault(classify(v), []).append(v)
+        out = {}
+        for name in sorted(groups):
+            lo, hi = min(groups[name]), max(groups[name])
+            out[name] = [lo] if lo == hi else [lo, hi]
+        return out
+
+
+    def run_table(func, table):
+        """Table-driven tests. `table` is a list of rows (args, expected). `args` is a tuple that func is called with. If `expected` is a tuple ('raises', 'ValueError') the call must raise that exception (use assert_raises); otherwise the result is compared with compare. Return the list of problems, one text per bad row, in order: 'row I: ' followed by the message (the row index counts from 0). A function that raises an exception where a value was expected counts as a problem with the message 'raised NAME' (the class name). No problems give an empty list."""
+        problems = []
+        for i, (args, expected) in enumerate(table):
+            if isinstance(expected, tuple) and len(expected) == 2 and expected[0] == "raises":
+                msg = assert_raises(func, list(args), expected[1])
+            else:
+                try:
+                    msg = compare(func(*args), expected)
+                except Exception as err:
+                    msg = "raised " + type(err).__name__
+            if msg:
+                problems.append("row " + str(i) + ": " + msg)
+        return problems
+
+    def shipping(weight):
+        if weight < 1 or weight > 50:
+            raise ValueError("weight out of range")
+        return 5 if weight <= 10 else 9
+
+    print(boundary_values(1, 50))
+    rows = [((w,), 5 if w <= 10 else 9) for w in (1, 2, 9, 10, 11, 49, 50)]
+    rows += [((w,), ("raises", "ValueError")) for w in (0, 51)]
+    print(run_table(shipping, rows))
+    print(pick_representatives(range(0, 60), lambda w: "invalid" if w < 1 or w > 50 else "light" if w <= 10 else "heavy"))
+  output: |
+    [0, 1, 2, 49, 50, 51]
+    []
+    {'heavy': [11, 50], 'invalid': [0, 59], 'light': [1, 10]}
+  lines:
+  - line: 67
+    note: Values at both edges of the valid range.
+  - line: 70
+    note: 'An empty list: every row passed.'
+  - line: 71
+    note: One small and one large example from every class.
+- title: Properties and shrinking
+  intro: Find the smallest list that breaks a buggy sort.
+  code: |
+    def check_property(prop, gen, n, seed):
+        """Property-based testing. Make a random generator with random.Random(seed). Do up to n rounds: call gen(rng) to get a tuple of arguments, then prop(*args), which should return True. Return the FIRST argument tuple for which prop returns anything but True or raises an exception, or None if all n rounds passed."""
+        import random
+        rng = random.Random(seed)
+        for _ in range(n):
+            args = gen(rng)
+            try:
+                ok = prop(*args) is True
+            except Exception:
+                ok = False
+            if not ok:
+                return args
+        return None
+
+
+    def shrink(items, fails):
+        """Make a failing input as small as possible. `fails(items)` returns True when the list still makes the test fail. Start from `items` (which fails). Repeat: try removing ONE item at a time, from the front, and keep the first removal after which the list still fails; start again from the shorter list. Stop when no single removal still fails and return that list (a new list; the input is not changed)."""
+        current = list(items)
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(current)):
+                candidate = current[:i] + current[i + 1:]
+                if fails(candidate):
+                    current = candidate
+                    changed = True
+                    break
+        return current
+
+
+    def minimal_counterexample(prop, gen, n, seed):
+        """Find a small counterexample. `gen(rng)` returns a tuple holding ONE list; `prop(items)` should be True. Use check_property to find a failing tuple (return None if there is none) and then shrink its list with `shrink`, where a list fails if prop(list) is not True or raises. Return the shrunk list."""
+        found = check_property(prop, gen, n, seed)
+        if found is None:
+            return None
+
+        def fails(items):
+            try:
+                return prop(items) is not True
+            except Exception:
+                return True
+
+        return shrink(found[0], fails)
+
+    def my_sort(xs):
+        """A sort with a hidden bug: it reverses the result when the 2nd and 3rd smallest values are equal."""
+        out = sorted(xs)
+        if len(out) >= 4 and out[1] == out[2]:
+            out = out[::-1]
+        return out
+
+    gen = lambda rng: ([rng.randint(0, 5) for _ in range(rng.randint(6, 10))],)
+    print(check_property(lambda xs: my_sort(xs) == sorted(xs), gen, 100, 1))
+    print(minimal_counterexample(lambda xs: my_sort(xs) == sorted(xs), gen, 100, 1))
+  output: |
+    ([1, 0, 3, 0, 3, 3, 4, 0, 5],)
+    [0, 0, 0, 5]
+  lines:
+  - line: 53
+    note: A random failing list with many items, hard to read.
+  - line: 54
+    note: Shrinking leaves the smallest list that still fails.
+playground:
+  prompt: Generate reproducible random lists with a seed.
+  code: |
+    import random
+    rng = random.Random(5)
+    print([rng.randint(0, 9) for _ in range(6)])
+exercises:
+- id: boundary
+  title: Boundary values
+  difficulty: 3
+  prompt: 'Bugs love **boundaries** (`<` versus `<=`, off-by-one). For a function that accepts the whole numbers from `lo` to `hi` (both included), the best test inputs are right on and next to each end. Write `boundary_values(lo, hi)`: return the sorted list, without duplicates, of `lo - 1`, `lo`, `lo + 1`, `hi - 1`, `hi` and `hi + 1`. `ValueError("empty range")` when `hi < lo`.'
+  starter: |-
+    def boundary_values(lo, hi):
+        """Boundary value analysis for a function that accepts the whole numbers from lo to hi (both included). Return the sorted list, without duplicates, of the values on and next to each boundary: lo - 1, lo, lo + 1, hi - 1, hi and hi + 1. ValueError('empty range') when hi < lo."""
+        pass
+  tests:
+  - name: normal ranges
+    code: |
+      assert boundary_values(1, 10) == [0, 1, 2, 9, 10, 11] and boundary_values(0, 100) == [-1, 0, 1, 99, 100, 101] and boundary_values(-5, 5) == [-6, -5, -4, 4, 5, 6]
+  - name: small ranges
+    code: |
+      assert boundary_values(3, 3) == [2, 3, 4] and boundary_values(3, 4) == [2, 3, 4, 5] and boundary_values(3, 5) == [2, 3, 4, 5, 6]
+      for lo, hi in ((5, 4), (0, -1)):
+          try:
+              boundary_values(lo, hi)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "empty range" in str(e)
+  hints:
+  - Use a set to remove duplicates, then sort.
+  - Check the empty range first.
+  solution: |
+    def boundary_values(lo, hi):
+        """Boundary value analysis for a function that accepts the whole numbers from lo to hi (both included). Return the sorted list, without duplicates, of the values on and next to each boundary: lo - 1, lo, lo + 1, hi - 1, hi and hi + 1. ValueError('empty range') when hi < lo."""
+        if hi < lo:
+            raise ValueError("empty range")
+        return sorted({lo - 1, lo, lo + 1, hi - 1, hi, hi + 1})
+  explanation: 'Imagine a shop that gives a discount for 10 or more items: test 9, 10 and 11. The bug is almost always at the edge.'
+- id: classes
+  title: Equivalence classes
+  difficulty: 4
+  prompt: 'You cannot test every input, but many inputs behave **the same way**. They form an **equivalence class**; test one or two of each class and its edges. Write `pick_representatives(values, classify)`: `classify(value)` gives the **name** of the class a value belongs to. Return a dict `{class name: [smallest value, largest value]}` for the classes that occur in `values` (the list has **one** item when the smallest and the largest are the same). The keys of the dict are in **sorted** order.'
+  starter: |-
+    def pick_representatives(values, classify):
+        """Equivalence classes: `classify(value)` gives the NAME of the class a value belongs to. Return a dict {class name: [smallest value of that class, largest value of that class]} for the classes that occur in `values` (the list has ONE item when the smallest and the largest are the same value). The dict keys are in sorted order."""
+        pass
+  tests:
+  - name: grades
+    code: |
+      def grade(score):
+          return "fail" if score < 50 else "pass" if score < 90 else "distinction"
+      got = pick_representatives([95, 10, 50, 49, 89, 90, 100, 0, 70], grade)
+      assert got == {"distinction": [90, 100], "fail": [0, 49], "pass": [50, 89]} and list(got) == ["distinction", "fail", "pass"]
+  - name: small inputs
+    code: |
+      assert pick_representatives([], str) == {} and pick_representatives([5], lambda v: "x") == {"x": [5]} and pick_representatives([3, 3, 3], lambda v: "same") == {"same": [3]}
+      assert pick_representatives(["pear", "fig", "apple", "kiwi"], len) == {3: ["fig"], 4: ["kiwi", "pear"], 5: ["apple"]} and pick_representatives([1, 2, 3, 4, 5, 6], lambda v: v % 2 == 0) == {False: [1, 5], True: [2, 6]}
+  hints:
+  - Group the values by class name in a dict of lists.
+  - Each class gives its min and max, as one item when they are equal.
+  solution: |
+    def pick_representatives(values, classify):
+        """Equivalence classes: `classify(value)` gives the NAME of the class a value belongs to. Return a dict {class name: [smallest value of that class, largest value of that class]} for the classes that occur in `values` (the list has ONE item when the smallest and the largest are the same value). The dict keys are in sorted order."""
+        groups = {}
+        for v in values:
+            groups.setdefault(classify(v), []).append(v)
+        out = {}
+        for name in sorted(groups):
+            lo, hi = min(groups[name]), max(groups[name])
+            out[name] = [lo] if lo == hi else [lo, hi]
+        return out
+  explanation: 'Testing a login form: valid password, too short, too long and empty are four classes; testing a thousand random strings adds almost nothing.'
+- id: table
+  title: Table-driven tests
+  difficulty: 4
+  prompt: 'Instead of one test function per case, a **table-driven test** lists many cases as data. `compare` and `assert_raises` are given. Write `run_table(func, table)`: `table` is a list of rows `(args, expected)`. `args` is a tuple that `func` is called with. If `expected` is a tuple `("raises", "ValueError")` the call must raise that exception (use `assert_raises`); otherwise the result is compared with `compare`. Return the list of **problems**, one text per bad row in order: `"row I: "` followed by the message (the index counts from 0). A function that raises where a value was expected is a problem with the message `"raised NAME"` (the class name). No problems give an empty list.'
+  starter: |-
+    def compare(actual, expected):
+        """Compare two values like a test framework. Return '' when they are equal. Numbers (int or float) are equal when they differ by less than 1e-9. Two lists (or tuples) of the same length are compared item by item and the FIRST difference is reported as 'item I: ' followed by the message for the two items (so nested lists work, the index counts from 0); lists of different length give 'length: expected N but got M'. Anything else is compared with ==. The message for a difference is 'expected E but got A' using repr for both values (E is the expected value, A the actual)."""
+        nums = (int, float)
+        if isinstance(actual, nums) and isinstance(expected, nums) and not isinstance(actual, bool) and not isinstance(expected, bool):
+            return "" if abs(actual - expected) < 1e-9 else "expected " + repr(expected) + " but got " + repr(actual)
+        if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+            if len(actual) != len(expected):
+                return "length: expected " + str(len(expected)) + " but got " + str(len(actual))
+            for i, (a, e) in enumerate(zip(actual, expected)):
+                msg = compare(a, e)
+                if msg:
+                    return "item " + str(i) + ": " + msg
+            return ""
+        return "" if actual == expected else "expected " + repr(expected) + " but got " + repr(actual)
+
+
+    def assert_raises(func, args, exc_name):
+        """Check that func(*args) raises the exception called exc_name (given as TEXT, such as 'ValueError'); a subclass counts too (look at the names in type(err).__mro__). Return '' when it does, 'did not raise ' + exc_name when the call returns normally, and 'raised OTHER instead of ' + exc_name (OTHER is the class name) for an exception of another kind."""
+        try:
+            func(*args)
+        except Exception as err:
+            if exc_name in [c.__name__ for c in type(err).__mro__]:
+                return ""
+            return "raised " + type(err).__name__ + " instead of " + exc_name
+        return "did not raise " + exc_name
+
+
+
+
+    def run_table(func, table):
+        """Table-driven tests. `table` is a list of rows (args, expected). `args` is a tuple that func is called with. If `expected` is a tuple ('raises', 'ValueError') the call must raise that exception (use assert_raises); otherwise the result is compared with compare. Return the list of problems, one text per bad row, in order: 'row I: ' followed by the message (the row index counts from 0). A function that raises an exception where a value was expected counts as a problem with the message 'raised NAME' (the class name). No problems give an empty list."""
+        pass
+  tests:
+  - name: all good
+    code: |
+      def double(x):
+          return x * 2
+      assert run_table(double, [((2,), 4), ((0,), 0), ((-3,), -6), ((1.5,), 3.0)]) == [] and run_table(double, []) == []
+      def safe_div(a, b):
+          if b == 0:
+              raise ValueError("zero")
+          return a / b
+      assert run_table(safe_div, [((6, 3), 2), ((1, 0), ("raises", "ValueError")), ((1, 4), 0.25)]) == []
+  - name: problems
+    code: |
+      def double(x):
+          return x * 2
+      assert run_table(double, [((2,), 4), ((3,), 7), ((1,), 2)]) == ["row 1: expected 7 but got 6"]
+      def safe_div(a, b):
+          if b == 0:
+              raise ValueError("zero")
+          return a / b
+      table = [((6, 3), 3), ((1, 0), 0), ((1, 0), ("raises", "KeyError")), ((2, 1), ("raises", "ValueError")), ((4, 2), 2)]
+      assert run_table(safe_div, table) == ["row 0: expected 3 but got 2.0", "row 1: raised ValueError", "row 2: raised ValueError instead of KeyError", "row 3: did not raise ValueError"]
+      assert run_table(len, [(([1, 2],), 2), ((5,), 0)]) == ["row 1: raised TypeError"]
+  hints:
+  - Check whether expected is the special ('raises', name) tuple before comparing.
+  - Wrap the call in try/except so that a crash becomes a problem and the loop continues.
+  solution: |
+    def compare(actual, expected):
+        """Compare two values like a test framework. Return '' when they are equal. Numbers (int or float) are equal when they differ by less than 1e-9. Two lists (or tuples) of the same length are compared item by item and the FIRST difference is reported as 'item I: ' followed by the message for the two items (so nested lists work, the index counts from 0); lists of different length give 'length: expected N but got M'. Anything else is compared with ==. The message for a difference is 'expected E but got A' using repr for both values (E is the expected value, A the actual)."""
+        nums = (int, float)
+        if isinstance(actual, nums) and isinstance(expected, nums) and not isinstance(actual, bool) and not isinstance(expected, bool):
+            return "" if abs(actual - expected) < 1e-9 else "expected " + repr(expected) + " but got " + repr(actual)
+        if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+            if len(actual) != len(expected):
+                return "length: expected " + str(len(expected)) + " but got " + str(len(actual))
+            for i, (a, e) in enumerate(zip(actual, expected)):
+                msg = compare(a, e)
+                if msg:
+                    return "item " + str(i) + ": " + msg
+            return ""
+        return "" if actual == expected else "expected " + repr(expected) + " but got " + repr(actual)
+
+
+    def assert_raises(func, args, exc_name):
+        """Check that func(*args) raises the exception called exc_name (given as TEXT, such as 'ValueError'); a subclass counts too (look at the names in type(err).__mro__). Return '' when it does, 'did not raise ' + exc_name when the call returns normally, and 'raised OTHER instead of ' + exc_name (OTHER is the class name) for an exception of another kind."""
+        try:
+            func(*args)
+        except Exception as err:
+            if exc_name in [c.__name__ for c in type(err).__mro__]:
+                return ""
+            return "raised " + type(err).__name__ + " instead of " + exc_name
+        return "did not raise " + exc_name
+
+
+
+
+    def run_table(func, table):
+        """Table-driven tests. `table` is a list of rows (args, expected). `args` is a tuple that func is called with. If `expected` is a tuple ('raises', 'ValueError') the call must raise that exception (use assert_raises); otherwise the result is compared with compare. Return the list of problems, one text per bad row, in order: 'row I: ' followed by the message (the row index counts from 0). A function that raises an exception where a value was expected counts as a problem with the message 'raised NAME' (the class name). No problems give an empty list."""
+        problems = []
+        for i, (args, expected) in enumerate(table):
+            if isinstance(expected, tuple) and len(expected) == 2 and expected[0] == "raises":
+                msg = assert_raises(func, list(args), expected[1])
+            else:
+                try:
+                    msg = compare(func(*args), expected)
+                except Exception as err:
+                    msg = "raised " + type(err).__name__
+            if msg:
+                problems.append("row " + str(i) + ": " + msg)
+        return problems
+  explanation: Adding a new case is one new line, so people actually add them. Almost every serious test suite has tables like this.
+- id: property
+  title: Properties and random inputs
+  difficulty: 5
+  prompt: 'Instead of picking examples, state a **property** that must always hold (for example, sorting twice gives the same as sorting once) and test it on many **random** inputs. Write `check_property(prop, gen, n, seed)`. Make a random generator with `random.Random(seed)`. Do up to `n` rounds: call `gen(rng)` to get a tuple of arguments, then `prop(*args)`, which should return `True`. Return the **first** argument tuple for which `prop` returns anything but `True` or raises an exception, or `None` if all `n` rounds passed. Because the seed is fixed the test is the same every run (**deterministic**).'
+  starter: |-
+    def check_property(prop, gen, n, seed):
+        """Property-based testing. Make a random generator with random.Random(seed). Do up to n rounds: call gen(rng) to get a tuple of arguments, then prop(*args), which should return True. Return the FIRST argument tuple for which prop returns anything but True or raises an exception, or None if all n rounds passed."""
+        pass
+  tests:
+  - name: true properties
+    code: |
+      gen = lambda rng: ([rng.randint(-50, 50) for _ in range(rng.randint(0, 8))],)
+      assert check_property(lambda xs: sorted(sorted(xs)) == sorted(xs), gen, 200, 1) is None and check_property(lambda xs: len(sorted(xs)) == len(xs), gen, 200, 2) is None and check_property(lambda xs: list(reversed(list(reversed(xs)))) == xs, gen, 50, 3) is None and check_property(lambda x: True, lambda rng: (1,), 0, 0) is None
+  - name: false properties
+    code: |
+      import random
+      gen = lambda rng: ([rng.randint(0, 9) for _ in range(rng.randint(0, 6))],)
+      bad = check_property(lambda xs: sorted(xs) == xs, gen, 100, 7)
+      assert isinstance(bad, tuple) and len(bad) == 1 and sorted(bad[0]) != bad[0]
+      assert check_property(lambda xs: sorted(xs) == xs, gen, 100, 7) == bad
+      assert check_property(lambda xs: sum(xs) < 10, gen, 100, 3)[0] != [] and check_property(lambda x: 1, lambda rng: (rng.random(),), 5, 1) is not None
+      assert check_property(lambda a, b: a + b == b + a, lambda rng: (rng.randint(0, 5), rng.randint(0, 5)), 20, 1) is None and check_property(lambda a, b: a - b == b - a, lambda rng: (rng.randint(0, 5), rng.randint(0, 5)), 100, 1) is not None
+      calls = []
+      check_property(lambda x: calls.append(x) or True, lambda rng: (rng.random(),), 7, 4)
+      assert len(calls) == 7
+      def explode(xs):
+          return 1 / len(xs) > 0
+      found = check_property(explode, gen, 100, 5)
+      assert found is not None and found[0] == []
+  hints:
+  - Create the generator once with random.Random(seed) and pass it to gen each round.
+  - prop(*args) is True is stricter than just truthy.
+  solution: |
+    def check_property(prop, gen, n, seed):
+        """Property-based testing. Make a random generator with random.Random(seed). Do up to n rounds: call gen(rng) to get a tuple of arguments, then prop(*args), which should return True. Return the FIRST argument tuple for which prop returns anything but True or raises an exception, or None if all n rounds passed."""
+        import random
+        rng = random.Random(seed)
+        for _ in range(n):
+            args = gen(rng)
+            try:
+                ok = prop(*args) is True
+            except Exception:
+                ok = False
+            if not ok:
+                return args
+        return None
+  explanation: This is called property-based testing; libraries such as Hypothesis do it for real code and find bugs that humans never think of.
+- id: shrink
+  title: 'Capstone: the smallest failing case'
+  difficulty: 5
+  prompt: 'A random counterexample like `[7, 3, 9, 3, 1, 8]` is hard to read. **Shrinking** makes it small. `check_property` is given. Write `shrink(items, fails)`: `fails(items)` returns `True` when the list still makes the test fail. Start from `items` (which fails). Repeat: try removing **one** item at a time, from the front, and keep the first removal after which the list still fails; then start again from the shorter list. Stop when no single removal still fails and return that list (a **new** list; do not change the input). Then write `minimal_counterexample(prop, gen, n, seed)`: `gen(rng)` returns a tuple holding **one** list; use `check_property` to find a failing tuple (return `None` if there is none) and shrink its list, where a list fails if `prop(list)` is not `True` or raises. Return the shrunk list.'
+  starter: |-
+    def check_property(prop, gen, n, seed):
+        """Property-based testing. Make a random generator with random.Random(seed). Do up to n rounds: call gen(rng) to get a tuple of arguments, then prop(*args), which should return True. Return the FIRST argument tuple for which prop returns anything but True or raises an exception, or None if all n rounds passed."""
+        import random
+        rng = random.Random(seed)
+        for _ in range(n):
+            args = gen(rng)
+            try:
+                ok = prop(*args) is True
+            except Exception:
+                ok = False
+            if not ok:
+                return args
+        return None
+
+
+
+
+    def shrink(items, fails):
+        """Make a failing input as small as possible. `fails(items)` returns True when the list still makes the test fail. Start from `items` (which fails). Repeat: try removing ONE item at a time, from the front, and keep the first removal after which the list still fails; start again from the shorter list. Stop when no single removal still fails and return that list (a new list; the input is not changed)."""
+        pass
+
+
+    def minimal_counterexample(prop, gen, n, seed):
+        """Find a small counterexample. `gen(rng)` returns a tuple holding ONE list; `prop(items)` should be True. Use check_property to find a failing tuple (return None if there is none) and then shrink its list with `shrink`, where a list fails if prop(list) is not True or raises. Return the shrunk list."""
+        pass
+  tests:
+  - name: shrinking a list
+    code: |
+      fails = lambda xs: 3 in xs
+      before = [7, 3, 9, 3, 1, 8]
+      assert shrink(before, fails) == [3] and before == [7, 3, 9, 3, 1, 8] and shrink([3], fails) == [3]
+      assert shrink([5, 1, 9, 2, 8], lambda xs: sum(xs) > 10) == [9, 8] and shrink([1, 2, 3, 4], lambda xs: len(xs) >= 2) == [3, 4] and shrink([4, 9, 2], lambda xs: True) == []
+      assert shrink([2, 1, 5, 0], lambda xs: any(a > b for a, b in zip(xs, xs[1:]))) == [5, 0]
+  - name: minimal counterexamples
+    code: |
+      gen = lambda rng: ([rng.randint(0, 9) for _ in range(rng.randint(0, 8))],)
+      small = minimal_counterexample(lambda xs: sorted(xs) == xs, gen, 100, 7)
+      assert len(small) == 2 and small[0] > small[1]
+      assert minimal_counterexample(lambda xs: sorted(xs) == xs, gen, 100, 7) == small
+      assert minimal_counterexample(lambda xs: len(xs) == len(set(xs)), gen, 100, 3) in ([0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7], [8, 8], [9, 9])
+      assert minimal_counterexample(lambda xs: sum(xs) >= 0, gen, 100, 1) is None and minimal_counterexample(lambda xs: 1 / len(xs) > 0, gen, 100, 5) == []
+      assert minimal_counterexample(lambda xs: max(xs) < 9, gen, 100, 2) in ([9], []) and minimal_counterexample(lambda xs: 9 not in xs, gen, 100, 2) == [9]
+  hints:
+  - After a successful removal, start the loop again from the shorter list.
+  - fails(candidate) may need a try/except around prop in the second function.
+  solution: |
+    def check_property(prop, gen, n, seed):
+        """Property-based testing. Make a random generator with random.Random(seed). Do up to n rounds: call gen(rng) to get a tuple of arguments, then prop(*args), which should return True. Return the FIRST argument tuple for which prop returns anything but True or raises an exception, or None if all n rounds passed."""
+        import random
+        rng = random.Random(seed)
+        for _ in range(n):
+            args = gen(rng)
+            try:
+                ok = prop(*args) is True
+            except Exception:
+                ok = False
+            if not ok:
+                return args
+        return None
+
+
+
+
+    def shrink(items, fails):
+        """Make a failing input as small as possible. `fails(items)` returns True when the list still makes the test fail. Start from `items` (which fails). Repeat: try removing ONE item at a time, from the front, and keep the first removal after which the list still fails; start again from the shorter list. Stop when no single removal still fails and return that list (a new list; the input is not changed)."""
+        current = list(items)
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(current)):
+                candidate = current[:i] + current[i + 1:]
+                if fails(candidate):
+                    current = candidate
+                    changed = True
+                    break
+        return current
+
+
+    def minimal_counterexample(prop, gen, n, seed):
+        """Find a small counterexample. `gen(rng)` returns a tuple holding ONE list; `prop(items)` should be True. Use check_property to find a failing tuple (return None if there is none) and then shrink its list with `shrink`, where a list fails if prop(list) is not True or raises. Return the shrunk list."""
+        found = check_property(prop, gen, n, seed)
+        if found is None:
+            return None
+
+        def fails(items):
+            try:
+                return prop(items) is not True
+            except Exception:
+                return True
+
+        return shrink(found[0], fails)
+  explanation: Shrinking is why property-based tools report 'fails for [1, 0]' rather than a 30-element mess.
+commonMistakes:
+- title: Only testing typical values
+  explanation: Bugs hide at the edges.
+- title: Using random inputs without a seed
+  explanation: You cannot reproduce a failure.
+- title: Copying the code's logic into the test
+  explanation: The test then agrees with the bug.
+- title: One huge test for everything
+  explanation: A failure should point at one thing.
+- title: Forgetting empty and None inputs
+  explanation: They are the most common crash.
+summary:
+- Test at boundaries and inside each equivalence class.
+- Put many cases in a table.
+- Test rules (properties) on random, seeded inputs.
+- Shrink a failing input to the smallest one.
+- Turn every bug into a regression test.
+next: u30-isolate
+quiz:
+- type: mcq
+  question: Which inputs best test a function accepting 1 to 50?
+  options:
+  - 0, 1, 2, 49, 50, 51
+  - 10, 20, 30
+  - Only 25
+  - Only random numbers
+  answer: 0
+  explanation: Boundaries.
+- type: mcq
+  question: What is an equivalence class?
+  options:
+  - Inputs the code treats the same way
+  - Two equal tests
+  - A kind of loop
+  - A type of bug
+  answer: 0
+  explanation: Same behaviour.
+- type: mcq
+  question: Why seed a random test generator?
+  options:
+  - To reproduce a failure
+  - To make it slower
+  - To hide bugs
+  - No reason
+  answer: 0
+  explanation: Same inputs every run.
+- type: mcq
+  question: What is shrinking?
+  options:
+  - Making a failing input as small as possible
+  - Deleting tests
+  - Compressing files
+  - Making code shorter
+  answer: 0
+  explanation: A small counterexample.
+- type: mcq
+  question: What does sort(sort(x)) == sort(x) express?
+  options:
+  - Idempotence
+  - Round trip
+  - A boundary
+  - A mock
+  answer: 0
+  explanation: Doing it twice changes nothing.
+- type: mcq
+  question: What do you do first when you find a bug?
+  options:
+  - Write a failing test for it
+  - Delete the code
+  - Ignore it
+  - Rewrite everything
+  answer: 0
+  explanation: Regression test.
+- type: code
+  question: Write `is_idempotent(func, value)` returning True when `func(func(value)) == func(value)`.
+  starter: |
+    def is_idempotent(func, value):
+        pass
+  tests:
+  - name: idempotent
+    code: |
+      assert is_idempotent(abs, -3) is True and is_idempotent(str.upper, "abc") is True and is_idempotent(lambda x: x + 1, 1) is False and is_idempotent(sorted, [3, 1, 2]) is True
+  solution: |
+    def is_idempotent(func, value):
+        once = func(value)
+        return func(once) == once

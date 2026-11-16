@@ -1,0 +1,789 @@
+id: u30-isolate
+title: Test Doubles and Dependency Injection
+minutes: 110
+objective: Learn how to test code that depends on slow or unpredictable things (the network, the clock, randomness) by **injecting** replacements. You will build mocks, call verification, a retry loop with backoff and a cache with expiry, all testable without waiting.
+outcomes:
+- Explain stubs, fakes and mocks
+- Pass dependencies as parameters
+- Verify how a mock was called
+- Test time-dependent code without waiting
+sections:
+- heading: Why isolate code
+  body: |-
+    A good unit test is **fast**, **deterministic** and **independent**. Code that calls the internet, reads the real clock, uses random numbers or writes to a real database is none of those: it is slow, it changes between runs and it can fail for reasons that have nothing to do with your code.
+
+    The fix is **isolation**: separate the code you are testing (the **unit**) from the things it depends on (its **dependencies**), and in tests replace those with **test doubles**:
+
+    - A **stub** returns fixed answers (`get` always returns the same user).
+    - A **fake** is a simple working version (an in-memory dictionary instead of a database).
+    - A **mock** records how it was called so you can check it afterwards (`send_email` was called once with this address).
+    - A **spy** is a real object wrapped so that its calls are recorded.
+- heading: Dependency injection
+  body: |-
+    The easiest way to swap a dependency is to **pass it in**. This is called **dependency injection**. Compare:
+
+    ```python
+    import time
+    def is_expired(created):                      # hard to test: reads the real clock
+        return time.time() - created > 3600
+
+    def is_expired(created, now):                 # easy to test: time is a parameter
+        return now - created > 3600
+    ```
+
+    The second version can be tested for "just before" and "just after" the limit in microseconds. In the same way a function can take the `get` function, the `sleep` function, the random generator or the file system as an argument, with a real one as the default in production.
+
+    Retries show why: `retry(func, attempts, sleep)` waits 1, 2, 4... seconds between attempts. With a fake `sleep` that only records the delays, you can test a five-minute retry schedule instantly.
+
+    > **Warning:** Over-mocking is a trap. If a test mocks everything, it only checks that your code calls the mocks the way you wrote it, and it breaks whenever you change the inside. Prefer **fakes** and check **results** over checking calls, and keep a few **integration tests** that use the real thing.
+examples:
+- title: A mock for the network
+  intro: A function that retries once, tested without a network.
+  code: |
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+    def verify_calls(calls, expected):
+        """Check a mock's calls. `calls` is the list of (args, kwargs) from make_recorder and `expected` a list of args tuples (no keyword arguments expected). Return '' if the number of calls is the same and every call's args match, in order, and its kwargs are empty. Otherwise return the FIRST problem: 'expected N calls but got M' (check the count first), or 'call I: expected EXPECTED but got ACTUAL' (with repr of the tuples; I from 0). A call with keyword arguments is shown as the args tuple followed by the text ' with ' and repr of the kwargs, for example "(1,) with {'x': 2}", and counts as different."""
+        if len(calls) != len(expected):
+            return "expected " + str(len(expected)) + " calls but got " + str(len(calls))
+        for i, ((args, kwargs), want) in enumerate(zip(calls, expected)):
+            if args != tuple(want) or kwargs:
+                shown = repr(args) + (" with " + repr(kwargs) if kwargs else "")
+                return "call " + str(i) + ": expected " + repr(tuple(want)) + " but got " + shown
+        return ""
+
+
+    def fetch_user_name(get, user_id):
+        """Code that is easy to test because it receives its helper as a parameter (DEPENDENCY INJECTION). `get(url)` returns a dict {"status": number, "body": dict} or raises ConnectionError. Call get('/users/' + str(user_id)). Return the 'name' from the body when the status is 200; 'unknown' when the status is 404. For any other status raise ValueError('bad status NUMBER'). If get raises ConnectionError, try ONE more time; if the second call also fails, let the error out."""
+        for attempt in range(2):
+            try:
+                response = get("/users/" + str(user_id))
+                break
+            except ConnectionError:
+                if attempt == 1:
+                    raise
+        if response["status"] == 200:
+            return response["body"]["name"]
+        if response["status"] == 404:
+            return "unknown"
+        raise ValueError("bad status " + str(response["status"]))
+
+    get, calls = make_recorder([ConnectionError("network down"), {"status": 200, "body": {"name": "Ada"}}])
+    print(fetch_user_name(get, 7))
+    print(len(calls), "calls:", [c[0] for c in calls])
+    print(repr(verify_calls(calls, [("/users/7",), ("/users/7",)])))
+    print(verify_calls(calls, [("/users/7",)]))
+    get, calls = make_recorder([{"status": 404, "body": {}}])
+    print(fetch_user_name(get, 99), verify_calls(calls, [("/users/98",)]))
+  output: |
+    Ada
+    2 calls: [('/users/7',), ('/users/7',)]
+    ''
+    expected 1 calls but got 2
+    unknown call 0: expected ('/users/98',) but got ('/users/99',)
+  lines:
+  - line: 45
+    note: The first call fails, the retry succeeds.
+  - line: 46
+    note: Both attempts were recorded.
+  - line: 47
+    note: An empty string means the calls are as expected.
+- title: Retry and cache with fake time
+  intro: A fake clock and a fake sleep make time-based code instant to test.
+  code: |
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+    def retry(func, attempts, sleep):
+        """Call func() until it works. Make at most `attempts` calls (attempts >= 1). If a call raises an exception, wait with sleep(seconds) and try again: the waits are 1, 2, 4, 8 ... seconds (doubling: EXPONENTIAL BACKOFF), never after the last attempt. Return the first successful result. If every attempt fails, raise the LAST exception. The sleep function is a parameter so that tests do not really wait. ValueError('attempts must be at least 1') for fewer than one attempt."""
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
+        delay = 1
+        for i in range(attempts):
+            try:
+                return func()
+            except Exception:
+                if i == attempts - 1:
+                    raise
+                sleep(delay)
+                delay *= 2
+
+
+    def ttl_cache(func, ttl, clock):
+        """Wrap `func` in a cache whose entries expire. Return a function `cached(*args)` (positional, hashable arguments only). `clock()` returns the current time in seconds (a parameter so tests can control time). The first call with some arguments calls func and remembers the result with the time. A later call with the same arguments returns the remembered result if the entry is YOUNGER than ttl seconds (clock() - stored time < ttl), otherwise it calls func again and replaces the entry. `cached.stats` is a dict {"hits": number of answers from the cache, "misses": number of calls of func}; `cached.clear()` forgets all entries (the stats stay)."""
+        store = {}
+
+        def cached(*args):
+            now = clock()
+            if args in store and now - store[args][1] < ttl:
+                cached.stats["hits"] += 1
+                return store[args][0]
+            cached.stats["misses"] += 1
+            value = func(*args)
+            store[args] = (value, now)
+            return value
+
+        cached.stats = {"hits": 0, "misses": 0}
+        cached.clear = store.clear
+        return cached
+
+    sleeps, slept = make_recorder()
+    flaky, _ = make_recorder([OSError("a"), OSError("b"), OSError("c"), "finally"])
+    print(retry(flaky, 5, sleeps), [c[0][0] for c in slept])
+
+    time = [0]
+    slow, calls = make_recorder(["result 1", "result 2"])
+    cached = ttl_cache(slow, 30, lambda: time[0])
+    for t in (0, 10, 29, 30, 40):
+        time[0] = t
+        print(t, cached("q"))
+    print(cached.stats)
+  output: |
+    finally [1, 2, 4]
+    0 result 1
+    10 result 1
+    29 result 1
+    30 result 2
+    40 result 2
+    {'hits': 3, 'misses': 2}
+  lines:
+  - line: 53
+    note: Three failures, with waits of 1, 2 and 4 seconds that never actually happened.
+  - line: 58
+    note: The cache answer expires exactly at 30 seconds.
+playground:
+  prompt: Use Python's own mock library.
+  code: |
+    from unittest.mock import Mock
+    m = Mock(return_value=5)
+    print(m(1, 2), m.call_args)
+exercises:
+- id: recorder
+  title: A mock function
+  difficulty: 4
+  prompt: 'Real code often talks to things you do not want in a test: the internet, the clock, a database, an email server. In a test you replace them with **test doubles**. A **mock** is a stand-in that remembers how it was used. Write `make_recorder(results=None)`: return `(mock, calls)`. `calls` is a list that gets one entry `(args, kwargs)` for every call to the mock (`args` a tuple, `kwargs` a dict). `results` is a list of what the calls should return, in order: call 1 returns `results[0]`, and so on; once the list is used up (or if it is `None`) the mock returns `None`. If the entry is an exception **instance**, the mock **raises** it instead of returning it.'
+  starter: |-
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        pass
+  tests:
+  - name: recording
+    code: |
+      mock, calls = make_recorder()
+      assert mock(1, 2) is None and mock("a", key=5) is None and mock() is None
+      assert calls == [((1, 2), {}), (("a",), {"key": 5}), ((), {})] and make_recorder()[1] == []
+      m1, c1 = make_recorder([10, 20])
+      assert (m1("x"), m1("y"), m1("z"), m1("w")) == (10, 20, None, None) and len(c1) == 4 and c1[2] == (("z",), {})
+      m2, c2 = make_recorder([0, "", None, []])
+      assert (m2(), m2(), m2(), m2()) == (0, "", None, [])
+  - name: raising
+    code: |
+      mock, calls = make_recorder([ConnectionError("down"), "ok", ValueError("bad")])
+      try:
+          mock("first")
+          raise AssertionError("did not raise")
+      except ConnectionError as e:
+          assert str(e) == "down"
+      assert mock("second") == "ok"
+      try:
+          mock("third")
+          raise AssertionError("did not raise")
+      except ValueError:
+          pass
+      assert [c[0] for c in calls] == [("first",), ("second",), ("third",)] and mock() is None
+      a, ca = make_recorder([1])
+      b, cb = make_recorder([2])
+      assert a() == 1 and b() == 2 and len(ca) == 1 and len(cb) == 1
+  hints:
+  - Use a closure over a list for the calls and a list for the remaining results.
+  - Check isinstance(value, Exception) before returning.
+  solution: |
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+  explanation: Python's unittest.mock.Mock does this and much more; building the idea yourself shows there is no magic.
+- id: verify
+  title: Checking the calls
+  difficulty: 4
+  prompt: 'Having a mock is only useful if you check what happened to it. `make_recorder` is given. Write `verify_calls(calls, expected)`: `calls` is the list of `(args, kwargs)` and `expected` a list of args tuples (no keyword arguments expected). Return `""` if the number of calls is the same and every call''s args match, in order, and its kwargs are empty. Otherwise return the **first** problem: `"expected N calls but got M"` (check the **count** first), or `"call I: expected EXPECTED but got ACTUAL"` (using `repr` of the tuples, `I` from 0). A call with keyword arguments is shown as the args tuple followed by `" with "` and `repr` of the kwargs, for example `"(1,) with {''x'': 2}"`, and counts as different.'
+  starter: |-
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+
+
+    def verify_calls(calls, expected):
+        """Check a mock's calls. `calls` is the list of (args, kwargs) from make_recorder and `expected` a list of args tuples (no keyword arguments expected). Return '' if the number of calls is the same and every call's args match, in order, and its kwargs are empty. Otherwise return the FIRST problem: 'expected N calls but got M' (check the count first), or 'call I: expected EXPECTED but got ACTUAL' (with repr of the tuples; I from 0). A call with keyword arguments is shown as the args tuple followed by the text ' with ' and repr of the kwargs, for example "(1,) with {'x': 2}", and counts as different."""
+        pass
+  tests:
+  - name: matching
+    code: |
+      mock, calls = make_recorder()
+      mock(1)
+      mock("a", "b")
+      mock()
+      assert verify_calls(calls, [(1,), ("a", "b"), ()]) == "" and verify_calls([], []) == "" and verify_calls(calls, [[1], ["a", "b"], []]) == ""
+  - name: problems
+    code: |
+      mock, calls = make_recorder()
+      mock(1)
+      mock(2, key="v")
+      assert verify_calls(calls, [(1,)]) == "expected 1 calls but got 2" and verify_calls(calls, [(1,), (2,), (3,)]) == "expected 3 calls but got 2"
+      assert verify_calls(calls, [(1,), (2,)]) == "call 1: expected (2,) but got (2,) with {'key': 'v'}" and verify_calls(calls, [(9,), (2,)]) == "call 0: expected (9,) but got (1,)"
+      assert verify_calls([((), {})], [()]) == "" and verify_calls(calls[:1], [("1",)]) == "call 0: expected ('1',) but got (1,)" and verify_calls([], [(1,)]) == "expected 1 calls but got 0"
+  hints:
+  - Compare the number of calls first.
+  - A call with keyword arguments never matches an expected args tuple.
+  solution: |
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+
+
+    def verify_calls(calls, expected):
+        """Check a mock's calls. `calls` is the list of (args, kwargs) from make_recorder and `expected` a list of args tuples (no keyword arguments expected). Return '' if the number of calls is the same and every call's args match, in order, and its kwargs are empty. Otherwise return the FIRST problem: 'expected N calls but got M' (check the count first), or 'call I: expected EXPECTED but got ACTUAL' (with repr of the tuples; I from 0). A call with keyword arguments is shown as the args tuple followed by the text ' with ' and repr of the kwargs, for example "(1,) with {'x': 2}", and counts as different."""
+        if len(calls) != len(expected):
+            return "expected " + str(len(expected)) + " calls but got " + str(len(calls))
+        for i, ((args, kwargs), want) in enumerate(zip(calls, expected)):
+            if args != tuple(want) or kwargs:
+                shown = repr(args) + (" with " + repr(kwargs) if kwargs else "")
+                return "call " + str(i) + ": expected " + repr(tuple(want)) + " but got " + shown
+        return ""
+  explanation: 'Be careful not to over-specify: a test that checks every internal call breaks whenever you improve the code without changing what it does.'
+- id: inject
+  title: Injecting a dependency
+  difficulty: 5
+  prompt: 'Code is easy to test when it **receives** what it depends on instead of creating it. Write `fetch_user_name(get, user_id)`, where `get(url)` returns a dict `{"status": number, "body": dict}` or raises `ConnectionError`. Call `get("/users/" + str(user_id))`. Return the `"name"` from the body when the status is 200; `"unknown"` when the status is 404. For any other status raise `ValueError("bad status NUMBER")`. If `get` raises `ConnectionError`, try **one** more time; if the second call also fails, let the error out. (`make_recorder` is given for your own tests.)'
+  starter: |-
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+
+
+    def fetch_user_name(get, user_id):
+        """Code that is easy to test because it receives its helper as a parameter (DEPENDENCY INJECTION). `get(url)` returns a dict {"status": number, "body": dict} or raises ConnectionError. Call get('/users/' + str(user_id)). Return the 'name' from the body when the status is 200; 'unknown' when the status is 404. For any other status raise ValueError('bad status NUMBER'). If get raises ConnectionError, try ONE more time; if the second call also fails, let the error out."""
+        pass
+  tests:
+  - name: normal answers
+    code: |
+      def make_recorder(results=None):
+          """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+          calls = []
+          queue = list(results) if results is not None else []
+
+          def mock(*args, **kwargs):
+              calls.append((args, kwargs))
+              if not queue:
+                  return None
+              value = queue.pop(0)
+              if isinstance(value, Exception):
+                  raise value
+              return value
+
+          return mock, calls
+
+      get, calls = make_recorder([{"status": 200, "body": {"name": "Ada"}}])
+      assert fetch_user_name(get, 7) == "Ada" and calls == [(("/users/7",), {})]
+      get, calls = make_recorder([{"status": 404, "body": {}}])
+      assert fetch_user_name(get, "x") == "unknown" and len(calls) == 1
+      for status in (500, 301, 403):
+          get, _ = make_recorder([{"status": status, "body": {}}])
+          try:
+              fetch_user_name(get, 1)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "bad status " + str(status)
+  - name: retrying
+    code: |
+      def make_recorder(results=None):
+          """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+          calls = []
+          queue = list(results) if results is not None else []
+
+          def mock(*args, **kwargs):
+              calls.append((args, kwargs))
+              if not queue:
+                  return None
+              value = queue.pop(0)
+              if isinstance(value, Exception):
+                  raise value
+              return value
+
+          return mock, calls
+
+      good = {"status": 200, "body": {"name": "Bo"}}
+      get, calls = make_recorder([ConnectionError("blip"), good])
+      assert fetch_user_name(get, 2) == "Bo" and [c[0] for c in calls] == [("/users/2",), ("/users/2",)]
+      get, calls = make_recorder([ConnectionError("a"), ConnectionError("b"), good])
+      try:
+          fetch_user_name(get, 3)
+          raise AssertionError("did not raise")
+      except ConnectionError as e:
+          assert str(e) == "b" and len(calls) == 2
+      get, calls = make_recorder([ConnectionError("a"), {"status": 404, "body": {}}])
+      assert fetch_user_name(get, 4) == "unknown"
+      get, calls = make_recorder([ValueError("not retried")])
+      try:
+          fetch_user_name(get, 5)
+          raise AssertionError("did not raise")
+      except ValueError as e:
+          assert str(e) == "not retried" and len(calls) == 1
+  hints:
+  - Use a loop of two attempts; on the second failure re-raise.
+  - Only ConnectionError is retried.
+  solution: |
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+
+
+    def fetch_user_name(get, user_id):
+        """Code that is easy to test because it receives its helper as a parameter (DEPENDENCY INJECTION). `get(url)` returns a dict {"status": number, "body": dict} or raises ConnectionError. Call get('/users/' + str(user_id)). Return the 'name' from the body when the status is 200; 'unknown' when the status is 404. For any other status raise ValueError('bad status NUMBER'). If get raises ConnectionError, try ONE more time; if the second call also fails, let the error out."""
+        for attempt in range(2):
+            try:
+                response = get("/users/" + str(user_id))
+                break
+            except ConnectionError:
+                if attempt == 1:
+                    raise
+        if response["status"] == 200:
+            return response["body"]["name"]
+        if response["status"] == 404:
+            return "unknown"
+        raise ValueError("bad status " + str(response["status"]))
+  explanation: The real function would pass a real HTTP function; the test passes a mock. Same code, no internet needed.
+- id: retry
+  title: Retry with backoff
+  difficulty: 5
+  prompt: 'Networks fail for a moment and then work again, so programs **retry**. Waiting longer each time (**exponential backoff**) avoids hammering a struggling server. Write `retry(func, attempts, sleep)`: call `func()` until it works. Make at most `attempts` calls. If a call raises an exception, wait with `sleep(seconds)` and try again: the waits are `1`, `2`, `4`, `8` ... seconds, never after the last attempt. Return the first successful result. If every attempt fails, raise the **last** exception. `sleep` is a parameter so that tests do not really wait. `ValueError("attempts must be at least 1")` for fewer than one attempt.'
+  starter: |-
+    def retry(func, attempts, sleep):
+        """Call func() until it works. Make at most `attempts` calls (attempts >= 1). If a call raises an exception, wait with sleep(seconds) and try again: the waits are 1, 2, 4, 8 ... seconds (doubling: EXPONENTIAL BACKOFF), never after the last attempt. Return the first successful result. If every attempt fails, raise the LAST exception. The sleep function is a parameter so that tests do not really wait. ValueError('attempts must be at least 1') for fewer than one attempt."""
+        pass
+  tests:
+  - name: success
+    code: |
+      def make_recorder(results=None):
+          """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+          calls = []
+          queue = list(results) if results is not None else []
+
+          def mock(*args, **kwargs):
+              calls.append((args, kwargs))
+              if not queue:
+                  return None
+              value = queue.pop(0)
+              if isinstance(value, Exception):
+                  raise value
+              return value
+
+          return mock, calls
+
+      sleeps, calls = make_recorder()
+      ok, okcalls = make_recorder([42])
+      assert retry(ok, 3, sleeps) == 42 and len(okcalls) == 1 and calls == []
+      flaky, fcalls = make_recorder([ConnectionError("1"), ConnectionError("2"), "done"])
+      assert retry(flaky, 5, sleeps) == "done" and len(fcalls) == 3 and [c[0] for c in calls] == [(1,), (2,)]
+  - name: giving up
+    code: |
+      def make_recorder(results=None):
+          """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+          calls = []
+          queue = list(results) if results is not None else []
+
+          def mock(*args, **kwargs):
+              calls.append((args, kwargs))
+              if not queue:
+                  return None
+              value = queue.pop(0)
+              if isinstance(value, Exception):
+                  raise value
+              return value
+
+          return mock, calls
+
+      sleeps, calls = make_recorder()
+      bad, bcalls = make_recorder([KeyError("a"), KeyError("b"), KeyError("c"), KeyError("d")])
+      try:
+          retry(bad, 4, sleeps)
+          raise AssertionError("did not raise")
+      except KeyError as e:
+          assert str(e) == "'d'"
+      assert len(bcalls) == 4 and [c[0][0] for c in calls] == [1, 2, 4]
+      sleeps2, calls2 = make_recorder()
+      once, ocalls = make_recorder([ValueError("x")])
+      try:
+          retry(once, 1, sleeps2)
+          raise AssertionError("did not raise")
+      except ValueError:
+          pass
+      assert len(ocalls) == 1 and calls2 == []
+      for bad_n in (0, -2):
+          try:
+              retry(lambda: 1, bad_n, sleeps2)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "at least 1" in str(e)
+      many, mcalls = make_recorder([OSError()] * 7)
+      sleeps3, calls3 = make_recorder()
+      try:
+          retry(many, 7, sleeps3)
+      except OSError:
+          pass
+      assert [c[0][0] for c in calls3] == [1, 2, 4, 8, 16, 32]
+  hints:
+  - Keep the delay in a variable that you double after every wait.
+  - 'Do not sleep after the last failed attempt: re-raise instead.'
+  solution: |
+    def retry(func, attempts, sleep):
+        """Call func() until it works. Make at most `attempts` calls (attempts >= 1). If a call raises an exception, wait with sleep(seconds) and try again: the waits are 1, 2, 4, 8 ... seconds (doubling: EXPONENTIAL BACKOFF), never after the last attempt. Return the first successful result. If every attempt fails, raise the LAST exception. The sleep function is a parameter so that tests do not really wait. ValueError('attempts must be at least 1') for fewer than one attempt."""
+        if attempts < 1:
+            raise ValueError("attempts must be at least 1")
+        delay = 1
+        for i in range(attempts):
+            try:
+                return func()
+            except Exception:
+                if i == attempts - 1:
+                    raise
+                sleep(delay)
+                delay *= 2
+  explanation: Real systems add a little random jitter to the delay so that thousands of clients do not all retry at the same instant.
+- id: cache
+  title: 'Capstone: a cache with a fake clock'
+  difficulty: 5
+  prompt: 'A **cache** remembers answers so work is not repeated, but old answers must **expire**. Testing expiry would need real waiting unless time is **injected**. Write `ttl_cache(func, ttl, clock)`. Return a function `cached(*args)` (positional, hashable arguments only). `clock()` returns the current time in seconds. The first call with some arguments calls `func` and remembers the result with the time. A later call with the same arguments returns the remembered result if the entry is **younger** than `ttl` seconds (`clock() - stored time < ttl`), otherwise it calls `func` again and replaces the entry. `cached.stats` is a dict `{"hits": answers from the cache, "misses": calls of func}`; `cached.clear()` forgets all entries (the stats stay).'
+  starter: |-
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+
+
+    def ttl_cache(func, ttl, clock):
+        """Wrap `func` in a cache whose entries expire. Return a function `cached(*args)` (positional, hashable arguments only). `clock()` returns the current time in seconds (a parameter so tests can control time). The first call with some arguments calls func and remembers the result with the time. A later call with the same arguments returns the remembered result if the entry is YOUNGER than ttl seconds (clock() - stored time < ttl), otherwise it calls func again and replaces the entry. `cached.stats` is a dict {"hits": number of answers from the cache, "misses": number of calls of func}; `cached.clear()` forgets all entries (the stats stay)."""
+        pass
+  tests:
+  - name: hits and misses
+    code: |
+      def make_recorder(results=None):
+          """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+          calls = []
+          queue = list(results) if results is not None else []
+
+          def mock(*args, **kwargs):
+              calls.append((args, kwargs))
+              if not queue:
+                  return None
+              value = queue.pop(0)
+              if isinstance(value, Exception):
+                  raise value
+              return value
+
+          return mock, calls
+
+      now = [100.0]
+      clock = lambda: now[0]
+      slow, calls = make_recorder([10, 20, 30, 40])
+      cached = ttl_cache(slow, 60, clock)
+      assert cached(1) == 10 and cached(1) == 10 and cached(2) == 20 and cached(2) == 20 and cached(1) == 10
+      assert len(calls) == 2 and cached.stats == {"hits": 3, "misses": 2} and [c[0] for c in calls] == [(1,), (2,)]
+      assert ttl_cache(slow, 5, clock).stats == {"hits": 0, "misses": 0}
+  - name: expiry
+    code: |
+      def make_recorder(results=None):
+          """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+          calls = []
+          queue = list(results) if results is not None else []
+
+          def mock(*args, **kwargs):
+              calls.append((args, kwargs))
+              if not queue:
+                  return None
+              value = queue.pop(0)
+              if isinstance(value, Exception):
+                  raise value
+              return value
+
+          return mock, calls
+
+      now = [0.0]
+      clock = lambda: now[0]
+      slow, calls = make_recorder(["a", "b", "c", "d"])
+      cached = ttl_cache(slow, 10, clock)
+      assert cached("k") == "a"
+      now[0] = 9.9
+      assert cached("k") == "a"
+      now[0] = 10.0
+      assert cached("k") == "b"
+      now[0] = 19.9
+      assert cached("k") == "b"
+      now[0] = 25
+      assert cached("k") == "c" and len(calls) == 3 and cached.stats == {"hits": 2, "misses": 3}
+      zero = ttl_cache(slow, 0, clock)
+      assert zero("z") == "d" and zero("z") is None and len(calls) == 5
+  - name: clear and arguments
+    code: |
+      def make_recorder(results=None):
+          """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+          calls = []
+          queue = list(results) if results is not None else []
+
+          def mock(*args, **kwargs):
+              calls.append((args, kwargs))
+              if not queue:
+                  return None
+              value = queue.pop(0)
+              if isinstance(value, Exception):
+                  raise value
+              return value
+
+          return mock, calls
+
+      now = [0]
+      slow, calls = make_recorder([1, 2, 3, 4, 5])
+      cached = ttl_cache(slow, 100, lambda: now[0])
+      assert cached(1, 2) == 1 and cached(2, 1) == 2 and cached(1, 2) == 1 and cached("a") == 3 and cached() == 4 and cached() == 4
+      cached.clear()
+      assert cached(1, 2) == 5 and cached.stats == {"hits": 2, "misses": 5}
+      a = ttl_cache(slow, 100, lambda: 0)
+      b = ttl_cache(slow, 100, lambda: 0)
+      a(7)
+      b(7)
+      assert a.stats == {"hits": 0, "misses": 1} and b.stats == {"hits": 0, "misses": 1}
+  hints:
+  - Keep a dict from the arguments tuple to (value, time).
+  - Read the clock once per call.
+  solution: |
+    def make_recorder(results=None):
+        """Make a MOCK: a stand-in function that remembers how it was used. Return (mock, calls). `calls` is a list that gets one entry (args, kwargs) for every call to the mock (args is a tuple, kwargs a dict). `results` is a list of what the calls should return, in order: call number 1 returns results[0], and so on; once the list is used up (or if it is None) the mock returns None. If the entry is an exception INSTANCE, the mock raises it instead of returning it."""
+        calls = []
+        queue = list(results) if results is not None else []
+
+        def mock(*args, **kwargs):
+            calls.append((args, kwargs))
+            if not queue:
+                return None
+            value = queue.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return mock, calls
+
+
+
+
+    def ttl_cache(func, ttl, clock):
+        """Wrap `func` in a cache whose entries expire. Return a function `cached(*args)` (positional, hashable arguments only). `clock()` returns the current time in seconds (a parameter so tests can control time). The first call with some arguments calls func and remembers the result with the time. A later call with the same arguments returns the remembered result if the entry is YOUNGER than ttl seconds (clock() - stored time < ttl), otherwise it calls func again and replaces the entry. `cached.stats` is a dict {"hits": number of answers from the cache, "misses": number of calls of func}; `cached.clear()` forgets all entries (the stats stay)."""
+        store = {}
+
+        def cached(*args):
+            now = clock()
+            if args in store and now - store[args][1] < ttl:
+                cached.stats["hits"] += 1
+                return store[args][0]
+            cached.stats["misses"] += 1
+            value = func(*args)
+            store[args] = (value, now)
+            return value
+
+        cached.stats = {"hits": 0, "misses": 0}
+        cached.clear = store.clear
+        return cached
+  explanation: 'This is the clock-injection trick in miniature: the same idea lets you test ''expires after 30 days'' in one millisecond.'
+commonMistakes:
+- title: Using the real clock in the code under test
+  explanation: Pass the time in.
+- title: Mocking everything
+  explanation: The test then proves nothing about real behaviour.
+- title: Checking internal calls instead of results
+  explanation: Refactoring breaks such tests.
+- title: Sharing a mock between tests
+  explanation: Calls from one test leak into the next.
+- title: No integration tests at all
+  explanation: Units can work and still fail together.
+summary:
+- Replace slow or random dependencies with test doubles.
+- 'Stub: fixed answers. Fake: simple working copy. Mock: records calls.'
+- Inject dependencies as parameters.
+- Fake the clock and sleep to test time instantly.
+- Do not over-mock; keep some integration tests.
+next: u30-coverage
+quiz:
+- type: mcq
+  question: What is a mock?
+  options:
+  - A stand-in that records how it was called
+  - A real database
+  - A kind of loop
+  - A slow function
+  answer: 0
+  explanation: It remembers calls.
+- type: mcq
+  question: What is dependency injection?
+  options:
+  - Passing dependencies into code as parameters
+  - A virus
+  - A kind of cache
+  - Deleting a dependency
+  answer: 0
+  explanation: Parameters.
+- type: mcq
+  question: Why pass the clock into a function?
+  options:
+  - So tests control time
+  - To make it slower
+  - To use less memory
+  - No reason
+  answer: 0
+  explanation: Deterministic time.
+- type: mcq
+  question: What is exponential backoff?
+  options:
+  - Waiting longer after each failed attempt
+  - Retrying instantly
+  - Never retrying
+  - Using exponents in math
+  answer: 0
+  explanation: 1, 2, 4, 8 seconds.
+- type: mcq
+  question: What is a downside of too many mocks?
+  options:
+  - The test only checks the mocks, not real behaviour
+  - Tests get faster
+  - More coverage
+  - None
+  answer: 0
+  explanation: Over-mocking.
+- type: mcq
+  question: What is a fake?
+  options:
+  - A simple working replacement such as an in-memory database
+  - A broken test
+  - A random generator
+  - A log file
+  answer: 0
+  explanation: Working copy.
+- type: code
+  question: Write `is_expired(created, now, limit)` returning True when more than `limit` seconds have passed (`now - created > limit`).
+  starter: |
+    def is_expired(created, now, limit):
+        pass
+  tests:
+  - name: expiry
+    code: |
+      assert is_expired(0, 3601, 3600) is True and is_expired(0, 3600, 3600) is False and is_expired(100, 100, 0) is False and is_expired(100, 101, 0) is True
+  solution: |
+    def is_expired(created, now, limit):
+        return now - created > limit

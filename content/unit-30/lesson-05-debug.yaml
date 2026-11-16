@@ -1,0 +1,674 @@
+id: u30-debug
+title: Debugging Like a Scientist
+minutes: 110
+objective: Learn a **method** for finding bugs instead of guessing. Read tracebacks, search history with binary search, watch variables, reduce a failing input to a tiny one and deal with flaky tests.
+outcomes:
+- Read a traceback from the bottom
+- Reproduce, isolate and fix a bug step by step
+- Use binary search to find a breaking change
+- Reduce a failing input with delta debugging
+- Recognise and handle flaky tests
+sections:
+- heading: The scientific method for bugs
+  body: |-
+    Debugging is not guessing; it is the **scientific method**. Follow these steps every time:
+
+    1. **Reproduce** the bug. If you cannot make it happen on purpose you cannot know that you fixed it. Write down the exact input and steps.
+    2. **Read the error.** A **traceback** is read from the **bottom**: the last line names the exception and the message; the last frame is where it crashed. The frames above show how the program got there.
+    3. **Form a hypothesis**: "the list is empty when it gets here". A hypothesis is a *guess that can be tested*.
+    4. **Test the hypothesis** with an experiment: add a `print`, use a **debugger** (`python -m pdb`, or the one in your editor) to stop at a line, look at the variables and step forward. Change *one* thing at a time.
+    5. **Fix** the real cause (not just the symptom), then add a **regression test** and remove the debugging code.
+
+    Two helpful habits: explain the problem aloud to a rubber duck (**rubber-duck debugging**; putting it in words often shows the answer), and take a break: fresh eyes find bugs faster than tired ones.
+- heading: Finding it faster
+  body: |-
+    **Binary search the history.** If it worked in version 100 and fails in version 900, do not test every version. Check version 500: if it works, the problem is later; if not, earlier. About 10 checks find the exact change among 1000. `git bisect` automates this: you say which commit is good and which is bad, and Git checks out the middle ones for you while you run the test.
+
+    **Shrink the input.** A failure on a 10,000-line input is hard to read. **Delta debugging** removes chunks of the input and keeps any smaller version that still fails, until nothing more can be removed. The result is a tiny **minimal reproduction**, perfect for a bug report.
+
+    **Watch the state.** Where does a value go wrong? A **watchpoint** reports each time a variable changes and which line changed it. Often the first wrong value is far from where the crash happens.
+
+    **Flaky tests.** A test that sometimes passes and sometimes fails usually depends on timing, random numbers, the order of tests or shared state. Run it many times with different seeds to see how often it fails, then remove the dependence: fix the seed, inject the clock (lesson 3) or make the test create its own data.
+
+    > **Tip:** The bug is almost never in the compiler or the library. If your assumption "this cannot be wrong" does not hold up, check it first.
+examples:
+- title: Traceback and bisect
+  intro: Pull the facts out of a traceback and find the breaking version in 20 history entries.
+  code: |
+    def parse_traceback(text):
+        """Read a Python traceback. Example:
+    Traceback (most recent call last):
+      File "app.py", line 12, in main
+        result = divide(1, 0)
+      File "app.py", line 5, in divide
+        return a / b
+    ZeroDivisionError: division by zero
+        Return a dict {"error": exception name, "message": the text after the first ': ' on the last line ('' if there is none), "frames": list of {"file": text, "line": int, "function": text, "code": the source line stripped} in the order shown (the LAST frame is where it crashed)}. A frame line looks like '  File "NAME", line N, in FUNC' and is followed by an indented source line (if there is none, the code is ''). ValueError('not a traceback') if the first non-blank line is not 'Traceback (most recent call last):' or there is no final exception line (a last line that is not indented and not a File line)."""
+        import re
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines or lines[0].strip() != "Traceback (most recent call last):":
+            raise ValueError("not a traceback")
+        frames = []
+        i = 1
+        pattern = re.compile(r'^\s*File "(.*)", line (\d+), in (.*)$')
+        while i < len(lines):
+            m = pattern.match(lines[i])
+            if not m:
+                break
+            code = ""
+            if i + 1 < len(lines) and not pattern.match(lines[i + 1]) and lines[i + 1].startswith("    "):
+                code = lines[i + 1].strip()
+                i += 1
+            frames.append({"file": m.group(1), "line": int(m.group(2)), "function": m.group(3), "code": code})
+            i += 1
+        if i >= len(lines) or lines[i].startswith(" "):
+            raise ValueError("not a traceback")
+        last = lines[-1]
+        name, sep, message = last.partition(": ")
+        return {"error": name.strip(), "message": message if sep else "", "frames": frames}
+
+
+    def bisect_first_bad(versions, is_bad):
+        """Find the version that BROKE something, like `git bisect`. `versions` is a list ordered from oldest to newest; every version up to some point is good and every later one is bad (is_bad(version) returns True for bad ones). Use binary search so that few checks are needed. Return (index of the first bad version, number of times is_bad was called). If no version is bad return (None, number of calls); if the very first version is bad the index is 0. Do not call is_bad twice for the same index. An empty list gives (None, 0)."""
+        lo, hi = 0, len(versions)
+        calls = 0
+        while lo < hi:
+            mid = (lo + hi) // 2
+            calls += 1
+            if is_bad(versions[mid]):
+                hi = mid
+            else:
+                lo = mid + 1
+        return (lo if lo < len(versions) else None), calls
+
+    text = """Traceback (most recent call last):
+      File "shop.py", line 20, in main
+        print(average_price(prices))
+      File "shop.py", line 9, in average_price
+        return sum(prices) / len(prices)
+    ZeroDivisionError: division by zero
+    """
+    tb = parse_traceback(text)
+    print(tb["error"], "-", tb["message"])
+    last = tb["frames"][-1]
+    print("crashed in", last["function"], "at line", last["line"], ":", last["code"])
+    print("called from", [f["function"] for f in tb["frames"][:-1]])
+
+    history = ["v" + str(i) for i in range(1, 21)]
+    broken_from = "v13"
+    idx, checks = bisect_first_bad(history, lambda v: int(v[1:]) >= int(broken_from[1:]))
+    print("first bad:", history[idx], "after", checks, "checks of", len(history))
+  output: |
+    ZeroDivisionError - division by zero
+    crashed in average_price at line 9 : return sum(prices) / len(prices)
+    called from ['main']
+    first bad: v13 after 5 checks of 20
+  lines:
+  - line: 55
+    note: The exception name and message come from the last line.
+  - line: 57
+    note: The last frame is the crash site.
+  - line: 63
+    note: About 5 checks find one of 20 versions.
+- title: Watchpoints, reduction and flakiness
+  intro: Find where a value goes wrong, shrink a failing input and measure a flaky test.
+  code: |
+    def watch_variable(source, call, var):
+        """A watchpoint: follow ONE local variable while a function runs. Compile the source with the file name '<watch>' and run it with exec (untraced) in a new dict, then evaluate `call` (such as 'total([1, 2, 3])') under sys.settrace. On every 'line' event and on the 'return' event of a function that belongs to '<watch>' (and is not the module), read `var` in the frame's locals. If the variable exists and its repr differs from the last repr seen in THIS call of the function (or nothing was seen yet), append the pair (prev, repr text) where prev is the line number of the previous 'line' event of this call (None when the change is seen at the very first event). Return the list of pairs. Always switch the trace off again and ignore exceptions raised by the call. (Use a dict keyed by id(frame) or the frame object for the per-call state.)"""
+        import sys
+        ns = {}
+        exec(compile(source, "<watch>", "exec"), ns)
+        out = []
+        state = {}
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != "<watch>" or frame.f_code.co_name == "<module>":
+                return None
+            st = state.setdefault(frame, {"prev": None, "last": None, "first": True})
+            if event in ("line", "return"):
+                if var in frame.f_locals:
+                    text = repr(frame.f_locals[var])
+                    if st["last"] != text:
+                        out.append((st["prev"], text))
+                        st["last"] = text
+                if event == "line":
+                    st["prev"] = frame.f_lineno
+            return tracer
+
+        sys.settrace(tracer)
+        try:
+            eval(call, ns)
+        except Exception:
+            pass
+        finally:
+            sys.settrace(None)
+        return out
+
+
+    def classify_flaky(test, seeds):
+        """Is a test flaky? Run test(seed) once for every seed in `seeds`. A run PASSES when it returns without raising an exception (the returned value does not matter). Return a dict {"runs": how many, "passed": how many passed, "status": text}. The status is 'stable pass' when all passed, 'stable fail' when none passed, and 'flaky' when some passed and some did not. With no seeds the status is 'no runs'. Also add "failing_seeds": the list of seeds that failed, in order."""
+        failing = []
+        for s in seeds:
+            try:
+                test(s)
+            except Exception:
+                failing.append(s)
+        runs = len(seeds)
+        passed = runs - len(failing)
+        if runs == 0:
+            status = "no runs"
+        elif passed == runs:
+            status = "stable pass"
+        elif passed == 0:
+            status = "stable fail"
+        else:
+            status = "flaky"
+        return {"runs": runs, "passed": passed, "status": status, "failing_seeds": failing}
+
+
+    def ddmin(items, fails):
+        """Delta debugging: find a SMALL subset of `items` that still makes `fails(subset)` return True (the whole list fails; keep the original order). Algorithm: n = 2. While the list has at least 2 items: cut it into n chunks of nearly equal size (the first len % n chunks get one extra item). First try every chunk ALONE: if fails(chunk) take it as the new list and set n = 2. Otherwise try every COMPLEMENT (the list without that chunk): if fails(complement) take it as the new list and set n = max(n - 1, 2). If neither worked: if n >= len(list) stop, otherwise n = min(2 * n, len(list)). Return the final list. A list of one item or none is returned as is. The input list is not changed."""
+        current = list(items)
+        n = 2
+        while len(current) >= 2:
+            size, extra = divmod(len(current), n)
+            chunks, start = [], 0
+            for k in range(n):
+                end = start + size + (1 if k < extra else 0)
+                chunks.append(current[start:end])
+                start = end
+            reduced = False
+            for chunk in chunks:
+                if chunk and fails(chunk):
+                    current, n, reduced = chunk, 2, True
+                    break
+            if not reduced:
+                for k in range(n):
+                    complement = [x for j, c in enumerate(chunks) if j != k for x in c]
+                    if complement and fails(complement):
+                        current, n, reduced = complement, max(n - 1, 2), True
+                        break
+            if not reduced:
+                if n >= len(current):
+                    break
+                n = min(2 * n, len(current))
+        return current
+
+    buggy = """def average(values):
+        total = 0
+        for v in values:
+            total += v
+        total = total / len(values) + 1
+        return total
+    """
+    for line, value in watch_variable(buggy, "average([2, 4, 6])", "total"):
+        print("after line", line, "total =", value)
+
+    def fails(items):
+        return "bad" in items and "worse" in items
+
+    big = ["ok"] * 20 + ["bad"] + ["ok"] * 15 + ["worse"] + ["ok"] * 10
+    print(len(big), "items ->", ddmin(big, fails))
+
+    import random
+    def test_dice(seed):
+        assert random.Random(seed).randint(1, 6) <= 4
+
+    print(classify_flaky(test_dice, range(12)))
+  output: |
+    after line 2 total = 0
+    after line 4 total = 2
+    after line 4 total = 6
+    after line 4 total = 12
+    after line 5 total = 5.0
+    47 items -> ['bad', 'worse']
+    {'runs': 12, 'passed': 9, 'status': 'flaky', 'failing_seeds': [5, 6, 10]}
+  lines:
+  - line: 89
+    note: The value is wrong only after the division line.
+  - line: 96
+    note: Two culprits hidden among 47 items.
+  - line: 102
+    note: 'Some seeds fail: flaky.'
+playground:
+  prompt: Read a real traceback captured in a variable.
+  code: |
+    import traceback
+    try:
+        1 / 0
+    except Exception:
+        text = traceback.format_exc()
+    print(text.strip().splitlines()[-1])
+exercises:
+- id: traceback
+  title: Reading a traceback
+  difficulty: 4
+  prompt: |-
+    When a Python program crashes it prints a **traceback**: the chain of function calls that led to the error, oldest first, with the **last frame** being where it crashed. Write `parse_traceback(text)`. Example:
+
+    ```
+    Traceback (most recent call last):
+      File "app.py", line 12, in main
+        result = divide(1, 0)
+      File "app.py", line 5, in divide
+        return a / b
+    ZeroDivisionError: division by zero
+    ```
+
+    Return a dict `{"error": exception name, "message": the text after the first ": " on the last line ("" if there is none), "frames": [...]}` where each frame is `{"file": text, "line": int, "function": text, "code": the source line stripped}` in the order shown. A frame line looks like `  File "NAME", line N, in FUNC` and is followed by an indented source line (if there is none, the code is `""`). `ValueError("not a traceback")` if the first non-blank line is not `Traceback (most recent call last):` or there is no final exception line (a last line that is indented or is a `File` line).
+  starter: |-
+    def parse_traceback(text):
+        """Read a Python traceback. Example:
+    Traceback (most recent call last):
+      File "app.py", line 12, in main
+        result = divide(1, 0)
+      File "app.py", line 5, in divide
+        return a / b
+    ZeroDivisionError: division by zero
+        Return a dict {"error": exception name, "message": the text after the first ': ' on the last line ('' if there is none), "frames": list of {"file": text, "line": int, "function": text, "code": the source line stripped} in the order shown (the LAST frame is where it crashed)}. A frame line looks like '  File "NAME", line N, in FUNC' and is followed by an indented source line (if there is none, the code is ''). ValueError('not a traceback') if the first non-blank line is not 'Traceback (most recent call last):' or there is no final exception line (a last line that is not indented and not a File line)."""
+        pass
+  tests:
+  - name: a normal traceback
+    code: |
+      text = """Traceback (most recent call last):
+        File "app.py", line 12, in main
+          result = divide(1, 0)
+        File "app.py", line 5, in divide
+          return a / b
+      ZeroDivisionError: division by zero
+      """
+      got = parse_traceback(text)
+      assert got["error"] == "ZeroDivisionError" and got["message"] == "division by zero" and got["frames"] == [{"file": "app.py", "line": 12, "function": "main", "code": "result = divide(1, 0)"}, {"file": "app.py", "line": 5, "function": "divide", "code": "return a / b"}]
+      text2 = """Traceback (most recent call last):
+        File "<stdin>", line 1, in <module>
+      KeyboardInterrupt
+      """
+      assert parse_traceback(text2) == {"error": "KeyboardInterrupt", "message": "", "frames": [{"file": "<stdin>", "line": 1, "function": "<module>", "code": ""}]}
+  - name: messages with colons and several files
+    code: |
+      text = """
+      Traceback (most recent call last):
+        File "/home/user/my project/run.py", line 3, in <module>
+          load("a: b")
+        File "/home/user/my project/lib.py", line 40, in load
+          raise ValueError("bad: value")
+      ValueError: bad: value: more
+      """
+      got = parse_traceback(text)
+      assert got["error"] == "ValueError" and got["message"] == "bad: value: more" and [f["file"] for f in got["frames"]] == ["/home/user/my project/run.py", "/home/user/my project/lib.py"] and got["frames"][0]["code"] == 'load("a: b")' and got["frames"][1]["line"] == 40 and got["frames"][1]["function"] == "load"
+      assert parse_traceback("Traceback (most recent call last):\nOSError: no disk\n") == {"error": "OSError", "message": "no disk", "frames": []}
+  - name: not tracebacks
+    code: |
+      for bad in ("", "hello", "ValueError: x", "Traceback (most recent call last):", "Traceback (most recent call last):\n  File \"a.py\", line 1, in f\n    x()\n"):
+          try:
+              parse_traceback(bad)
+              raise AssertionError("accepted " + repr(bad))
+          except ValueError as e:
+              assert "not a traceback" in str(e)
+  hints:
+  - Collect the non-blank lines, check the first one, then read frames while lines match the File pattern.
+  - The line after a File line is the code if it is indented and not another File line.
+  solution: |
+    def parse_traceback(text):
+        """Read a Python traceback. Example:
+    Traceback (most recent call last):
+      File "app.py", line 12, in main
+        result = divide(1, 0)
+      File "app.py", line 5, in divide
+        return a / b
+    ZeroDivisionError: division by zero
+        Return a dict {"error": exception name, "message": the text after the first ': ' on the last line ('' if there is none), "frames": list of {"file": text, "line": int, "function": text, "code": the source line stripped} in the order shown (the LAST frame is where it crashed)}. A frame line looks like '  File "NAME", line N, in FUNC' and is followed by an indented source line (if there is none, the code is ''). ValueError('not a traceback') if the first non-blank line is not 'Traceback (most recent call last):' or there is no final exception line (a last line that is not indented and not a File line)."""
+        import re
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines or lines[0].strip() != "Traceback (most recent call last):":
+            raise ValueError("not a traceback")
+        frames = []
+        i = 1
+        pattern = re.compile(r'^\s*File "(.*)", line (\d+), in (.*)$')
+        while i < len(lines):
+            m = pattern.match(lines[i])
+            if not m:
+                break
+            code = ""
+            if i + 1 < len(lines) and not pattern.match(lines[i + 1]) and lines[i + 1].startswith("    "):
+                code = lines[i + 1].strip()
+                i += 1
+            frames.append({"file": m.group(1), "line": int(m.group(2)), "function": m.group(3), "code": code})
+            i += 1
+        if i >= len(lines) or lines[i].startswith(" "):
+            raise ValueError("not a traceback")
+        last = lines[-1]
+        name, sep, message = last.partition(": ")
+        return {"error": name.strip(), "message": message if sep else "", "frames": frames}
+  explanation: 'Always read a traceback from the bottom: the last line says what went wrong, the last frame says where.'
+- id: bisect
+  title: Finding the change that broke it
+  difficulty: 4
+  prompt: 'If something worked last week and is broken today, the quickest way to find the culprit is **binary search** through the history, exactly like `git bisect`. Write `bisect_first_bad(versions, is_bad)`. `versions` is a list ordered from oldest to newest: every version up to some point is good and every later one is bad (`is_bad(version)` returns `True` for bad ones). Use binary search so that few checks are needed. Return `(index of the first bad version, number of times is_bad was called)`. If no version is bad return `(None, calls)`; if the very first version is bad the index is `0`. An empty list gives `(None, 0)`.'
+  starter: |-
+    def bisect_first_bad(versions, is_bad):
+        """Find the version that BROKE something, like `git bisect`. `versions` is a list ordered from oldest to newest; every version up to some point is good and every later one is bad (is_bad(version) returns True for bad ones). Use binary search so that few checks are needed. Return (index of the first bad version, number of times is_bad was called). If no version is bad return (None, number of calls); if the very first version is bad the index is 0. Do not call is_bad twice for the same index. An empty list gives (None, 0)."""
+        pass
+  tests:
+  - name: finding the first bad
+    code: |
+      versions = list(range(100))
+      for first in (0, 1, 37, 50, 98, 99):
+          assert bisect_first_bad(versions, lambda v: v >= first)[0] == first
+      idx, calls = bisect_first_bad(versions, lambda v: v >= 63)
+      assert idx == 63 and calls <= 7
+      assert bisect_first_bad(["a"], lambda v: True) == (0, 1) and bisect_first_bad(["a"], lambda v: False) == (None, 1) and bisect_first_bad([], lambda v: True) == (None, 0)
+  - name: few checks
+    code: |
+      seen = []
+      def check(v):
+          seen.append(v)
+          return v >= 700
+      idx, calls = bisect_first_bad(list(range(1000)), check)
+      assert idx == 700 and calls == len(seen) <= 10 and len(set(seen)) == len(seen)
+      names = ["v1.0", "v1.1", "v1.2", "v2.0", "v2.1"]
+      assert bisect_first_bad(names, lambda v: v >= "v2.0") == (3, 3) and bisect_first_bad(names, lambda v: False)[0] is None and bisect_first_bad(names, lambda v: True)[0] == 0
+  hints:
+  - Keep a range lo..hi and look at the middle each time.
+  - If the middle is bad, the first bad one is at or before it.
+  solution: |
+    def bisect_first_bad(versions, is_bad):
+        """Find the version that BROKE something, like `git bisect`. `versions` is a list ordered from oldest to newest; every version up to some point is good and every later one is bad (is_bad(version) returns True for bad ones). Use binary search so that few checks are needed. Return (index of the first bad version, number of times is_bad was called). If no version is bad return (None, number of calls); if the very first version is bad the index is 0. Do not call is_bad twice for the same index. An empty list gives (None, 0)."""
+        lo, hi = 0, len(versions)
+        calls = 0
+        while lo < hi:
+            mid = (lo + hi) // 2
+            calls += 1
+            if is_bad(versions[mid]):
+                hi = mid
+            else:
+                lo = mid + 1
+        return (lo if lo < len(versions) else None), calls
+  explanation: 'A history of 1,000,000 changes needs only 20 checks: that is why bisect is so powerful.'
+- id: watch
+  title: A watchpoint
+  difficulty: 5
+  prompt: 'A debugger can **watch** a variable and tell you when it changes. Write `watch_variable(source, call, var)`: compile the source with the file name `"<watch>"` and run it with `exec` (untraced) in a new dict, then evaluate `call` (such as `"total([1, 2, 3])"`) under `sys.settrace`. On every `"line"` event and on the `"return"` event of a function that belongs to `"<watch>"` (not the module) read `var` in the frame''s locals. If the variable exists and its `repr` differs from the last one seen in **this call** of the function (or nothing was seen yet), append the pair `(prev, repr text)` where `prev` is the line number of the previous `"line"` event of this call (`None` when the change is seen at the very first event). Return the list of pairs. Always switch the trace off again and ignore exceptions raised by the call.'
+  starter: |-
+    def watch_variable(source, call, var):
+        """A watchpoint: follow ONE local variable while a function runs. Compile the source with the file name '<watch>' and run it with exec (untraced) in a new dict, then evaluate `call` (such as 'total([1, 2, 3])') under sys.settrace. On every 'line' event and on the 'return' event of a function that belongs to '<watch>' (and is not the module), read `var` in the frame's locals. If the variable exists and its repr differs from the last repr seen in THIS call of the function (or nothing was seen yet), append the pair (prev, repr text) where prev is the line number of the previous 'line' event of this call (None when the change is seen at the very first event). Return the list of pairs. Always switch the trace off again and ignore exceptions raised by the call. (Use a dict keyed by id(frame) or the frame object for the per-call state.)"""
+        pass
+  tests:
+  - name: a loop
+    code: |
+      src = """def total(items):
+          t = 0
+          for x in items:
+              t += x
+          return t
+      """
+      assert watch_variable(src, "total([1, 2, 3])", "t") == [(2, "0"), (4, "1"), (4, "3"), (4, "6")]
+      assert watch_variable(src, "total([])", "t") == [(2, "0")] and watch_variable(src, "total([5])", "missing") == [] and watch_variable(src, "total([1, 2])", "x") == [(3, "1"), (3, "2")]
+  - name: arguments and bugs
+    code: |
+      src = """def count_up(n):
+          i = 0
+          while i < n:
+              i += 2
+          return i
+      """
+      assert watch_variable(src, "count_up(5)", "i") == [(2, "0"), (4, "2"), (4, "4"), (4, "6")]
+      assert watch_variable(src, "count_up(5)", "n") == [(None, "5")]
+      buggy = """def average(values):
+          result = sum(values)
+          result = result / len(values)
+          return result
+      """
+      assert watch_variable(buggy, "average([2, 4])", "result") == [(2, "6"), (3, "3.0")]
+      assert watch_variable(buggy, "average([])", "result") == [(2, "0")]
+  - name: separate calls
+    code: |
+      import sys
+      src = """def f(n):
+          v = n
+          if n > 0:
+              v = f(n - 1) + 1
+          return v
+      """
+      got = watch_variable(src, "f(2)", "v")
+      assert got == [(2, "2"), (2, "1"), (2, "0")]
+      assert sys.gettrace() is None
+  hints:
+  - Trace only frames of the file '<watch>' and keep a small state dict per frame.
+  - The previous line number is updated AFTER you have checked the variable.
+  solution: |
+    def watch_variable(source, call, var):
+        """A watchpoint: follow ONE local variable while a function runs. Compile the source with the file name '<watch>' and run it with exec (untraced) in a new dict, then evaluate `call` (such as 'total([1, 2, 3])') under sys.settrace. On every 'line' event and on the 'return' event of a function that belongs to '<watch>' (and is not the module), read `var` in the frame's locals. If the variable exists and its repr differs from the last repr seen in THIS call of the function (or nothing was seen yet), append the pair (prev, repr text) where prev is the line number of the previous 'line' event of this call (None when the change is seen at the very first event). Return the list of pairs. Always switch the trace off again and ignore exceptions raised by the call. (Use a dict keyed by id(frame) or the frame object for the per-call state.)"""
+        import sys
+        ns = {}
+        exec(compile(source, "<watch>", "exec"), ns)
+        out = []
+        state = {}
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != "<watch>" or frame.f_code.co_name == "<module>":
+                return None
+            st = state.setdefault(frame, {"prev": None, "last": None, "first": True})
+            if event in ("line", "return"):
+                if var in frame.f_locals:
+                    text = repr(frame.f_locals[var])
+                    if st["last"] != text:
+                        out.append((st["prev"], text))
+                        st["last"] = text
+                if event == "line":
+                    st["prev"] = frame.f_lineno
+            return tracer
+
+        sys.settrace(tracer)
+        try:
+            eval(call, ns)
+        except Exception:
+            pass
+        finally:
+            sys.settrace(None)
+        return out
+  explanation: 'This is the idea behind the ''watch'' window of every debugger: you see not just the value but the line that changed it.'
+- id: flaky
+  title: Flaky tests
+  difficulty: 4
+  prompt: 'A **flaky** test passes sometimes and fails sometimes without any code change: usually it depends on time, random numbers, ordering or shared state. Finding out whether a test is flaky means running it many times. Write `classify_flaky(test, seeds)`: run `test(seed)` once for every seed in `seeds`. A run **passes** when it returns without raising an exception (the returned value does not matter). Return a dict `{"runs": how many, "passed": how many passed, "status": text, "failing_seeds": the seeds that failed, in order}`. The status is `"stable pass"` when all passed, `"stable fail"` when none passed, `"flaky"` when some passed and some did not, and `"no runs"` for no seeds.'
+  starter: |-
+    def classify_flaky(test, seeds):
+        """Is a test flaky? Run test(seed) once for every seed in `seeds`. A run PASSES when it returns without raising an exception (the returned value does not matter). Return a dict {"runs": how many, "passed": how many passed, "status": text}. The status is 'stable pass' when all passed, 'stable fail' when none passed, and 'flaky' when some passed and some did not. With no seeds the status is 'no runs'. Also add "failing_seeds": the list of seeds that failed, in order."""
+        pass
+  tests:
+  - name: classifying
+    code: |
+      def stable(seed):
+          assert 1 + 1 == 2
+      def broken(seed):
+          assert False
+      def sometimes(seed):
+          assert seed % 3 != 0, "unlucky"
+      assert classify_flaky(stable, [1, 2, 3]) == {"runs": 3, "passed": 3, "status": "stable pass", "failing_seeds": []}
+      assert classify_flaky(broken, [1, 2]) == {"runs": 2, "passed": 0, "status": "stable fail", "failing_seeds": [1, 2]}
+      assert classify_flaky(sometimes, range(1, 8)) == {"runs": 7, "passed": 5, "status": "flaky", "failing_seeds": [3, 6]}
+  - name: randomness and errors
+    code: |
+      import random
+      def uses_random(seed):
+          rng = random.Random(seed)
+          assert rng.random() < 0.9
+      r = classify_flaky(uses_random, list(range(20)))
+      assert r["runs"] == 20 and r["status"] == "flaky" and r["passed"] + len(r["failing_seeds"]) == 20 and r == classify_flaky(uses_random, list(range(20)))
+      def crash(seed):
+          return 1 / (seed - 2)
+      assert classify_flaky(crash, [1, 2, 3]) == {"runs": 3, "passed": 2, "status": "flaky", "failing_seeds": [2]} and classify_flaky(crash, []) == {"runs": 0, "passed": 0, "status": "no runs", "failing_seeds": []}
+      assert classify_flaky(lambda s: False, [1])["status"] == "stable pass"
+  hints:
+  - Count the failing seeds; the passed count is the rest.
+  - Any exception means failure; a False return value does not.
+  solution: |
+    def classify_flaky(test, seeds):
+        """Is a test flaky? Run test(seed) once for every seed in `seeds`. A run PASSES when it returns without raising an exception (the returned value does not matter). Return a dict {"runs": how many, "passed": how many passed, "status": text}. The status is 'stable pass' when all passed, 'stable fail' when none passed, and 'flaky' when some passed and some did not. With no seeds the status is 'no runs'. Also add "failing_seeds": the list of seeds that failed, in order."""
+        failing = []
+        for s in seeds:
+            try:
+                test(s)
+            except Exception:
+                failing.append(s)
+        runs = len(seeds)
+        passed = runs - len(failing)
+        if runs == 0:
+            status = "no runs"
+        elif passed == runs:
+            status = "stable pass"
+        elif passed == 0:
+            status = "stable fail"
+        else:
+            status = "flaky"
+        return {"runs": runs, "passed": passed, "status": status, "failing_seeds": failing}
+  explanation: A flaky test is worse than no test because people learn to ignore failures. Fix it, or delete it, quickly.
+- id: ddmin
+  title: 'Capstone: delta debugging'
+  difficulty: 5
+  prompt: 'Given a large input that triggers a bug, **delta debugging** finds a small piece that still triggers it. Write `ddmin(items, fails)`: `fails(subset)` returns `True` when the bug shows (the whole list fails; keep the original order). Algorithm: `n = 2`. While the list has at least 2 items: cut it into `n` chunks of nearly equal size (the first `len % n` chunks get one extra item). First try every chunk **alone**: if `fails(chunk)` take it as the new list and set `n = 2`. Otherwise try every **complement** (the list without that chunk): if `fails(complement)` take it as the new list and set `n = max(n - 1, 2)`. If neither worked: if `n >= len(list)` stop, otherwise `n = min(2 * n, len(list))`. Return the final list. A list of one item or none is returned as is; the input is not changed.'
+  starter: |-
+    def ddmin(items, fails):
+        """Delta debugging: find a SMALL subset of `items` that still makes `fails(subset)` return True (the whole list fails; keep the original order). Algorithm: n = 2. While the list has at least 2 items: cut it into n chunks of nearly equal size (the first len % n chunks get one extra item). First try every chunk ALONE: if fails(chunk) take it as the new list and set n = 2. Otherwise try every COMPLEMENT (the list without that chunk): if fails(complement) take it as the new list and set n = max(n - 1, 2). If neither worked: if n >= len(list) stop, otherwise n = min(2 * n, len(list)). Return the final list. A list of one item or none is returned as is. The input list is not changed."""
+        pass
+  tests:
+  - name: single culprit
+    code: |
+      assert ddmin(list(range(100)), lambda xs: 42 in xs) == [42] and ddmin([5], lambda xs: True) == [5] and ddmin([], lambda xs: True) == [] and ddmin([1, 2, 3, 4], lambda xs: True) == [1]
+      before = list(range(20))
+      assert ddmin(before, lambda xs: 13 in xs) == [13] and before == list(range(20)) and ddmin(["a", "b", "c"], lambda xs: "c" in xs) == ["c"] and ddmin([7, 7, 7], lambda xs: 7 in xs) == [7]
+  - name: several culprits
+    code: |
+      assert ddmin(list(range(50)), lambda xs: 3 in xs and 41 in xs) == [3, 41] and ddmin(list(range(16)), lambda xs: 0 in xs and 15 in xs) == [0, 15] and ddmin(list(range(10)), lambda xs: 2 in xs and 3 in xs and 4 in xs) == [2, 3, 4]
+      assert ddmin(list("abcdefgh"), lambda xs: "b" in xs and "g" in xs) == ["b", "g"] and ddmin(list(range(30)), lambda xs: sum(xs) > 50 and len(xs) >= 2)[0:0] == []
+  - name: counting the work
+    code: |
+      calls = []
+      def fails(xs):
+          calls.append(len(xs))
+          return 77 in xs
+      assert ddmin(list(range(128)), fails) == [77] and len(calls) < 40
+      calls.clear()
+      def adj(xs):
+          calls.append(1)
+          return any(a == 5 and b == 6 for a, b in zip(xs, xs[1:]))
+      assert ddmin(list(range(10)), adj) == [5, 6]
+  hints:
+  - Build the chunks with divmod so their sizes differ by at most one.
+  - Try the chunks first, then the complements, then make the chunks smaller.
+  solution: |
+    def ddmin(items, fails):
+        """Delta debugging: find a SMALL subset of `items` that still makes `fails(subset)` return True (the whole list fails; keep the original order). Algorithm: n = 2. While the list has at least 2 items: cut it into n chunks of nearly equal size (the first len % n chunks get one extra item). First try every chunk ALONE: if fails(chunk) take it as the new list and set n = 2. Otherwise try every COMPLEMENT (the list without that chunk): if fails(complement) take it as the new list and set n = max(n - 1, 2). If neither worked: if n >= len(list) stop, otherwise n = min(2 * n, len(list)). Return the final list. A list of one item or none is returned as is. The input list is not changed."""
+        current = list(items)
+        n = 2
+        while len(current) >= 2:
+            size, extra = divmod(len(current), n)
+            chunks, start = [], 0
+            for k in range(n):
+                end = start + size + (1 if k < extra else 0)
+                chunks.append(current[start:end])
+                start = end
+            reduced = False
+            for chunk in chunks:
+                if chunk and fails(chunk):
+                    current, n, reduced = chunk, 2, True
+                    break
+            if not reduced:
+                for k in range(n):
+                    complement = [x for j, c in enumerate(chunks) if j != k for x in c]
+                    if complement and fails(complement):
+                        current, n, reduced = complement, max(n - 1, 2), True
+                        break
+            if not reduced:
+                if n >= len(current):
+                    break
+                n = min(2 * n, len(current))
+        return current
+  explanation: 'Real compilers are tested like this: a 10,000-line file that crashes the compiler is reduced automatically to the 5 lines you can actually read.'
+commonMistakes:
+- title: Changing several things at once
+  explanation: You then do not know which change mattered.
+- title: Fixing the symptom
+  explanation: Find the cause, or the bug returns.
+- title: Reading the traceback from the top
+  explanation: The last line and last frame are the important ones.
+- title: Leaving debug prints in the code
+  explanation: Remove them or use logging.
+- title: No regression test
+  explanation: Without one the bug can silently come back.
+summary:
+- Reproduce, read the error, hypothesise, experiment, fix, add a test.
+- Read tracebacks from the bottom.
+- Binary search through history finds a breaking change fast.
+- Delta debugging shrinks a failing input.
+- Flaky tests depend on time, randomness or shared state.
+next: u30-quality
+quiz:
+- type: mcq
+  question: Where do you start reading a Python traceback?
+  options:
+  - At the bottom
+  - At the top
+  - In the middle
+  - Nowhere
+  answer: 0
+  explanation: Last line and last frame.
+- type: mcq
+  question: How many checks does bisect need for 1000 versions?
+  options:
+  - About 10
+  - '1000'
+  - '500'
+  - '100'
+  answer: 0
+  explanation: log2 of 1000.
+- type: mcq
+  question: What is a minimal reproduction?
+  options:
+  - The smallest input or program that still shows the bug
+  - The first version
+  - A backup
+  - A log
+  answer: 0
+  explanation: Small and still failing.
+- type: mcq
+  question: Why change only one thing at a time?
+  options:
+  - To know which change had the effect
+  - To save time
+  - To avoid typing
+  - No reason
+  answer: 0
+  explanation: Controlled experiments.
+- type: mcq
+  question: What often causes flaky tests?
+  options:
+  - Time, randomness, ordering or shared state
+  - Too many assertions
+  - Short names
+  - Comments
+  answer: 0
+  explanation: Non-determinism.
+- type: mcq
+  question: What should you add after fixing a bug?
+  options:
+  - A regression test
+  - More comments
+  - A new library
+  - Nothing
+  answer: 0
+  explanation: So it stays fixed.
+- type: code
+  question: Write `last_line(traceback_text)` returning the last non-blank line of a traceback, stripped.
+  starter: |
+    def last_line(traceback_text):
+        pass
+  tests:
+  - name: last
+    code: |
+      assert last_line("Traceback (most recent call last):\n  File \"a.py\", line 1, in f\n    x()\nNameError: name 'x' is not defined\n\n") == "NameError: name 'x' is not defined" and last_line("A\nB  ") == "B" and last_line("only") == "only"
+  solution: |
+    def last_line(traceback_text):
+        lines = [l.strip() for l in traceback_text.splitlines() if l.strip()]
+        return lines[-1]

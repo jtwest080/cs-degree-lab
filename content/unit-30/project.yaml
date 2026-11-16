@@ -1,0 +1,471 @@
+title: Mini Test Lab
+language: python
+brief: 'Build a complete test tool, like a tiny version of pytest with coverage.py and a mutation tester.
+  The failure-versus-error runner (`run_test`), the report formatter, the statement finder and the mutant
+  maker from this unit are given. You write the parts that join them: `discover` finds `test_` functions,
+  `run_suite` handles setup and teardown fixtures, `run_tests` loads source and tests, `measure` records
+  line coverage while the tests run, `mutation_check` scores the tests with mutants, and `main` prints
+  the whole report with an exit code. When the tests pass you can point your tool at any small Python
+  function and learn how good its tests are.'
+steps:
+- title: Finding tests
+  body: Write `discover`. A test is a callable called `test_...`; `setup` and `teardown` apply to every
+    test.
+- title: Running them
+  body: 'Write `run_suite` with fixtures: setup first, teardown always, and the right result when they
+    raise.'
+- title: Loading code
+  body: 'Write `run_tests`: execute the source and the test file in one namespace and report load errors
+    instead of crashing.'
+- title: Coverage
+  body: 'Write `measure`: trace the test run with `sys.settrace` and compare with the statement lines.'
+- title: Mutants and the report
+  body: Write `mutation_check` and `main`, then try your tool on your own functions.
+checklist:
+- text: Finds test functions and hooks
+  test: finding tests
+- text: Runs tests with fixtures
+  test: running tests and fixtures
+- text: Handles setup and teardown failures
+  test: setup and teardown problems
+- text: Loads source and test code safely
+  test: loading source and tests
+- text: Measures line coverage
+  test: coverage while testing
+- text: Scores tests with mutants
+  test: mutation check
+- text: Prints a full report with an exit code
+  test: the whole tool
+starter: |-
+  def run_test(func, *args):
+      """Run one test function and classify what happens. Return a pair (status, message): ('pass', '') when it returns normally; ('fail', the text of the AssertionError, or 'assertion failed' if the text is empty) when it raises AssertionError; ('error', 'TypeName: text') for any other exception, where TypeName is the exception's class name and the text is str(exception) (just 'TypeName' when the text is empty). The arguments are passed to the function."""
+      try:
+          func(*args)
+      except AssertionError as err:
+          return "fail", str(err) or "assertion failed"
+      except Exception as err:
+          return "error", type(err).__name__ + (": " + str(err) if str(err) else "")
+      return "pass", ""
+
+
+  def report(results):
+      """Format test results. `results` is a list of (name, status, message). Return (lines, code). One line per result in order: 'PASS name' for a pass and 'FAIL name: message' or 'ERROR name: message' otherwise. After a line '---' add a summary line 'N passed' followed by ', M failed' only if M > 0 and then ', K error' ('errors' if K > 1) only if K > 0 (so '3 passed', '3 passed, 1 failed', '2 passed, 2 errors'). With no results the summary is '0 passed'. The code is 0 when everything passed and 1 otherwise."""
+      lines = []
+      passed = failed = errors = 0
+      for name, status, message in results:
+          if status == "pass":
+              passed += 1
+              lines.append("PASS " + name)
+          else:
+              if status == "fail":
+                  failed += 1
+              else:
+                  errors += 1
+              lines.append(status.upper() + " " + name + ": " + message)
+      summary = str(passed) + " passed"
+      if failed:
+          summary += ", " + str(failed) + " failed"
+      if errors:
+          summary += ", " + str(errors) + " error" + ("s" if errors > 1 else "")
+      return lines + ["---", summary], 0 if failed + errors == 0 else 1
+
+
+  def statement_lines(source):
+      """Which lines of this Python source can be executed inside a function? Parse the source with the ast module. Collect the line number (node.lineno, 1-based) of every STATEMENT (ast.stmt) that is inside the body of a function definition (at any depth, also inside loops, ifs, try blocks and nested functions), but NOT the def statements themselves and NOT docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted."""
+      import ast
+      tree = ast.parse(source)
+      lines = set()
+
+      def is_doc(node):
+          return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+      for fn in ast.walk(tree):
+          if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+              for node in ast.walk(fn):
+                  if isinstance(node, ast.stmt) and node is not fn and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not is_doc(node):
+                      lines.add(node.lineno)
+      return sorted(lines)
+
+
+  def make_mutants(source):
+      """Mutation testing creates slightly WRONG copies of the code (mutants) to find out if the tests notice. Parse the source with ast and build one mutant for EVERY place that can be changed, in the order in which ast.walk visits the nodes. The possible changes: a + becomes -, - becomes +, * becomes //, a < becomes <=, <= becomes <, > becomes >=, >= becomes >, == becomes !=, != becomes ==, and becomes or, or becomes and, True becomes False, False becomes True, an integer constant n (not bool) becomes n + 1. Only the ONE chosen place is changed in each mutant. Return a list of pairs (description, new source text made with ast.unparse) where the description is 'line L: OLD -> NEW' using the symbols (+, -, *, //, <, <=, >, >=, ==, !=, and, or, True, False) or the numbers, for example 'line 3: < -> <='. A comparison with several operators changes each operator separately. Do not change anything for the other node types."""
+      import ast
+      swaps = {ast.Add: (ast.Sub, "+", "-"), ast.Sub: (ast.Add, "-", "+"), ast.Mult: (ast.FloorDiv, "*", "//"), ast.Lt: (ast.LtE, "<", "<="), ast.LtE: (ast.Lt, "<=", "<"), ast.Gt: (ast.GtE, ">", ">="), ast.GtE: (ast.Gt, ">=", ">"), ast.Eq: (ast.NotEq, "==", "!="), ast.NotEq: (ast.Eq, "!=", "=="), ast.And: (ast.Or, "and", "or"), ast.Or: (ast.And, "or", "and")}
+      count = sum(1 for _ in ast.walk(ast.parse(source)))
+      out = []
+      for index in range(count):
+          tree = ast.parse(source)
+          node = list(ast.walk(tree))[index]
+          desc = None
+          if isinstance(node, (ast.BinOp, ast.BoolOp)):
+              op = node.op
+              if type(op) in swaps:
+                  new, old_s, new_s = swaps[type(op)]
+                  node.op = new()
+                  desc = "line " + str(node.lineno) + ": " + old_s + " -> " + new_s
+              subs = []
+          elif isinstance(node, ast.Compare):
+              for k, op in enumerate(node.ops):
+                  if type(op) in swaps:
+                      t2 = ast.parse(source)
+                      n2 = list(ast.walk(t2))[index]
+                      new, old_s, new_s = swaps[type(op)]
+                      n2.ops[k] = new()
+                      out.append(("line " + str(node.lineno) + ": " + old_s + " -> " + new_s, ast.unparse(t2)))
+              continue
+          elif isinstance(node, ast.Constant):
+              if node.value is True or node.value is False:
+                  desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(not node.value)
+                  node.value = not node.value
+              elif isinstance(node.value, int):
+                  desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(node.value + 1)
+                  node.value = node.value + 1
+          if desc:
+              out.append((desc, ast.unparse(tree)))
+      return out
+
+
+  def discover(names):
+      """Find the tests in a dict of names (like the globals of a test file). A test is a callable whose name starts with 'test_'. Return a list of dicts {"name": the name, "func": the function}, sorted by name. If the dict also has a callable called 'setup' every test dict gets the key "setup" with it; the same for a callable called 'teardown' (key "teardown")."""
+      pass
+
+
+  def run_suite(tests):
+      """Run the tests (dicts from discover) in order and return a list of (name, status, message). Use run_test for the calls. With a setup, call it first: if it raises the result is ('error', 'setup: ' + 'TypeName: text') and the test and teardown are skipped. Otherwise the test gets the fixture as its argument if its function takes at least one parameter (func.__code__.co_argcount >= 1) and no arguments otherwise. The teardown (called with the fixture) runs after the test even if it failed; if it raises while the test had passed, the result is ('error', 'teardown: ' + 'TypeName: text'); a test that already failed keeps its own result."""
+      pass
+
+
+  def run_tests(source, test_source):
+      """Load and run: exec the `source` (the code under test) in a new dict, then exec `test_source` in the SAME dict (so the tests can use the functions), then run the suite of everything that discover finds there. Return the results. If the source or the tests cannot even be loaded (any exception while executing them), return [('load', 'error', 'TypeName: text')] with the text made like in run_test."""
+      pass
+
+
+  def measure(source, test_source):
+      """Run the tests while recording which lines of the SOURCE run. Compile the source with the file name '<cov>' and exec it in a new dict, exec the tests in the same dict (untraced), then run the suite of discover(names) with sys.settrace recording every 'line' event of frames whose code file is '<cov>' and that are not the module itself. Switch the tracing off in all cases. Return {"results": the results of the suite, "percent": percent of statement_lines(source) that ran, rounded to 1 decimal (100.0 when there are no statement lines), "missing": sorted statement lines that did not run}. If the load fails, run_tests-style: results [('load', 'error', ...)], percent 0.0 and missing = all statement lines."""
+      pass
+
+
+  def mutation_check(source, test_source):
+      """How good are the tests? First run them on the original with run_tests: if any result is not a pass raise ValueError('tests fail on the original'). Then run them on every mutant from make_mutants(source): a mutant is KILLED when any of its results is not a pass (a load error counts too) and it SURVIVES when everything passes. Return (killed, total, survivors) with the descriptions of the survivors in order."""
+      pass
+
+
+  def main(source, test_source):
+      """The whole tool. Return (lines, code). Use measure to run the tests with coverage. The lines are first the lines of report(results); then 'coverage: P%' with P the percent as in '85.7%' and, when lines are missing, ' (missing: 3, 8)' (comma and space separated); then, if ALL tests passed, 'mutation: K/N killed' and one line 'survived: DESCRIPTION' for every survivor (from mutation_check); if any test did not pass the line is 'mutation: skipped (tests failing)'. The code is the code of report (1 when any test failed)."""
+      pass
+tests:
+- name: finding tests
+  code: |
+    def test_b():
+        pass
+    def test_a():
+        pass
+    def helper():
+        pass
+    test_value = 5
+    def setup():
+        return 1
+    names = {"test_b": test_b, "test_a": test_a, "helper": helper, "test_value": test_value, "setup": setup}
+    found = discover(names)
+    assert [t["name"] for t in found] == ["test_a", "test_b"] and all(t["setup"] is setup and "teardown" not in t for t in found) and found[0]["func"] is test_a
+    assert discover({}) == [] and discover({"x": 1, "test_x": 5}) == [] and [sorted(t) for t in discover({"test_z": test_a, "teardown": helper})] == [["func", "name", "teardown"]]
+- name: running tests and fixtures
+  code: |
+    log = []
+    def test_ok():
+        assert True
+    def test_bad():
+        assert 1 == 2, "nope"
+    def test_crash():
+        {}["k"]
+    res = run_suite(discover({"test_ok": test_ok, "test_bad": test_bad, "test_crash": test_crash}))
+    assert res == [("test_bad", "fail", "nope"), ("test_crash", "error", "KeyError: 'k'"), ("test_ok", "pass", "")]
+    def setup():
+        log.append("setup")
+        return {"n": 5}
+    def teardown(fx):
+        log.append("teardown")
+    def test_with(fx):
+        assert fx["n"] == 5
+    def test_without():
+        log.append("no fixture")
+    def test_fails(fx):
+        assert False, "boom"
+    res = run_suite(discover({"setup": setup, "teardown": teardown, "test_with": test_with, "test_without": test_without, "test_fails": test_fails}))
+    assert res == [("test_fails", "fail", "boom"), ("test_with", "pass", ""), ("test_without", "pass", "")]
+    assert log == ["setup", "teardown", "setup", "teardown", "setup", "no fixture", "teardown"]
+- name: setup and teardown problems
+  code: |
+    def bad_setup():
+        raise OSError("no disk")
+    def teardown(fx):
+        raise ValueError("cleanup failed")
+    def test_a(fx):
+        pass
+    def test_b():
+        assert False, "own failure"
+    tests = discover({"setup": bad_setup, "test_a": test_a})
+    assert run_suite(tests) == [("test_a", "error", "setup: OSError: no disk")]
+    def setup():
+        return 1
+    res = run_suite(discover({"setup": setup, "teardown": teardown, "test_a": test_a, "test_b": test_b}))
+    assert res == [("test_a", "error", "teardown: ValueError: cleanup failed"), ("test_b", "fail", "own failure")]
+    assert run_suite([]) == []
+- name: loading source and tests
+  code: |
+    src = "def add(a, b):\n    return a + b\n"
+    tests = "def test_add():\n    assert add(2, 3) == 5\n\ndef test_zero():\n    assert add(0, 0) == 1, 'zero is wrong'\n\ndef helper():\n    return 1\n"
+    assert run_tests(src, tests) == [("test_add", "pass", ""), ("test_zero", "fail", "zero is wrong")]
+    assert len(run_tests("def broken(:\n", tests)) == 1 and run_tests("def broken(:\n", tests)[0][:2] == ("load", "error") and run_tests("def broken(:\n", tests)[0][2].startswith("SyntaxError")
+    assert run_tests(src, "raise RuntimeError('bad test file')\n") == [("load", "error", "RuntimeError: bad test file")] and run_tests("", "") == []
+    assert run_tests("x = undefined_name\n", tests)[0][:2] == ("load", "error") and run_tests(src, "def test_new():\n    return add\n") == [("test_new", "pass", "")]
+- name: coverage while testing
+  code: |
+    import sys
+    src = """def grade(score):
+        if score < 0 or score > 100:
+            raise ValueError("bad score")
+        if score >= 90:
+            return "A"
+        elif score >= 50:
+            return "B"
+        return "F"
+    """
+    weak = "def test_a():\n    assert grade(95) == 'A'\n"
+    info = measure(src, weak)
+    assert info == {"results": [("test_a", "pass", "")], "percent": 42.9, "missing": [3, 6, 7, 8]}
+    more = weak + "def test_b():\n    assert grade(60) == 'B'\n\ndef test_c():\n    assert grade(1) == 'F'\n"
+    info = measure(src, more)
+    assert info["percent"] == 85.7 and info["missing"] == [3] and [r[1] for r in info["results"]] == ["pass", "pass", "pass"]
+    assert sys.gettrace() is None
+    failing = "def test_x():\n    grade(-5)\n"
+    info = measure(src, failing)
+    assert info["results"] == [("test_x", "error", "ValueError: bad score")] and info["percent"] == 28.6 and info["missing"] == [4, 5, 6, 7, 8]
+    assert measure("x = 1\n", "def test_t():\n    pass\n") == {"results": [("test_t", "pass", "")], "percent": 100.0, "missing": []}
+    assert measure(src, "1/0\n") == {"results": [("load", "error", "ZeroDivisionError: division by zero")], "percent": 0.0, "missing": [2, 3, 4, 5, 6, 7, 8]} and sys.gettrace() is None
+- name: mutation check
+  code: |
+    src = "def is_adult(age):\n    return age >= 18\n"
+    weak = "def test_old():\n    assert is_adult(30) is True\n"
+    strong = "def test_edges():\n    assert is_adult(18) is True\n    assert is_adult(17) is False\n    assert is_adult(30) is True\n"
+    assert mutation_check(src, weak) == (0, 2, ["line 2: >= -> >", "line 2: 18 -> 19"]) and mutation_check(src, strong) == (2, 2, [])
+    try:
+        mutation_check(src, "def test_wrong():\n    assert is_adult(1) is True\n")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert "tests fail on the original" in str(e)
+    try:
+        mutation_check(src, "raise RuntimeError('x')\n")
+        raise AssertionError("accepted")
+    except ValueError:
+        pass
+    assert mutation_check("x = 'a'\n", "def test_t():\n    pass\n") == (0, 0, [])
+- name: the whole tool
+  code: |
+    src = "def grade(score):\n    if score < 0 or score > 100:\n        raise ValueError('bad score')\n    if score >= 90:\n        return 'A'\n    elif score >= 50:\n        return 'B'\n    return 'F'\n"
+    weak = "def test_a():\n    assert grade(95) == 'A'\n\ndef test_f():\n    assert grade(10) == 'F'\n"
+    lines, code = main(src, weak)
+    assert code == 0 and lines[:4] == ["PASS test_a", "PASS test_f", "---", "2 passed"] and lines[4] == "coverage: 71.4% (missing: 3, 7)" and lines[5] == "mutation: 0/9 killed" and len(lines) == 6 + 9 and lines[6].startswith("survived: line ")
+    strong = "def test_all():\n    r = (grade(95), grade(90), grade(89), grade(50), grade(49), grade(0), grade(100))\n    assert r == ('A', 'A', 'B', 'B', 'F', 'F', 'A')\n\ndef test_errors():\n    for bad in (-1, 101):\n        try:\n            grade(bad)\n        except ValueError:\n            continue\n        raise AssertionError('accepted')\n"
+    lines, code = main(src, strong)
+    assert code == 0 and lines == ["PASS test_all", "PASS test_errors", "---", "2 passed", "coverage: 100.0%", "mutation: 9/9 killed"]
+    broken = "def test_wrong():\n    assert grade(95) == 'B', 'expected B'\n\ndef test_ok():\n    assert grade(10) == 'F'\n"
+    lines, code = main(src, broken)
+    assert code == 1 and lines == ["PASS test_ok", "FAIL test_wrong: expected B", "---", "1 passed, 1 failed", "coverage: 71.4% (missing: 3, 7)", "mutation: skipped (tests failing)"]
+solution: |
+  def run_test(func, *args):
+      """Run one test function and classify what happens. Return a pair (status, message): ('pass', '') when it returns normally; ('fail', the text of the AssertionError, or 'assertion failed' if the text is empty) when it raises AssertionError; ('error', 'TypeName: text') for any other exception, where TypeName is the exception's class name and the text is str(exception) (just 'TypeName' when the text is empty). The arguments are passed to the function."""
+      try:
+          func(*args)
+      except AssertionError as err:
+          return "fail", str(err) or "assertion failed"
+      except Exception as err:
+          return "error", type(err).__name__ + (": " + str(err) if str(err) else "")
+      return "pass", ""
+
+
+  def report(results):
+      """Format test results. `results` is a list of (name, status, message). Return (lines, code). One line per result in order: 'PASS name' for a pass and 'FAIL name: message' or 'ERROR name: message' otherwise. After a line '---' add a summary line 'N passed' followed by ', M failed' only if M > 0 and then ', K error' ('errors' if K > 1) only if K > 0 (so '3 passed', '3 passed, 1 failed', '2 passed, 2 errors'). With no results the summary is '0 passed'. The code is 0 when everything passed and 1 otherwise."""
+      lines = []
+      passed = failed = errors = 0
+      for name, status, message in results:
+          if status == "pass":
+              passed += 1
+              lines.append("PASS " + name)
+          else:
+              if status == "fail":
+                  failed += 1
+              else:
+                  errors += 1
+              lines.append(status.upper() + " " + name + ": " + message)
+      summary = str(passed) + " passed"
+      if failed:
+          summary += ", " + str(failed) + " failed"
+      if errors:
+          summary += ", " + str(errors) + " error" + ("s" if errors > 1 else "")
+      return lines + ["---", summary], 0 if failed + errors == 0 else 1
+
+
+  def statement_lines(source):
+      """Which lines of this Python source can be executed inside a function? Parse the source with the ast module. Collect the line number (node.lineno, 1-based) of every STATEMENT (ast.stmt) that is inside the body of a function definition (at any depth, also inside loops, ifs, try blocks and nested functions), but NOT the def statements themselves and NOT docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted."""
+      import ast
+      tree = ast.parse(source)
+      lines = set()
+
+      def is_doc(node):
+          return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+      for fn in ast.walk(tree):
+          if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+              for node in ast.walk(fn):
+                  if isinstance(node, ast.stmt) and node is not fn and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not is_doc(node):
+                      lines.add(node.lineno)
+      return sorted(lines)
+
+
+  def make_mutants(source):
+      """Mutation testing creates slightly WRONG copies of the code (mutants) to find out if the tests notice. Parse the source with ast and build one mutant for EVERY place that can be changed, in the order in which ast.walk visits the nodes. The possible changes: a + becomes -, - becomes +, * becomes //, a < becomes <=, <= becomes <, > becomes >=, >= becomes >, == becomes !=, != becomes ==, and becomes or, or becomes and, True becomes False, False becomes True, an integer constant n (not bool) becomes n + 1. Only the ONE chosen place is changed in each mutant. Return a list of pairs (description, new source text made with ast.unparse) where the description is 'line L: OLD -> NEW' using the symbols (+, -, *, //, <, <=, >, >=, ==, !=, and, or, True, False) or the numbers, for example 'line 3: < -> <='. A comparison with several operators changes each operator separately. Do not change anything for the other node types."""
+      import ast
+      swaps = {ast.Add: (ast.Sub, "+", "-"), ast.Sub: (ast.Add, "-", "+"), ast.Mult: (ast.FloorDiv, "*", "//"), ast.Lt: (ast.LtE, "<", "<="), ast.LtE: (ast.Lt, "<=", "<"), ast.Gt: (ast.GtE, ">", ">="), ast.GtE: (ast.Gt, ">=", ">"), ast.Eq: (ast.NotEq, "==", "!="), ast.NotEq: (ast.Eq, "!=", "=="), ast.And: (ast.Or, "and", "or"), ast.Or: (ast.And, "or", "and")}
+      count = sum(1 for _ in ast.walk(ast.parse(source)))
+      out = []
+      for index in range(count):
+          tree = ast.parse(source)
+          node = list(ast.walk(tree))[index]
+          desc = None
+          if isinstance(node, (ast.BinOp, ast.BoolOp)):
+              op = node.op
+              if type(op) in swaps:
+                  new, old_s, new_s = swaps[type(op)]
+                  node.op = new()
+                  desc = "line " + str(node.lineno) + ": " + old_s + " -> " + new_s
+              subs = []
+          elif isinstance(node, ast.Compare):
+              for k, op in enumerate(node.ops):
+                  if type(op) in swaps:
+                      t2 = ast.parse(source)
+                      n2 = list(ast.walk(t2))[index]
+                      new, old_s, new_s = swaps[type(op)]
+                      n2.ops[k] = new()
+                      out.append(("line " + str(node.lineno) + ": " + old_s + " -> " + new_s, ast.unparse(t2)))
+              continue
+          elif isinstance(node, ast.Constant):
+              if node.value is True or node.value is False:
+                  desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(not node.value)
+                  node.value = not node.value
+              elif isinstance(node.value, int):
+                  desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(node.value + 1)
+                  node.value = node.value + 1
+          if desc:
+              out.append((desc, ast.unparse(tree)))
+      return out
+
+
+  def discover(names):
+      """Find the tests in a dict of names (like the globals of a test file). A test is a callable whose name starts with 'test_'. Return a list of dicts {"name": the name, "func": the function}, sorted by name. If the dict also has a callable called 'setup' every test dict gets the key "setup" with it; the same for a callable called 'teardown' (key "teardown")."""
+      found = []
+      for name in sorted(names):
+          if name.startswith("test_") and callable(names[name]):
+              test = {"name": name, "func": names[name]}
+              for hook in ("setup", "teardown"):
+                  if callable(names.get(hook)):
+                      test[hook] = names[hook]
+              found.append(test)
+      return found
+
+
+  def run_suite(tests):
+      """Run the tests (dicts from discover) in order and return a list of (name, status, message). Use run_test for the calls. With a setup, call it first: if it raises the result is ('error', 'setup: ' + 'TypeName: text') and the test and teardown are skipped. Otherwise the test gets the fixture as its argument if its function takes at least one parameter (func.__code__.co_argcount >= 1) and no arguments otherwise. The teardown (called with the fixture) runs after the test even if it failed; if it raises while the test had passed, the result is ('error', 'teardown: ' + 'TypeName: text'); a test that already failed keeps its own result."""
+      results = []
+      for t in tests:
+          fixture, args = None, ()
+          if "setup" in t:
+              try:
+                  fixture = t["setup"]()
+              except Exception as err:
+                  results.append((t["name"], "error", "setup: " + type(err).__name__ + (": " + str(err) if str(err) else "")))
+                  continue
+              if t["func"].__code__.co_argcount >= 1:
+                  args = (fixture,)
+          status, message = run_test(t["func"], *args)
+          if "teardown" in t:
+              tstatus, tmessage = run_test(t["teardown"], fixture)
+              if tstatus != "pass" and status == "pass":
+                  status, message = "error", "teardown: " + tmessage
+          results.append((t["name"], status, message))
+      return results
+
+
+  def run_tests(source, test_source):
+      """Load and run: exec the `source` (the code under test) in a new dict, then exec `test_source` in the SAME dict (so the tests can use the functions), then run the suite of everything that discover finds there. Return the results. If the source or the tests cannot even be loaded (any exception while executing them), return [('load', 'error', 'TypeName: text')] with the text made like in run_test."""
+      names = {}
+      try:
+          exec(source, names)
+          exec(test_source, names)
+      except Exception as err:
+          return [("load", "error", type(err).__name__ + (": " + str(err) if str(err) else ""))]
+      return run_suite(discover(names))
+
+
+  def measure(source, test_source):
+      """Run the tests while recording which lines of the SOURCE run. Compile the source with the file name '<cov>' and exec it in a new dict, exec the tests in the same dict (untraced), then run the suite of discover(names) with sys.settrace recording every 'line' event of frames whose code file is '<cov>' and that are not the module itself. Switch the tracing off in all cases. Return {"results": the results of the suite, "percent": percent of statement_lines(source) that ran, rounded to 1 decimal (100.0 when there are no statement lines), "missing": sorted statement lines that did not run}. If the load fails, run_tests-style: results [('load', 'error', ...)], percent 0.0 and missing = all statement lines."""
+      import sys
+      stmts = set(statement_lines(source))
+      seen = set()
+      names = {}
+      try:
+          exec(compile(source, "<cov>", "exec"), names)
+          exec(test_source, names)
+      except Exception as err:
+          return {"results": [("load", "error", type(err).__name__ + (": " + str(err) if str(err) else ""))], "percent": 0.0, "missing": sorted(stmts)}
+
+      def tracer(frame, event, arg):
+          if frame.f_code.co_filename != "<cov>" or frame.f_code.co_name == "<module>":
+              return None
+          if event == "line":
+              seen.add(frame.f_lineno)
+          return tracer
+
+      tests = discover(names)
+      sys.settrace(tracer)
+      try:
+          results = run_suite(tests)
+      finally:
+          sys.settrace(None)
+      covered = stmts & seen
+      percent = round(100 * len(covered) / len(stmts), 1) if stmts else 100.0
+      return {"results": results, "percent": percent, "missing": sorted(stmts - seen)}
+
+
+  def mutation_check(source, test_source):
+      """How good are the tests? First run them on the original with run_tests: if any result is not a pass raise ValueError('tests fail on the original'). Then run them on every mutant from make_mutants(source): a mutant is KILLED when any of its results is not a pass (a load error counts too) and it SURVIVES when everything passes. Return (killed, total, survivors) with the descriptions of the survivors in order."""
+      if any(status != "pass" for _, status, _ in run_tests(source, test_source)):
+          raise ValueError("tests fail on the original")
+      mutants = make_mutants(source)
+      killed, survivors = 0, []
+      for desc, text in mutants:
+          if any(status != "pass" for _, status, _ in run_tests(text, test_source)):
+              killed += 1
+          else:
+              survivors.append(desc)
+      return killed, len(mutants), survivors
+
+
+  def main(source, test_source):
+      """The whole tool. Return (lines, code). Use measure to run the tests with coverage. The lines are first the lines of report(results); then 'coverage: P%' with P the percent as in '85.7%' and, when lines are missing, ' (missing: 3, 8)' (comma and space separated); then, if ALL tests passed, 'mutation: K/N killed' and one line 'survived: DESCRIPTION' for every survivor (from mutation_check); if any test did not pass the line is 'mutation: skipped (tests failing)'. The code is the code of report (1 when any test failed)."""
+      info = measure(source, test_source)
+      lines, code = report(info["results"])
+      line = "coverage: " + str(info["percent"]) + "%"
+      if info["missing"]:
+          line += " (missing: " + ", ".join(str(n) for n in info["missing"]) + ")"
+      lines.append(line)
+      if code == 0:
+          killed, total, survivors = mutation_check(source, test_source)
+          lines.append("mutation: " + str(killed) + "/" + str(total) + " killed")
+          lines.extend("survived: " + s for s in survivors)
+      else:
+          lines.append("mutation: skipped (tests failing)")
+      return lines, code
+stretch: Add branch coverage, a `--seed` that shuffles the test order to find tests that depend on each
+  other, parametrised tests from a table, timing for every test, a `-k` filter by name, or shrink a failing
+  input with `ddmin` from lesson 5.

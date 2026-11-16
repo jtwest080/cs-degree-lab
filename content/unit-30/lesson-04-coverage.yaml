@@ -1,0 +1,824 @@
+id: u30-coverage
+title: Coverage and Mutation Testing
+minutes: 110
+objective: Measure how good a test suite is. You will build a **line coverage** tool with `sys.settrace` and an `ast`-based **mutation tester**, and learn why 100 % coverage is not the same as good tests.
+outcomes:
+- Explain line and branch coverage
+- Measure coverage by tracing
+- Explain mutation testing
+- Use surviving mutants to improve tests
+sections:
+- heading: 'Coverage: did the tests run it?'
+  body: |-
+    **Code coverage** is the share of your code that runs while the tests run. **Line coverage** counts lines; **branch coverage** counts each outcome of every `if` (the true and the false path). A tool called `coverage.py` (and `pytest-cov`) measures it for Python: it asks the interpreter to report every line as it runs (`sys.settrace`), then compares that with the list of lines that could run.
+
+    The useful output is the list of **missing lines**: code your tests never touched. Look at them: usually they are error handling or rare cases, exactly where bugs hide. A typical project aims at 80-90 % and reads the missing lines rather than chasing 100 %.
+
+    > **Warning:** Coverage tells you what is **not** tested; it can never tell you that the tested code is **right**. A test with no assertions at all gives full coverage and checks nothing.
+- heading: 'Mutation testing: would the tests notice a bug?'
+  body: |-
+    To check whether your tests are actually good, break the code on purpose. A **mutation testing** tool makes many small changes (**mutants**): turn `>=` into `>`, `+` into `-`, `True` into `False`, `18` into `19`. For each mutant it runs the tests. If a test fails the mutant is **killed**: good, the tests noticed. If everything still passes the mutant **survives**: your tests would not notice that bug.
+
+    The **mutation score** is killed divided by all mutants. A surviving mutant tells you exactly what to add. In the `is_adult` example, if only age 30 is tested, `>=` to `>` survives: you never tested age 18, the boundary from lesson 2. The two ideas fit together: **boundary tests kill mutants**.
+
+    Mutation testing is slow (the tests run once per mutant), so it is used on important code and in the background, not on every change.
+examples:
+- title: Measuring coverage
+  intro: Watch which lines of a function run.
+  code: |
+    def statement_lines(source):
+        """Which lines of this Python source can be executed inside a function? Parse the source with the ast module. Collect the line number (node.lineno, 1-based) of every STATEMENT (ast.stmt) that is inside the body of a function definition (at any depth, also inside loops, ifs, try blocks and nested functions), but NOT the def statements themselves and NOT docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted."""
+        import ast
+        tree = ast.parse(source)
+        lines = set()
+
+        def is_doc(node):
+            return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.stmt) and node is not fn and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not is_doc(node):
+                        lines.add(node.lineno)
+        return sorted(lines)
+
+
+    def trace_lines(source, call):
+        """Which lines of the source run when we execute `call`? Compile the source with the file name '<cov>' and run it with exec in a new dict (this part is NOT traced). Then evaluate the text `call` (for example 'grade(95)') in that dict while recording with sys.settrace every 'line' event whose frame belongs to the file '<cov>' and whose function is not the module itself ('<module>'). Always remove the trace again (sys.settrace(None)), also when the call raises an exception (the exception is swallowed: a crashing call still counts for the lines it reached). Return the sorted list of the different line numbers."""
+        import sys
+        seen = set()
+        ns = {}
+        exec(compile(source, "<cov>", "exec"), ns)
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != "<cov>" or frame.f_code.co_name == "<module>":
+                return None
+            if event == "line":
+                seen.add(frame.f_lineno)
+            return tracer
+
+        sys.settrace(tracer)
+        try:
+            eval(call, ns)
+        except Exception:
+            pass
+        finally:
+            sys.settrace(None)
+        return sorted(seen)
+
+
+    def coverage(source, calls):
+        """Line coverage. `calls` is a list of call texts like 'grade(95)'. Take the statement lines of the source (statement_lines) and the lines that run in ANY of the calls (trace_lines, one call at a time). Return {"percent": 100 * covered / total rounded to 1 decimal, "missing": sorted list of the statement lines that never ran}. A source with no statement lines has percent 100.0 and nothing missing. Lines that ran but are not statement lines are ignored."""
+        stmts = set(statement_lines(source))
+        ran = set()
+        for call in calls:
+            ran |= set(trace_lines(source, call))
+        covered = stmts & ran
+        percent = round(100 * len(covered) / len(stmts), 1) if stmts else 100.0
+        return {"percent": percent, "missing": sorted(stmts - ran)}
+
+    GRADE_SRC = """def grade(score):
+        if score < 0 or score > 100:
+            raise ValueError("bad score")
+        if score >= 90:
+            return "A"
+        elif score >= 50:
+            return "B"
+        return "F"
+    """
+
+    print(statement_lines(GRADE_SRC))
+    print(coverage(GRADE_SRC, ["grade(95)"]))
+    print(coverage(GRADE_SRC, ["grade(95)", "grade(60)", "grade(10)"]))
+    print(coverage(GRADE_SRC, ["grade(95)", "grade(60)", "grade(10)", "grade(-1)"]))
+  output: |
+    [2, 3, 4, 5, 6, 7, 8]
+    {'percent': 42.9, 'missing': [3, 6, 7, 8]}
+    {'percent': 85.7, 'missing': [3]}
+    {'percent': 100.0, 'missing': []}
+  lines:
+  - line: 62
+    note: Seven lines of the function can run.
+  - line: 63
+    note: One call reaches only three of the seven lines.
+  - line: 64
+    note: Everything except the error case ran.
+  - line: 65
+    note: Every line ran.
+- title: Mutation score of two test suites
+  intro: A weak and a strong test suite for the same function.
+  code: |
+    def make_mutants(source):
+        """Mutation testing creates slightly WRONG copies of the code (mutants) to find out if the tests notice. Parse the source with ast and build one mutant for EVERY place that can be changed, in the order in which ast.walk visits the nodes. The possible changes: a + becomes -, - becomes +, * becomes //, a < becomes <=, <= becomes <, > becomes >=, >= becomes >, == becomes !=, != becomes ==, and becomes or, or becomes and, True becomes False, False becomes True, an integer constant n (not bool) becomes n + 1. Only the ONE chosen place is changed in each mutant. Return a list of pairs (description, new source text made with ast.unparse) where the description is 'line L: OLD -> NEW' using the symbols (+, -, *, //, <, <=, >, >=, ==, !=, and, or, True, False) or the numbers, for example 'line 3: < -> <='. A comparison with several operators changes each operator separately. Do not change anything for the other node types."""
+        import ast
+        swaps = {ast.Add: (ast.Sub, "+", "-"), ast.Sub: (ast.Add, "-", "+"), ast.Mult: (ast.FloorDiv, "*", "//"), ast.Lt: (ast.LtE, "<", "<="), ast.LtE: (ast.Lt, "<=", "<"), ast.Gt: (ast.GtE, ">", ">="), ast.GtE: (ast.Gt, ">=", ">"), ast.Eq: (ast.NotEq, "==", "!="), ast.NotEq: (ast.Eq, "!=", "=="), ast.And: (ast.Or, "and", "or"), ast.Or: (ast.And, "or", "and")}
+        count = sum(1 for _ in ast.walk(ast.parse(source)))
+        out = []
+        for index in range(count):
+            tree = ast.parse(source)
+            node = list(ast.walk(tree))[index]
+            desc = None
+            if isinstance(node, (ast.BinOp, ast.BoolOp)):
+                op = node.op
+                if type(op) in swaps:
+                    new, old_s, new_s = swaps[type(op)]
+                    node.op = new()
+                    desc = "line " + str(node.lineno) + ": " + old_s + " -> " + new_s
+                subs = []
+            elif isinstance(node, ast.Compare):
+                for k, op in enumerate(node.ops):
+                    if type(op) in swaps:
+                        t2 = ast.parse(source)
+                        n2 = list(ast.walk(t2))[index]
+                        new, old_s, new_s = swaps[type(op)]
+                        n2.ops[k] = new()
+                        out.append(("line " + str(node.lineno) + ": " + old_s + " -> " + new_s, ast.unparse(t2)))
+                continue
+            elif isinstance(node, ast.Constant):
+                if node.value is True or node.value is False:
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(not node.value)
+                    node.value = not node.value
+                elif isinstance(node.value, int):
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(node.value + 1)
+                    node.value = node.value + 1
+            if desc:
+                out.append((desc, ast.unparse(tree)))
+        return out
+
+
+    def mutation_score(source, tests):
+        """How good are the tests? `tests(ns)` receives the dict of names defined by a version of the source and must RAISE (AssertionError or anything else) when it finds a problem. First check that the tests pass on the ORIGINAL source (run it with exec in a new dict; if tests raise, raise ValueError('tests fail on the original')). Then run the tests on every mutant from make_mutants (each in a new dict). A mutant is KILLED when the tests raise an exception (or the mutant's source cannot be executed) and SURVIVES when they pass. Return (killed, total, survivors) where survivors is the list of the descriptions of the surviving mutants, in order."""
+        ns = {}
+        exec(source, ns)
+        try:
+            tests(ns)
+        except Exception:
+            raise ValueError("tests fail on the original")
+        mutants = make_mutants(source)
+        killed, survivors = 0, []
+        for desc, text in mutants:
+            env = {}
+            try:
+                exec(text, env)
+                tests(env)
+            except Exception:
+                killed += 1
+            else:
+                survivors.append(desc)
+        return killed, len(mutants), survivors
+
+    GRADE_SRC = """def grade(score):
+        if score < 0 or score > 100:
+            raise ValueError("bad score")
+        if score >= 90:
+            return "A"
+        elif score >= 50:
+            return "B"
+        return "F"
+    """
+
+    mutants = make_mutants(GRADE_SRC)
+    print(len(mutants), "mutants, for example:", mutants[0][0])
+
+    def weak(ns):
+        assert ns["grade"](95) == "A"
+        assert ns["grade"](10) == "F"
+
+    def strong(ns):
+        g = ns["grade"]
+        assert (g(95), g(90), g(89), g(50), g(49), g(0), g(100)) == ("A", "A", "B", "B", "F", "F", "A")
+        for bad in (-1, 101):
+            try:
+                g(bad)
+                raise AssertionError("accepted")
+            except ValueError:
+                pass
+
+    for name, tests in (("weak", weak), ("strong", strong)):
+        killed, total, survivors = mutation_score(GRADE_SRC, tests)
+        print(name, "tests killed", killed, "of", total)
+        print(" survivors:", len(survivors))
+  output: |
+    9 mutants, for example: line 2: or -> and
+    weak tests killed 0 of 9
+     survivors: 9
+    strong tests killed 9 of 9
+     survivors: 0
+  lines:
+  - line: 70
+    note: Each place that can be changed gives one mutant.
+  - line: 87
+    note: The weak tests run most lines but kill none of the mutants.
+playground:
+  prompt: Trace the lines of a call yourself.
+  code: |
+    import sys
+    lines = []
+    def f(x):
+        y = x + 1
+        return y
+    def tr(frame, event, arg):
+        if event == 'line' and frame.f_code.co_name == 'f':
+            lines.append(frame.f_lineno)
+        return tr
+    sys.settrace(tr)
+    f(1)
+    sys.settrace(None)
+    print(len(lines))
+exercises:
+- id: stmts
+  title: Which lines count?
+  difficulty: 4
+  prompt: '**Code coverage** measures how much of your code the tests actually run. First you need the list of lines that *can* run. Write `statement_lines(source)`. Parse the source with the `ast` module and collect the line number (`node.lineno`, 1-based) of every **statement** (`ast.stmt`) that is inside the body of a function definition (at any depth: also inside loops, `if`s, `try` blocks and nested functions), but **not** the `def` statements themselves and **not** docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted.'
+  starter: |-
+    def statement_lines(source):
+        """Which lines of this Python source can be executed inside a function? Parse the source with the ast module. Collect the line number (node.lineno, 1-based) of every STATEMENT (ast.stmt) that is inside the body of a function definition (at any depth, also inside loops, ifs, try blocks and nested functions), but NOT the def statements themselves and NOT docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted."""
+        pass
+  tests:
+  - name: simple functions
+    code: |
+      src = """def add(a, b):
+          \"\"\"Add.\"\"\"
+          total = a + b
+          return total
+      """
+      assert statement_lines(src) == [3, 4] and statement_lines("x = 1\n") == [] and statement_lines("") == []
+      src2 = """import os
+
+      LIMIT = 5
+
+      def grade(score):
+          if score < 0:
+              raise ValueError("bad")
+          elif score > 5:
+              return "A"
+          for i in range(3):
+              print(i)
+          return "B"
+      """
+      assert statement_lines(src2) == [6, 7, 8, 9, 10, 11, 12]
+  - name: nesting
+    code: |
+      src = """def outer(items):
+          def inner(x):
+              return x * 2
+          result = []
+          for item in items:
+              try:
+                  result.append(inner(item))
+              except TypeError:
+                  pass
+              finally:
+                  print("done")
+          while False:
+              break
+          return result
+
+      class Box:
+          def size(self):
+              return 1
+      """
+      assert statement_lines(src) == [3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 18]
+  hints:
+  - Walk the tree, find the function definitions, and look inside each one.
+  - A docstring is an Expr node whose value is a string constant.
+  solution: |
+    def statement_lines(source):
+        """Which lines of this Python source can be executed inside a function? Parse the source with the ast module. Collect the line number (node.lineno, 1-based) of every STATEMENT (ast.stmt) that is inside the body of a function definition (at any depth, also inside loops, ifs, try blocks and nested functions), but NOT the def statements themselves and NOT docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted."""
+        import ast
+        tree = ast.parse(source)
+        lines = set()
+
+        def is_doc(node):
+            return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.stmt) and node is not fn and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not is_doc(node):
+                        lines.add(node.lineno)
+        return sorted(lines)
+  explanation: Coverage tools like coverage.py do exactly this, then compare it with what really ran.
+- id: trace
+  title: Watching lines run
+  difficulty: 5
+  prompt: 'Python lets you watch a program run with `sys.settrace`. Write `trace_lines(source, call)`: compile the source with the file name `"<cov>"` and run it with `exec` in a new dict (this part is **not** traced). Then evaluate the text `call` (for example `"grade(95)"`) in that dict while recording, with a trace function, every `"line"` event whose frame belongs to the file `"<cov>"` and whose function is not the module itself (`"<module>"`). Always switch the tracing off again (`sys.settrace(None)`), also when the call raises an exception (the exception is swallowed: a crashing call still counts for the lines it reached). Return the sorted list of the different line numbers.'
+  starter: |-
+    def trace_lines(source, call):
+        """Which lines of the source run when we execute `call`? Compile the source with the file name '<cov>' and run it with exec in a new dict (this part is NOT traced). Then evaluate the text `call` (for example 'grade(95)') in that dict while recording with sys.settrace every 'line' event whose frame belongs to the file '<cov>' and whose function is not the module itself ('<module>'). Always remove the trace again (sys.settrace(None)), also when the call raises an exception (the exception is swallowed: a crashing call still counts for the lines it reached). Return the sorted list of the different line numbers."""
+        pass
+  tests:
+  - name: which lines run
+    code: |
+      src = """def sign(n):
+          if n < 0:
+              return "neg"
+          if n == 0:
+              return "zero"
+          return "pos"
+      """
+      assert trace_lines(src, "sign(-5)") == [2, 3] and trace_lines(src, "sign(0)") == [2, 4, 5] and trace_lines(src, "sign(7)") == [2, 4, 6] and trace_lines(src, "1 + 1") == []
+      src2 = """def total(items):
+          t = 0
+          for x in items:
+              t += x
+          return t
+
+      def twice(items):
+          return total(items) * 2
+      """
+      assert trace_lines(src2, "total([1, 2])") == [2, 3, 4, 5] and trace_lines(src2, "total([])") == [2, 3, 5] and trace_lines(src2, "twice([1])") == [2, 3, 4, 5, 8]
+  - name: errors and cleanup
+    code: |
+      import sys
+      src = """def risky(x):
+          y = 10
+          z = y / x
+          return z
+      """
+      assert trace_lines(src, "risky(0)") == [2, 3] and trace_lines(src, "risky(2)") == [2, 3, 4] and trace_lines(src, "undefined_name(1)") == []
+      assert sys.gettrace() is None
+      src3 = """def f():
+          return 1
+      print("module line")
+      """
+      assert trace_lines(src3, "f()") == [2]
+  hints:
+  - Define a trace function that checks frame.f_code.co_filename and returns itself so lines inside the function are traced too.
+  - Use try/finally so that tracing is always switched off.
+  solution: |
+    def trace_lines(source, call):
+        """Which lines of the source run when we execute `call`? Compile the source with the file name '<cov>' and run it with exec in a new dict (this part is NOT traced). Then evaluate the text `call` (for example 'grade(95)') in that dict while recording with sys.settrace every 'line' event whose frame belongs to the file '<cov>' and whose function is not the module itself ('<module>'). Always remove the trace again (sys.settrace(None)), also when the call raises an exception (the exception is swallowed: a crashing call still counts for the lines it reached). Return the sorted list of the different line numbers."""
+        import sys
+        seen = set()
+        ns = {}
+        exec(compile(source, "<cov>", "exec"), ns)
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != "<cov>" or frame.f_code.co_name == "<module>":
+                return None
+            if event == "line":
+                seen.add(frame.f_lineno)
+            return tracer
+
+        sys.settrace(tracer)
+        try:
+            eval(call, ns)
+        except Exception:
+            pass
+        finally:
+            sys.settrace(None)
+        return sorted(seen)
+  explanation: Tracing slows programs down a lot, which is why coverage is usually measured only in the test run.
+- id: coverage
+  title: 'Capstone: a coverage report'
+  difficulty: 5
+  prompt: '`statement_lines` and `trace_lines` are given. Write `coverage(source, calls)`. `calls` is a list of call texts like `"grade(95)"`. Take the statement lines of the source and the lines that run in **any** of the calls (use `trace_lines` once for each call). Return a dict `{"percent": 100 * covered / total rounded to 1 decimal, "missing": the sorted list of the statement lines that never ran}`. A source with no statement lines has percent `100.0` and nothing missing. Lines that ran but are not statement lines are ignored.'
+  starter: |-
+    def statement_lines(source):
+        """Which lines of this Python source can be executed inside a function? Parse the source with the ast module. Collect the line number (node.lineno, 1-based) of every STATEMENT (ast.stmt) that is inside the body of a function definition (at any depth, also inside loops, ifs, try blocks and nested functions), but NOT the def statements themselves and NOT docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted."""
+        import ast
+        tree = ast.parse(source)
+        lines = set()
+
+        def is_doc(node):
+            return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.stmt) and node is not fn and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not is_doc(node):
+                        lines.add(node.lineno)
+        return sorted(lines)
+
+
+    def trace_lines(source, call):
+        """Which lines of the source run when we execute `call`? Compile the source with the file name '<cov>' and run it with exec in a new dict (this part is NOT traced). Then evaluate the text `call` (for example 'grade(95)') in that dict while recording with sys.settrace every 'line' event whose frame belongs to the file '<cov>' and whose function is not the module itself ('<module>'). Always remove the trace again (sys.settrace(None)), also when the call raises an exception (the exception is swallowed: a crashing call still counts for the lines it reached). Return the sorted list of the different line numbers."""
+        import sys
+        seen = set()
+        ns = {}
+        exec(compile(source, "<cov>", "exec"), ns)
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != "<cov>" or frame.f_code.co_name == "<module>":
+                return None
+            if event == "line":
+                seen.add(frame.f_lineno)
+            return tracer
+
+        sys.settrace(tracer)
+        try:
+            eval(call, ns)
+        except Exception:
+            pass
+        finally:
+            sys.settrace(None)
+        return sorted(seen)
+
+
+
+
+    def coverage(source, calls):
+        """Line coverage. `calls` is a list of call texts like 'grade(95)'. Take the statement lines of the source (statement_lines) and the lines that run in ANY of the calls (trace_lines, one call at a time). Return {"percent": 100 * covered / total rounded to 1 decimal, "missing": sorted list of the statement lines that never ran}. A source with no statement lines has percent 100.0 and nothing missing. Lines that ran but are not statement lines are ignored."""
+        pass
+  tests:
+  - name: grade function
+    code: |
+      src = """def grade(score):
+          if score < 0 or score > 100:
+              raise ValueError("bad score")
+          if score >= 90:
+              return "A"
+          elif score >= 50:
+              return "B"
+          return "F"
+      """
+      assert coverage(src, []) == {"percent": 0.0, "missing": [2, 3, 4, 5, 6, 7, 8]}
+      assert coverage(src, ["grade(95)"]) == {"percent": 42.9, "missing": [3, 6, 7, 8]} and coverage(src, ["grade(95)", "grade(60)"]) == {"percent": 71.4, "missing": [3, 8]}
+      assert coverage(src, ["grade(95)", "grade(60)", "grade(10)", "grade(-1)"]) == {"percent": 100.0, "missing": []} and coverage(src, ["grade(500)"]) == {"percent": 28.6, "missing": [4, 5, 6, 7, 8]}
+  - name: edges
+    code: |
+      assert coverage("x = 1\n", []) == {"percent": 100.0, "missing": []} and coverage("", ["1"]) == {"percent": 100.0, "missing": []}
+      src = """def f(x):
+          return x
+      """
+      assert coverage(src, ["f(1)", "f(2)"]) == {"percent": 100.0, "missing": []} and coverage(src, ["print('hi')"]) == {"percent": 0.0, "missing": [2]}
+      src = """def a():
+          return 1
+      def b():
+          return 2
+      def c():
+          return 3
+      """
+      assert coverage(src, ["a()", "c()"]) == {"percent": 66.7, "missing": [4]}
+  hints:
+  - Collect all lines that ran into a set across the calls.
+  - Intersect that set with the statement lines to count the covered ones.
+  solution: |
+    def statement_lines(source):
+        """Which lines of this Python source can be executed inside a function? Parse the source with the ast module. Collect the line number (node.lineno, 1-based) of every STATEMENT (ast.stmt) that is inside the body of a function definition (at any depth, also inside loops, ifs, try blocks and nested functions), but NOT the def statements themselves and NOT docstrings (an expression statement that is just a string constant). Return the sorted list of different line numbers. Statements outside any function are not counted."""
+        import ast
+        tree = ast.parse(source)
+        lines = set()
+
+        def is_doc(node):
+            return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.stmt) and node is not fn and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not is_doc(node):
+                        lines.add(node.lineno)
+        return sorted(lines)
+
+
+    def trace_lines(source, call):
+        """Which lines of the source run when we execute `call`? Compile the source with the file name '<cov>' and run it with exec in a new dict (this part is NOT traced). Then evaluate the text `call` (for example 'grade(95)') in that dict while recording with sys.settrace every 'line' event whose frame belongs to the file '<cov>' and whose function is not the module itself ('<module>'). Always remove the trace again (sys.settrace(None)), also when the call raises an exception (the exception is swallowed: a crashing call still counts for the lines it reached). Return the sorted list of the different line numbers."""
+        import sys
+        seen = set()
+        ns = {}
+        exec(compile(source, "<cov>", "exec"), ns)
+
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename != "<cov>" or frame.f_code.co_name == "<module>":
+                return None
+            if event == "line":
+                seen.add(frame.f_lineno)
+            return tracer
+
+        sys.settrace(tracer)
+        try:
+            eval(call, ns)
+        except Exception:
+            pass
+        finally:
+            sys.settrace(None)
+        return sorted(seen)
+
+
+
+
+    def coverage(source, calls):
+        """Line coverage. `calls` is a list of call texts like 'grade(95)'. Take the statement lines of the source (statement_lines) and the lines that run in ANY of the calls (trace_lines, one call at a time). Return {"percent": 100 * covered / total rounded to 1 decimal, "missing": sorted list of the statement lines that never ran}. A source with no statement lines has percent 100.0 and nothing missing. Lines that ran but are not statement lines are ignored."""
+        stmts = set(statement_lines(source))
+        ran = set()
+        for call in calls:
+            ran |= set(trace_lines(source, call))
+        covered = stmts & ran
+        percent = round(100 * len(covered) / len(stmts), 1) if stmts else 100.0
+        return {"percent": percent, "missing": sorted(stmts - ran)}
+  explanation: '100 % coverage does not mean the code is correct: it only means every line ran. The next exercise shows how to measure whether the tests would notice a bug.'
+- id: mutants
+  title: Making mutants
+  difficulty: 5
+  prompt: 'Coverage only shows that lines **ran**, not that the tests would **notice** a mistake. **Mutation testing** creates slightly wrong copies of the code (**mutants**) and checks whether the tests catch them. Write `make_mutants(source)`. Parse the source with `ast` and build one mutant for **every** place that can be changed, in the order in which `ast.walk` visits the nodes. The possible changes: `+` becomes `-`, `-` becomes `+`, `*` becomes `//`, `<` becomes `<=`, `<=` becomes `<`, `>` becomes `>=`, `>=` becomes `>`, `==` becomes `!=`, `!=` becomes `==`, `and` becomes `or`, `or` becomes `and`, `True` becomes `False` and back, an integer constant `n` (not a bool) becomes `n + 1`. Only the **one** chosen place is changed in each mutant. Return a list of pairs `(description, new source text made with ast.unparse)` where the description is `"line L: OLD -> NEW"` using the symbols or numbers, for example `"line 3: < -> <="`. A comparison with several operators changes each operator separately. Nothing else is changed.'
+  starter: |-
+    def make_mutants(source):
+        """Mutation testing creates slightly WRONG copies of the code (mutants) to find out if the tests notice. Parse the source with ast and build one mutant for EVERY place that can be changed, in the order in which ast.walk visits the nodes. The possible changes: a + becomes -, - becomes +, * becomes //, a < becomes <=, <= becomes <, > becomes >=, >= becomes >, == becomes !=, != becomes ==, and becomes or, or becomes and, True becomes False, False becomes True, an integer constant n (not bool) becomes n + 1. Only the ONE chosen place is changed in each mutant. Return a list of pairs (description, new source text made with ast.unparse) where the description is 'line L: OLD -> NEW' using the symbols (+, -, *, //, <, <=, >, >=, ==, !=, and, or, True, False) or the numbers, for example 'line 3: < -> <='. A comparison with several operators changes each operator separately. Do not change anything for the other node types."""
+        pass
+  tests:
+  - name: single mutants
+    code: |
+      src = "def f(a, b):\n    return a + b\n"
+      m = make_mutants(src)
+      assert m == [("line 2: + -> -", "def f(a, b):\n    return a - b")]
+      m = make_mutants("def g(x):\n    return x > 5\n")
+      assert [d for d, _ in m] == ["line 2: > -> >=", "line 2: 5 -> 6"] and m[0][1] == "def g(x):\n    return x >= 5" and m[1][1] == "def g(x):\n    return x > 6"
+      assert make_mutants("x = 'text'\n") == [] and make_mutants("") == [] and make_mutants("def f(): pass\n") == []
+  - name: operators and constants
+    code: |
+      src = "def h(a, b, ok):\n    if a <= 3 and ok == True:\n        return a * 2 - b\n    return False\n"
+      m = make_mutants(src)
+      assert [d for d, _ in m] == ["line 2: and -> or", "line 4: False -> True", "line 2: <= -> <", "line 2: == -> !=", "line 3: - -> +", "line 2: 3 -> 4", "line 2: True -> False", "line 3: * -> //", "line 3: 2 -> 3"]
+      by = dict(m)
+      assert "a * 2 + b" in by["line 3: - -> +"] and "a // 2 - b" in by["line 3: * -> //"] and "return True" in by["line 4: False -> True"] and "ok == False" in by["line 2: True -> False"] and all(compile(t, "m", "exec") for _, t in m)
+      c = make_mutants("def k(x):\n    return 1 < x < 10\n")
+      assert [d for d, _ in c] == ["line 2: < -> <=", "line 2: < -> <=", "line 2: 1 -> 2", "line 2: 10 -> 11"] and c[0][1].endswith("return 1 <= x < 10") and c[1][1].endswith("return 1 < x <= 10")
+  hints:
+  - For every node position, parse the source again so each mutant starts from the original.
+  - A comparison can hold several operators, so loop over them.
+  solution: |
+    def make_mutants(source):
+        """Mutation testing creates slightly WRONG copies of the code (mutants) to find out if the tests notice. Parse the source with ast and build one mutant for EVERY place that can be changed, in the order in which ast.walk visits the nodes. The possible changes: a + becomes -, - becomes +, * becomes //, a < becomes <=, <= becomes <, > becomes >=, >= becomes >, == becomes !=, != becomes ==, and becomes or, or becomes and, True becomes False, False becomes True, an integer constant n (not bool) becomes n + 1. Only the ONE chosen place is changed in each mutant. Return a list of pairs (description, new source text made with ast.unparse) where the description is 'line L: OLD -> NEW' using the symbols (+, -, *, //, <, <=, >, >=, ==, !=, and, or, True, False) or the numbers, for example 'line 3: < -> <='. A comparison with several operators changes each operator separately. Do not change anything for the other node types."""
+        import ast
+        swaps = {ast.Add: (ast.Sub, "+", "-"), ast.Sub: (ast.Add, "-", "+"), ast.Mult: (ast.FloorDiv, "*", "//"), ast.Lt: (ast.LtE, "<", "<="), ast.LtE: (ast.Lt, "<=", "<"), ast.Gt: (ast.GtE, ">", ">="), ast.GtE: (ast.Gt, ">=", ">"), ast.Eq: (ast.NotEq, "==", "!="), ast.NotEq: (ast.Eq, "!=", "=="), ast.And: (ast.Or, "and", "or"), ast.Or: (ast.And, "or", "and")}
+        count = sum(1 for _ in ast.walk(ast.parse(source)))
+        out = []
+        for index in range(count):
+            tree = ast.parse(source)
+            node = list(ast.walk(tree))[index]
+            desc = None
+            if isinstance(node, (ast.BinOp, ast.BoolOp)):
+                op = node.op
+                if type(op) in swaps:
+                    new, old_s, new_s = swaps[type(op)]
+                    node.op = new()
+                    desc = "line " + str(node.lineno) + ": " + old_s + " -> " + new_s
+                subs = []
+            elif isinstance(node, ast.Compare):
+                for k, op in enumerate(node.ops):
+                    if type(op) in swaps:
+                        t2 = ast.parse(source)
+                        n2 = list(ast.walk(t2))[index]
+                        new, old_s, new_s = swaps[type(op)]
+                        n2.ops[k] = new()
+                        out.append(("line " + str(node.lineno) + ": " + old_s + " -> " + new_s, ast.unparse(t2)))
+                continue
+            elif isinstance(node, ast.Constant):
+                if node.value is True or node.value is False:
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(not node.value)
+                    node.value = not node.value
+                elif isinstance(node.value, int):
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(node.value + 1)
+                    node.value = node.value + 1
+            if desc:
+                out.append((desc, ast.unparse(tree)))
+        return out
+  explanation: Tools such as mutmut (Python) and Stryker (JavaScript) work this way, which is why they take a long time to run on big projects.
+- id: score
+  title: 'Capstone: how good are the tests?'
+  difficulty: 5
+  prompt: '`make_mutants` is given. Write `mutation_score(source, tests)`. `tests(ns)` receives the dict of names defined by a version of the source and must **raise** (an `AssertionError` or anything else) when it finds a problem. First check that the tests pass on the **original** source (run it with `exec` in a new dict; if `tests` raises, raise `ValueError("tests fail on the original")`). Then run the tests on every mutant (each in a new dict). A mutant is **killed** when the tests raise an exception (or the mutant''s source cannot be executed) and **survives** when they pass. Return `(killed, total, survivors)` where `survivors` is the list of the descriptions of the surviving mutants, in order.'
+  starter: |-
+    def make_mutants(source):
+        """Mutation testing creates slightly WRONG copies of the code (mutants) to find out if the tests notice. Parse the source with ast and build one mutant for EVERY place that can be changed, in the order in which ast.walk visits the nodes. The possible changes: a + becomes -, - becomes +, * becomes //, a < becomes <=, <= becomes <, > becomes >=, >= becomes >, == becomes !=, != becomes ==, and becomes or, or becomes and, True becomes False, False becomes True, an integer constant n (not bool) becomes n + 1. Only the ONE chosen place is changed in each mutant. Return a list of pairs (description, new source text made with ast.unparse) where the description is 'line L: OLD -> NEW' using the symbols (+, -, *, //, <, <=, >, >=, ==, !=, and, or, True, False) or the numbers, for example 'line 3: < -> <='. A comparison with several operators changes each operator separately. Do not change anything for the other node types."""
+        import ast
+        swaps = {ast.Add: (ast.Sub, "+", "-"), ast.Sub: (ast.Add, "-", "+"), ast.Mult: (ast.FloorDiv, "*", "//"), ast.Lt: (ast.LtE, "<", "<="), ast.LtE: (ast.Lt, "<=", "<"), ast.Gt: (ast.GtE, ">", ">="), ast.GtE: (ast.Gt, ">=", ">"), ast.Eq: (ast.NotEq, "==", "!="), ast.NotEq: (ast.Eq, "!=", "=="), ast.And: (ast.Or, "and", "or"), ast.Or: (ast.And, "or", "and")}
+        count = sum(1 for _ in ast.walk(ast.parse(source)))
+        out = []
+        for index in range(count):
+            tree = ast.parse(source)
+            node = list(ast.walk(tree))[index]
+            desc = None
+            if isinstance(node, (ast.BinOp, ast.BoolOp)):
+                op = node.op
+                if type(op) in swaps:
+                    new, old_s, new_s = swaps[type(op)]
+                    node.op = new()
+                    desc = "line " + str(node.lineno) + ": " + old_s + " -> " + new_s
+                subs = []
+            elif isinstance(node, ast.Compare):
+                for k, op in enumerate(node.ops):
+                    if type(op) in swaps:
+                        t2 = ast.parse(source)
+                        n2 = list(ast.walk(t2))[index]
+                        new, old_s, new_s = swaps[type(op)]
+                        n2.ops[k] = new()
+                        out.append(("line " + str(node.lineno) + ": " + old_s + " -> " + new_s, ast.unparse(t2)))
+                continue
+            elif isinstance(node, ast.Constant):
+                if node.value is True or node.value is False:
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(not node.value)
+                    node.value = not node.value
+                elif isinstance(node.value, int):
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(node.value + 1)
+                    node.value = node.value + 1
+            if desc:
+                out.append((desc, ast.unparse(tree)))
+        return out
+
+
+
+
+    def mutation_score(source, tests):
+        """How good are the tests? `tests(ns)` receives the dict of names defined by a version of the source and must RAISE (AssertionError or anything else) when it finds a problem. First check that the tests pass on the ORIGINAL source (run it with exec in a new dict; if tests raise, raise ValueError('tests fail on the original')). Then run the tests on every mutant from make_mutants (each in a new dict). A mutant is KILLED when the tests raise an exception (or the mutant's source cannot be executed) and SURVIVES when they pass. Return (killed, total, survivors) where survivors is the list of the descriptions of the surviving mutants, in order."""
+        pass
+  tests:
+  - name: weak and strong tests
+    code: |
+      src = "def is_adult(age):\n    return age >= 18\n"
+      def weak(ns):
+          assert ns["is_adult"](30) is True
+      def strong(ns):
+          f = ns["is_adult"]
+          assert f(30) is True and f(18) is True and f(17) is False and f(0) is False
+      assert mutation_score(src, weak) == (0, 2, ["line 2: >= -> >", "line 2: 18 -> 19"]) or mutation_score(src, weak)[0] >= 0
+      assert mutation_score(src, strong) == (2, 2, [])
+      w = mutation_score(src, weak)
+      assert w[1] == 2 and w[0] == 0 and w[2] == ["line 2: >= -> >", "line 2: 18 -> 19"]
+  - name: calculator
+    code: |
+      src = "def total(price, qty, tax):\n    cost = price * qty\n    if qty > 10:\n        cost = cost - 5\n    return cost + tax\n"
+      def tests(ns):
+          f = ns["total"]
+          assert f(2, 3, 1) == 7
+          assert f(2, 11, 0) == 17
+          assert f(1, 10, 0) == 10
+      k, n, s = mutation_score(src, tests)
+      assert n == 6 and k == 6 and s == []
+      def only_one(ns):
+          assert ns["total"](2, 3, 1) == 7
+      k1, n1, s1 = mutation_score(src, only_one)
+      assert n1 == 6 and k1 == 2 and s1 == ["line 3: > -> >=", "line 3: 10 -> 11", "line 4: - -> +", "line 4: 5 -> 6"]
+  - name: bad tests
+    code: |
+      src = "def f(x):\n    return x + 1\n"
+      def wrong(ns):
+          assert ns["f"](1) == 5
+      try:
+          mutation_score(src, wrong)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "tests fail on the original" in str(e)
+      def crashy(ns):
+          ns["f"]("a")
+      try:
+          mutation_score(src, crashy)
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+      def good(ns):
+          assert ns["f"](1) == 2
+      assert mutation_score(src, good) == (2, 2, []) and mutation_score("x = 'a'\n", lambda ns: None) == (0, 0, [])
+  hints:
+  - Run the tests once on the original to make sure they pass before you mutate.
+  - Count any exception in exec or in the tests as a kill.
+  solution: |
+    def make_mutants(source):
+        """Mutation testing creates slightly WRONG copies of the code (mutants) to find out if the tests notice. Parse the source with ast and build one mutant for EVERY place that can be changed, in the order in which ast.walk visits the nodes. The possible changes: a + becomes -, - becomes +, * becomes //, a < becomes <=, <= becomes <, > becomes >=, >= becomes >, == becomes !=, != becomes ==, and becomes or, or becomes and, True becomes False, False becomes True, an integer constant n (not bool) becomes n + 1. Only the ONE chosen place is changed in each mutant. Return a list of pairs (description, new source text made with ast.unparse) where the description is 'line L: OLD -> NEW' using the symbols (+, -, *, //, <, <=, >, >=, ==, !=, and, or, True, False) or the numbers, for example 'line 3: < -> <='. A comparison with several operators changes each operator separately. Do not change anything for the other node types."""
+        import ast
+        swaps = {ast.Add: (ast.Sub, "+", "-"), ast.Sub: (ast.Add, "-", "+"), ast.Mult: (ast.FloorDiv, "*", "//"), ast.Lt: (ast.LtE, "<", "<="), ast.LtE: (ast.Lt, "<=", "<"), ast.Gt: (ast.GtE, ">", ">="), ast.GtE: (ast.Gt, ">=", ">"), ast.Eq: (ast.NotEq, "==", "!="), ast.NotEq: (ast.Eq, "!=", "=="), ast.And: (ast.Or, "and", "or"), ast.Or: (ast.And, "or", "and")}
+        count = sum(1 for _ in ast.walk(ast.parse(source)))
+        out = []
+        for index in range(count):
+            tree = ast.parse(source)
+            node = list(ast.walk(tree))[index]
+            desc = None
+            if isinstance(node, (ast.BinOp, ast.BoolOp)):
+                op = node.op
+                if type(op) in swaps:
+                    new, old_s, new_s = swaps[type(op)]
+                    node.op = new()
+                    desc = "line " + str(node.lineno) + ": " + old_s + " -> " + new_s
+                subs = []
+            elif isinstance(node, ast.Compare):
+                for k, op in enumerate(node.ops):
+                    if type(op) in swaps:
+                        t2 = ast.parse(source)
+                        n2 = list(ast.walk(t2))[index]
+                        new, old_s, new_s = swaps[type(op)]
+                        n2.ops[k] = new()
+                        out.append(("line " + str(node.lineno) + ": " + old_s + " -> " + new_s, ast.unparse(t2)))
+                continue
+            elif isinstance(node, ast.Constant):
+                if node.value is True or node.value is False:
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(not node.value)
+                    node.value = not node.value
+                elif isinstance(node.value, int):
+                    desc = "line " + str(node.lineno) + ": " + str(node.value) + " -> " + str(node.value + 1)
+                    node.value = node.value + 1
+            if desc:
+                out.append((desc, ast.unparse(tree)))
+        return out
+
+
+
+
+    def mutation_score(source, tests):
+        """How good are the tests? `tests(ns)` receives the dict of names defined by a version of the source and must RAISE (AssertionError or anything else) when it finds a problem. First check that the tests pass on the ORIGINAL source (run it with exec in a new dict; if tests raise, raise ValueError('tests fail on the original')). Then run the tests on every mutant from make_mutants (each in a new dict). A mutant is KILLED when the tests raise an exception (or the mutant's source cannot be executed) and SURVIVES when they pass. Return (killed, total, survivors) where survivors is the list of the descriptions of the surviving mutants, in order."""
+        ns = {}
+        exec(source, ns)
+        try:
+            tests(ns)
+        except Exception:
+            raise ValueError("tests fail on the original")
+        mutants = make_mutants(source)
+        killed, survivors = 0, []
+        for desc, text in mutants:
+            env = {}
+            try:
+                exec(text, env)
+                tests(env)
+            except Exception:
+                killed += 1
+            else:
+                survivors.append(desc)
+        return killed, len(mutants), survivors
+  explanation: 'A surviving mutant is a to-do item: it shows exactly which behaviour your tests do not check yet.'
+commonMistakes:
+- title: Chasing 100 % coverage
+  explanation: It encourages tests without assertions.
+- title: Reading coverage as correctness
+  explanation: Coverage only shows what ran.
+- title: Ignoring surviving mutants
+  explanation: They show real gaps.
+- title: Running mutation tests on every commit
+  explanation: They are slow.
+- title: Testing only lines, not branches
+  explanation: An if with only the true side tested has hidden gaps.
+summary:
+- Coverage shows which lines the tests ran.
+- Missing lines point at untested cases.
+- Coverage cannot show that tests are good.
+- Mutation testing breaks code on purpose to see if tests notice.
+- Boundary tests kill mutants.
+next: u30-debug
+quiz:
+- type: mcq
+  question: What does coverage measure?
+  options:
+  - How much code runs during the tests
+  - How correct the code is
+  - How fast it is
+  - How many tests there are
+  answer: 0
+  explanation: What ran.
+- type: mcq
+  question: What is a mutant?
+  options:
+  - A slightly wrong copy of the code
+  - A new test
+  - A bug report
+  - A fast function
+  answer: 0
+  explanation: Mutation testing.
+- type: mcq
+  question: What is a surviving mutant?
+  options:
+  - A mutant that the tests did not catch
+  - A mutant that crashed
+  - A passing test
+  - A deleted line
+  answer: 0
+  explanation: Tests still pass.
+- type: mcq
+  question: Can a test with no assertions give 100% coverage?
+  options:
+  - 'Yes'
+  - 'No'
+  - Only in Python
+  - Only with mocks
+  answer: 0
+  explanation: It runs the lines.
+- type: mcq
+  question: Which test kills the mutant >= to > in age >= 18?
+  options:
+  - Testing age 18
+  - Testing age 30
+  - Testing age 5
+  - Testing age 100
+  answer: 0
+  explanation: The boundary.
+- type: mcq
+  question: What is branch coverage?
+  options:
+  - Both outcomes of every if are tested
+  - Git branches are tested
+  - Only the first branch
+  - The count of functions
+  answer: 0
+  explanation: True and false paths.
+- type: code
+  question: Write `mutation_score_percent(killed, total)` returning the percentage `100 * killed / total` rounded to one decimal; return `100.0` when `total` is 0.
+  starter: |
+    def mutation_score_percent(killed, total):
+        pass
+  tests:
+  - name: score
+    code: |
+      assert mutation_score_percent(3, 4) == 75.0 and mutation_score_percent(0, 5) == 0.0 and mutation_score_percent(0, 0) == 100.0 and mutation_score_percent(2, 3) == 66.7
+  solution: |
+    def mutation_score_percent(killed, total):
+        if total == 0:
+            return 100.0
+        return round(100 * killed / total, 1)

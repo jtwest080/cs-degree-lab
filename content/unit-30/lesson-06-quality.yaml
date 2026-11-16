@@ -1,0 +1,701 @@
+id: u30-quality
+title: Logging, Validation and Reliability
+minutes: 110
+objective: 'Make programs **reliable** in the real world: log what happens, validate input, limit the rate of requests, keep error chains and stop calling failing services. You will build a logger, a validator, a token bucket, an error-chain reader and a circuit breaker.'
+outcomes:
+- Use log levels and structured fields
+- Validate input at the edge
+- Explain rate limiting and circuit breakers
+- Chain exceptions without losing the cause
+sections:
+- heading: 'Seeing what happens: logging'
+  body: |-
+    You cannot attach a debugger to a program that runs on a server at 3 a.m., so it must tell you what it is doing. **Logging** writes messages with a **level**: DEBUG (details), INFO (normal events), WARNING (odd but handled), ERROR (an operation failed) and CRITICAL (the program may not continue). In production you show INFO and above; when investigating you turn on DEBUG.
+
+    Good log lines say *what happened* and carry the facts as **fields** (`user=ada path=/pay ms=250`): this is **structured logging**, easy to search and count. Never log secrets (passwords, tokens) or private personal data. Python has the `logging` module for this; `print` is only for quick experiments.
+
+    Related ideas: **metrics** (numbers over time such as requests per second), **tracing** (following one request through many services) and **alerts** (a message to a person when a metric goes bad). Together they are called **observability**.
+- heading: Defending the program
+  body: |-
+    **Validate input** where it enters the program: check type, range, length and format, and reject what does not fit with a clear message. Prefer an **allow-list** (what is permitted) to a block-list (what is forbidden). Code that trusts its input is the root of most security bugs (see Unit 31).
+
+    **Fail loudly, recover deliberately.** Catch an exception only where you can do something sensible about it. When you translate one error into another, use `raise NewError(...) from old` so that the **root cause** stays in the chain. Do not write a bare `except: pass`, which hides bugs.
+
+    For services that call other services, three patterns keep failures from spreading. **Retry with backoff** (lesson 3) handles short blips. A **rate limiter** such as a **token bucket** protects a service from being flooded. A **circuit breaker** stops calling a service that keeps failing and tries again after a cooldown, letting it recover instead of piling on more requests. A **timeout** on every network call means that a slow service cannot freeze you forever.
+
+    > **Tip:** Reliability is a feature you test: write tests that make the dependency fail, and check that your code logs it, limits it and recovers (lessons 1-3).
+examples:
+- title: Logging and validation together
+  intro: Reject bad records and write down why.
+  code: |
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+    def make_logger(min_level):
+        """A tiny logging system. Return (log, lines). `lines` is a list. `log(level, message, **fields)` adds ONE line to it when the level is at least min_level (compare the numbers in LEVELS; both names are given as text, such as 'INFO'). The line is the level, a space, the message and then for every extra field (sorted by name) a space and 'name=value' using str(value): 'ERROR disk full path=/tmp code=28'. A message with no fields has no trailing space. ValueError('unknown level NAME') for a level that is not in LEVELS, also when the message would have been hidden (and also for min_level when the logger is made)."""
+        if min_level not in LEVELS:
+            raise ValueError("unknown level " + str(min_level))
+        lines = []
+
+        def log(level, message, **fields):
+            if level not in LEVELS:
+                raise ValueError("unknown level " + str(level))
+            if LEVELS[level] < LEVELS[min_level]:
+                return
+            parts = [level, message] + [k + "=" + str(fields[k]) for k in sorted(fields)]
+            lines.append(" ".join(parts))
+
+        return log, lines
+
+
+    def validate_record(record, rules):
+        """Never trust input. `rules` is a dict {field name: {"type": int/float/str, "required": True/False, "min": number, "max": number}} (every key except "type" is optional; required defaults to False; min and max apply to numbers, and to the LENGTH of text). Return the list of problems as text, ordered by field name. For every field: if it is missing (or None) and required: 'NAME: is required'; if it is missing and not required: nothing. Otherwise a value of the wrong type (bool never counts as int or float; an int is accepted where float is wanted) gives 'NAME: must be TYPE' (TYPE is the type's __name__) and no further checks for it; a number below min gives 'NAME: must be at least MIN', above max 'NAME: must be at most MAX'; for text the same messages say 'NAME: length must be at least MIN' and 'NAME: length must be at most MAX'. Fields of the record that have no rule give 'NAME: unknown field' (in the same ordering by name)."""
+        problems = {}
+        for name in sorted(set(rules) | set(record)):
+            if name not in rules:
+                problems[name] = [name + ": unknown field"]
+                continue
+            rule = rules[name]
+            value = record.get(name)
+            if value is None:
+                if rule.get("required", False):
+                    problems[name] = [name + ": is required"]
+                continue
+            want = rule["type"]
+            ok = isinstance(value, want) and not (isinstance(value, bool) and want is not bool)
+            if want is float and isinstance(value, int) and not isinstance(value, bool):
+                ok = True
+            if not ok:
+                problems[name] = [name + ": must be " + want.__name__]
+                continue
+            size, label = (len(value), "length ") if isinstance(value, str) else (value, "")
+            found = []
+            if "min" in rule and size < rule["min"]:
+                found.append(name + ": " + label + "must be at least " + str(rule["min"]))
+            if "max" in rule and size > rule["max"]:
+                found.append(name + ": " + label + "must be at most " + str(rule["max"]))
+            if found:
+                problems[name] = found
+        return [p for name in sorted(problems) for p in problems[name]]
+
+    log, lines = make_logger("INFO")
+    log("DEBUG", "not shown")
+    log("INFO", "request", path="/home", ms=12)
+    rules = {"name": {"type": str, "required": True, "min": 1, "max": 20}, "age": {"type": int, "min": 0, "max": 120}}
+    for record in ({"name": "Ada", "age": 36}, {"name": "", "age": 300, "role": "admin"}):
+        problems = validate_record(record, rules)
+        if problems:
+            log("WARNING", "rejected record", problems=len(problems))
+            for p in problems:
+                log("ERROR", p)
+        else:
+            log("INFO", "accepted", name=record["name"])
+    for line in lines:
+        print(line)
+  output: |
+    INFO request ms=12 path=/home
+    INFO accepted name=Ada
+    WARNING rejected record problems=3
+    ERROR age: must be at most 120
+    ERROR name: length must be at least 1
+    ERROR role: unknown field
+  lines:
+  - line: 63
+    note: Everything that happened, in order, as searchable lines.
+- title: Limiter, error chain and breaker
+  intro: Three reliability tools on a fake clock.
+  code: |
+    def make_limiter(capacity, refill_per_second, clock):
+        """A TOKEN BUCKET rate limiter. The bucket holds up to `capacity` tokens and starts full. `clock()` returns the time in seconds. Return a function allow() -> bool: first add refill_per_second * (seconds since the last call of allow) tokens (never more than capacity; the first call counts from the moment the limiter was made, so read the clock when making it), then if at least 1 token is available take one and return True, otherwise return False (and take nothing). Time never goes backwards in the tests."""
+        state = {"tokens": float(capacity), "last": clock()}
+
+        def allow():
+            now = clock()
+            state["tokens"] = min(capacity, state["tokens"] + (now - state["last"]) * refill_per_second)
+            state["last"] = now
+            if state["tokens"] >= 1:
+                state["tokens"] -= 1
+                return True
+            return False
+
+        return allow
+
+
+    def describe_error(err):
+        """When code catches one error and raises another with `raise NewError(...) from old` (or raises inside an except block), Python links the errors. Return the list of 'TypeName: message' texts for the error and everything that led to it, from the OUTERMOST (the error given) down to the root cause. Follow err.__cause__ if it is set, otherwise err.__context__ unless err.__suppress_context__ is True (raise ... from None), otherwise stop. The text is just 'TypeName' when the message is empty. Stop if an error repeats (never loop forever)."""
+        out, seen = [], set()
+        while err is not None and id(err) not in seen:
+            seen.add(id(err))
+            text = str(err)
+            out.append(type(err).__name__ + (": " + text if text else ""))
+            if err.__cause__ is not None:
+                err = err.__cause__
+            elif err.__context__ is not None and not err.__suppress_context__:
+                err = err.__context__
+            else:
+                err = None
+        return out
+
+
+    def circuit_breaker(func, threshold, cooldown, clock):
+        """A CIRCUIT BREAKER stops calling a service that keeps failing, so that it can recover and callers fail fast. Return a function guarded(*args). The breaker starts CLOSED: calls go through to func. A call that raises counts as a failure (the exception is passed on) and a call that returns normally resets the failure count to 0. After `threshold` failures IN A ROW the breaker OPENS at the current time clock(). While it is open every call raises RuntimeError('circuit open') WITHOUT calling func, until `cooldown` seconds have passed (clock() - opened_at >= cooldown). Then it is HALF-OPEN: the next call is a trial and goes through to func; if it succeeds the breaker closes (count 0), if it fails the breaker opens again at the current time (the exception is passed on). guarded.state() returns 'closed', 'open' or 'half-open' ('half-open' once the cooldown has passed, before the trial)."""
+        st = {"fails": 0, "opened": None}
+
+        def state():
+            if st["opened"] is None:
+                return "closed"
+            return "half-open" if clock() - st["opened"] >= cooldown else "open"
+
+        def guarded(*args):
+            if state() == "open":
+                raise RuntimeError("circuit open")
+            try:
+                result = func(*args)
+            except Exception:
+                st["fails"] += 1
+                if st["opened"] is not None or st["fails"] >= threshold:
+                    st["opened"] = clock()
+                raise
+            st["fails"], st["opened"] = 0, None
+            return result
+
+        guarded.state = state
+        return guarded
+
+    now = [0.0]
+    allow = make_limiter(2, 0.5, lambda: now[0])
+    answers = []
+    for t in (0, 0, 0, 1, 2, 2):
+        now[0] = t
+        answers.append(allow())
+    print(answers)
+
+    def load():
+        try:
+            {}["settings"]
+        except KeyError as e:
+            raise ValueError("could not load settings") from e
+    try:
+        load()
+    except ValueError as err:
+        for text in describe_error(err):
+            print(">", text)
+
+    clock = [0]
+    def flaky_service():
+        raise ConnectionError("down")
+    guarded = circuit_breaker(flaky_service, 2, 5, lambda: clock[0])
+    for step in range(5):
+        try:
+            guarded()
+        except Exception as e:
+            print(step, guarded.state(), type(e).__name__)
+  output: |
+    [True, True, False, False, True, False]
+    > ValueError: could not load settings
+    > KeyError: 'settings'
+    0 closed ConnectionError
+    1 open ConnectionError
+    2 open RuntimeError
+    3 open RuntimeError
+    4 open RuntimeError
+  lines:
+  - line: 64
+    note: Two tokens at the start, then one new token arrives every two seconds.
+  - line: 74
+    note: The root cause is still there.
+  - line: 81
+    note: After two failures the circuit opens and later calls are blocked.
+playground:
+  prompt: Use Python's real logging module.
+  code: |
+    import logging, io
+    stream = io.StringIO()
+    logging.basicConfig(stream=stream, level=logging.INFO, format='%(levelname)s %(message)s', force=True)
+    logging.info('started')
+    logging.debug('hidden')
+    print(stream.getvalue().strip())
+exercises:
+- id: logger
+  title: Logging
+  difficulty: 4
+  prompt: '**Logging** is writing down what a program does so that you can understand problems later, without a debugger. Each message has a **level**: `DEBUG` (details for developers), `INFO` (normal events), `WARNING` (something odd), `ERROR` (an operation failed) and `CRITICAL` (the program may stop). A logger hides messages below its **minimum level**. Write `make_logger(min_level)` with `LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}` (given). Return `(log, lines)`. `lines` is a list. `log(level, message, **fields)` adds **one** line to it when the level is at least `min_level`. The line is the level, a space, the message and then, for every extra field (sorted by name), a space and `name=value` using `str(value)`: `ERROR disk full code=28 path=/tmp`. A message with no fields has no trailing space. `ValueError("unknown level NAME")` for a level that is not in `LEVELS` (also when the message would have been hidden, and for `min_level` when the logger is made).'
+  starter: |-
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+    def make_logger(min_level):
+        """A tiny logging system. Return (log, lines). `lines` is a list. `log(level, message, **fields)` adds ONE line to it when the level is at least min_level (compare the numbers in LEVELS; both names are given as text, such as 'INFO'). The line is the level, a space, the message and then for every extra field (sorted by name) a space and 'name=value' using str(value): 'ERROR disk full path=/tmp code=28'. A message with no fields has no trailing space. ValueError('unknown level NAME') for a level that is not in LEVELS, also when the message would have been hidden (and also for min_level when the logger is made)."""
+        pass
+  tests:
+  - name: levels
+    code: |
+      log, lines = make_logger("INFO")
+      log("DEBUG", "hidden")
+      log("INFO", "started")
+      log("WARNING", "slow", ms=250)
+      log("ERROR", "disk full", path="/tmp", code=28)
+      log("CRITICAL", "stopping")
+      assert lines == ["INFO started", "WARNING slow ms=250", "ERROR disk full code=28 path=/tmp", "CRITICAL stopping"]
+      dbg, d = make_logger("DEBUG")
+      dbg("DEBUG", "x")
+      quiet, q = make_logger("CRITICAL")
+      quiet("ERROR", "x")
+      quiet("CRITICAL", "y", a=1)
+      assert d == ["DEBUG x"] and q == ["CRITICAL y a=1"]
+  - name: fields and errors
+    code: |
+      log, lines = make_logger("DEBUG")
+      log("INFO", "user", name="Ada", age=36, ok=True, tags=[1, 2], none=None)
+      assert lines == ["INFO user age=36 name=Ada none=None ok=True tags=[1, 2]"]
+      a, la = make_logger("INFO")
+      b, lb = make_logger("INFO")
+      a("INFO", "only a")
+      assert la == ["INFO only a"] and lb == []
+      for bad in ("TRACE", "info", ""):
+          try:
+              log(bad, "x")
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "unknown level " + bad
+          try:
+              make_logger(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "unknown level " + bad
+      quiet, q = make_logger("ERROR")
+      try:
+          quiet("TRACE", "hidden but bad")
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+  hints:
+  - Use a closure over the lines list and compare the numbers in LEVELS.
+  - sorted(fields) gives the field names in order.
+  solution: |
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+    def make_logger(min_level):
+        """A tiny logging system. Return (log, lines). `lines` is a list. `log(level, message, **fields)` adds ONE line to it when the level is at least min_level (compare the numbers in LEVELS; both names are given as text, such as 'INFO'). The line is the level, a space, the message and then for every extra field (sorted by name) a space and 'name=value' using str(value): 'ERROR disk full path=/tmp code=28'. A message with no fields has no trailing space. ValueError('unknown level NAME') for a level that is not in LEVELS, also when the message would have been hidden (and also for min_level when the logger is made)."""
+        if min_level not in LEVELS:
+            raise ValueError("unknown level " + str(min_level))
+        lines = []
+
+        def log(level, message, **fields):
+            if level not in LEVELS:
+                raise ValueError("unknown level " + str(level))
+            if LEVELS[level] < LEVELS[min_level]:
+                return
+            parts = [level, message] + [k + "=" + str(fields[k]) for k in sorted(fields)]
+            lines.append(" ".join(parts))
+
+        return log, lines
+  explanation: Real programs use the logging module and send these lines to files or services. Never log passwords or personal data.
+- id: validate
+  title: Never trust input
+  difficulty: 5
+  prompt: 'Bugs and attacks often start with **input that nobody checked**. Write `validate_record(record, rules)`. `rules` is a dict `{field name: {"type": int/float/str, "required": True/False, "min": number, "max": number}}` (every key except `"type"` is optional; `required` defaults to `False`; `min` and `max` apply to numbers, and to the **length** of text). Return the list of problems as text, ordered by field name. For every field: if it is missing (or `None`) and required: `"NAME: is required"`; missing and not required: nothing. Otherwise a value of the wrong type (a `bool` never counts as int or float; an int **is** accepted where float is wanted) gives `"NAME: must be TYPE"` (`TYPE` is the type''s `__name__`) and no more checks for it; a number below `min` gives `"NAME: must be at least MIN"`, above `max` `"NAME: must be at most MAX"`; for text the same messages say `"NAME: length must be at least MIN"` and `"NAME: length must be at most MAX"`. A field of the record with **no rule** gives `"NAME: unknown field"`.'
+  starter: |-
+    def validate_record(record, rules):
+        """Never trust input. `rules` is a dict {field name: {"type": int/float/str, "required": True/False, "min": number, "max": number}} (every key except "type" is optional; required defaults to False; min and max apply to numbers, and to the LENGTH of text). Return the list of problems as text, ordered by field name. For every field: if it is missing (or None) and required: 'NAME: is required'; if it is missing and not required: nothing. Otherwise a value of the wrong type (bool never counts as int or float; an int is accepted where float is wanted) gives 'NAME: must be TYPE' (TYPE is the type's __name__) and no further checks for it; a number below min gives 'NAME: must be at least MIN', above max 'NAME: must be at most MAX'; for text the same messages say 'NAME: length must be at least MIN' and 'NAME: length must be at most MAX'. Fields of the record that have no rule give 'NAME: unknown field' (in the same ordering by name)."""
+        pass
+  tests:
+  - name: good and bad records
+    code: |
+      rules = {"name": {"type": str, "required": True, "min": 1, "max": 10}, "age": {"type": int, "required": True, "min": 0, "max": 120}, "score": {"type": float, "max": 100}}
+      assert validate_record({"name": "Ada", "age": 36, "score": 99.5}, rules) == [] and validate_record({"name": "Bo", "age": 0}, rules) == [] and validate_record({"name": "Cy", "age": 120, "score": 100}, rules) == []
+      assert validate_record({}, rules) == ["age: is required", "name: is required"] and validate_record({"name": None, "age": 5}, rules) == ["name: is required"]
+      assert validate_record({"name": "", "age": -1, "score": 100.1}, rules) == ["age: must be at least 0", "name: length must be at least 1", "score: must be at most 100"]
+      assert validate_record({"name": "Averyverylongname", "age": 121}, rules) == ["age: must be at most 120", "name: length must be at most 10"]
+  - name: types and unknown fields
+    code: |
+      rules = {"name": {"type": str, "required": True}, "age": {"type": int, "min": 0}, "score": {"type": float, "min": 0}}
+      assert validate_record({"name": 5, "age": "7", "score": "x"}, rules) == ["age: must be int", "name: must be str", "score: must be float"]
+      assert validate_record({"name": "A", "age": True, "score": False}, rules) == ["age: must be int", "score: must be float"] and validate_record({"name": "A", "age": 3.5}, rules) == ["age: must be int"] and validate_record({"name": "A", "score": 3}, rules) == []
+      assert validate_record({"name": "A", "email": "x", "admin": True}, rules) == ["admin: unknown field", "email: unknown field"] and validate_record({"zzz": 1}, {"name": {"type": str, "required": True}}) == ["name: is required", "zzz: unknown field"]
+      assert validate_record({"age": "x", "colour": 1}, {"age": {"type": int, "min": 0}}) == ["age: must be int", "colour: unknown field"] and validate_record({}, {}) == [] and validate_record({"a": None}, {}) == ["a: unknown field"]
+  hints:
+  - Go through the sorted union of rule names and record names.
+  - Use isinstance but exclude bool unless bool is wanted.
+  solution: |
+    def validate_record(record, rules):
+        """Never trust input. `rules` is a dict {field name: {"type": int/float/str, "required": True/False, "min": number, "max": number}} (every key except "type" is optional; required defaults to False; min and max apply to numbers, and to the LENGTH of text). Return the list of problems as text, ordered by field name. For every field: if it is missing (or None) and required: 'NAME: is required'; if it is missing and not required: nothing. Otherwise a value of the wrong type (bool never counts as int or float; an int is accepted where float is wanted) gives 'NAME: must be TYPE' (TYPE is the type's __name__) and no further checks for it; a number below min gives 'NAME: must be at least MIN', above max 'NAME: must be at most MAX'; for text the same messages say 'NAME: length must be at least MIN' and 'NAME: length must be at most MAX'. Fields of the record that have no rule give 'NAME: unknown field' (in the same ordering by name)."""
+        problems = {}
+        for name in sorted(set(rules) | set(record)):
+            if name not in rules:
+                problems[name] = [name + ": unknown field"]
+                continue
+            rule = rules[name]
+            value = record.get(name)
+            if value is None:
+                if rule.get("required", False):
+                    problems[name] = [name + ": is required"]
+                continue
+            want = rule["type"]
+            ok = isinstance(value, want) and not (isinstance(value, bool) and want is not bool)
+            if want is float and isinstance(value, int) and not isinstance(value, bool):
+                ok = True
+            if not ok:
+                problems[name] = [name + ": must be " + want.__name__]
+                continue
+            size, label = (len(value), "length ") if isinstance(value, str) else (value, "")
+            found = []
+            if "min" in rule and size < rule["min"]:
+                found.append(name + ": " + label + "must be at least " + str(rule["min"]))
+            if "max" in rule and size > rule["max"]:
+                found.append(name + ": " + label + "must be at most " + str(rule["max"]))
+            if found:
+                problems[name] = found
+        return [p for name in sorted(problems) for p in problems[name]]
+  explanation: 'Validate at the edge of your program: every form field, every file, every network message. This is also the first rule of security (Unit 31).'
+- id: limiter
+  title: Rate limiting
+  difficulty: 5
+  prompt: 'A service protects itself by limiting how often a caller may act. A **token bucket** holds up to `capacity` tokens and starts full; time adds tokens back; each action costs one token. Write `make_limiter(capacity, refill_per_second, clock)`. `clock()` returns the time in seconds. Return a function `allow()` that returns a bool: first add `refill_per_second * (seconds since the last call of allow)` tokens (never more than `capacity`; for the first call count from the moment the limiter was made, so read the clock when making it), then if at least `1` token is available take one and return `True`, otherwise return `False` (and take nothing). Time never goes backwards in the tests.'
+  starter: |-
+    def make_limiter(capacity, refill_per_second, clock):
+        """A TOKEN BUCKET rate limiter. The bucket holds up to `capacity` tokens and starts full. `clock()` returns the time in seconds. Return a function allow() -> bool: first add refill_per_second * (seconds since the last call of allow) tokens (never more than capacity; the first call counts from the moment the limiter was made, so read the clock when making it), then if at least 1 token is available take one and return True, otherwise return False (and take nothing). Time never goes backwards in the tests."""
+        pass
+  tests:
+  - name: burst and refill
+    code: |
+      now = [0.0]
+      allow = make_limiter(3, 1, lambda: now[0])
+      assert [allow(), allow(), allow(), allow()] == [True, True, True, False]
+      now[0] = 0.5
+      assert allow() is False
+      now[0] = 1.0
+      assert allow() is True and allow() is False
+      now[0] = 3.5
+      assert allow() is True and allow() is True and allow() is False
+      now[0] = 1000
+      assert [allow() for _ in range(5)] == [True, True, True, False, False]
+  - name: fractions and independence
+    code: |
+      now = [10.0]
+      a = make_limiter(1, 0.5, lambda: now[0])
+      b = make_limiter(2, 2, lambda: now[0])
+      assert a() is True and a() is False and [b(), b(), b()] == [True, True, False]
+      now[0] = 11.0
+      assert a() is False and b() is True and b() is True and b() is False
+      now[0] = 12.0
+      assert a() is True and a() is False
+      now[0] = 1.0e6
+      slow = make_limiter(5, 0, lambda: now[0])
+      assert [slow() for _ in range(6)] == [True] * 5 + [False]
+      now[0] = 2.0e6
+      assert slow() is False
+  hints:
+  - Store the tokens as a float and the time of the last call.
+  - Remember to cap at capacity after adding.
+  solution: |
+    def make_limiter(capacity, refill_per_second, clock):
+        """A TOKEN BUCKET rate limiter. The bucket holds up to `capacity` tokens and starts full. `clock()` returns the time in seconds. Return a function allow() -> bool: first add refill_per_second * (seconds since the last call of allow) tokens (never more than capacity; the first call counts from the moment the limiter was made, so read the clock when making it), then if at least 1 token is available take one and return True, otherwise return False (and take nothing). Time never goes backwards in the tests."""
+        state = {"tokens": float(capacity), "last": clock()}
+
+        def allow():
+            now = clock()
+            state["tokens"] = min(capacity, state["tokens"] + (now - state["last"]) * refill_per_second)
+            state["last"] = now
+            if state["tokens"] >= 1:
+                state["tokens"] -= 1
+                return True
+            return False
+
+        return allow
+  explanation: The same bucket protects APIs, login pages and chat messages. It allows short bursts but keeps the long-run rate fixed.
+- id: chain
+  title: Error chains
+  difficulty: 4
+  prompt: 'When code catches one error and raises another with `raise NewError(...) from old` (or raises inside an `except` block), Python **links** the errors, so that the root cause is not lost. Write `describe_error(err)`: return the list of `"TypeName: message"` texts for the error and everything that led to it, from the **outermost** (the error given) down to the root cause. Follow `err.__cause__` if it is set, otherwise `err.__context__` unless `err.__suppress_context__` is `True` (`raise ... from None`), otherwise stop. The text is just `"TypeName"` when the message is empty. Stop if an error repeats (never loop forever).'
+  starter: |-
+    def describe_error(err):
+        """When code catches one error and raises another with `raise NewError(...) from old` (or raises inside an except block), Python links the errors. Return the list of 'TypeName: message' texts for the error and everything that led to it, from the OUTERMOST (the error given) down to the root cause. Follow err.__cause__ if it is set, otherwise err.__context__ unless err.__suppress_context__ is True (raise ... from None), otherwise stop. The text is just 'TypeName' when the message is empty. Stop if an error repeats (never loop forever)."""
+        pass
+  tests:
+  - name: causes
+    code: |
+      def low():
+          raise OSError("disk unreadable")
+      def mid():
+          try:
+              low()
+          except OSError as e:
+              raise ValueError("cannot load config") from e
+      def high():
+          try:
+              mid()
+          except ValueError as e:
+              raise RuntimeError("startup failed") from e
+      try:
+          high()
+      except RuntimeError as err:
+          got = describe_error(err)
+      assert got == ["RuntimeError: startup failed", "ValueError: cannot load config", "OSError: disk unreadable"]
+      assert describe_error(ValueError("alone")) == ["ValueError: alone"] and describe_error(KeyError()) == ["KeyError"]
+  - name: context and suppression
+    code: |
+      try:
+          try:
+              1 / 0
+          except ZeroDivisionError:
+              raise KeyError("lookup failed")
+      except KeyError as err:
+          assert describe_error(err) == ["KeyError: 'lookup failed'", "ZeroDivisionError: division by zero"]
+      try:
+          try:
+              1 / 0
+          except ZeroDivisionError:
+              raise KeyError("hidden") from None
+      except KeyError as err:
+          assert describe_error(err) == ["KeyError: 'hidden'"]
+      a = ValueError("a")
+      b = ValueError("b")
+      a.__cause__ = b
+      b.__cause__ = a
+      assert describe_error(a) == ["ValueError: a", "ValueError: b"]
+      try:
+          try:
+              raise OSError("first")
+          except OSError as first:
+              raise TypeError("second") from RuntimeError("explicit cause")
+      except TypeError as err:
+          assert describe_error(err) == ["TypeError: second", "RuntimeError: explicit cause"]
+  hints:
+  - Walk down the chain in a loop, remembering the ids of errors you have seen.
+  - __cause__ wins over __context__.
+  solution: |
+    def describe_error(err):
+        """When code catches one error and raises another with `raise NewError(...) from old` (or raises inside an except block), Python links the errors. Return the list of 'TypeName: message' texts for the error and everything that led to it, from the OUTERMOST (the error given) down to the root cause. Follow err.__cause__ if it is set, otherwise err.__context__ unless err.__suppress_context__ is True (raise ... from None), otherwise stop. The text is just 'TypeName' when the message is empty. Stop if an error repeats (never loop forever)."""
+        out, seen = [], set()
+        while err is not None and id(err) not in seen:
+            seen.add(id(err))
+            text = str(err)
+            out.append(type(err).__name__ + (": " + text if text else ""))
+            if err.__cause__ is not None:
+                err = err.__cause__
+            elif err.__context__ is not None and not err.__suppress_context__:
+                err = err.__context__
+            else:
+                err = None
+        return out
+  explanation: A good error message names the operation that failed; the chain keeps the technical detail underneath.
+- id: breaker
+  title: 'Capstone: a circuit breaker'
+  difficulty: 5
+  prompt: 'When a service keeps failing, calling it again and again only makes things worse. A **circuit breaker** stops the calls for a while. Write `circuit_breaker(func, threshold, cooldown, clock)`: return a function `guarded(*args)`. The breaker starts **closed**: calls go through to `func`. A call that raises counts as a failure (the exception is passed on); a call that returns normally resets the failure count to 0. After `threshold` failures **in a row** the breaker **opens** at the current time `clock()`. While it is open every call raises `RuntimeError("circuit open")` **without** calling `func`, until `cooldown` seconds have passed (`clock() - opened_at >= cooldown`). Then it is **half-open**: the next call is a **trial** that goes through to `func`; if it succeeds the breaker closes (count 0), if it fails the breaker opens again at the current time (the exception is passed on). `guarded.state()` returns `"closed"`, `"open"` or `"half-open"` (`"half-open"` once the cooldown has passed, before the trial).'
+  starter: |-
+    def circuit_breaker(func, threshold, cooldown, clock):
+        """A CIRCUIT BREAKER stops calling a service that keeps failing, so that it can recover and callers fail fast. Return a function guarded(*args). The breaker starts CLOSED: calls go through to func. A call that raises counts as a failure (the exception is passed on) and a call that returns normally resets the failure count to 0. After `threshold` failures IN A ROW the breaker OPENS at the current time clock(). While it is open every call raises RuntimeError('circuit open') WITHOUT calling func, until `cooldown` seconds have passed (clock() - opened_at >= cooldown). Then it is HALF-OPEN: the next call is a trial and goes through to func; if it succeeds the breaker closes (count 0), if it fails the breaker opens again at the current time (the exception is passed on). guarded.state() returns 'closed', 'open' or 'half-open' ('half-open' once the cooldown has passed, before the trial)."""
+        pass
+  tests:
+  - name: opening
+    code: |
+      now = [0.0]
+      calls = []
+      def service(x):
+          calls.append(x)
+          if x < 0:
+              raise ConnectionError("down")
+          return x * 2
+      g = circuit_breaker(service, 3, 10, lambda: now[0])
+      assert g(1) == 2 and g.state() == "closed"
+      for i in range(2):
+          try:
+              g(-1)
+              raise AssertionError("no error")
+          except ConnectionError:
+              pass
+      assert g.state() == "closed" and g(5) == 10
+      for i in range(3):
+          try:
+              g(-1)
+          except ConnectionError:
+              pass
+      assert g.state() == "open" and len(calls) == 7
+      try:
+          g(1)
+          raise AssertionError("not blocked")
+      except RuntimeError as e:
+          assert str(e) == "circuit open" and len(calls) == 7
+  - name: recovering
+    code: |
+      now = [100.0]
+      calls = []
+      healthy = [False]
+      def service():
+          calls.append(1)
+          if not healthy[0]:
+              raise ConnectionError("down")
+          return "ok"
+      g = circuit_breaker(service, 2, 30, lambda: now[0])
+      for i in range(2):
+          try:
+              g()
+          except ConnectionError:
+              pass
+      assert g.state() == "open"
+      now[0] = 129.9
+      assert g.state() == "open"
+      try:
+          g()
+          raise AssertionError("not blocked")
+      except RuntimeError:
+          pass
+      now[0] = 130.0
+      assert g.state() == "half-open"
+      try:
+          g()
+          raise AssertionError("no error")
+      except ConnectionError:
+          pass
+      assert g.state() == "open" and len(calls) == 3
+      now[0] = 159.0
+      assert g.state() == "open"
+      now[0] = 160.0
+      healthy[0] = True
+      assert g.state() == "half-open" and g() == "ok" and g.state() == "closed" and g() == "ok" and len(calls) == 5
+      healthy[0] = False
+      try:
+          g()
+      except ConnectionError:
+          pass
+      assert g.state() == "closed"
+      try:
+          g()
+      except ConnectionError:
+          pass
+      assert g.state() == "open"
+  - name: independent breakers
+    code: |
+      now = [0]
+      def bad():
+          raise ValueError("x")
+      a = circuit_breaker(bad, 1, 5, lambda: now[0])
+      b = circuit_breaker(bad, 1, 5, lambda: now[0])
+      try:
+          a()
+      except ValueError:
+          pass
+      assert a.state() == "open" and b.state() == "closed"
+      try:
+          b()
+      except ValueError:
+          pass
+      assert b.state() == "open"
+  hints:
+  - 'Keep two numbers: the count of failures in a row and the time it opened (or None).'
+  - state() is computed from the clock, so it never needs a timer.
+  solution: |
+    def circuit_breaker(func, threshold, cooldown, clock):
+        """A CIRCUIT BREAKER stops calling a service that keeps failing, so that it can recover and callers fail fast. Return a function guarded(*args). The breaker starts CLOSED: calls go through to func. A call that raises counts as a failure (the exception is passed on) and a call that returns normally resets the failure count to 0. After `threshold` failures IN A ROW the breaker OPENS at the current time clock(). While it is open every call raises RuntimeError('circuit open') WITHOUT calling func, until `cooldown` seconds have passed (clock() - opened_at >= cooldown). Then it is HALF-OPEN: the next call is a trial and goes through to func; if it succeeds the breaker closes (count 0), if it fails the breaker opens again at the current time (the exception is passed on). guarded.state() returns 'closed', 'open' or 'half-open' ('half-open' once the cooldown has passed, before the trial)."""
+        st = {"fails": 0, "opened": None}
+
+        def state():
+            if st["opened"] is None:
+                return "closed"
+            return "half-open" if clock() - st["opened"] >= cooldown else "open"
+
+        def guarded(*args):
+            if state() == "open":
+                raise RuntimeError("circuit open")
+            try:
+                result = func(*args)
+            except Exception:
+                st["fails"] += 1
+                if st["opened"] is not None or st["fails"] >= threshold:
+                    st["opened"] = clock()
+                raise
+            st["fails"], st["opened"] = 0, None
+            return result
+
+        guarded.state = state
+        return guarded
+  explanation: Netflix made this pattern famous. It stops one slow service from taking down everything that calls it.
+commonMistakes:
+- title: Using print instead of logging
+  explanation: You cannot filter or route print output.
+- title: Logging secrets
+  explanation: Logs are copied and read by many people.
+- title: A bare except that passes
+  explanation: It hides bugs.
+- title: No timeout on network calls
+  explanation: One slow server can freeze the whole program.
+- title: Retrying forever without backoff
+  explanation: It floods the service that is trying to recover.
+summary:
+- Log levels separate normal events from problems.
+- Log facts as fields; never log secrets.
+- Validate input at the edge with an allow-list.
+- Chain errors with raise from so the cause is kept.
+- Rate limiters and circuit breakers keep failures from spreading.
+next: u30-project
+quiz:
+- type: mcq
+  question: Which level is for normal events?
+  options:
+  - INFO
+  - ERROR
+  - CRITICAL
+  - DEBUG
+  answer: 0
+  explanation: INFO.
+- type: mcq
+  question: What does raise X from e do?
+  options:
+  - Keeps e as the cause of X
+  - Hides e
+  - Retries
+  - Logs e
+  answer: 0
+  explanation: Chains the errors.
+- type: mcq
+  question: What does a token bucket allow?
+  options:
+  - Short bursts but a fixed long-run rate
+  - Unlimited calls
+  - No calls
+  - Only one call
+  answer: 0
+  explanation: Burst and rate.
+- type: mcq
+  question: When does a circuit breaker open?
+  options:
+  - After several failures in a row
+  - On the first success
+  - Every hour
+  - Never
+  answer: 0
+  explanation: Threshold of failures.
+- type: mcq
+  question: What is an allow-list?
+  options:
+  - A list of what is permitted
+  - A list of banned words
+  - A log file
+  - A kind of cache
+  answer: 0
+  explanation: Permit what you expect.
+- type: mcq
+  question: Why set a timeout on a network call?
+  options:
+  - So a slow server cannot freeze the program
+  - To make the server faster
+  - To save logs
+  - No reason
+  answer: 0
+  explanation: Bounded waiting.
+- type: code
+  question: Write `should_log(level, minimum)` returning True if `level` is at least as important as `minimum`. Levels from low to high are DEBUG, INFO, WARNING, ERROR, CRITICAL.
+  starter: |
+    def should_log(level, minimum):
+        pass
+  tests:
+  - name: levels
+    code: |
+      assert should_log("ERROR", "INFO") is True and should_log("INFO", "INFO") is True and should_log("DEBUG", "WARNING") is False and should_log("CRITICAL", "CRITICAL") is True
+  solution: |
+    def should_log(level, minimum):
+        order = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        return order.index(level) >= order.index(minimum)

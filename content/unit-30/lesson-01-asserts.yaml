@@ -1,0 +1,534 @@
+id: u30-asserts
+title: Why Test? A Test Runner from Scratch
+minutes: 110
+objective: 'Understand why programmers write **automated tests** and how a test framework works inside. You will build the pieces of a tiny framework: a comparison that explains differences, a runner that tells failures from errors, an expected-exception check, a report and a suite runner with setup and teardown.'
+outcomes:
+- Explain why automated tests matter
+- Tell failures from errors
+- Write assertions and expected-exception checks
+- Use fixtures with setup and teardown
+- Read a test report and its exit code
+sections:
+- heading: Why we test
+  body: |-
+    Every program has **bugs**: mistakes in the code that make it do the wrong thing. Testing means running the code on purpose and checking that the results are what you expect. You could do that by hand, typing inputs and reading outputs, but you would stop after a few tries and never repeat it after the next change. An **automated test** is a small program that does the checking for you in a fraction of a second, every time, forever.
+
+    A **test** has three parts, called **arrange, act, assert**: set up the data, call the code you are testing (the **code under test**), and check the result with an **assertion**, a statement that must be true. If an assertion is false the test **fails** and tells you what was wrong. Python's `assert` statement does this: `assert add(2, 3) == 5, "adding is broken"`.
+
+    ```python
+    def test_add():
+        result = add(2, 3)          # act
+        assert result == 5          # assert
+    ```
+
+    Tests give you confidence to change code (**refactoring**): if the tests still pass, you probably did not break anything. A test that guards against a bug that was fixed is a **regression test**: the bug cannot silently come back.
+- heading: Failures, errors and test runners
+  body: |-
+    A test can end in three ways. It **passes** (no problem). It **fails** (an assertion was false: the code ran but gave a wrong answer). Or it has an **error** (some other exception, such as `ZeroDivisionError`, crashed the code or the test itself). Telling failures from errors matters: a failure says "the logic is wrong", an error often says "the code or the test is broken".
+
+    A **test runner** finds test functions, runs each one separately (so one crash does not stop the rest), and prints a **report**. Real ones are `unittest` (built into Python), `pytest` (popular) and `jest` (JavaScript). The runner ends with an **exit code**: 0 for success, non-zero for any problem, so that scripts and **continuous integration** know to stop.
+
+    Write an **expected-exception** test when bad input must be rejected: call the code with the bad input and check that it raises the right error. With `pytest` it reads `with pytest.raises(ValueError):`.
+- heading: Fixtures and independence
+  body: |-
+    Many tests need the same starting point, such as a fresh database, a temporary folder or a list with some data. A **fixture** is that prepared starting state, made by a **setup** step and cleaned up by a **teardown** step (which must run even if the test failed, or you would leave a mess behind).
+
+    The rule that makes tests trustworthy is **independence**: each test creates what it needs and must give the same result alone or in any order. Tests that share state (a global list, a file) cause **flaky** results that pass on one run and fail on another. A good test is also **fast**, **deterministic** (no random surprises; seed random numbers) and **readable**: its name says what is tested and what the expected behaviour is, such as `test_divide_by_zero_raises`.
+
+    > **Tip:** Write the test first, watch it fail, then write the code that makes it pass. This is **test-driven development** (TDD). Seeing the test fail first proves that the test can fail.
+examples:
+- title: A test suite and its report
+  intro: Four tests, one failing and one crashing, run by the framework we build in this lesson.
+  code: |
+    def compare(actual, expected):
+        """Compare two values like a test framework. Return '' when they are equal. Numbers (int or float) are equal when they differ by less than 1e-9. Two lists (or tuples) of the same length are compared item by item and the FIRST difference is reported as 'item I: ' followed by the message for the two items (so nested lists work, the index counts from 0); lists of different length give 'length: expected N but got M'. Anything else is compared with ==. The message for a difference is 'expected E but got A' using repr for both values (E is the expected value, A the actual)."""
+        nums = (int, float)
+        if isinstance(actual, nums) and isinstance(expected, nums) and not isinstance(actual, bool) and not isinstance(expected, bool):
+            return "" if abs(actual - expected) < 1e-9 else "expected " + repr(expected) + " but got " + repr(actual)
+        if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+            if len(actual) != len(expected):
+                return "length: expected " + str(len(expected)) + " but got " + str(len(actual))
+            for i, (a, e) in enumerate(zip(actual, expected)):
+                msg = compare(a, e)
+                if msg:
+                    return "item " + str(i) + ": " + msg
+            return ""
+        return "" if actual == expected else "expected " + repr(expected) + " but got " + repr(actual)
+
+
+    def run_test(func, *args):
+        """Run one test function and classify what happens. Return a pair (status, message): ('pass', '') when it returns normally; ('fail', the text of the AssertionError, or 'assertion failed' if the text is empty) when it raises AssertionError; ('error', 'TypeName: text') for any other exception, where TypeName is the exception's class name and the text is str(exception) (just 'TypeName' when the text is empty). The arguments are passed to the function."""
+        try:
+            func(*args)
+        except AssertionError as err:
+            return "fail", str(err) or "assertion failed"
+        except Exception as err:
+            return "error", type(err).__name__ + (": " + str(err) if str(err) else "")
+        return "pass", ""
+
+
+    def assert_raises(func, args, exc_name):
+        """Check that func(*args) raises the exception called exc_name (given as TEXT, such as 'ValueError'); a subclass counts too (look at the names in type(err).__mro__). Return '' when it does, 'did not raise ' + exc_name when the call returns normally, and 'raised OTHER instead of ' + exc_name (OTHER is the class name) for an exception of another kind."""
+        try:
+            func(*args)
+        except Exception as err:
+            if exc_name in [c.__name__ for c in type(err).__mro__]:
+                return ""
+            return "raised " + type(err).__name__ + " instead of " + exc_name
+        return "did not raise " + exc_name
+
+
+    def report(results):
+        """Format test results. `results` is a list of (name, status, message). Return (lines, code). One line per result in order: 'PASS name' for a pass and 'FAIL name: message' or 'ERROR name: message' otherwise. After a line '---' add a summary line 'N passed' followed by ', M failed' only if M > 0 and then ', K error' ('errors' if K > 1) only if K > 0 (so '3 passed', '3 passed, 1 failed', '2 passed, 2 errors'). With no results the summary is '0 passed'. The code is 0 when everything passed and 1 otherwise."""
+        lines = []
+        passed = failed = errors = 0
+        for name, status, message in results:
+            if status == "pass":
+                passed += 1
+                lines.append("PASS " + name)
+            else:
+                if status == "fail":
+                    failed += 1
+                else:
+                    errors += 1
+                lines.append(status.upper() + " " + name + ": " + message)
+        summary = str(passed) + " passed"
+        if failed:
+            summary += ", " + str(failed) + " failed"
+        if errors:
+            summary += ", " + str(errors) + " error" + ("s" if errors > 1 else "")
+        return lines + ["---", summary], 0 if failed + errors == 0 else 1
+
+
+    def run_suite(tests):
+        """Run a list of tests and return a list of (name, status, message) in the same order. Each test is a dict {"name": text, "func": function} and may also have "setup" (a function with no arguments that makes a FIXTURE) and "teardown" (a function that takes the fixture). With a setup, func is called with the fixture as its only argument (otherwise with no arguments). Use run_test for the call. If the setup raises, the test is ('error', 'setup: ' + the usual error message) and nothing else runs for it. The teardown runs after the test even when it failed; if the teardown itself raises, the result becomes ('error', 'teardown: ' + the message) (even when the test had passed; if the test had already failed or errored keep that result). Tests must not influence each other: every test gets a new fixture from its own setup."""
+        results = []
+        for t in tests:
+            fixture, args, status, message = None, (), "pass", ""
+            if "setup" in t:
+                try:
+                    fixture = t["setup"]()
+                except Exception as err:
+                    results.append((t["name"], "error", "setup: " + type(err).__name__ + (": " + str(err) if str(err) else "")))
+                    continue
+                args = (fixture,)
+            status, message = run_test(t["func"], *args)
+            if "teardown" in t:
+                tstatus, tmessage = run_test(t["teardown"], fixture)
+                if tstatus != "pass" and status == "pass":
+                    status, message = "error", "teardown: " + tmessage
+            results.append((t["name"], status, message))
+        return results
+
+    def add(a, b):
+        return a + b
+
+    def divide(a, b):
+        return a / b
+
+    def test_add():
+        assert compare(add(2, 3), 5) == ""
+
+    def test_add_wrong():
+        msg = compare(add(2, 2), 5)
+        assert msg == "", msg
+
+    def test_divide_zero():
+        assert assert_raises(divide, [1, 0], "ZeroDivisionError") == ""
+
+    def test_crash():
+        return add(1, None)
+
+    tests = [{"name": name, "func": func} for name, func in (("add", test_add), ("add wrong", test_add_wrong), ("divide by zero", test_divide_zero), ("crash", test_crash))]
+    lines, code = report(run_suite(tests))
+    for line in lines:
+        print(line)
+    print("exit code", code)
+  output: |
+    PASS add
+    FAIL add wrong: expected 5 but got 4
+    PASS divide by zero
+    ERROR crash: TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'
+    ---
+    2 passed, 1 failed, 1 error
+    exit code 1
+  lines:
+  - line: 101
+    note: The runner runs every test even though one fails and one crashes.
+  - line: 104
+    note: 1 tells scripts that something went wrong.
+playground:
+  prompt: Use Python's own unittest runner on a tiny test.
+  code: |
+    import unittest
+
+    class T(unittest.TestCase):
+        def test_sum(self):
+            self.assertEqual(sum([1, 2, 3]), 6)
+
+    result = unittest.TextTestRunner(stream=open('/dev/null', 'w')).run(unittest.defaultTestLoader.loadTestsFromTestCase(T))
+    print(result.wasSuccessful())
+exercises:
+- id: compare
+  title: Comparing values
+  difficulty: 4
+  prompt: 'A test framework needs a good **comparison** so that failures are easy to read. Write `compare(actual, expected)`. Return `""` when they are equal. Numbers (int or float, but not bool) are equal when they differ by less than `1e-9`. Two lists or tuples of the same length are compared item by item and the **first** difference is reported as `"item I: "` followed by the message for the two items (nested lists work; the index counts from 0); lists of different length give `"length: expected N but got M"`. Anything else is compared with `==`. The message for a difference is `"expected E but got A"` using `repr` for both values.'
+  starter: |-
+    def compare(actual, expected):
+        """Compare two values like a test framework. Return '' when they are equal. Numbers (int or float) are equal when they differ by less than 1e-9. Two lists (or tuples) of the same length are compared item by item and the FIRST difference is reported as 'item I: ' followed by the message for the two items (so nested lists work, the index counts from 0); lists of different length give 'length: expected N but got M'. Anything else is compared with ==. The message for a difference is 'expected E but got A' using repr for both values (E is the expected value, A the actual)."""
+        pass
+  tests:
+  - name: equal things
+    code: |
+      assert compare(3, 3) == "" and compare("a", "a") == "" and compare([1, 2], [1, 2]) == "" and compare((1, 2), [1, 2]) == "" and compare({"a": 1}, {"a": 1}) == "" and compare(None, None) == "" and compare(0.1 + 0.2, 0.3) == "" and compare(1, 1.0) == "" and compare([], []) == ""
+      assert compare([[1, 2], [3]], [[1, 2], [3]]) == "" and compare(True, True) == "" and compare([0.1 + 0.2], [0.3]) == ""
+  - name: messages
+    code: |
+      assert compare(4, 5) == "expected 5 but got 4" and compare("b", "a") == "expected 'a' but got 'b'" and compare(None, 0) == "expected 0 but got None" and compare(1.5, 2) == "expected 2 but got 1.5"
+      assert compare([1, 2, 3], [1, 9, 3]) == "item 1: expected 9 but got 2" and compare([1, 2], [1, 2, 3]) == "length: expected 3 but got 2" and compare([[1, 2], [3, 4]], [[1, 2], [3, 5]]) == "item 1: item 1: expected 5 but got 4" and compare([1, [2]], [1, 2]) == "item 1: expected 2 but got [2]"
+      assert compare(True, False) == "expected False but got True" and compare({"a": 1}, {"a": 2}) == "expected {'a': 2} but got {'a': 1}" and compare((1, 2), (1, 3)) == "item 1: expected 3 but got 2"
+  hints:
+  - Handle numbers first, then sequences, then everything else.
+  - bool is a kind of int in Python, so exclude it before comparing numbers.
+  solution: |
+    def compare(actual, expected):
+        """Compare two values like a test framework. Return '' when they are equal. Numbers (int or float) are equal when they differ by less than 1e-9. Two lists (or tuples) of the same length are compared item by item and the FIRST difference is reported as 'item I: ' followed by the message for the two items (so nested lists work, the index counts from 0); lists of different length give 'length: expected N but got M'. Anything else is compared with ==. The message for a difference is 'expected E but got A' using repr for both values (E is the expected value, A the actual)."""
+        nums = (int, float)
+        if isinstance(actual, nums) and isinstance(expected, nums) and not isinstance(actual, bool) and not isinstance(expected, bool):
+            return "" if abs(actual - expected) < 1e-9 else "expected " + repr(expected) + " but got " + repr(actual)
+        if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+            if len(actual) != len(expected):
+                return "length: expected " + str(len(expected)) + " but got " + str(len(actual))
+            for i, (a, e) in enumerate(zip(actual, expected)):
+                msg = compare(a, e)
+                if msg:
+                    return "item " + str(i) + ": " + msg
+            return ""
+        return "" if actual == expected else "expected " + repr(expected) + " but got " + repr(actual)
+  explanation: 'Good failure messages are half of testing: ''expected 5 but got 4'' tells you immediately what to look at.'
+- id: runtest
+  title: Running one test
+  difficulty: 4
+  prompt: 'Write `run_test(func, *args)`. Run the function and classify what happens. Return `(status, message)`: `("pass", "")` when it returns normally; `("fail", text)` when it raises `AssertionError`, where `text` is the message of the error, or `"assertion failed"` if that is empty; `("error", "TypeName: text")` for **any other** exception, where `TypeName` is the exception''s class name and `text` its message (just `"TypeName"` when the message is empty). The arguments are passed to the function.'
+  starter: |-
+    def run_test(func, *args):
+        """Run one test function and classify what happens. Return a pair (status, message): ('pass', '') when it returns normally; ('fail', the text of the AssertionError, or 'assertion failed' if the text is empty) when it raises AssertionError; ('error', 'TypeName: text') for any other exception, where TypeName is the exception's class name and the text is str(exception) (just 'TypeName' when the text is empty). The arguments are passed to the function."""
+        pass
+  tests:
+  - name: passing and failing
+    code: |
+      def ok():
+          assert 1 + 1 == 2
+      def bad():
+          assert 1 + 1 == 3, "math is broken"
+      def bare():
+          assert False
+      def raiser():
+          raise AssertionError("explicit")
+      def returns_value():
+          return 5
+      assert run_test(ok) == ("pass", "") and run_test(returns_value) == ("pass", "") and run_test(bad) == ("fail", "math is broken") and run_test(bare) == ("fail", "assertion failed") and run_test(raiser) == ("fail", "explicit")
+  - name: errors and arguments
+    code: |
+      def divide(a, b):
+          assert a / b > 0
+      assert run_test(divide, 6, 3) == ("pass", "") and run_test(divide, -6, 3) == ("fail", "assertion failed") and run_test(divide, 1, 0) == ("error", "ZeroDivisionError: division by zero")
+      def key():
+          return {}["x"]
+      def silent():
+          raise RuntimeError
+      def custom():
+          class Oops(Exception):
+              pass
+          raise Oops("custom message")
+      assert run_test(key) == ("error", "KeyError: 'x'") and run_test(silent) == ("error", "RuntimeError") and run_test(custom) == ("error", "Oops: custom message") and run_test(lambda: int("x"))[0] == "error"
+  hints:
+  - Catch AssertionError first and any other Exception second.
+  - type(err).__name__ gives the class name.
+  solution: |
+    def run_test(func, *args):
+        """Run one test function and classify what happens. Return a pair (status, message): ('pass', '') when it returns normally; ('fail', the text of the AssertionError, or 'assertion failed' if the text is empty) when it raises AssertionError; ('error', 'TypeName: text') for any other exception, where TypeName is the exception's class name and the text is str(exception) (just 'TypeName' when the text is empty). The arguments are passed to the function."""
+        try:
+            func(*args)
+        except AssertionError as err:
+            return "fail", str(err) or "assertion failed"
+        except Exception as err:
+            return "error", type(err).__name__ + (": " + str(err) if str(err) else "")
+        return "pass", ""
+  explanation: The difference between a failure (a wrong result) and an error (the code crashed) tells you where to look first.
+- id: raises
+  title: Expecting an error
+  difficulty: 4
+  prompt: 'Good tests also check that the code **fails correctly**. Write `assert_raises(func, args, exc_name)`: check that `func(*args)` raises the exception called `exc_name` (given as **text**, such as `"ValueError"`); a **subclass** counts too (look at the names of the classes in `type(err).__mro__`). Return `""` when it does, `"did not raise " + exc_name` when the call returns normally, and `"raised OTHER instead of " + exc_name` (`OTHER` is the class name) for an exception of another kind.'
+  starter: |-
+    def assert_raises(func, args, exc_name):
+        """Check that func(*args) raises the exception called exc_name (given as TEXT, such as 'ValueError'); a subclass counts too (look at the names in type(err).__mro__). Return '' when it does, 'did not raise ' + exc_name when the call returns normally, and 'raised OTHER instead of ' + exc_name (OTHER is the class name) for an exception of another kind."""
+        pass
+  tests:
+  - name: matching
+    code: |
+      def parse(text):
+          return int(text)
+      assert assert_raises(parse, ["abc"], "ValueError") == "" and assert_raises(parse, [None], "TypeError") == "" and assert_raises(lambda: {}["k"], [], "KeyError") == "" and assert_raises(lambda: [][1], [], "IndexError") == ""
+      assert assert_raises(lambda: {}["k"], [], "LookupError") == "" and assert_raises(lambda: 1 / 0, [], "ArithmeticError") == "" and assert_raises(lambda: 1 / 0, [], "Exception") == ""
+  - name: not matching
+    code: |
+      assert assert_raises(int, ["5"], "ValueError") == "did not raise ValueError" and assert_raises(len, [[1]], "TypeError") == "did not raise TypeError"
+      assert assert_raises(int, ["x"], "KeyError") == "raised ValueError instead of KeyError" and assert_raises(lambda: 1 / 0, [], "ValueError") == "raised ZeroDivisionError instead of ValueError" and assert_raises(lambda: {}["x"], [], "IndexError") == "raised KeyError instead of IndexError"
+      class MyError(ValueError):
+          pass
+      def boom():
+          raise MyError("x")
+      assert assert_raises(boom, [], "MyError") == "" and assert_raises(boom, [], "ValueError") == "" and assert_raises(boom, [], "TypeError") == "raised MyError instead of TypeError"
+  hints:
+  - Use try/except Exception around the call and look at the names of the classes in the exception's type.__mro__.
+  solution: |
+    def assert_raises(func, args, exc_name):
+        """Check that func(*args) raises the exception called exc_name (given as TEXT, such as 'ValueError'); a subclass counts too (look at the names in type(err).__mro__). Return '' when it does, 'did not raise ' + exc_name when the call returns normally, and 'raised OTHER instead of ' + exc_name (OTHER is the class name) for an exception of another kind."""
+        try:
+            func(*args)
+        except Exception as err:
+            if exc_name in [c.__name__ for c in type(err).__mro__]:
+                return ""
+            return "raised " + type(err).__name__ + " instead of " + exc_name
+        return "did not raise " + exc_name
+  explanation: 'This is how you test that bad input is rejected: a function that quietly accepts nonsense is often worse than one that crashes.'
+- id: report
+  title: Reporting results
+  difficulty: 4
+  prompt: 'Write `report(results)`. `results` is a list of `(name, status, message)`. Return `(lines, code)`. One line per result in order: `"PASS name"` for a pass and `"FAIL name: message"` or `"ERROR name: message"` otherwise. After a line `"---"` add a summary line `"N passed"` followed by `", M failed"` only if `M > 0` and then `", K error"` (`"errors"` if `K > 1`) only if `K > 0` (so `"3 passed"`, `"3 passed, 1 failed"`, `"2 passed, 2 errors"`). With no results the summary is `"0 passed"`. The code is `0` when everything passed and `1` otherwise, like the **exit status** of a command (it lets scripts and CI notice a failing test run).'
+  starter: |-
+    def report(results):
+        """Format test results. `results` is a list of (name, status, message). Return (lines, code). One line per result in order: 'PASS name' for a pass and 'FAIL name: message' or 'ERROR name: message' otherwise. After a line '---' add a summary line 'N passed' followed by ', M failed' only if M > 0 and then ', K error' ('errors' if K > 1) only if K > 0 (so '3 passed', '3 passed, 1 failed', '2 passed, 2 errors'). With no results the summary is '0 passed'. The code is 0 when everything passed and 1 otherwise."""
+        pass
+  tests:
+  - name: all passing
+    code: |
+      assert report([]) == (["---", "0 passed"], 0) and report([("a", "pass", ""), ("b", "pass", "")]) == (["PASS a", "PASS b", "---", "2 passed"], 0)
+  - name: failures
+    code: |
+      res = [("add", "pass", ""), ("sub", "fail", "expected 1 but got 2"), ("div", "error", "ZeroDivisionError: division by zero"), ("mul", "pass", "")]
+      assert report(res) == (["PASS add", "FAIL sub: expected 1 but got 2", "ERROR div: ZeroDivisionError: division by zero", "PASS mul", "---", "2 passed, 1 failed, 1 error"], 1)
+      assert report([("x", "error", "A"), ("y", "error", "B")]) == (["ERROR x: A", "ERROR y: B", "---", "0 passed, 2 errors"], 1) and report([("x", "fail", "m")]) == (["FAIL x: m", "---", "0 passed, 1 failed"], 1) and report([("p", "pass", ""), ("q", "fail", "n"), ("r", "fail", "o")])[0][-1] == "1 passed, 2 failed"
+  hints:
+  - Count passes, failures and errors while you build the lines.
+  solution: |
+    def report(results):
+        """Format test results. `results` is a list of (name, status, message). Return (lines, code). One line per result in order: 'PASS name' for a pass and 'FAIL name: message' or 'ERROR name: message' otherwise. After a line '---' add a summary line 'N passed' followed by ', M failed' only if M > 0 and then ', K error' ('errors' if K > 1) only if K > 0 (so '3 passed', '3 passed, 1 failed', '2 passed, 2 errors'). With no results the summary is '0 passed'. The code is 0 when everything passed and 1 otherwise."""
+        lines = []
+        passed = failed = errors = 0
+        for name, status, message in results:
+            if status == "pass":
+                passed += 1
+                lines.append("PASS " + name)
+            else:
+                if status == "fail":
+                    failed += 1
+                else:
+                    errors += 1
+                lines.append(status.upper() + " " + name + ": " + message)
+        summary = str(passed) + " passed"
+        if failed:
+            summary += ", " + str(failed) + " failed"
+        if errors:
+            summary += ", " + str(errors) + " error" + ("s" if errors > 1 else "")
+        return lines + ["---", summary], 0 if failed + errors == 0 else 1
+  explanation: 'CI systems (lesson 28.7) rely on exactly this: a non-zero exit code makes the pipeline stop.'
+- id: suite
+  title: 'Capstone: running a suite'
+  difficulty: 5
+  prompt: 'Write `run_suite(tests)`; `run_test` is given. Each test is a dict `{"name": text, "func": function}` and may also have `"setup"` (a function with no arguments that makes a **fixture**) and `"teardown"` (a function that takes the fixture). With a setup, `func` is called with the fixture as its only argument (otherwise with no arguments). Return a list of `(name, status, message)` in the same order. If the setup raises, the result is `("error", "setup: " + the usual message)` and nothing else runs for that test (no teardown, since there is no fixture). The teardown runs after the test **even when it failed**; if the teardown itself raises, a test that had passed becomes `("error", "teardown: " + the message)`; a test that had already failed or errored keeps its own result. Every test gets a **new** fixture from its own setup, so tests cannot influence each other. Call setup only once per test.'
+  starter: |-
+    def run_test(func, *args):
+        """Run one test function and classify what happens. Return a pair (status, message): ('pass', '') when it returns normally; ('fail', the text of the AssertionError, or 'assertion failed' if the text is empty) when it raises AssertionError; ('error', 'TypeName: text') for any other exception, where TypeName is the exception's class name and the text is str(exception) (just 'TypeName' when the text is empty). The arguments are passed to the function."""
+        try:
+            func(*args)
+        except AssertionError as err:
+            return "fail", str(err) or "assertion failed"
+        except Exception as err:
+            return "error", type(err).__name__ + (": " + str(err) if str(err) else "")
+        return "pass", ""
+
+
+
+
+    def run_suite(tests):
+        """Run a list of tests and return a list of (name, status, message) in the same order. Each test is a dict {"name": text, "func": function} and may also have "setup" (a function with no arguments that makes a FIXTURE) and "teardown" (a function that takes the fixture). With a setup, func is called with the fixture as its only argument (otherwise with no arguments). Use run_test for the call. If the setup raises, the test is ('error', 'setup: ' + the usual error message) and nothing else runs for it. The teardown runs after the test even when it failed; if the teardown itself raises, the result becomes ('error', 'teardown: ' + the message) (even when the test had passed; if the test had already failed or errored keep that result). Tests must not influence each other: every test gets a new fixture from its own setup."""
+        pass
+  tests:
+  - name: plain tests
+    code: |
+      def good():
+          assert True
+      def bad():
+          assert 1 == 2, "nope"
+      def crash():
+          [][0]
+      res = run_suite([{"name": "good", "func": good}, {"name": "bad", "func": bad}, {"name": "crash", "func": crash}])
+      assert res == [("good", "pass", ""), ("bad", "fail", "nope"), ("crash", "error", "IndexError: list index out of range")] and run_suite([]) == []
+  - name: fixtures
+    code: |
+      made = []
+      def make():
+          made.append(1)
+          return {"items": []}
+      def t_add(box):
+          box["items"].append(1)
+          assert box["items"] == [1]
+      def t_fresh(box):
+          assert box["items"] == []
+      res = run_suite([{"name": "a", "func": t_add, "setup": make}, {"name": "b", "func": t_fresh, "setup": make}])
+      assert res == [("a", "pass", ""), ("b", "pass", "")] and len(made) == 2
+  - name: setup and teardown
+    code: |
+      log = []
+      def setup():
+          log.append("setup")
+          return "fx"
+      def teardown(fx):
+          log.append("teardown " + fx)
+      def failing(fx):
+          log.append("test")
+          assert False, "boom"
+      res = run_suite([{"name": "t", "func": failing, "setup": setup, "teardown": teardown}])
+      assert res == [("t", "fail", "boom")] and log == ["setup", "test", "teardown fx"]
+      def broken_setup():
+          raise OSError("no disk")
+      log.clear()
+      res = run_suite([{"name": "s", "func": failing, "setup": broken_setup, "teardown": teardown}, {"name": "ok", "func": lambda: None}])
+      assert res == [("s", "error", "setup: OSError: no disk"), ("ok", "pass", "")] and log == []
+      def bad_teardown(fx):
+          raise ValueError("cleanup failed")
+      res = run_suite([{"name": "p", "func": lambda fx: None, "setup": setup, "teardown": bad_teardown}, {"name": "f", "func": failing, "setup": setup, "teardown": bad_teardown}])
+      assert res == [("p", "error", "teardown: ValueError: cleanup failed"), ("f", "fail", "boom")]
+      calls = []
+      def counted():
+          calls.append(1)
+          return 5
+      run_suite([{"name": "c", "func": lambda x: None, "setup": counted}])
+      assert calls == [1]
+  hints:
+  - 'Run the setup with run_test only once: you need its returned fixture, so call it yourself inside try/except.'
+  - Do the teardown after the test whatever happened, then adjust the result.
+  solution: |
+    def run_test(func, *args):
+        """Run one test function and classify what happens. Return a pair (status, message): ('pass', '') when it returns normally; ('fail', the text of the AssertionError, or 'assertion failed' if the text is empty) when it raises AssertionError; ('error', 'TypeName: text') for any other exception, where TypeName is the exception's class name and the text is str(exception) (just 'TypeName' when the text is empty). The arguments are passed to the function."""
+        try:
+            func(*args)
+        except AssertionError as err:
+            return "fail", str(err) or "assertion failed"
+        except Exception as err:
+            return "error", type(err).__name__ + (": " + str(err) if str(err) else "")
+        return "pass", ""
+
+
+
+
+    def run_suite(tests):
+        """Run a list of tests and return a list of (name, status, message) in the same order. Each test is a dict {"name": text, "func": function} and may also have "setup" (a function with no arguments that makes a FIXTURE) and "teardown" (a function that takes the fixture). With a setup, func is called with the fixture as its only argument (otherwise with no arguments). Use run_test for the call. If the setup raises, the test is ('error', 'setup: ' + the usual error message) and nothing else runs for it. The teardown runs after the test even when it failed; if the teardown itself raises, the result becomes ('error', 'teardown: ' + the message) (even when the test had passed; if the test had already failed or errored keep that result). Tests must not influence each other: every test gets a new fixture from its own setup."""
+        results = []
+        for t in tests:
+            fixture, args, status, message = None, (), "pass", ""
+            if "setup" in t:
+                try:
+                    fixture = t["setup"]()
+                except Exception as err:
+                    results.append((t["name"], "error", "setup: " + type(err).__name__ + (": " + str(err) if str(err) else "")))
+                    continue
+                args = (fixture,)
+            status, message = run_test(t["func"], *args)
+            if "teardown" in t:
+                tstatus, tmessage = run_test(t["teardown"], fixture)
+                if tstatus != "pass" and status == "pass":
+                    status, message = "error", "teardown: " + tmessage
+            results.append((t["name"], status, message))
+        return results
+  explanation: These are the same ideas as the setUp and tearDown methods of unittest and the fixtures of pytest.
+commonMistakes:
+- title: Tests that depend on each other
+  explanation: Each test must create its own data.
+- title: Testing only the happy path
+  explanation: Also test bad input and edge cases.
+- title: Comparing floats with ==
+  explanation: 0.1 + 0.2 is not exactly 0.3; allow a small difference.
+- title: A test that can never fail
+  explanation: Watch it fail first.
+- title: Ignoring the exit code
+  explanation: A runner that always returns 0 hides failures from CI.
+summary:
+- A test arranges, acts and asserts.
+- A failure is a wrong answer; an error is a crash.
+- A runner runs every test separately and reports.
+- Fixtures prepare state; teardown always runs.
+- Independent, fast, deterministic tests are trustworthy.
+next: u30-design
+quiz:
+- type: mcq
+  question: What is a regression test?
+  options:
+  - A test that stops an old bug from coming back
+  - A test of speed
+  - A test of the screen
+  - A test that is deleted later
+  answer: 0
+  explanation: It guards a fixed bug.
+- type: mcq
+  question: What is the difference between a failure and an error?
+  options:
+  - 'Failure: assertion false; error: some other exception'
+  - They are the same
+  - 'Error: assertion false; failure: crash'
+  - Failure only happens in loops
+  answer: 0
+  explanation: Wrong answer vs crash.
+- type: mcq
+  question: Why must teardown run even when a test fails?
+  options:
+  - To clean up the fixture so it does not affect other tests
+  - To hide the failure
+  - To make the test faster
+  - It does not have to
+  answer: 0
+  explanation: Cleanup.
+- type: mcq
+  question: Why compare floats with a tolerance?
+  options:
+  - Floating point arithmetic is not exact
+  - Floats are slow
+  - Floats cannot be compared
+  - To make tests pass
+  answer: 0
+  explanation: 0.1 + 0.2 != 0.3.
+- type: mcq
+  question: What does a non-zero exit code mean?
+  options:
+  - Something failed
+  - Success
+  - The program is fast
+  - Nothing
+  answer: 0
+  explanation: By convention.
+- type: mcq
+  question: What is test-driven development?
+  options:
+  - Writing a failing test first, then the code
+  - Writing tests after release
+  - Never writing tests
+  - Testing by hand
+  answer: 0
+  explanation: Test first.
+- type: code
+  question: Write `summary(passed, failed)` returning text like `'3 passed, 1 failed'`; when `failed` is 0 return just `'3 passed'`.
+  starter: |
+    def summary(passed, failed):
+        pass
+  tests:
+  - name: summary
+    code: |
+      assert summary(3, 1) == "3 passed, 1 failed" and summary(5, 0) == "5 passed" and summary(0, 2) == "0 passed, 2 failed"
+  solution: |
+    def summary(passed, failed):
+        text = str(passed) + " passed"
+        if failed:
+            text += ", " + str(failed) + " failed"
+        return text
