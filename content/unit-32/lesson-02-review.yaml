@@ -1,0 +1,863 @@
+id: u32-review
+title: Reviewing AI-Written Code
+minutes: 115
+objective: Learn to treat AI code as a draft from an untrusted author. You will read it for the classic failures and build a small review robot with the ast module that finds invented names, invented libraries, dangerous calls and bad habits.
+outcomes:
+- List the typical mistakes in AI-written code
+- Find undefined names and unknown imports automatically
+- Spot dangerous calls and bad habits
+- Review code with a checklist and a robot
+sections:
+- heading: Code from an AI is a draft from a stranger
+  body: |-
+    An assistant writes code in seconds, and it **looks** finished: tidy names, a docstring, confident comments. That is exactly why you must review it. A **code review** is a careful reading of code written by someone else before it is accepted. Treat AI output like a pull request from a stranger who is clever, fast and sometimes wrong, in a few typical ways:
+
+    - **Invented things (hallucinations).** A function, a method, a parameter or a whole library that does not exist, or that existed in an older version. Attackers even publish malicious packages under names that assistants tend to invent (**slopsquatting**).
+    - **Plausible but wrong logic.** Off-by-one errors, wrong edge cases (empty input, negative numbers), a formula that is almost right. It works on the example in the prompt and fails elsewhere.
+    - **Outdated or insecure habits.** `eval`, string-built SQL, `shell=True`, hard-coded passwords, `pickle` for untrusted data, `except:` that hides errors.
+    - **Solving a different problem.** It answers the question as it understood it, not as you meant it; or it adds features you did not ask for.
+    - **Too much code.** Copy-pasted blocks, unnecessary classes, layers nobody needs. Less code is less to review.
+- heading: How to review
+  body: |-
+    Use a routine, every time:
+
+    1. **Read it all** and make sure you can explain every line. If you cannot, ask the assistant to explain it, or rewrite it more simply. Code you do not understand is code you cannot fix.
+    2. **Check what it depends on.** Does each function and library exist, in the version you use? Look in the official documentation, not in the assistant's memory.
+    3. **Run the cheap automatic checks**: syntax check, a linter (such as `ruff` or `pyflakes`), a type checker, and a security scanner. This lesson builds a tiny version of such a tool with the `ast` module, the **abstract syntax tree** that Python itself uses to understand your program.
+    4. **Test it** (next lesson), starting with the edge cases.
+    5. **Read the diff** when it changes existing code: what did it touch that you did not ask for?
+
+    Keep an eye on **scope**: ask for one small change at a time, so that each review is small. And keep **ownership**: when you commit the code, it is yours. "The AI wrote it" is not an answer in a code review, a bug report or a security incident.
+examples:
+- title: Invented names and libraries
+  intro: 'The two classic hallucinations: a helper that does not exist and a library that is not allowed.'
+  code: |
+    def undefined_names(source):
+        """AI assistants sometimes use a helper function or variable that DOES NOT EXIST (a hallucination). Parse the source with ast and return the sorted list of (line, name) for every place where a name is READ (an ast.Name in Load context) that is defined nowhere in the code and is not a built-in name (dir(builtins)). Use this simple FLAT rule: a name counts as defined if, anywhere in the code, it is assigned or deleted (a Name in Store or Del context, including for-loop and comprehension targets and with-as), defined by def or class, a parameter (of a def or lambda: normal, positional-only, keyword-only, *args, **kwargs), imported (import x, import x.y defines x, 'as' gives the new name, from m import n), or the name of an except-as. Raise the SyntaxError of a broken source."""
+        import ast, builtins
+        tree = ast.parse(source)
+        defined = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = node.args
+                for arg in a.posonlyargs + a.args + a.kwonlyargs:
+                    defined.add(arg.arg)
+                for arg in (a.vararg, a.kwarg):
+                    if arg:
+                        defined.add(arg.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+        found = [(n.lineno, n.id) for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined]
+        return sorted(found)
+
+
+    def check_imports(source, allowed):
+        """Assistants also invent LIBRARIES, or use ones your project does not have. Parse the source and return the sorted list of (line, module) for every import of a module whose TOP-LEVEL name (the part before the first dot) is not in the collection `allowed`. 'import a.b, c' gives the modules a and c (one entry each, on the line of the statement); 'from a.b import x' gives a; relative imports (from . import x) are ignored. The same module imported on two lines appears twice."""
+        import ast
+        problems = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top not in allowed:
+                        problems.append((node.lineno, top))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                top = node.module.split(".")[0]
+                if top not in allowed:
+                    problems.append((node.lineno, top))
+        return sorted(problems)
+
+    code = "import os\nimport fancy_ai_helpers\n\ndef report(items):\n    total = sum_all(items)\n    return os.linesep + str(total)\n"
+    print(undefined_names(code))
+    print(check_imports(code, {"os", "json"}))
+  output: |
+    [(5, 'sum_all')]
+    [(2, 'fancy_ai_helpers')]
+  lines:
+  - line: 47
+    note: Line 5 uses sum_all, which nobody defined.
+  - line: 48
+    note: The invented library fancy_ai_helpers is not allowed.
+- title: Dangerous calls and bad habits
+  intro: A snippet with a shell command, a bare except, a mutable default and an eval.
+  code: |
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+    def risky_calls(source):
+        """Find DANGEROUS calls that AI code sometimes contains. Parse the source and return the sorted list of unique (line, label) pairs for every call of: eval -> 'eval'; exec -> 'exec'; os.system -> 'os.system'; pickle.load or pickle.loads -> 'pickle load' (unpickling can run any code); any subprocess.NAME(...) call that has the keyword shell=True (the constant True) -> 'subprocess shell=True'; and yaml.load -> 'yaml.load' (unsafe unless a safe loader is used; yaml.safe_load is fine). The helper dotted_name gives the called name."""
+        import ast
+        labels = {"eval": "eval", "exec": "exec", "os.system": "os.system", "pickle.load": "pickle load", "pickle.loads": "pickle load", "yaml.load": "yaml.load"}
+        found = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call):
+                name = dotted_name(node.func)
+                if name in labels:
+                    found.add((node.lineno, labels[name]))
+                elif name.startswith("subprocess.") and any(k.arg == "shell" and isinstance(k.value, ast.Constant) and k.value.value is True for k in node.keywords):
+                    found.add((node.lineno, "subprocess shell=True"))
+        return sorted(found)
+
+
+    def style_problems(source):
+        """Find common bad habits. Parse the source and return the sorted list of unique (line, message) pairs: 'bare except' for an except without an exception type (it hides every error, even Ctrl-C); 'mutable default argument' for a function (def, at the line of the def) whose default value is a list, dict or set display or comprehension, or a call to list(), dict() or set() (the one default object is shared between all calls); 'compare to None with is' for a == or != comparison where either side is the constant None; 'missing docstring' for every function whose body does not start with a string constant."""
+        import ast
+        problems = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                problems.add((node.lineno, "bare except"))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defaults = [d for d in node.args.defaults + node.args.kw_defaults if d is not None]
+                for d in defaults:
+                    if isinstance(d, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)) or (isinstance(d, ast.Call) and dotted_name(d.func) in ("list", "dict", "set")):
+                        problems.add((node.lineno, "mutable default argument"))
+                first = node.body[0]
+                if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str)):
+                    problems.add((node.lineno, "missing docstring"))
+            elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+                sides = [node.left] + node.comparators
+                if any(isinstance(s, ast.Constant) and s.value is None for s in sides):
+                    problems.add((node.lineno, "compare to None with is"))
+        return sorted(problems)
+
+    code = "import os\n\ndef run(cmd, args=[]):\n    try:\n        return os.system(cmd)\n    except:\n        return eval(cmd)\n"
+    print(risky_calls(code))
+    print(style_problems(code))
+  output: |
+    [(5, 'os.system'), (7, 'eval')]
+    [(3, 'missing docstring'), (3, 'mutable default argument'), (6, 'bare except')]
+  lines:
+  - line: 51
+    note: 'Two dangerous calls: a shell command and eval.'
+  - line: 52
+    note: Missing docstring, a shared list and a bare except.
+- title: The review robot
+  intro: All four checks together on an answer that looks fine at first glance.
+  code: |
+    def undefined_names(source):
+        """AI assistants sometimes use a helper function or variable that DOES NOT EXIST (a hallucination). Parse the source with ast and return the sorted list of (line, name) for every place where a name is READ (an ast.Name in Load context) that is defined nowhere in the code and is not a built-in name (dir(builtins)). Use this simple FLAT rule: a name counts as defined if, anywhere in the code, it is assigned or deleted (a Name in Store or Del context, including for-loop and comprehension targets and with-as), defined by def or class, a parameter (of a def or lambda: normal, positional-only, keyword-only, *args, **kwargs), imported (import x, import x.y defines x, 'as' gives the new name, from m import n), or the name of an except-as. Raise the SyntaxError of a broken source."""
+        import ast, builtins
+        tree = ast.parse(source)
+        defined = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = node.args
+                for arg in a.posonlyargs + a.args + a.kwonlyargs:
+                    defined.add(arg.arg)
+                for arg in (a.vararg, a.kwarg):
+                    if arg:
+                        defined.add(arg.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+        found = [(n.lineno, n.id) for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined]
+        return sorted(found)
+
+
+    def check_imports(source, allowed):
+        """Assistants also invent LIBRARIES, or use ones your project does not have. Parse the source and return the sorted list of (line, module) for every import of a module whose TOP-LEVEL name (the part before the first dot) is not in the collection `allowed`. 'import a.b, c' gives the modules a and c (one entry each, on the line of the statement); 'from a.b import x' gives a; relative imports (from . import x) are ignored. The same module imported on two lines appears twice."""
+        import ast
+        problems = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top not in allowed:
+                        problems.append((node.lineno, top))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                top = node.module.split(".")[0]
+                if top not in allowed:
+                    problems.append((node.lineno, top))
+        return sorted(problems)
+
+
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+    def risky_calls(source):
+        """Find DANGEROUS calls that AI code sometimes contains. Parse the source and return the sorted list of unique (line, label) pairs for every call of: eval -> 'eval'; exec -> 'exec'; os.system -> 'os.system'; pickle.load or pickle.loads -> 'pickle load' (unpickling can run any code); any subprocess.NAME(...) call that has the keyword shell=True (the constant True) -> 'subprocess shell=True'; and yaml.load -> 'yaml.load' (unsafe unless a safe loader is used; yaml.safe_load is fine). The helper dotted_name gives the called name."""
+        import ast
+        labels = {"eval": "eval", "exec": "exec", "os.system": "os.system", "pickle.load": "pickle load", "pickle.loads": "pickle load", "yaml.load": "yaml.load"}
+        found = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call):
+                name = dotted_name(node.func)
+                if name in labels:
+                    found.add((node.lineno, labels[name]))
+                elif name.startswith("subprocess.") and any(k.arg == "shell" and isinstance(k.value, ast.Constant) and k.value.value is True for k in node.keywords):
+                    found.add((node.lineno, "subprocess shell=True"))
+        return sorted(found)
+
+
+    def style_problems(source):
+        """Find common bad habits. Parse the source and return the sorted list of unique (line, message) pairs: 'bare except' for an except without an exception type (it hides every error, even Ctrl-C); 'mutable default argument' for a function (def, at the line of the def) whose default value is a list, dict or set display or comprehension, or a call to list(), dict() or set() (the one default object is shared between all calls); 'compare to None with is' for a == or != comparison where either side is the constant None; 'missing docstring' for every function whose body does not start with a string constant."""
+        import ast
+        problems = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                problems.add((node.lineno, "bare except"))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defaults = [d for d in node.args.defaults + node.args.kw_defaults if d is not None]
+                for d in defaults:
+                    if isinstance(d, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)) or (isinstance(d, ast.Call) and dotted_name(d.func) in ("list", "dict", "set")):
+                        problems.add((node.lineno, "mutable default argument"))
+                first = node.body[0]
+                if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str)):
+                    problems.add((node.lineno, "missing docstring"))
+            elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+                sides = [node.left] + node.comparators
+                if any(isinstance(s, ast.Constant) and s.value is None for s in sides):
+                    problems.add((node.lineno, "compare to None with is"))
+        return sorted(problems)
+
+
+    def review_report(source, allowed):
+        """The review of a whole piece of AI code. If the source has a syntax error return ['syntax error at line N'] (N from the SyntaxError, or 1 if it has none). Otherwise return the list of text lines, sorted by line number and then alphabetically, made from: 'line N: undefined name X' for undefined_names, 'line N: module X is not allowed' for check_imports, 'line N: risky call LABEL' for risky_calls and 'line N: MESSAGE' for style_problems. An empty list means the review found nothing."""
+        try:
+            undefined = undefined_names(source)
+            imports = check_imports(source, allowed)
+            risky = risky_calls(source)
+            style = style_problems(source)
+        except SyntaxError as err:
+            return ["syntax error at line " + str(err.lineno or 1)]
+        lines = [(n, "undefined name " + name) for n, name in undefined]
+        lines += [(n, "module " + mod + " is not allowed") for n, mod in imports]
+        lines += [(n, "risky call " + label) for n, label in risky]
+        lines += [(n, msg) for n, msg in style]
+        return ["line " + str(n) + ": " + msg for n, msg in sorted(lines)]
+
+    answer = "import os\nimport super_utils\n\ndef clean(path, seen=[]):\n    \"\"\"Delete a file.\"\"\"\n    os.system('rm ' + path)\n    return fix_path(path)\n"
+    for line in review_report(answer, {"os"}):
+        print(line)
+  output: |
+    line 2: module super_utils is not allowed
+    line 4: mutable default argument
+    line 6: risky call os.system
+    line 7: undefined name fix_path
+  lines:
+  - line: 113
+    note: One list, sorted by line, ready to read.
+playground:
+  prompt: Parse a snippet and count its function definitions.
+  code: |
+    import ast
+    tree = ast.parse('def a():\n    pass\ndef b():\n    pass\n')
+    print(sum(isinstance(n, ast.FunctionDef) for n in ast.walk(tree)))
+exercises:
+- id: undefined
+  title: Names that do not exist
+  difficulty: 5
+  prompt: 'An assistant may call a helper that **does not exist** (a *hallucination*). Python only finds out when that line runs. A tool can find it earlier with the `ast` module (the tree of the program). Write `undefined_names(source)`. AI assistants sometimes use a helper function or variable that DOES NOT EXIST (a hallucination). Parse the source with ast and return the sorted list of (line, name) for every place where a name is READ (an ast.Name in Load context) that is defined nowhere in the code and is not a built-in name (dir(builtins)). Use this simple FLAT rule: a name counts as defined if, anywhere in the code, it is assigned or deleted (a Name in Store or Del context, including for-loop and comprehension targets and with-as), defined by def or class, a parameter (of a def or lambda: normal, positional-only, keyword-only, *args, **kwargs), imported (import x, import x.y defines x, ''as'' gives the new name, from m import n), or the name of an except-as. Raise the SyntaxError of a broken source.'
+  starter: |-
+    def undefined_names(source):
+        """AI assistants sometimes use a helper function or variable that DOES NOT EXIST (a hallucination). Parse the source with ast and return the sorted list of (line, name) for every place where a name is READ (an ast.Name in Load context) that is defined nowhere in the code and is not a built-in name (dir(builtins)). Use this simple FLAT rule: a name counts as defined if, anywhere in the code, it is assigned or deleted (a Name in Store or Del context, including for-loop and comprehension targets and with-as), defined by def or class, a parameter (of a def or lambda: normal, positional-only, keyword-only, *args, **kwargs), imported (import x, import x.y defines x, 'as' gives the new name, from m import n), or the name of an except-as. Raise the SyntaxError of a broken source."""
+        pass
+  tests:
+  - name: finding them
+    code: |
+      src = "import os\n\ndef total(items, rate=2):\n    s = sum(items)\n    return apply_rate(s, rate) + os.sep\n\nvalue = total([1, 2]) + unknown\nprint(value, bad_name)\n"
+      assert undefined_names(src) == [(5, "apply_rate"), (7, "unknown"), (8, "bad_name")]
+      assert undefined_names("x = 1\ny = x + 1\nprint(len([y]))") == [] and undefined_names("") == [] and undefined_names("print(z)\nprint(z)") == [(1, "z"), (2, "z")]
+  - name: what counts as defined
+    code: |
+      src = """import os.path, json as j
+      from math import sqrt as root, pi
+      class K:
+          pass
+      def f(a, /, b, *args, c=1, **kw):
+          for i in range(3):
+              pass
+          with open(a) as fh:
+              pass
+          try:
+              pass
+          except ValueError as err:
+              print(err)
+          sq = [n * n for n in args]
+          g = lambda p, *q: p + len(q)
+          del sq
+          return a, b, c, kw, fh, i, g, os, j, root, pi, K, f
+      """
+      assert undefined_names(src) == []
+      assert undefined_names("def f():\n    return later\nlater = 1\n") == [] and undefined_names("print(a)\na = 1") == [] and undefined_names("x = [q for q in w]") == [(1, "w")]
+      try:
+          undefined_names("def f(:")
+          raise AssertionError("accepted")
+      except SyntaxError:
+          pass
+  hints:
+  - Collect the defined names first (also include dir(builtins)), then list the loads.
+  - ast.walk visits every node; look at isinstance and ctx.
+  solution: |
+    def undefined_names(source):
+        """AI assistants sometimes use a helper function or variable that DOES NOT EXIST (a hallucination). Parse the source with ast and return the sorted list of (line, name) for every place where a name is READ (an ast.Name in Load context) that is defined nowhere in the code and is not a built-in name (dir(builtins)). Use this simple FLAT rule: a name counts as defined if, anywhere in the code, it is assigned or deleted (a Name in Store or Del context, including for-loop and comprehension targets and with-as), defined by def or class, a parameter (of a def or lambda: normal, positional-only, keyword-only, *args, **kwargs), imported (import x, import x.y defines x, 'as' gives the new name, from m import n), or the name of an except-as. Raise the SyntaxError of a broken source."""
+        import ast, builtins
+        tree = ast.parse(source)
+        defined = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = node.args
+                for arg in a.posonlyargs + a.args + a.kwonlyargs:
+                    defined.add(arg.arg)
+                for arg in (a.vararg, a.kwarg):
+                    if arg:
+                        defined.add(arg.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+        found = [(n.lineno, n.id) for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined]
+        return sorted(found)
+  explanation: This simple version ignores scopes, so it misses some mistakes, but it already catches the classic invented helper. Real linters such as pyflakes do the same job more carefully.
+- id: imports
+  title: Libraries that do not exist
+  difficulty: 4
+  prompt: Assistants also invent **libraries**, or use ones your project does not have; attackers even publish packages with names that assistants tend to invent. Write `check_imports(source, allowed)`. Assistants also invent LIBRARIES, or use ones your project does not have. Parse the source and return the sorted list of (line, module) for every import of a module whose TOP-LEVEL name (the part before the first dot) is not in the collection `allowed`. 'import a.b, c' gives the modules a and c (one entry each, on the line of the statement); 'from a.b import x' gives a; relative imports (from . import x) are ignored. The same module imported on two lines appears twice.
+  starter: |-
+    def check_imports(source, allowed):
+        """Assistants also invent LIBRARIES, or use ones your project does not have. Parse the source and return the sorted list of (line, module) for every import of a module whose TOP-LEVEL name (the part before the first dot) is not in the collection `allowed`. 'import a.b, c' gives the modules a and c (one entry each, on the line of the statement); 'from a.b import x' gives a; relative imports (from . import x) are ignored. The same module imported on two lines appears twice."""
+        pass
+  tests:
+  - name: finding imports
+    code: |
+      src = "import os\nimport numpy as np\nimport requests, sys\nfrom pandas.io import x\nfrom os.path import join\nimport a.b.c\nimport sys\n"
+      assert check_imports(src, {"os", "sys"}) == [(2, "numpy"), (3, "requests"), (4, "pandas"), (6, "a")]
+      assert check_imports(src, {"os", "sys", "numpy", "requests", "pandas", "a"}) == [] and check_imports("", set()) == [] and check_imports("import os\nimport os", []) == [(1, "os"), (2, "os")]
+  - name: special forms
+    code: |
+      assert check_imports("from . import x\nfrom .sibling import y\nfrom .. import z", set()) == [] and check_imports("def f():\n    import secret_lib\n", ["os"]) == [(2, "secret_lib")] and check_imports("import os as o, sys as s", ["os"]) == [(1, "sys")]
+      assert check_imports("from collections.abc import Mapping", {"collections"}) == [] and check_imports("try:\n    import ujson\nexcept ImportError:\n    import json", {"json"}) == [(2, "ujson")]
+      try:
+          check_imports("import (", [])
+          raise AssertionError("accepted")
+      except SyntaxError:
+          pass
+  hints:
+  - Walk the tree and look at ast.Import and ast.ImportFrom nodes.
+  - For ImportFrom use node.module and check node.level == 0.
+  solution: |
+    def check_imports(source, allowed):
+        """Assistants also invent LIBRARIES, or use ones your project does not have. Parse the source and return the sorted list of (line, module) for every import of a module whose TOP-LEVEL name (the part before the first dot) is not in the collection `allowed`. 'import a.b, c' gives the modules a and c (one entry each, on the line of the statement); 'from a.b import x' gives a; relative imports (from . import x) are ignored. The same module imported on two lines appears twice."""
+        import ast
+        problems = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top not in allowed:
+                        problems.append((node.lineno, top))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                top = node.module.split(".")[0]
+                if top not in allowed:
+                    problems.append((node.lineno, top))
+        return sorted(problems)
+  explanation: Before you install a package that an assistant recommends, check that it exists, who made it, and how many people use it.
+- id: risky
+  title: Dangerous calls
+  difficulty: 5
+  prompt: 'Some code is dangerous even when it works. `eval` runs any text as code, `os.system` and `shell=True` let special characters in a text become commands (lesson 3 of the security unit), and `pickle` can run code while loading. The helper `dotted_name(node)` is given: it returns the name of what is called, such as `"os.system"`. Write `risky_calls(source)`. Find DANGEROUS calls that AI code sometimes contains. Parse the source and return the sorted list of unique (line, label) pairs for every call of: eval -> ''eval''; exec -> ''exec''; os.system -> ''os.system''; pickle.load or pickle.loads -> ''pickle load'' (unpickling can run any code); any subprocess.NAME(...) call that has the keyword shell=True (the constant True) -> ''subprocess shell=True''; and yaml.load -> ''yaml.load'' (unsafe unless a safe loader is used; yaml.safe_load is fine). The helper dotted_name gives the called name.'
+  starter: |-
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+
+
+    def risky_calls(source):
+        """Find DANGEROUS calls that AI code sometimes contains. Parse the source and return the sorted list of unique (line, label) pairs for every call of: eval -> 'eval'; exec -> 'exec'; os.system -> 'os.system'; pickle.load or pickle.loads -> 'pickle load' (unpickling can run any code); any subprocess.NAME(...) call that has the keyword shell=True (the constant True) -> 'subprocess shell=True'; and yaml.load -> 'yaml.load' (unsafe unless a safe loader is used; yaml.safe_load is fine). The helper dotted_name gives the called name."""
+        pass
+  tests:
+  - name: danger signs
+    code: |
+      src = "import os, pickle, subprocess, yaml\nx = eval(text)\nexec(code)\nos.system('ls ' + name)\nd = pickle.loads(blob)\nwith open('f', 'rb') as f:\n    e = pickle.load(f)\nsubprocess.run(cmd, shell=True)\nsubprocess.call('ls', shell=True)\ncfg = yaml.load(text)\n"
+      assert risky_calls(src) == [(2, "eval"), (3, "exec"), (4, "os.system"), (5, "pickle load"), (7, "pickle load"), (8, "subprocess shell=True"), (9, "subprocess shell=True"), (10, "yaml.load")]
+      assert risky_calls("") == [] and risky_calls("x = 1 + 2") == []
+  - name: safe look-alikes
+    code: |
+      src = "import subprocess, yaml, ast\nsubprocess.run(['ls', '-l'])\nsubprocess.run('ls', shell=False)\nsubprocess.run(cmd, shell=flag)\nyaml.safe_load(text)\nast.literal_eval(text)\nobj.eval(x)\nmyeval = 1\nprint(eval)\nresult = foo(os.system)\n"
+      assert risky_calls(src) == []
+      assert risky_calls("a = [eval(x) for x in y]\nb = eval(eval(z))") == [(1, "eval"), (2, "eval")] and risky_calls("os.system('a'); os.system('b')") == [(1, "os.system")]
+  hints:
+  - Use dotted_name on node.func for every ast.Call.
+  - Look through node.keywords for shell=True.
+  solution: |
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+
+
+    def risky_calls(source):
+        """Find DANGEROUS calls that AI code sometimes contains. Parse the source and return the sorted list of unique (line, label) pairs for every call of: eval -> 'eval'; exec -> 'exec'; os.system -> 'os.system'; pickle.load or pickle.loads -> 'pickle load' (unpickling can run any code); any subprocess.NAME(...) call that has the keyword shell=True (the constant True) -> 'subprocess shell=True'; and yaml.load -> 'yaml.load' (unsafe unless a safe loader is used; yaml.safe_load is fine). The helper dotted_name gives the called name."""
+        import ast
+        labels = {"eval": "eval", "exec": "exec", "os.system": "os.system", "pickle.load": "pickle load", "pickle.loads": "pickle load", "yaml.load": "yaml.load"}
+        found = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call):
+                name = dotted_name(node.func)
+                if name in labels:
+                    found.add((node.lineno, labels[name]))
+                elif name.startswith("subprocess.") and any(k.arg == "shell" and isinstance(k.value, ast.Constant) and k.value.value is True for k in node.keywords):
+                    found.add((node.lineno, "subprocess shell=True"))
+        return sorted(found)
+  explanation: 'Safer choices: ast.literal_eval for data, subprocess with a list and no shell, json or yaml.safe_load for files.'
+- id: habits
+  title: Bad habits
+  difficulty: 5
+  prompt: 'Some bad habits cause real bugs: an `except:` that hides every error, a **mutable default** such as `def f(x, items=[])` (the list is created once and shared by every call), and `== None`. Reuse the given helper `dotted_name`. Write `style_problems(source)`. Find common bad habits. Parse the source and return the sorted list of unique (line, message) pairs: ''bare except'' for an except without an exception type (it hides every error, even Ctrl-C); ''mutable default argument'' for a function (def, at the line of the def) whose default value is a list, dict or set display or comprehension, or a call to list(), dict() or set() (the one default object is shared between all calls); ''compare to None with is'' for a == or != comparison where either side is the constant None; ''missing docstring'' for every function whose body does not start with a string constant.'
+  starter: |-
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+
+
+    def style_problems(source):
+        """Find common bad habits. Parse the source and return the sorted list of unique (line, message) pairs: 'bare except' for an except without an exception type (it hides every error, even Ctrl-C); 'mutable default argument' for a function (def, at the line of the def) whose default value is a list, dict or set display or comprehension, or a call to list(), dict() or set() (the one default object is shared between all calls); 'compare to None with is' for a == or != comparison where either side is the constant None; 'missing docstring' for every function whose body does not start with a string constant."""
+        pass
+  tests:
+  - name: the four habits
+    code: |
+      src = "def add(item, items=[]):\n    items.append(item)\n    return items\n\ndef load(path):\n    \"\"\"Read it.\"\"\"\n    try:\n        return open(path).read()\n    except:\n        return None\n\nif load('x') == None or 1 != None:\n    pass\n"
+      assert style_problems(src) == [(1, "missing docstring"), (1, "mutable default argument"), (9, "bare except"), (12, "compare to None with is")]
+      assert style_problems("") == [] and style_problems("x = 1") == []
+  - name: details
+    code: |
+      src = "def a(x, *, d={}, e=None):\n    \"\"\"Doc.\"\"\"\n\ndef b(x=set(), y=list(), z=(1, 2), w=\"s\", v=[i for i in x]):\n    \"\"\"Doc.\"\"\"\n\nasync def c():\n    pass\n\nclass K:\n    def m(self, a=dict()):\n        x = 1\n\ny = lambda p=[]: p\nif None == y or y is None or y != 3:\n    pass\ntry:\n    pass\nexcept ValueError:\n    pass\n"
+      assert style_problems(src) == [(1, "mutable default argument"), (4, "mutable default argument"), (7, "missing docstring"), (11, "missing docstring"), (11, "mutable default argument"), (15, "compare to None with is")]
+  hints:
+  - Use ast.walk and check the type of every node.
+  - 'A docstring is the first statement of the body: an expression that is a string constant.'
+  solution: |
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+
+
+    def style_problems(source):
+        """Find common bad habits. Parse the source and return the sorted list of unique (line, message) pairs: 'bare except' for an except without an exception type (it hides every error, even Ctrl-C); 'mutable default argument' for a function (def, at the line of the def) whose default value is a list, dict or set display or comprehension, or a call to list(), dict() or set() (the one default object is shared between all calls); 'compare to None with is' for a == or != comparison where either side is the constant None; 'missing docstring' for every function whose body does not start with a string constant."""
+        import ast
+        problems = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                problems.add((node.lineno, "bare except"))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defaults = [d for d in node.args.defaults + node.args.kw_defaults if d is not None]
+                for d in defaults:
+                    if isinstance(d, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)) or (isinstance(d, ast.Call) and dotted_name(d.func) in ("list", "dict", "set")):
+                        problems.add((node.lineno, "mutable default argument"))
+                first = node.body[0]
+                if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str)):
+                    problems.add((node.lineno, "missing docstring"))
+            elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+                sides = [node.left] + node.comparators
+                if any(isinstance(s, ast.Constant) and s.value is None for s in sides):
+                    problems.add((node.lineno, "compare to None with is"))
+        return sorted(problems)
+  explanation: A linter such as ruff or pylint knows hundreds of habits like these. The point is that machines are good at checking rules, so let them do it before you read the code yourself.
+- id: review
+  title: 'Capstone: a code review robot'
+  difficulty: 5
+  prompt: 'Now combine the four checks into one **review** of a piece of AI-written code. The functions `undefined_names`, `check_imports`, `risky_calls`, `style_problems` and `dotted_name` are given. Write `review_report(source, allowed)`. The review of a whole piece of AI code. If the source has a syntax error return [''syntax error at line N''] (N from the SyntaxError, or 1 if it has none). Otherwise return the list of text lines, sorted by line number and then alphabetically, made from: ''line N: undefined name X'' for undefined_names, ''line N: module X is not allowed'' for check_imports, ''line N: risky call LABEL'' for risky_calls and ''line N: MESSAGE'' for style_problems. An empty list means the review found nothing.'
+  starter: |-
+    def undefined_names(source):
+        """AI assistants sometimes use a helper function or variable that DOES NOT EXIST (a hallucination). Parse the source with ast and return the sorted list of (line, name) for every place where a name is READ (an ast.Name in Load context) that is defined nowhere in the code and is not a built-in name (dir(builtins)). Use this simple FLAT rule: a name counts as defined if, anywhere in the code, it is assigned or deleted (a Name in Store or Del context, including for-loop and comprehension targets and with-as), defined by def or class, a parameter (of a def or lambda: normal, positional-only, keyword-only, *args, **kwargs), imported (import x, import x.y defines x, 'as' gives the new name, from m import n), or the name of an except-as. Raise the SyntaxError of a broken source."""
+        import ast, builtins
+        tree = ast.parse(source)
+        defined = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = node.args
+                for arg in a.posonlyargs + a.args + a.kwonlyargs:
+                    defined.add(arg.arg)
+                for arg in (a.vararg, a.kwarg):
+                    if arg:
+                        defined.add(arg.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+        found = [(n.lineno, n.id) for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined]
+        return sorted(found)
+
+
+    def check_imports(source, allowed):
+        """Assistants also invent LIBRARIES, or use ones your project does not have. Parse the source and return the sorted list of (line, module) for every import of a module whose TOP-LEVEL name (the part before the first dot) is not in the collection `allowed`. 'import a.b, c' gives the modules a and c (one entry each, on the line of the statement); 'from a.b import x' gives a; relative imports (from . import x) are ignored. The same module imported on two lines appears twice."""
+        import ast
+        problems = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top not in allowed:
+                        problems.append((node.lineno, top))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                top = node.module.split(".")[0]
+                if top not in allowed:
+                    problems.append((node.lineno, top))
+        return sorted(problems)
+
+
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+    def risky_calls(source):
+        """Find DANGEROUS calls that AI code sometimes contains. Parse the source and return the sorted list of unique (line, label) pairs for every call of: eval -> 'eval'; exec -> 'exec'; os.system -> 'os.system'; pickle.load or pickle.loads -> 'pickle load' (unpickling can run any code); any subprocess.NAME(...) call that has the keyword shell=True (the constant True) -> 'subprocess shell=True'; and yaml.load -> 'yaml.load' (unsafe unless a safe loader is used; yaml.safe_load is fine). The helper dotted_name gives the called name."""
+        import ast
+        labels = {"eval": "eval", "exec": "exec", "os.system": "os.system", "pickle.load": "pickle load", "pickle.loads": "pickle load", "yaml.load": "yaml.load"}
+        found = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call):
+                name = dotted_name(node.func)
+                if name in labels:
+                    found.add((node.lineno, labels[name]))
+                elif name.startswith("subprocess.") and any(k.arg == "shell" and isinstance(k.value, ast.Constant) and k.value.value is True for k in node.keywords):
+                    found.add((node.lineno, "subprocess shell=True"))
+        return sorted(found)
+
+
+    def style_problems(source):
+        """Find common bad habits. Parse the source and return the sorted list of unique (line, message) pairs: 'bare except' for an except without an exception type (it hides every error, even Ctrl-C); 'mutable default argument' for a function (def, at the line of the def) whose default value is a list, dict or set display or comprehension, or a call to list(), dict() or set() (the one default object is shared between all calls); 'compare to None with is' for a == or != comparison where either side is the constant None; 'missing docstring' for every function whose body does not start with a string constant."""
+        import ast
+        problems = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                problems.add((node.lineno, "bare except"))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defaults = [d for d in node.args.defaults + node.args.kw_defaults if d is not None]
+                for d in defaults:
+                    if isinstance(d, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)) or (isinstance(d, ast.Call) and dotted_name(d.func) in ("list", "dict", "set")):
+                        problems.add((node.lineno, "mutable default argument"))
+                first = node.body[0]
+                if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str)):
+                    problems.add((node.lineno, "missing docstring"))
+            elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+                sides = [node.left] + node.comparators
+                if any(isinstance(s, ast.Constant) and s.value is None for s in sides):
+                    problems.add((node.lineno, "compare to None with is"))
+        return sorted(problems)
+
+
+
+
+    def review_report(source, allowed):
+        """The review of a whole piece of AI code. If the source has a syntax error return ['syntax error at line N'] (N from the SyntaxError, or 1 if it has none). Otherwise return the list of text lines, sorted by line number and then alphabetically, made from: 'line N: undefined name X' for undefined_names, 'line N: module X is not allowed' for check_imports, 'line N: risky call LABEL' for risky_calls and 'line N: MESSAGE' for style_problems. An empty list means the review found nothing."""
+        pass
+  tests:
+  - name: a full review
+    code: |
+      src = "import os\nimport numpy as np\n\ndef add(a, b=[]):\n    total = helper(a)\n    try:\n        r = eval(b)\n    except:\n        pass\n    return os.system('ls')\n"
+      assert review_report(src, {"os"}) == ["line 2: module numpy is not allowed", "line 4: missing docstring", "line 4: mutable default argument", "line 5: undefined name helper", "line 7: risky call eval", "line 8: bare except", "line 10: risky call os.system"]
+      clean = "import os\n\ndef cwd():\n    \"\"\"Where am I?\"\"\"\n    return os.getcwd()\n"
+      assert review_report(clean, {"os"}) == [] and review_report("", set()) == []
+  - name: broken code
+    code: |
+      assert review_report("def f(:\n    pass", set()) == ["syntax error at line 1"] and review_report("x = 1\nprint(\n", set())[0].startswith("syntax error at line ")
+      assert review_report("a = 1\nb = (2 +\n", set()) != [] and review_report("x = 1\nx == None\nimport zzz\nundefined1", {"os"}) == ["line 2: compare to None with is", "line 3: module zzz is not allowed", "line 4: undefined name undefined1"]
+  hints:
+  - Call the four checks inside one try block so that a SyntaxError is caught once.
+  - Put every finding as (line, text) in one list and sort it.
+  solution: |
+    def undefined_names(source):
+        """AI assistants sometimes use a helper function or variable that DOES NOT EXIST (a hallucination). Parse the source with ast and return the sorted list of (line, name) for every place where a name is READ (an ast.Name in Load context) that is defined nowhere in the code and is not a built-in name (dir(builtins)). Use this simple FLAT rule: a name counts as defined if, anywhere in the code, it is assigned or deleted (a Name in Store or Del context, including for-loop and comprehension targets and with-as), defined by def or class, a parameter (of a def or lambda: normal, positional-only, keyword-only, *args, **kwargs), imported (import x, import x.y defines x, 'as' gives the new name, from m import n), or the name of an except-as. Raise the SyntaxError of a broken source."""
+        import ast, builtins
+        tree = ast.parse(source)
+        defined = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = node.args
+                for arg in a.posonlyargs + a.args + a.kwonlyargs:
+                    defined.add(arg.arg)
+                for arg in (a.vararg, a.kwarg):
+                    if arg:
+                        defined.add(arg.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+        found = [(n.lineno, n.id) for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined]
+        return sorted(found)
+
+
+    def check_imports(source, allowed):
+        """Assistants also invent LIBRARIES, or use ones your project does not have. Parse the source and return the sorted list of (line, module) for every import of a module whose TOP-LEVEL name (the part before the first dot) is not in the collection `allowed`. 'import a.b, c' gives the modules a and c (one entry each, on the line of the statement); 'from a.b import x' gives a; relative imports (from . import x) are ignored. The same module imported on two lines appears twice."""
+        import ast
+        problems = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top not in allowed:
+                        problems.append((node.lineno, top))
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                top = node.module.split(".")[0]
+                if top not in allowed:
+                    problems.append((node.lineno, top))
+        return sorted(problems)
+
+
+    def dotted_name(node):
+        """The name of what is called: 'eval' for eval(...), 'os.system' for os.system(...); '' for anything more complicated."""
+        import ast
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+            return ".".join(reversed(parts))
+        return ""
+
+
+    def risky_calls(source):
+        """Find DANGEROUS calls that AI code sometimes contains. Parse the source and return the sorted list of unique (line, label) pairs for every call of: eval -> 'eval'; exec -> 'exec'; os.system -> 'os.system'; pickle.load or pickle.loads -> 'pickle load' (unpickling can run any code); any subprocess.NAME(...) call that has the keyword shell=True (the constant True) -> 'subprocess shell=True'; and yaml.load -> 'yaml.load' (unsafe unless a safe loader is used; yaml.safe_load is fine). The helper dotted_name gives the called name."""
+        import ast
+        labels = {"eval": "eval", "exec": "exec", "os.system": "os.system", "pickle.load": "pickle load", "pickle.loads": "pickle load", "yaml.load": "yaml.load"}
+        found = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call):
+                name = dotted_name(node.func)
+                if name in labels:
+                    found.add((node.lineno, labels[name]))
+                elif name.startswith("subprocess.") and any(k.arg == "shell" and isinstance(k.value, ast.Constant) and k.value.value is True for k in node.keywords):
+                    found.add((node.lineno, "subprocess shell=True"))
+        return sorted(found)
+
+
+    def style_problems(source):
+        """Find common bad habits. Parse the source and return the sorted list of unique (line, message) pairs: 'bare except' for an except without an exception type (it hides every error, even Ctrl-C); 'mutable default argument' for a function (def, at the line of the def) whose default value is a list, dict or set display or comprehension, or a call to list(), dict() or set() (the one default object is shared between all calls); 'compare to None with is' for a == or != comparison where either side is the constant None; 'missing docstring' for every function whose body does not start with a string constant."""
+        import ast
+        problems = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ExceptHandler) and node.type is None:
+                problems.add((node.lineno, "bare except"))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defaults = [d for d in node.args.defaults + node.args.kw_defaults if d is not None]
+                for d in defaults:
+                    if isinstance(d, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp)) or (isinstance(d, ast.Call) and dotted_name(d.func) in ("list", "dict", "set")):
+                        problems.add((node.lineno, "mutable default argument"))
+                first = node.body[0]
+                if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str)):
+                    problems.add((node.lineno, "missing docstring"))
+            elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+                sides = [node.left] + node.comparators
+                if any(isinstance(s, ast.Constant) and s.value is None for s in sides):
+                    problems.add((node.lineno, "compare to None with is"))
+        return sorted(problems)
+
+
+
+
+    def review_report(source, allowed):
+        """The review of a whole piece of AI code. If the source has a syntax error return ['syntax error at line N'] (N from the SyntaxError, or 1 if it has none). Otherwise return the list of text lines, sorted by line number and then alphabetically, made from: 'line N: undefined name X' for undefined_names, 'line N: module X is not allowed' for check_imports, 'line N: risky call LABEL' for risky_calls and 'line N: MESSAGE' for style_problems. An empty list means the review found nothing."""
+        try:
+            undefined = undefined_names(source)
+            imports = check_imports(source, allowed)
+            risky = risky_calls(source)
+            style = style_problems(source)
+        except SyntaxError as err:
+            return ["syntax error at line " + str(err.lineno or 1)]
+        lines = [(n, "undefined name " + name) for n, name in undefined]
+        lines += [(n, "module " + mod + " is not allowed") for n, mod in imports]
+        lines += [(n, "risky call " + label) for n, label in risky]
+        lines += [(n, msg) for n, msg in style]
+        return ["line " + str(n) + ": " + msg for n, msg in sorted(lines)]
+  explanation: 'A robot review does not replace thinking, but it makes the boring part automatic, so that your attention is free for the question the robot cannot answer: is this the right thing to build?'
+commonMistakes:
+- title: Accepting code you cannot explain
+  explanation: If you cannot explain it, you cannot maintain it.
+- title: Trusting that it runs
+  explanation: Running once is not the same as being correct.
+- title: Installing a suggested package unchecked
+  explanation: The name may be invented or malicious.
+- title: Reviewing only the happy path
+  explanation: Most bugs live in empty, huge and odd inputs.
+- title: Asking for big changes
+  explanation: Big diffs are never really reviewed.
+summary:
+- AI code is a draft from a clever stranger.
+- 'Typical failures: inventions, wrong edge cases, insecure habits.'
+- Check dependencies against the real documentation.
+- Let tools do the mechanical checks, you do the thinking.
+- You own the code you commit.
+next: u32-verify
+quiz:
+- type: mcq
+  question: What is slopsquatting?
+  options:
+  - Publishing malicious packages named like ones an assistant invents
+  - A kind of sorting
+  - A testing method
+  - A way to compress prompts
+  answer: 0
+  explanation: Attackers register invented names.
+- type: mcq
+  question: Why review code that looks tidy?
+  options:
+  - Looks and correctness are different things
+  - Tidy code is always wrong
+  - Reviews are optional
+  - Tidy code is slow
+  answer: 0
+  explanation: Confidence is not evidence.
+- type: mcq
+  question: What is the ast module for?
+  options:
+  - Reading a program as a tree
+  - Running programs faster
+  - Drawing charts
+  - Installing packages
+  answer: 0
+  explanation: The abstract syntax tree.
+- type: mcq
+  question: What is wrong with a bare except?
+  options:
+  - It hides every error
+  - It is slower
+  - It is not allowed
+  - It needs a library
+  answer: 0
+  explanation: Even Ctrl-C and real bugs vanish.
+- type: mcq
+  question: What is a mutable default argument?
+  options:
+  - A list or dict created once and shared between calls
+  - A constant
+  - A keyword
+  - A type hint
+  answer: 0
+  explanation: A classic Python trap.
+- type: mcq
+  question: Who is responsible for AI-written code you commit?
+  options:
+  - You
+  - The assistant
+  - Nobody
+  - The editor
+  answer: 0
+  explanation: Ownership stays with you.
+- type: code
+  question: Write `count_functions(source)` returning how many functions (`def`, including `async def`) the source defines, counting methods and nested functions too. Use `ast`.
+  starter: |
+    def count_functions(source):
+        pass
+  tests:
+  - name: counting
+    code: |
+      assert count_functions("") == 0 and count_functions("def a():\n    def b():\n        pass\nclass K:\n    def m(self):\n        pass\nasync def c():\n    pass\nx = lambda: 1\n") == 4
+  solution: |
+    import ast
+
+
+    def count_functions(source):
+        return sum(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in ast.walk(ast.parse(source)))

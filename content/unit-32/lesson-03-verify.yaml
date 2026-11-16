@@ -1,0 +1,646 @@
+id: u32-verify
+title: Verifying AI Code
+minutes: 115
+objective: 'Learn the methods that turn ''it looks right'' into evidence: running examples, edge cases, a second implementation to compare against, and properties tested with random inputs. You will build each tool and combine them into a verdict.'
+outcomes:
+- Test AI code with examples and edge cases
+- Compare two implementations with differential testing
+- State properties and test them with random inputs
+- Shrink a failing input
+- Combine checks into one verdict
+sections:
+- heading: Evidence, not trust
+  body: |-
+    Reading code (last lesson) finds some bugs; **running** it finds others. The question is always: *what would convince me that this is correct?* An assistant can help here too, but you must understand what each test proves. In order of effort:
+
+    1. **Run the examples** from your prompt. They must pass, but they prove little: the assistant has seen them.
+    2. **Add edge cases**: empty input, one element, zero, negative numbers, the biggest number, duplicates, unusual characters (spaces, accents), very long input. Most real bugs live here. Ask yourself: what is the *weirdest* input a user could send?
+    3. **Test the error behaviour**: what should happen with bad input? An exception with a clear message, a default value? Decide, then check.
+    4. **Compare with a second opinion** (**differential testing**): a simple slow version that is obviously right (brute force), an older version, or a library function. Run both on thousands of inputs and look at the differences.
+    5. **State properties** (**property-based testing**): rules that hold for every input, such as "the result of sorting has the same length as the input and is in order", "decoding what you encoded gives the original back", "the total never goes negative". The computer invents the inputs. When it finds a failure it **shrinks** the input to the smallest case that still fails.
+
+    You can ask the assistant to **write the tests**, which is a good use. But then check that the tests are meaningful (mutation testing from Unit 30!) and that they were not written to match a wrong implementation: **write or read the tests first, before you read the code.**
+- heading: A bug report the assistant can use
+  body: |-
+    When a check fails, give the assistant what a good colleague would need: the **smallest** input that fails, the **expected** result, the **actual** result, and the **error message**. Shrinking gives you exactly that. Then ask it to explain *why* it fails before it changes anything, so that you do not get a patch that hides the symptom. After the fix, **re-run all** the checks: assistants sometimes fix one case and break another.
+
+    Keep the failing case as a permanent test. This is a **regression test**: it makes sure the same bug cannot return.
+examples:
+- title: The leap year that looked right
+  intro: An assistant's answer passes the three examples from the prompt, but a second implementation disagrees on some years.
+  code: |
+    def outcome(func, *args):
+        """What a call did: ('ok', the result) or ('error', the name of the exception type)."""
+        try:
+            return ("ok", func(*args))
+        except Exception as err:
+            return ("error", type(err).__name__)
+
+
+    def check_examples(func, cases):
+        """The first check of any code: do the examples work? `cases` is a list of (args, expected) where args is a tuple of arguments. `expected` is either the expected result or an exception CLASS (then the call must raise that class, or a subclass). Return the list of failure texts, in order of the cases (an empty list means all passed; case numbers start at 0): 'case N: expected X, got Y' when the result differs (X and Y written with repr); 'case N: expected E, got Y' when an exception E was expected but the call returned Y (E is the class name, Y written with repr); 'case N: expected E, got F' when another exception F was raised (class names); 'case N: expected X, raised F' when a result X was expected but exception F was raised. Compare results with ==."""
+        failures = []
+        for i, (args, expected) in enumerate(cases):
+            wants_error = isinstance(expected, type) and issubclass(expected, BaseException)
+            try:
+                got = func(*args)
+            except Exception as err:
+                if wants_error:
+                    if not isinstance(err, expected):
+                        failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + type(err).__name__)
+                else:
+                    failures.append("case " + str(i) + ": expected " + repr(expected) + ", raised " + type(err).__name__)
+                continue
+            if wants_error:
+                failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + repr(got))
+            elif got != expected:
+                failures.append("case " + str(i) + ": expected " + repr(expected) + ", got " + repr(got))
+        return failures
+
+
+    def differential(f, g, inputs):
+        """DIFFERENTIAL TESTING compares a new implementation f with a trusted one g (a slow simple version, an older version, a library). `inputs` is a list of argument tuples. Use the given helper outcome. Return the list of (args, outcome of f, outcome of g) for the inputs where the two outcomes differ, in the order of the inputs. Two calls that raise the same exception type agree."""
+        differences = []
+        for args in inputs:
+            a, b = outcome(f, *args), outcome(g, *args)
+            if a != b:
+                differences.append((args, a, b))
+        return differences
+
+    def leap_ai(year):
+        return year % 4 == 0
+
+    def leap_ref(year):
+        return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+    cases = [((2024,), True), ((2023,), False), ((2000,), True)]
+    print(check_examples(leap_ai, cases))
+    print(differential(leap_ai, leap_ref, [(y,) for y in range(1890, 1910)]))
+  output: |
+    []
+    [((1900,), ('ok', True), ('ok', False))]
+  lines:
+  - line: 46
+    note: 'All three examples pass: an empty list means no failures.'
+  - line: 47
+    note: 'But 1900 was not a leap year: the second version caught it.'
+- title: Edge cases, properties and shrinking
+  intro: An average function crashes on the empty list, a property check finds it by itself, and a failing input is shrunk.
+  code: |
+    def edge_cases(kind):
+        """Bugs hide at the EDGES: zero, empty, one, negative, huge. Return a NEW list of edge values for the type name `kind`: 'int' -> [0, 1, -1, 2147483647, -2147483648]; 'float' -> [0.0, 1.5, -1.5, 1e-09, 1e+9]; 'str' -> ['', ' ', 'a', 'A', 'a b', 'é', 'x' * 1000]; 'list' -> [[], [0], [1, 1], [3, 2, 1], list(range(100))]. ValueError('unsupported type') for any other kind. (Every call returns fresh lists, so a test that changes one cannot disturb the next.)"""
+        table = {
+            "int": lambda: [0, 1, -1, 2147483647, -2147483648],
+            "float": lambda: [0.0, 1.5, -1.5, 1e-09, 1e+9],
+            "str": lambda: ["", " ", "a", "A", "a b", "é", "x" * 1000],
+            "list": lambda: [[], [0], [1, 1], [3, 2, 1], list(range(100))],
+        }
+        if kind not in table:
+            raise ValueError("unsupported type")
+        return table[kind]()
+
+
+    def find_counterexample(prop, make_input, trials, seed):
+        """PROPERTY-BASED TESTING states a rule that must hold for ALL inputs and tries many random ones. `prop(x)` returns True if the rule holds, `make_input(rng)` builds a random input from a random.Random object. Create rng = random.Random(seed) ONCE, then for each of `trials` trials build an input and test it. A rule that returns something false or RAISES an exception is broken. Return the first input that breaks the rule, or None. ValueError('trials must not be negative') for negative trials. The same seed must give the same answer."""
+        import random
+        if trials < 0:
+            raise ValueError("trials must not be negative")
+        rng = random.Random(seed)
+        for _ in range(trials):
+            x = make_input(rng)
+            try:
+                ok = prop(x)
+            except Exception:
+                ok = False
+            if not ok:
+                return x
+        return None
+
+
+    def shrink_list(fails, items):
+        """A failing input of 80 numbers is hard to understand. SHRINK it: `fails(list)` returns True while a list still shows the bug. ValueError('list does not fail') if fails(items) is False. Otherwise repeat: try removing each element in turn (from the left, one at a time); at the first removal after which the list still fails, keep the shorter list and start again from the left; stop when no single removal keeps the failure. Return the shrunk list (a new list; the input is not changed)."""
+        if not fails(items):
+            raise ValueError("list does not fail")
+        current = list(items)
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(current)):
+                candidate = current[:i] + current[i + 1:]
+                if fails(candidate):
+                    current = candidate
+                    changed = True
+                    break
+        return current
+
+    def average(xs):
+        return sum(xs) / len(xs)
+
+    for xs in edge_cases("list")[:3]:
+        try:
+            print(xs, "->", average(xs))
+        except ZeroDivisionError:
+            print(xs, "-> crash")
+
+    import random
+    def make(rng):
+        return [rng.randint(0, 9) for _ in range(rng.randint(0, 5))]
+    def holds(xs):
+        return min(xs) <= average(xs) <= max(xs)
+    found = find_counterexample(holds, make, 50, 1)
+    print("counterexample:", found)
+    print(shrink_list(lambda xs: sum(xs) > 20, [9, 1, 9, 1, 9, 1]))
+  output: |
+    [] -> crash
+    [0] -> 0.0
+    [1, 1] -> 1.0
+    counterexample: []
+    [1, 9, 1, 9, 1]
+  lines:
+  - line: 50
+    note: The empty list is the first edge case.
+  - line: 62
+    note: The random search finds an input that breaks the rule.
+  - line: 63
+    note: Elements are removed for as long as the sum stays above 20.
+playground:
+  prompt: Try a function on the edge values of lists.
+  code: |
+    def first(xs):
+        return xs[0]
+    for xs in ([], [5], [1, 2]):
+        try:
+            print(xs, first(xs))
+        except IndexError:
+            print(xs, 'crash')
+exercises:
+- id: examples
+  title: Run the examples
+  difficulty: 3
+  prompt: 'The first check of any AI-written function is the cheapest: do the **examples** work? Write `check_examples(func, cases)`. The first check of any code: do the examples work? `cases` is a list of (args, expected) where args is a tuple of arguments. `expected` is either the expected result or an exception CLASS (then the call must raise that class, or a subclass). Return the list of failure texts, in order of the cases (an empty list means all passed; case numbers start at 0): ''case N: expected X, got Y'' when the result differs (X and Y written with repr); ''case N: expected E, got Y'' when an exception E was expected but the call returned Y (E is the class name, Y written with repr); ''case N: expected E, got F'' when another exception F was raised (class names); ''case N: expected X, raised F'' when a result X was expected but exception F was raised. Compare results with ==.'
+  starter: |-
+    def check_examples(func, cases):
+        """The first check of any code: do the examples work? `cases` is a list of (args, expected) where args is a tuple of arguments. `expected` is either the expected result or an exception CLASS (then the call must raise that class, or a subclass). Return the list of failure texts, in order of the cases (an empty list means all passed; case numbers start at 0): 'case N: expected X, got Y' when the result differs (X and Y written with repr); 'case N: expected E, got Y' when an exception E was expected but the call returned Y (E is the class name, Y written with repr); 'case N: expected E, got F' when another exception F was raised (class names); 'case N: expected X, raised F' when a result X was expected but exception F was raised. Compare results with ==."""
+        pass
+  tests:
+  - name: passing and failing
+    code: |
+      def add(a, b):
+          return a + b
+      assert check_examples(add, [((1, 2), 3), ((0, 0), 0)]) == [] and check_examples(add, []) == []
+      assert check_examples(add, [((1, 2), 3), ((2, 2), 5), ((1, 1), "2")]) == ["case 1: expected 5, got 4", "case 2: expected '2', got 2"]
+  - name: exceptions
+    code: |
+      def inv(x):
+          return 1 / x
+      assert check_examples(inv, [((0,), ZeroDivisionError), ((0,), ArithmeticError), ((2,), 0.5)]) == []
+      assert check_examples(inv, [((0,), ValueError), ((4,), ValueError), ((0,), 1), (("a",), ZeroDivisionError)]) == ["case 0: expected ValueError, got ZeroDivisionError", "case 1: expected ValueError, got 0.25", "case 2: expected 1, raised ZeroDivisionError", "case 3: expected ZeroDivisionError, got TypeError"]
+  hints:
+  - Tell apart an expected value from an expected exception class with isinstance(expected, type) and issubclass(...).
+  - Catch Exception around the call; compare with == afterwards.
+  solution: |
+    def check_examples(func, cases):
+        """The first check of any code: do the examples work? `cases` is a list of (args, expected) where args is a tuple of arguments. `expected` is either the expected result or an exception CLASS (then the call must raise that class, or a subclass). Return the list of failure texts, in order of the cases (an empty list means all passed; case numbers start at 0): 'case N: expected X, got Y' when the result differs (X and Y written with repr); 'case N: expected E, got Y' when an exception E was expected but the call returned Y (E is the class name, Y written with repr); 'case N: expected E, got F' when another exception F was raised (class names); 'case N: expected X, raised F' when a result X was expected but exception F was raised. Compare results with ==."""
+        failures = []
+        for i, (args, expected) in enumerate(cases):
+            wants_error = isinstance(expected, type) and issubclass(expected, BaseException)
+            try:
+                got = func(*args)
+            except Exception as err:
+                if wants_error:
+                    if not isinstance(err, expected):
+                        failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + type(err).__name__)
+                else:
+                    failures.append("case " + str(i) + ": expected " + repr(expected) + ", raised " + type(err).__name__)
+                continue
+            if wants_error:
+                failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + repr(got))
+            elif got != expected:
+                failures.append("case " + str(i) + ": expected " + repr(expected) + ", got " + repr(got))
+        return failures
+  explanation: Examples are the weakest check, because the assistant usually saw them in your prompt, but they catch the silly mistakes immediately.
+- id: edges
+  title: Edge cases
+  difficulty: 3
+  prompt: 'Bugs hide at the **edges**: zero, empty, one, negative, huge. Write `edge_cases(kind)`. Bugs hide at the EDGES: zero, empty, one, negative, huge. Return a NEW list of edge values for the type name `kind`: ''int'' -> [0, 1, -1, 2147483647, -2147483648]; ''float'' -> [0.0, 1.5, -1.5, 1e-09, 1e+9]; ''str'' -> ['''', '' '', ''a'', ''A'', ''a b'', ''é'', ''x'' * 1000]; ''list'' -> [[], [0], [1, 1], [3, 2, 1], list(range(100))]. ValueError(''unsupported type'') for any other kind. (Every call returns fresh lists, so a test that changes one cannot disturb the next.)'
+  starter: |-
+    def edge_cases(kind):
+        """Bugs hide at the EDGES: zero, empty, one, negative, huge. Return a NEW list of edge values for the type name `kind`: 'int' -> [0, 1, -1, 2147483647, -2147483648]; 'float' -> [0.0, 1.5, -1.5, 1e-09, 1e+9]; 'str' -> ['', ' ', 'a', 'A', 'a b', 'é', 'x' * 1000]; 'list' -> [[], [0], [1, 1], [3, 2, 1], list(range(100))]. ValueError('unsupported type') for any other kind. (Every call returns fresh lists, so a test that changes one cannot disturb the next.)"""
+        pass
+  tests:
+  - name: the tables
+    code: |
+      assert edge_cases("int") == [0, 1, -1, 2147483647, -2147483648] and edge_cases("float") == [0.0, 1.5, -1.5, 1e-09, 1000000000.0]
+      s = edge_cases("str")
+      assert s[:6] == ["", " ", "a", "A", "a b", "\u00e9"] and s[6] == "x" * 1000 and len(s) == 7
+      l = edge_cases("list")
+      assert l[:4] == [[], [0], [1, 1], [3, 2, 1]] and l[4] == list(range(100)) and len(l) == 5
+  - name: fresh copies and errors
+    code: |
+      a = edge_cases("list")
+      a[0].append(99)
+      a.append("junk")
+      assert edge_cases("list")[0] == [] and len(edge_cases("list")) == 5
+      for bad in ("dict", "INT", "", None, 5):
+          try:
+              edge_cases(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "unsupported type" in str(e)
+      def my_abs(x):
+          return x if x > 0 else -x
+      assert [my_abs(x) for x in edge_cases("int")] == [0, 1, 1, 2147483647, 2147483648]
+  hints:
+  - A dictionary of small functions that build a new list each time is the simplest.
+  - Use `in` on the dictionary to check the kind (a non-string kind is simply not in it).
+  solution: |
+    def edge_cases(kind):
+        """Bugs hide at the EDGES: zero, empty, one, negative, huge. Return a NEW list of edge values for the type name `kind`: 'int' -> [0, 1, -1, 2147483647, -2147483648]; 'float' -> [0.0, 1.5, -1.5, 1e-09, 1e+9]; 'str' -> ['', ' ', 'a', 'A', 'a b', 'é', 'x' * 1000]; 'list' -> [[], [0], [1, 1], [3, 2, 1], list(range(100))]. ValueError('unsupported type') for any other kind. (Every call returns fresh lists, so a test that changes one cannot disturb the next.)"""
+        table = {
+            "int": lambda: [0, 1, -1, 2147483647, -2147483648],
+            "float": lambda: [0.0, 1.5, -1.5, 1e-09, 1e+9],
+            "str": lambda: ["", " ", "a", "A", "a b", "é", "x" * 1000],
+            "list": lambda: [[], [0], [1, 1], [3, 2, 1], list(range(100))],
+        }
+        if kind not in table:
+            raise ValueError("unsupported type")
+        return table[kind]()
+  explanation: 'A short list of edge values, tried against every function, finds an astonishing number of bugs. Add values from your own domain: a leap day, an empty file, the maximum price.'
+- id: differential
+  title: Two versions disagree
+  difficulty: 4
+  prompt: 'Two independent implementations rarely make the **same** mistake. Ask the assistant for a simple slow version, or use a trusted one, and compare. The helper `outcome(func, *args)` is given: it returns `("ok", result)` or `("error", exception name)`. Write `differential(f, g, inputs)`. DIFFERENTIAL TESTING compares a new implementation f with a trusted one g (a slow simple version, an older version, a library). `inputs` is a list of argument tuples. Use the given helper outcome. Return the list of (args, outcome of f, outcome of g) for the inputs where the two outcomes differ, in the order of the inputs. Two calls that raise the same exception type agree.'
+  starter: |-
+    def outcome(func, *args):
+        """What a call did: ('ok', the result) or ('error', the name of the exception type)."""
+        try:
+            return ("ok", func(*args))
+        except Exception as err:
+            return ("error", type(err).__name__)
+
+
+
+
+    def differential(f, g, inputs):
+        """DIFFERENTIAL TESTING compares a new implementation f with a trusted one g (a slow simple version, an older version, a library). `inputs` is a list of argument tuples. Use the given helper outcome. Return the list of (args, outcome of f, outcome of g) for the inputs where the two outcomes differ, in the order of the inputs. Two calls that raise the same exception type agree."""
+        pass
+  tests:
+  - name: finding a bug
+    code: |
+      def leap_ai(y):
+          return y % 4 == 0
+      def leap_ref(y):
+          return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+      years = [(y,) for y in (1999, 2000, 2023, 2024, 1900, 2100, 1600)]
+      assert differential(leap_ai, leap_ref, years) == [((1900,), ("ok", True), ("ok", False)), ((2100,), ("ok", True), ("ok", False))]
+      assert differential(leap_ref, leap_ref, years) == [] and differential(leap_ai, leap_ref, []) == []
+  - name: errors count too
+    code: |
+      def f(a, b):
+          return a // b
+      def g(a, b):
+          return a / b if b else 0
+      r = differential(f, g, [(7, 2), (6, 3), (1, 0), ("a", 1)])
+      assert r == [((7, 2), ("ok", 3), ("ok", 3.5)), ((1, 0), ("error", "ZeroDivisionError"), ("ok", 0))]
+      def h(x):
+          raise KeyError(x)
+      def k(x):
+          raise ValueError(x)
+      assert differential(h, k, [(1,)]) == [((1,), ("error", "KeyError"), ("error", "ValueError"))] and differential(h, h, [(1,), (2,)]) == []
+  hints:
+  - Call both with the same arguments and compare the outcome tuples.
+  - Keep the arguments, so that you can show which input broke.
+  solution: |
+    def outcome(func, *args):
+        """What a call did: ('ok', the result) or ('error', the name of the exception type)."""
+        try:
+            return ("ok", func(*args))
+        except Exception as err:
+            return ("error", type(err).__name__)
+
+
+
+
+    def differential(f, g, inputs):
+        """DIFFERENTIAL TESTING compares a new implementation f with a trusted one g (a slow simple version, an older version, a library). `inputs` is a list of argument tuples. Use the given helper outcome. Return the list of (args, outcome of f, outcome of g) for the inputs where the two outcomes differ, in the order of the inputs. Two calls that raise the same exception type agree."""
+        differences = []
+        for args in inputs:
+            a, b = outcome(f, *args), outcome(g, *args)
+            if a != b:
+                differences.append((args, a, b))
+        return differences
+  explanation: This is how compilers, databases and cryptography libraries are tested against each other. It needs no knowledge of the right answer, only a second opinion.
+- id: property
+  title: Properties and shrinking
+  difficulty: 5
+  prompt: 'Instead of single examples, state a **property**, a rule that must hold for every input (for example: *sorting twice gives the same as sorting once*), and let the computer try hundreds of random inputs. This is **property-based testing**. Write `find_counterexample(prop, make_input, trials, seed)`. PROPERTY-BASED TESTING states a rule that must hold for ALL inputs and tries many random ones. `prop(x)` returns True if the rule holds, `make_input(rng)` builds a random input from a random.Random object. Create rng = random.Random(seed) ONCE, then for each of `trials` trials build an input and test it. A rule that returns something false or RAISES an exception is broken. Return the first input that breaks the rule, or None. ValueError(''trials must not be negative'') for negative trials. The same seed must give the same answer. Also write `shrink_list(fails, items)`: A failing input of 80 numbers is hard to understand. SHRINK it: `fails(list)` returns True while a list still shows the bug. ValueError(''list does not fail'') if fails(items) is False. Otherwise repeat: try removing each element in turn (from the left, one at a time); at the first removal after which the list still fails, keep the shorter list and start again from the left; stop when no single removal keeps the failure. Return the shrunk list (a new list; the input is not changed).'
+  starter: |-
+    def find_counterexample(prop, make_input, trials, seed):
+        """PROPERTY-BASED TESTING states a rule that must hold for ALL inputs and tries many random ones. `prop(x)` returns True if the rule holds, `make_input(rng)` builds a random input from a random.Random object. Create rng = random.Random(seed) ONCE, then for each of `trials` trials build an input and test it. A rule that returns something false or RAISES an exception is broken. Return the first input that breaks the rule, or None. ValueError('trials must not be negative') for negative trials. The same seed must give the same answer."""
+        pass
+
+
+    def shrink_list(fails, items):
+        """A failing input of 80 numbers is hard to understand. SHRINK it: `fails(list)` returns True while a list still shows the bug. ValueError('list does not fail') if fails(items) is False. Otherwise repeat: try removing each element in turn (from the left, one at a time); at the first removal after which the list still fails, keep the shorter list and start again from the left; stop when no single removal keeps the failure. Return the shrunk list (a new list; the input is not changed)."""
+        pass
+  tests:
+  - name: finding counterexamples
+    code: |
+      import random
+      def sort_ok(xs):
+          return sorted(xs) == sorted(sorted(xs))
+      def make(rng):
+          return [rng.randint(-5, 5) for _ in range(rng.randint(0, 6))]
+      assert find_counterexample(sort_ok, make, 200, 1) is None and find_counterexample(sort_ok, make, 0, 1) is None
+      def short(xs):
+          return len(xs) < 3
+      bad = find_counterexample(short, make, 100, 7)
+      assert bad is not None and len(bad) >= 3 and find_counterexample(short, make, 100, 7) == bad
+      def crashes(xs):
+          return 10 // len(xs) > 0
+      assert find_counterexample(crashes, make, 100, 3) is not None
+      try:
+          find_counterexample(short, make, -1, 0)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "trials must not be negative" in str(e)
+  - name: shrinking
+    code: |
+      def has_negative_and_big(xs):
+          return any(x < 0 for x in xs) and any(x > 90 for x in xs)
+      data = list(range(-3, 100))
+      small = shrink_list(has_negative_and_big, data)
+      assert len(small) == 2 and has_negative_and_big(small)
+      assert shrink_list(lambda xs: 5 in xs, [1, 2, 5, 3, 5, 4]) == [5] and shrink_list(lambda xs: True, [1, 2, 3]) == [] and shrink_list(lambda xs: len(xs) >= 2, [9, 8, 7, 6]) == [7, 6]
+      original = [4, 5, 6]
+      shrink_list(lambda xs: 6 in xs, original)
+      assert original == [4, 5, 6]
+      try:
+          shrink_list(lambda xs: False, [1])
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "list does not fail" in str(e)
+  hints:
+  - random.Random(seed) gives the same numbers for the same seed.
+  - For shrinking, restart from the beginning after every successful removal.
+  solution: |
+    def find_counterexample(prop, make_input, trials, seed):
+        """PROPERTY-BASED TESTING states a rule that must hold for ALL inputs and tries many random ones. `prop(x)` returns True if the rule holds, `make_input(rng)` builds a random input from a random.Random object. Create rng = random.Random(seed) ONCE, then for each of `trials` trials build an input and test it. A rule that returns something false or RAISES an exception is broken. Return the first input that breaks the rule, or None. ValueError('trials must not be negative') for negative trials. The same seed must give the same answer."""
+        import random
+        if trials < 0:
+            raise ValueError("trials must not be negative")
+        rng = random.Random(seed)
+        for _ in range(trials):
+            x = make_input(rng)
+            try:
+                ok = prop(x)
+            except Exception:
+                ok = False
+            if not ok:
+                return x
+        return None
+
+
+    def shrink_list(fails, items):
+        """A failing input of 80 numbers is hard to understand. SHRINK it: `fails(list)` returns True while a list still shows the bug. ValueError('list does not fail') if fails(items) is False. Otherwise repeat: try removing each element in turn (from the left, one at a time); at the first removal after which the list still fails, keep the shorter list and start again from the left; stop when no single removal keeps the failure. Return the shrunk list (a new list; the input is not changed)."""
+        if not fails(items):
+            raise ValueError("list does not fail")
+        current = list(items)
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(current)):
+                candidate = current[:i] + current[i + 1:]
+                if fails(candidate):
+                    current = candidate
+                    changed = True
+                    break
+        return current
+  explanation: Tools such as Hypothesis do this at scale and shrink the failing input for you. A tiny failing example is worth far more than a huge one, also when you report the bug to the assistant.
+- id: verify
+  title: 'Capstone: a verdict on AI code'
+  difficulty: 5
+  prompt: 'Put the checks together into one **verdict**. The functions `outcome`, `check_examples` and `differential` are given. Write `verify_solution(candidate, reference, cases, make_input, trials, seed)`. Judge a piece of AI code. Use the given check_examples and differential. Return a dict: ''failed_examples'' (how many failure texts check_examples gives for the candidate), ''differences'' (how many differences between candidate and reference over `trials` random argument tuples built by make_input(rng) from rng = random.Random(seed), created once), ''first_difference'' (the args of the first difference, or None) and ''verdict'' (''pass'' only if both numbers are 0, else ''fail''). ValueError(''trials must not be negative'') for negative trials.'
+  starter: |-
+    def outcome(func, *args):
+        """What a call did: ('ok', the result) or ('error', the name of the exception type)."""
+        try:
+            return ("ok", func(*args))
+        except Exception as err:
+            return ("error", type(err).__name__)
+
+
+    def check_examples(func, cases):
+        """The first check of any code: do the examples work? `cases` is a list of (args, expected) where args is a tuple of arguments. `expected` is either the expected result or an exception CLASS (then the call must raise that class, or a subclass). Return the list of failure texts, in order of the cases (an empty list means all passed; case numbers start at 0): 'case N: expected X, got Y' when the result differs (X and Y written with repr); 'case N: expected E, got Y' when an exception E was expected but the call returned Y (E is the class name, Y written with repr); 'case N: expected E, got F' when another exception F was raised (class names); 'case N: expected X, raised F' when a result X was expected but exception F was raised. Compare results with ==."""
+        failures = []
+        for i, (args, expected) in enumerate(cases):
+            wants_error = isinstance(expected, type) and issubclass(expected, BaseException)
+            try:
+                got = func(*args)
+            except Exception as err:
+                if wants_error:
+                    if not isinstance(err, expected):
+                        failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + type(err).__name__)
+                else:
+                    failures.append("case " + str(i) + ": expected " + repr(expected) + ", raised " + type(err).__name__)
+                continue
+            if wants_error:
+                failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + repr(got))
+            elif got != expected:
+                failures.append("case " + str(i) + ": expected " + repr(expected) + ", got " + repr(got))
+        return failures
+
+
+    def differential(f, g, inputs):
+        """DIFFERENTIAL TESTING compares a new implementation f with a trusted one g (a slow simple version, an older version, a library). `inputs` is a list of argument tuples. Use the given helper outcome. Return the list of (args, outcome of f, outcome of g) for the inputs where the two outcomes differ, in the order of the inputs. Two calls that raise the same exception type agree."""
+        differences = []
+        for args in inputs:
+            a, b = outcome(f, *args), outcome(g, *args)
+            if a != b:
+                differences.append((args, a, b))
+        return differences
+
+
+
+
+    def verify_solution(candidate, reference, cases, make_input, trials, seed):
+        """Judge a piece of AI code. Use the given check_examples and differential. Return a dict: 'failed_examples' (how many failure texts check_examples gives for the candidate), 'differences' (how many differences between candidate and reference over `trials` random argument tuples built by make_input(rng) from rng = random.Random(seed), created once), 'first_difference' (the args of the first difference, or None) and 'verdict' ('pass' only if both numbers are 0, else 'fail'). ValueError('trials must not be negative') for negative trials."""
+        pass
+  tests:
+  - name: a function that looks right
+    code: |
+      def leap_ai(y):
+          return y % 4 == 0
+      def leap_ref(y):
+          return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)
+      def years(rng):
+          return (rng.randint(1800, 2200),)
+      cases = [((2024,), True), ((2023,), False), ((2000,), True)]
+      r = verify_solution(leap_ai, leap_ref, cases, years, 300, 5)
+      assert r["failed_examples"] == 0 and r["differences"] > 0 and r["verdict"] == "fail" and r["first_difference"][0] % 100 == 0 and r["first_difference"][0] % 400 != 0
+      assert verify_solution(leap_ref, leap_ref, cases, years, 300, 5) == {"failed_examples": 0, "differences": 0, "first_difference": None, "verdict": "pass"}
+  - name: failing examples and trials
+    code: |
+      def double(x):
+          return x * 3
+      def ref(x):
+          return x * 2
+      def small(rng):
+          return (rng.randint(1, 9),)
+      r = verify_solution(double, ref, [((1,), 2), ((0,), 0), ((2,), 4)], small, 10, 1)
+      assert r["failed_examples"] == 2 and r["differences"] == 10 and r["verdict"] == "fail" and r["first_difference"] == small(__import__("random").Random(1))
+      assert verify_solution(double, ref, [], small, 0, 1) == {"failed_examples": 0, "differences": 0, "first_difference": None, "verdict": "pass"} and verify_solution(ref, ref, [((1,), 3)], small, 5, 1)["verdict"] == "fail"
+      try:
+          verify_solution(ref, ref, [], small, -1, 1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "trials must not be negative" in str(e)
+  hints:
+  - Create the random generator once and build all the inputs first.
+  - The verdict is 'pass' only when both counts are zero.
+  solution: |
+    def outcome(func, *args):
+        """What a call did: ('ok', the result) or ('error', the name of the exception type)."""
+        try:
+            return ("ok", func(*args))
+        except Exception as err:
+            return ("error", type(err).__name__)
+
+
+    def check_examples(func, cases):
+        """The first check of any code: do the examples work? `cases` is a list of (args, expected) where args is a tuple of arguments. `expected` is either the expected result or an exception CLASS (then the call must raise that class, or a subclass). Return the list of failure texts, in order of the cases (an empty list means all passed; case numbers start at 0): 'case N: expected X, got Y' when the result differs (X and Y written with repr); 'case N: expected E, got Y' when an exception E was expected but the call returned Y (E is the class name, Y written with repr); 'case N: expected E, got F' when another exception F was raised (class names); 'case N: expected X, raised F' when a result X was expected but exception F was raised. Compare results with ==."""
+        failures = []
+        for i, (args, expected) in enumerate(cases):
+            wants_error = isinstance(expected, type) and issubclass(expected, BaseException)
+            try:
+                got = func(*args)
+            except Exception as err:
+                if wants_error:
+                    if not isinstance(err, expected):
+                        failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + type(err).__name__)
+                else:
+                    failures.append("case " + str(i) + ": expected " + repr(expected) + ", raised " + type(err).__name__)
+                continue
+            if wants_error:
+                failures.append("case " + str(i) + ": expected " + expected.__name__ + ", got " + repr(got))
+            elif got != expected:
+                failures.append("case " + str(i) + ": expected " + repr(expected) + ", got " + repr(got))
+        return failures
+
+
+    def differential(f, g, inputs):
+        """DIFFERENTIAL TESTING compares a new implementation f with a trusted one g (a slow simple version, an older version, a library). `inputs` is a list of argument tuples. Use the given helper outcome. Return the list of (args, outcome of f, outcome of g) for the inputs where the two outcomes differ, in the order of the inputs. Two calls that raise the same exception type agree."""
+        differences = []
+        for args in inputs:
+            a, b = outcome(f, *args), outcome(g, *args)
+            if a != b:
+                differences.append((args, a, b))
+        return differences
+
+
+
+
+    def verify_solution(candidate, reference, cases, make_input, trials, seed):
+        """Judge a piece of AI code. Use the given check_examples and differential. Return a dict: 'failed_examples' (how many failure texts check_examples gives for the candidate), 'differences' (how many differences between candidate and reference over `trials` random argument tuples built by make_input(rng) from rng = random.Random(seed), created once), 'first_difference' (the args of the first difference, or None) and 'verdict' ('pass' only if both numbers are 0, else 'fail'). ValueError('trials must not be negative') for negative trials."""
+        import random
+        if trials < 0:
+            raise ValueError("trials must not be negative")
+        failed = check_examples(candidate, cases)
+        rng = random.Random(seed)
+        inputs = [make_input(rng) for _ in range(trials)]
+        diffs = differential(candidate, reference, inputs)
+        return {"failed_examples": len(failed), "differences": len(diffs), "first_difference": diffs[0][0] if diffs else None, "verdict": "pass" if not failed and not diffs else "fail"}
+  explanation: A passing verdict is evidence, never proof. But a failing one is a precise, reproducible bug report you can paste straight back into the conversation.
+commonMistakes:
+- title: Testing only the prompt's examples
+  explanation: The assistant saw them already.
+- title: Letting the same AI write code and tests blindly
+  explanation: Both can share one misunderstanding.
+- title: Skipping error cases
+  explanation: Decide what bad input should do.
+- title: Fixing the symptom
+  explanation: Ask why it failed before changing code.
+- title: Not keeping the failing case
+  explanation: A regression test prevents a repeat.
+summary:
+- 'Evidence beats trust: examples, edges, errors, comparisons, properties.'
+- Edge cases find most bugs.
+- Differential testing needs no known answers.
+- Properties plus random inputs find surprises; shrinking explains them.
+- A small failing case is the best bug report.
+next: u32-debug
+quiz:
+- type: mcq
+  question: Why are the examples in your prompt weak tests?
+  options:
+  - The assistant has already seen them
+  - They are too long
+  - They are random
+  - They cannot fail
+  answer: 0
+  explanation: They prove little.
+- type: mcq
+  question: What is differential testing?
+  options:
+  - Comparing two implementations on many inputs
+  - Testing differences in colour
+  - Running tests twice
+  - Comparing two tests
+  answer: 0
+  explanation: A second opinion.
+- type: mcq
+  question: What is a property in property-based testing?
+  options:
+  - A rule that must hold for every input
+  - A class attribute
+  - A test file
+  - A random number
+  answer: 0
+  explanation: 'For example: decode(encode(x)) == x.'
+- type: mcq
+  question: What does shrinking do?
+  options:
+  - Reduces a failing input to a smaller one that still fails
+  - Compresses the code
+  - Deletes tests
+  - Speeds up the run
+  answer: 0
+  explanation: A small case is easier to understand.
+- type: mcq
+  question: What is a regression test?
+  options:
+  - A test that keeps a fixed bug from returning
+  - A speed test
+  - A test of the oldest code
+  - A random test
+  answer: 0
+  explanation: Keep the failing case.
+- type: mcq
+  question: Which inputs find the most bugs?
+  options:
+  - Edge cases such as empty, zero and huge
+  - Only typical values
+  - Only valid values
+  - Always the same value
+  answer: 0
+  explanation: Bugs hide at the edges.
+- type: code
+  question: Write `round_trip_ok(encode, decode, values)` returning True if `decode(encode(v)) == v` for every value in `values` (an empty list gives True). An exception inside encode or decode counts as failure (return False).
+  starter: |
+    def round_trip_ok(encode, decode, values):
+        pass
+  tests:
+  - name: round trip
+    code: |
+      import json
+      assert round_trip_ok(json.dumps, json.loads, [1, "a", [1, 2], {"k": None}]) is True and round_trip_ok(str, int, [1, 2, 3]) is True and round_trip_ok(str, int, []) is True
+      assert round_trip_ok(str.upper, str.lower, ["abc", "ABC"]) is False and round_trip_ok(str, int, ["x"]) is False and round_trip_ok(lambda v: 1 / v, lambda v: v, [0]) is False
+  solution: |
+    def round_trip_ok(encode, decode, values):
+        for v in values:
+            try:
+                if decode(encode(v)) != v:
+                    return False
+            except Exception:
+                return False
+        return True

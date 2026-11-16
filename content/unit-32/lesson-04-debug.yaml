@@ -1,0 +1,560 @@
+id: u32-debug
+title: Debugging with an AI Partner
+minutes: 110
+objective: 'Learn the workflow of fixing bugs with an assistant: read the error, send the right context, check each proposed fix with tests, and give precise feedback. You will build the pieces, including a fake model, so that you can practise the whole loop without a real AI.'
+outcomes:
+- Summarize a traceback for a bug report
+- Send minimal, relevant context
+- Run proposed code against tests automatically
+- Write feedback that moves the conversation forward
+- Build an ask-check-repeat loop with a round limit
+sections:
+- heading: Debugging is still your job
+  body: |-
+    An assistant can be a very good debugging partner: it has seen millions of error messages. But it cannot see your computer. It sees only the text you send, so the quality of its help depends on the quality of your **bug report**. A good report is the same one a human colleague would want:
+
+    1. **What I wanted** (expected behaviour).
+    2. **What happened** (actual behaviour), with the **exact error message** (copy it, do not retype it) and the traceback.
+    3. **The smallest code** that shows the problem (a **minimal reproduction**), not the whole project.
+    4. **What I already tried**, and the versions of the language and libraries.
+
+    Before you send anything, **debug yourself for five minutes**: read the last line of the traceback (what), the last frame (where), and look at the line. Often you will see it. Explaining a problem to someone, even to an assistant, also helps you see it (**rubber-duck debugging**).
+- heading: The loop
+  body: |-
+    Working with an assistant is a **loop**: ask, check, report back, repeat.
+
+    - **Ask for an explanation first**, then a fix: "Why does this raise KeyError? Do not change the code yet." If you understand the cause, you can judge the fix.
+    - **Check every fix automatically** with a test that fails before and passes after. "It runs" is not enough.
+    - **Report back precisely**: not "still broken" but "now add(1, 2) returns -1; expected 3".
+    - **Change one thing at a time**, so that you know which change did what.
+    - **Watch for circles.** If the assistant undoes its own fix, or suggests the same thing twice, stop: start a **new conversation** with a short summary of what you learned, or go back to reading the code yourself.
+    - **Beware of fixes that hide the bug**: a `try/except` that swallows the error, a special case for your test input, a deleted check. Ask: does this fix the **cause** or only the **symptom**?
+
+    In a real tool the loop calls a model on the internet. Here you will use a **fake model** with prepared replies. This is also how professionals test code that uses AI: the fake makes the test fast, free and repeatable.
+examples:
+- title: A bug report from a traceback
+  intro: Pull the useful parts out of a traceback and show the lines around the error.
+  code: |
+    def summarize_traceback(text):
+        """A TRACEBACK is Python's report of an error. Only a few parts matter when you ask for help. Return a dict from the text: 'error' = the exception type and 'message' = its text, taken from the LAST line of the text (split at the first ': '; a last line without ': ' is only the type and the message is ''); and for the LAST stack frame (the last line of the form '  File \"NAME\", line N, in FUNC'): 'file' (NAME), 'line' (N as an int), 'function' (FUNC) and 'code' (the stripped text of the line right after the frame line, or '' if that line is missing or is the last line). ValueError('no traceback') if there is no frame line. Ignore blank lines at the start and end."""
+        import re
+        lines = [l for l in text.strip().split("\n")]
+        frame = None
+        for i, line in enumerate(lines):
+            m = re.fullmatch(r'\s*File "(.*)", line (\d+), in (.*)', line)
+            if m:
+                frame = (i, m)
+        if frame is None:
+            raise ValueError("no traceback")
+        i, m = frame
+        code = lines[i + 1].strip() if i + 1 < len(lines) - 1 else ""
+        last = lines[-1]
+        kind, _, message = last.partition(": ")
+        return {"error": kind.strip(), "message": message, "file": m.group(1), "line": int(m.group(2)), "function": m.group(3), "code": code}
+
+
+    def minimal_context(source, line, radius):
+        """Do not paste the whole file: send the error line and a few lines around it. Split the source into lines (line numbers start at 1). ValueError('line out of range') unless 1 <= line <= number of lines, and ValueError('radius must not be negative') for a negative radius. Return the lines from line - radius to line + radius (cut off at the start and end of the file), each as the text MARK + number + ': ' + the line, where MARK is '>' for the error line and a single blank for the others, joined with newlines."""
+        lines = source.split("\n")
+        if radius < 0:
+            raise ValueError("radius must not be negative")
+        if not 1 <= line <= len(lines):
+            raise ValueError("line out of range")
+        first, last = max(1, line - radius), min(len(lines), line + radius)
+        return "\n".join((">" if n == line else " ") + str(n) + ": " + lines[n - 1] for n in range(first, last + 1))
+
+    report = """Traceback (most recent call last):
+      File "shop.py", line 8, in <module>
+        print(average_price(prices))
+      File "shop.py", line 4, in average_price
+        return sum(prices) / len(prices)
+    ZeroDivisionError: division by zero
+    """
+    info = summarize_traceback(report)
+    print(info)
+    source = "def average_price(prices):\n    # prices in euros\n    return sum(prices) / len(prices)\n\nprices = []\nprint(average_price(prices))"
+    print(minimal_context(source, 3, 1))
+  output: |
+    {'error': 'ZeroDivisionError', 'message': 'division by zero', 'file': 'shop.py', 'line': 4, 'function': 'average_price', 'code': 'return sum(prices) / len(prices)'}
+     2:     # prices in euros
+    >3:     return sum(prices) / len(prices)
+     4: 
+  lines:
+  - line: 37
+    note: Error type, message, file, line and code in one dict.
+  - line: 39
+    note: The error line is marked with >, with one line of context.
+- title: The loop with a fake assistant
+  intro: The first answer is wrong, the test says why, and the second answer is right.
+  code: |
+    def make_fake_model(script):
+        """To practise without a real AI (and to test tools that use one) you can use a FAKE MODEL that returns prepared replies. Return the pair (model, calls). `model(prompt)` returns the next reply of the list `script` and remembers the prompt in the list `calls`; ValueError('script exhausted') (and nothing recorded) when all replies were used. The list `calls` is the same list object every time, so that a test can read it."""
+        calls = []
+
+        def model(prompt):
+            if len(calls) >= len(script):
+                raise ValueError("script exhausted")
+            calls.append(prompt)
+            return script[len(calls) - 1]
+        return model, calls
+
+
+    def check_with_tests(code, tests):
+        """Try a piece of code against tests. Run `code` and then `tests` (both source text) with exec in ONE new dict. Return (True, 'all tests passed') if nothing was raised. An AssertionError gives (False, 'test failed: ' + its text) or (False, 'test failed') if the text is empty; any other exception gives (False, 'TypeName: text'), or (False, 'TypeName') if the text is empty. A broken source (SyntaxError) is such an exception too. (Only run code you trust; this is a classroom tool.)"""
+        names = {}
+        try:
+            exec(code, names)
+            exec(tests, names)
+        except AssertionError as err:
+            return False, "test failed: " + str(err) if str(err) else "test failed"
+        except Exception as err:
+            return False, type(err).__name__ + (": " + str(err) if str(err) else "")
+        return True, "all tests passed"
+
+
+    def parse_code_block(reply):
+        """The first fenced code block of a reply (None if there is none), as in lesson 1."""
+        lines = reply.split("\n")
+        start = None
+        for i, line in enumerate(lines):
+            if line.strip().startswith("```"):
+                start = i
+                break
+        if start is None:
+            return None
+        code = []
+        for line in lines[start + 1:]:
+            if line.strip() == "```":
+                break
+            code.append(line)
+        return "\n".join(code)
+
+
+    def fix_loop(model, task, check, max_rounds):
+        """The loop of AI pair programming: ask, check, report back, repeat. Use the given parse_code_block and the function `check(code)`, which returns (ok, message). ValueError('max_rounds must be positive') if max_rounds < 1. Each round sends a prompt (the first is the task text itself) to model(prompt) and takes the first code block of the reply. No code block: the next prompt feedback is 'Your reply had no code block. Answer with one code block.' Otherwise call check: if ok, stop with success; if not, the next feedback is 'The previous attempt failed:' + a newline + the message. The next prompt is the task, a blank line (two newlines) and the feedback. Return a dict: 'solved' (True/False), 'rounds' (the number of rounds used), 'code' (the last code block found, or None) and 'prompts' (the list of all prompts sent)."""
+        if max_rounds < 1:
+            raise ValueError("max_rounds must be positive")
+        prompts, prompt, code = [], task, None
+        for round_no in range(1, max_rounds + 1):
+            prompts.append(prompt)
+            code = parse_code_block(model(prompt))
+            if code is None:
+                feedback = "Your reply had no code block. Answer with one code block."
+            else:
+                ok, message = check(code)
+                if ok:
+                    return {"solved": True, "rounds": round_no, "code": code, "prompts": prompts}
+                feedback = "The previous attempt failed:\n" + message
+            prompt = task + "\n\n" + feedback
+        return {"solved": False, "rounds": max_rounds, "code": code, "prompts": prompts}
+
+    fence = "`" * 3
+    wrong = fence + "python\ndef square(x):\n    return x + x\n" + fence
+    right = fence + "python\ndef square(x):\n    return x * x\n" + fence
+    model, calls = make_fake_model([wrong, right])
+    tests = "assert square(3) == 9, 'square(3) gave ' + str(square(3))\nassert square(-2) == 4"
+    result = fix_loop(model, "Write square(x).", lambda code: check_with_tests(code, tests), 4)
+    print(result["solved"], result["rounds"])
+    print(result["code"])
+    print(calls[1].replace("\n\n", " | "))
+  output: |
+    True 2
+    def square(x):
+        return x * x
+    Write square(x). | The previous attempt failed:
+    test failed: square(3) gave 6
+  lines:
+  - line: 68
+    note: Solved in the second round.
+  - line: 69
+    note: The code from the second answer.
+  - line: 70
+    note: The second prompt carries the test message back to the model.
+playground:
+  prompt: Trigger an error and print what a bug report needs.
+  code: |
+    import traceback
+    try:
+        {}['missing']
+    except KeyError as err:
+        print(type(err).__name__, err)
+        print(traceback.format_exc().splitlines()[-1])
+exercises:
+- id: traceback
+  title: Reading a traceback
+  difficulty: 4
+  prompt: 'When you ask for help, the **error message** is the most valuable thing to send. A traceback lists the calls that led to the error, **last call at the bottom**. Write `summarize_traceback(text)`. A TRACEBACK is Python''s report of an error. Only a few parts matter when you ask for help. Return a dict from the text: ''error'' = the exception type and ''message'' = its text, taken from the LAST line of the text (split at the first '': ''; a last line without '': '' is only the type and the message is ''''); and for the LAST stack frame (the last line of the form ''  File "NAME", line N, in FUNC''): ''file'' (NAME), ''line'' (N as an int), ''function'' (FUNC) and ''code'' (the stripped text of the line right after the frame line, or '''' if that line is missing or is the last line). ValueError(''no traceback'') if there is no frame line. Ignore blank lines at the start and end.'
+  starter: |-
+    def summarize_traceback(text):
+        """A TRACEBACK is Python's report of an error. Only a few parts matter when you ask for help. Return a dict from the text: 'error' = the exception type and 'message' = its text, taken from the LAST line of the text (split at the first ': '; a last line without ': ' is only the type and the message is ''); and for the LAST stack frame (the last line of the form '  File \"NAME\", line N, in FUNC'): 'file' (NAME), 'line' (N as an int), 'function' (FUNC) and 'code' (the stripped text of the line right after the frame line, or '' if that line is missing or is the last line). ValueError('no traceback') if there is no frame line. Ignore blank lines at the start and end."""
+        pass
+  tests:
+  - name: a normal traceback
+    code: |
+      tb = """Traceback (most recent call last):
+        File "app.py", line 20, in <module>
+          main()
+        File "app.py", line 14, in main
+          total = add_all(data)
+        File "tools.py", line 5, in add_all
+          return sum(x["price"] for x in items)
+      KeyError: 'price'
+      """
+      assert summarize_traceback(tb) == {"error": "KeyError", "message": "'price'", "file": "tools.py", "line": 5, "function": "add_all", "code": 'return sum(x["price"] for x in items)'}
+      assert summarize_traceback("\n\n" + tb + "\n\n") == summarize_traceback(tb)
+  - name: odd shapes
+    code: |
+      t1 = 'Traceback (most recent call last):\n  File "a.py", line 3, in <module>\n    1 / 0\nZeroDivisionError: division by zero'
+      assert summarize_traceback(t1) == {"error": "ZeroDivisionError", "message": "division by zero", "file": "a.py", "line": 3, "function": "<module>", "code": "1 / 0"}
+      t2 = 'Traceback (most recent call last):\n  File "a.py", line 9, in f\nKeyboardInterrupt'
+      assert summarize_traceback(t2) == {"error": "KeyboardInterrupt", "message": "", "file": "a.py", "line": 9, "function": "f", "code": ""}
+      t3 = 'Traceback (most recent call last):\n  File "x.py", line 1, in g\n    int("a: b")\nValueError: invalid literal: for int(): \'a: b\''
+      r = summarize_traceback(t3)
+      assert r["error"] == "ValueError" and r["message"] == "invalid literal: for int(): 'a: b'" and r["code"] == 'int("a: b")'
+      for bad in ("", "just text", "ValueError: x"):
+          try:
+              summarize_traceback(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "no traceback" in str(e)
+  hints:
+  - 'A regular expression can read the File line: File "(.*)", line (\d+), in (.*).'
+  - Keep the LAST matching frame and remember its position.
+  solution: |
+    def summarize_traceback(text):
+        """A TRACEBACK is Python's report of an error. Only a few parts matter when you ask for help. Return a dict from the text: 'error' = the exception type and 'message' = its text, taken from the LAST line of the text (split at the first ': '; a last line without ': ' is only the type and the message is ''); and for the LAST stack frame (the last line of the form '  File \"NAME\", line N, in FUNC'): 'file' (NAME), 'line' (N as an int), 'function' (FUNC) and 'code' (the stripped text of the line right after the frame line, or '' if that line is missing or is the last line). ValueError('no traceback') if there is no frame line. Ignore blank lines at the start and end."""
+        import re
+        lines = [l for l in text.strip().split("\n")]
+        frame = None
+        for i, line in enumerate(lines):
+            m = re.fullmatch(r'\s*File "(.*)", line (\d+), in (.*)', line)
+            if m:
+                frame = (i, m)
+        if frame is None:
+            raise ValueError("no traceback")
+        i, m = frame
+        code = lines[i + 1].strip() if i + 1 < len(lines) - 1 else ""
+        last = lines[-1]
+        kind, _, message = last.partition(": ")
+        return {"error": kind.strip(), "message": message, "file": m.group(1), "line": int(m.group(2)), "function": m.group(3), "code": code}
+  explanation: 'You can paste exactly this summary, with the surrounding lines of code, into a prompt: it says what failed, where, and why.'
+- id: context
+  title: Send only what matters
+  difficulty: 3
+  prompt: 'Do not paste the whole file. Write `minimal_context(source, line, radius)`. Do not paste the whole file: send the error line and a few lines around it. Split the source into lines (line numbers start at 1). ValueError(''line out of range'') unless 1 <= line <= number of lines, and ValueError(''radius must not be negative'') for a negative radius. Return the lines from line - radius to line + radius (cut off at the start and end of the file), each as the text MARK + number + '': '' + the line, where MARK is ''>'' for the error line and a single blank for the others, joined with newlines.'
+  starter: |-
+    def minimal_context(source, line, radius):
+        """Do not paste the whole file: send the error line and a few lines around it. Split the source into lines (line numbers start at 1). ValueError('line out of range') unless 1 <= line <= number of lines, and ValueError('radius must not be negative') for a negative radius. Return the lines from line - radius to line + radius (cut off at the start and end of the file), each as the text MARK + number + ': ' + the line, where MARK is '>' for the error line and a single blank for the others, joined with newlines."""
+        pass
+  tests:
+  - name: a window of lines
+    code: |
+      src = "a = 1\nb = 2\nc = a / 0\nd = 4\ne = 5"
+      assert minimal_context(src, 3, 1) == " 2: b = 2\n>3: c = a / 0\n 4: d = 4" and minimal_context(src, 3, 0) == ">3: c = a / 0" and minimal_context(src, 3, 10) == " 1: a = 1\n 2: b = 2\n>3: c = a / 0\n 4: d = 4\n 5: e = 5"
+      assert minimal_context(src, 1, 1) == ">1: a = 1\n 2: b = 2" and minimal_context(src, 5, 2) == " 3: c = a / 0\n 4: d = 4\n>5: e = 5" and minimal_context("only", 1, 3) == ">1: only"
+  - name: bad arguments
+    code: |
+      src = "a\nb\nc"
+      for line in (0, 4, -1):
+          try:
+              minimal_context(src, line, 1)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "line out of range" in str(e)
+      try:
+          minimal_context(src, 2, -1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "radius must not be negative" in str(e)
+      assert minimal_context("a\n\nc", 2, 1) == " 1: a\n>2: \n 3: c"
+  hints:
+  - Compute first and last with max and min before the loop.
+  - 'Build every output line from MARK + number + '': '' + text.'
+  solution: |
+    def minimal_context(source, line, radius):
+        """Do not paste the whole file: send the error line and a few lines around it. Split the source into lines (line numbers start at 1). ValueError('line out of range') unless 1 <= line <= number of lines, and ValueError('radius must not be negative') for a negative radius. Return the lines from line - radius to line + radius (cut off at the start and end of the file), each as the text MARK + number + ': ' + the line, where MARK is '>' for the error line and a single blank for the others, joined with newlines."""
+        lines = source.split("\n")
+        if radius < 0:
+            raise ValueError("radius must not be negative")
+        if not 1 <= line <= len(lines):
+            raise ValueError("line out of range")
+        first, last = max(1, line - radius), min(len(lines), line + radius)
+        return "\n".join((">" if n == line else " ") + str(n) + ": " + lines[n - 1] for n in range(first, last + 1))
+  explanation: 'Less context means a cheaper, faster and usually better answer: the model sees the problem, not the noise.'
+- id: fake
+  title: A pretend assistant
+  difficulty: 3
+  prompt: To practise (and to test tools that call an AI) you can use a **fake model** that returns prepared replies, so that everything is repeatable and free. Write `make_fake_model(script)`. To practise without a real AI (and to test tools that use one) you can use a FAKE MODEL that returns prepared replies. Return the pair (model, calls). `model(prompt)` returns the next reply of the list `script` and remembers the prompt in the list `calls`; ValueError('script exhausted') (and nothing recorded) when all replies were used. The list `calls` is the same list object every time, so that a test can read it.
+  starter: |-
+    def make_fake_model(script):
+        """To practise without a real AI (and to test tools that use one) you can use a FAKE MODEL that returns prepared replies. Return the pair (model, calls). `model(prompt)` returns the next reply of the list `script` and remembers the prompt in the list `calls`; ValueError('script exhausted') (and nothing recorded) when all replies were used. The list `calls` is the same list object every time, so that a test can read it."""
+        pass
+  tests:
+  - name: replying in order
+    code: |
+      model, calls = make_fake_model(["first", "second"])
+      assert calls == [] and model("hello") == "first" and calls == ["hello"] and model("again") == "second" and calls == ["hello", "again"]
+      try:
+          model("third")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "script exhausted" in str(e)
+      assert calls == ["hello", "again"]
+  - name: independent models
+    code: |
+      m1, c1 = make_fake_model(["a"])
+      m2, c2 = make_fake_model(["a", "b"])
+      assert m1("x") == "a" and m2("y") == "a" and m2("z") == "b" and c1 == ["x"] and c2 == ["y", "z"] and c1 is not c2
+      m3, c3 = make_fake_model([])
+      try:
+          m3("p")
+          raise AssertionError("accepted")
+      except ValueError:
+          pass
+      assert c3 == [] and make_fake_model(["r"])[0]("") == "r"
+  hints:
+  - A function defined inside a function can use the outer variables (a closure).
+  - Return the model and the list together as a tuple.
+  solution: |
+    def make_fake_model(script):
+        """To practise without a real AI (and to test tools that use one) you can use a FAKE MODEL that returns prepared replies. Return the pair (model, calls). `model(prompt)` returns the next reply of the list `script` and remembers the prompt in the list `calls`; ValueError('script exhausted') (and nothing recorded) when all replies were used. The list `calls` is the same list object every time, so that a test can read it."""
+        calls = []
+
+        def model(prompt):
+            if len(calls) >= len(script):
+                raise ValueError("script exhausted")
+            calls.append(prompt)
+            return script[len(calls) - 1]
+        return model, calls
+  explanation: Real model calls cost money and vary from run to run. Test your own code with fakes, and only then try it with the real thing.
+- id: tests
+  title: Does the code pass?
+  difficulty: 4
+  prompt: 'A debugging loop needs an automatic judge. Write `check_with_tests(code, tests)`. Try a piece of code against tests. Run `code` and then `tests` (both source text) with exec in ONE new dict. Return (True, ''all tests passed'') if nothing was raised. An AssertionError gives (False, ''test failed: '' + its text) or (False, ''test failed'') if the text is empty; any other exception gives (False, ''TypeName: text''), or (False, ''TypeName'') if the text is empty. A broken source (SyntaxError) is such an exception too. (Only run code you trust; this is a classroom tool.)'
+  starter: |-
+    def check_with_tests(code, tests):
+        """Try a piece of code against tests. Run `code` and then `tests` (both source text) with exec in ONE new dict. Return (True, 'all tests passed') if nothing was raised. An AssertionError gives (False, 'test failed: ' + its text) or (False, 'test failed') if the text is empty; any other exception gives (False, 'TypeName: text'), or (False, 'TypeName') if the text is empty. A broken source (SyntaxError) is such an exception too. (Only run code you trust; this is a classroom tool.)"""
+        pass
+  tests:
+  - name: pass and fail
+    code: |
+      code = "def add(a, b):\n    return a + b\n"
+      assert check_with_tests(code, "assert add(1, 2) == 3\nassert add(0, 0) == 0") == (True, "all tests passed")
+      assert check_with_tests(code, "assert add(1, 2) == 4, 'one plus two'") == (False, "test failed: one plus two") and check_with_tests(code, "assert add(1, 2) == 4") == (False, "test failed")
+      assert check_with_tests("", "") == (True, "all tests passed")
+  - name: other errors
+    code: |
+      assert check_with_tests("def f():\n    return 1 / 0\n", "f()") == (False, "ZeroDivisionError: division by zero") and check_with_tests("x = 1", "y") == (False, "NameError: name 'y' is not defined") and check_with_tests("raise KeyError", "pass") == (False, "KeyError")
+      ok, message = check_with_tests("def broken(:\n", "pass")
+      assert ok is False and message.startswith("SyntaxError")
+      assert check_with_tests("def f():\n    return 2\n", "assert f() == 2") == (True, "all tests passed") and check_with_tests("x = 5", "assert x == 5\nassert x == 6, 'six'") == (False, "test failed: six")
+  hints:
+  - Run the code first and the tests second, in the same namespace.
+  - Catch AssertionError before Exception, because it is a kind of Exception.
+  solution: |
+    def check_with_tests(code, tests):
+        """Try a piece of code against tests. Run `code` and then `tests` (both source text) with exec in ONE new dict. Return (True, 'all tests passed') if nothing was raised. An AssertionError gives (False, 'test failed: ' + its text) or (False, 'test failed') if the text is empty; any other exception gives (False, 'TypeName: text'), or (False, 'TypeName') if the text is empty. A broken source (SyntaxError) is such an exception too. (Only run code you trust; this is a classroom tool.)"""
+        names = {}
+        try:
+            exec(code, names)
+            exec(tests, names)
+        except AssertionError as err:
+            return False, "test failed: " + str(err) if str(err) else "test failed"
+        except Exception as err:
+            return False, type(err).__name__ + (": " + str(err) if str(err) else "")
+        return True, "all tests passed"
+  explanation: This is the same idea as the test runner of Unit 30, shrunk to what the loop needs.
+- id: loop
+  title: 'Capstone: the fix loop'
+  difficulty: 5
+  prompt: 'Now build the loop that you run in your head when you work with an assistant: **ask, check, report back, repeat**, with a limit so that it cannot go on for ever. The function `parse_code_block` from lesson 1 is given. Write `fix_loop(model, task, check, max_rounds)`. The loop of AI pair programming: ask, check, report back, repeat. Use the given parse_code_block and the function `check(code)`, which returns (ok, message). ValueError(''max_rounds must be positive'') if max_rounds < 1. Each round sends a prompt (the first is the task text itself) to model(prompt) and takes the first code block of the reply. No code block: the next prompt feedback is ''Your reply had no code block. Answer with one code block.'' Otherwise call check: if ok, stop with success; if not, the next feedback is ''The previous attempt failed:'' + a newline + the message. The next prompt is the task, a blank line (two newlines) and the feedback. Return a dict: ''solved'' (True/False), ''rounds'' (the number of rounds used), ''code'' (the last code block found, or None) and ''prompts'' (the list of all prompts sent).'
+  starter: |-
+    def parse_code_block(reply):
+        """The first fenced code block of a reply (None if there is none), as in lesson 1."""
+        lines = reply.split("\n")
+        start = None
+        for i, line in enumerate(lines):
+            if line.strip().startswith("```"):
+                start = i
+                break
+        if start is None:
+            return None
+        code = []
+        for line in lines[start + 1:]:
+            if line.strip() == "```":
+                break
+            code.append(line)
+        return "\n".join(code)
+
+
+
+
+    def fix_loop(model, task, check, max_rounds):
+        """The loop of AI pair programming: ask, check, report back, repeat. Use the given parse_code_block and the function `check(code)`, which returns (ok, message). ValueError('max_rounds must be positive') if max_rounds < 1. Each round sends a prompt (the first is the task text itself) to model(prompt) and takes the first code block of the reply. No code block: the next prompt feedback is 'Your reply had no code block. Answer with one code block.' Otherwise call check: if ok, stop with success; if not, the next feedback is 'The previous attempt failed:' + a newline + the message. The next prompt is the task, a blank line (two newlines) and the feedback. Return a dict: 'solved' (True/False), 'rounds' (the number of rounds used), 'code' (the last code block found, or None) and 'prompts' (the list of all prompts sent)."""
+        pass
+  tests:
+  - name: solving in two rounds
+    code: |
+      fence = "`" * 3
+      bad = "Try this:\n" + fence + "python\ndef add(a, b):\n    return a - b\n" + fence
+      good = "Fixed:\n" + fence + "python\ndef add(a, b):\n    return a + b\n" + fence
+      replies = [bad, good]
+      seen = []
+      def fake(prompt):
+          seen.append(prompt)
+          return replies[len(seen) - 1]
+      def check(code):
+          names = {}
+          exec(code, names)
+          got = names["add"](1, 2)
+          return got == 3, "add(1, 2) gave " + str(got)
+      r = fix_loop(fake, "Write add(a, b).", check, 5)
+      assert r["solved"] is True and r["rounds"] == 2 and r["code"] == "def add(a, b):\n    return a + b" and r["prompts"] == seen
+      assert seen[0] == "Write add(a, b)." and seen[1] == "Write add(a, b).\n\nThe previous attempt failed:\nadd(1, 2) gave -1"
+  - name: giving up and odd replies
+    code: |
+      fence = "`" * 3
+      replies = ["I think you should refactor.", fence + "\nx = 1\n" + fence, fence + "\nx = 2\n" + fence]
+      seen = []
+      def fake(prompt):
+          seen.append(prompt)
+          return replies[len(seen) - 1]
+      def never(code):
+          return False, "still wrong: " + code
+      r = fix_loop(fake, "T", never, 3)
+      assert r == {"solved": False, "rounds": 3, "code": "x = 2", "prompts": ["T", "T\n\nYour reply had no code block. Answer with one code block.", "T\n\nThe previous attempt failed:\nstill wrong: x = 1"]}
+      assert fix_loop(lambda p: "no code", "T", never, 1) == {"solved": False, "rounds": 1, "code": None, "prompts": ["T"]}
+      assert fix_loop(lambda p: fence + "\nok\n" + fence, "T", lambda c: (True, ""), 9) == {"solved": True, "rounds": 1, "code": "ok", "prompts": ["T"]}
+      try:
+          fix_loop(lambda p: "", "T", never, 0)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "max_rounds must be positive" in str(e)
+  hints:
+  - Collect the prompts in a list as you send them.
+  - The next prompt is always built from the ORIGINAL task plus the newest feedback, not from the previous prompt.
+  solution: |
+    def parse_code_block(reply):
+        """The first fenced code block of a reply (None if there is none), as in lesson 1."""
+        lines = reply.split("\n")
+        start = None
+        for i, line in enumerate(lines):
+            if line.strip().startswith("```"):
+                start = i
+                break
+        if start is None:
+            return None
+        code = []
+        for line in lines[start + 1:]:
+            if line.strip() == "```":
+                break
+            code.append(line)
+        return "\n".join(code)
+
+
+
+
+    def fix_loop(model, task, check, max_rounds):
+        """The loop of AI pair programming: ask, check, report back, repeat. Use the given parse_code_block and the function `check(code)`, which returns (ok, message). ValueError('max_rounds must be positive') if max_rounds < 1. Each round sends a prompt (the first is the task text itself) to model(prompt) and takes the first code block of the reply. No code block: the next prompt feedback is 'Your reply had no code block. Answer with one code block.' Otherwise call check: if ok, stop with success; if not, the next feedback is 'The previous attempt failed:' + a newline + the message. The next prompt is the task, a blank line (two newlines) and the feedback. Return a dict: 'solved' (True/False), 'rounds' (the number of rounds used), 'code' (the last code block found, or None) and 'prompts' (the list of all prompts sent)."""
+        if max_rounds < 1:
+            raise ValueError("max_rounds must be positive")
+        prompts, prompt, code = [], task, None
+        for round_no in range(1, max_rounds + 1):
+            prompts.append(prompt)
+            code = parse_code_block(model(prompt))
+            if code is None:
+                feedback = "Your reply had no code block. Answer with one code block."
+            else:
+                ok, message = check(code)
+                if ok:
+                    return {"solved": True, "rounds": round_no, "code": code, "prompts": prompts}
+                feedback = "The previous attempt failed:\n" + message
+            prompt = task + "\n\n" + feedback
+        return {"solved": False, "rounds": max_rounds, "code": code, "prompts": prompts}
+  explanation: 'Agents (next lesson) are this loop with more tools. The limit on rounds is not decoration: without it a confused model can burn money in circles.'
+commonMistakes:
+- title: Retyping the error
+  explanation: Copy the exact text; one character can matter.
+- title: Sending the whole project
+  explanation: A minimal reproduction is cheaper and clearer.
+- title: Saying 'it doesn't work'
+  explanation: Give expected and actual results.
+- title: Accepting a fix that hides the error
+  explanation: Check that it removes the cause.
+- title: Going round in circles
+  explanation: Start fresh with what you learned.
+summary:
+- 'A good bug report: expected, actual, exact error, minimal code.'
+- Try yourself first; explain the problem to find it.
+- Ask for the explanation before the fix.
+- Check each fix with a failing-then-passing test.
+- Limit the rounds; restart when the conversation loops.
+next: u32-agents
+quiz:
+- type: mcq
+  question: Which part of a traceback tells you where it failed?
+  options:
+  - The last frame near the bottom
+  - The first line
+  - The blank line
+  - The file size
+  answer: 0
+  explanation: The last call is closest to the error.
+- type: mcq
+  question: What is a minimal reproduction?
+  options:
+  - The smallest code that still shows the bug
+  - A copy of the project
+  - A summary of the bug
+  - A test of all features
+  answer: 0
+  explanation: Strip away everything else.
+- type: mcq
+  question: Why ask for an explanation before the fix?
+  options:
+  - So that you can judge the fix
+  - To waste time
+  - The model needs a warm-up
+  - Fixes are not allowed otherwise
+  answer: 0
+  explanation: Understanding comes first.
+- type: mcq
+  question: What is a fake model for?
+  options:
+  - Testing tools that use an AI, repeatably and for free
+  - Making replies longer
+  - Saving tokens in prompts
+  - Training a model
+  answer: 0
+  explanation: Prepared replies.
+- type: mcq
+  question: What should you do when the assistant goes in circles?
+  options:
+  - Start fresh with a summary of what you learned
+  - Repeat the same prompt
+  - Ask louder
+  - Give up on testing
+  answer: 0
+  explanation: A new, short conversation.
+- type: mcq
+  question: Which fix is suspicious?
+  options:
+  - A try/except that swallows the error
+  - A one-line fix with a test
+  - Adding a missing check
+  - Renaming a variable
+  answer: 0
+  explanation: It hides the symptom.
+- type: code
+  question: Write `last_line(text)` returning the last non-blank line of a text, stripped of blanks at both ends (an empty text or only blanks gives an empty text). This is the line of a traceback that names the error.
+  starter: |
+    def last_line(text):
+        pass
+  tests:
+  - name: last line
+    code: |
+      assert last_line("a\nb\nc") == "c" and last_line("a\nb\n\n  \n") == "b" and last_line("  x  ") == "x" and last_line("") == "" and last_line("\n \n") == ""
+  solution: |
+    def last_line(text):
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        return lines[-1] if lines else ""

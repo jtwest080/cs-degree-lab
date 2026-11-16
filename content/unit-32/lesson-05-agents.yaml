@@ -1,0 +1,686 @@
+id: u32-agents
+title: Agents, Tools and Guardrails
+minutes: 115
+objective: 'Understand how an AI system can act in the world: by asking for tools. You will parse tool requests, run tools without ever crashing, write a calculator that never uses eval, enforce a policy and put it all into an agent loop.'
+outcomes:
+- Explain what an agent is
+- Parse and run tool calls robustly
+- Write a tool that is safe against hostile input
+- Enforce guardrails outside the model
+- Build a complete agent loop with a step limit
+sections:
+- heading: From chat to agents
+  body: |-
+    A model on its own only produces text. An **agent** is a program around a model that lets it *act*. The loop is simple:
+
+    1. Send the model the task and everything that has happened so far.
+    2. The model replies either with a **final answer** or with a **tool call**: a request to run a function, with arguments, written in a fixed format such as JSON.
+    3. Your program checks the request, runs the tool and appends the result (an **observation**) to the conversation.
+    4. Go back to step 1, until there is a final answer or a **step limit** is reached.
+
+    Tools can read files, search the web, run tests, query a database, edit code or call other programs. This is how coding agents work: they read your project, make a change, run the tests, read the failures and try again. It is the loop of the last lesson with the human replaced by tools. Standards such as the **Model Context Protocol** (MCP) describe how tools are offered to models in a uniform way.
+- heading: Power needs guardrails
+  body: |-
+    An agent can do real damage if it misunderstands you, or if someone **tricks** it (next lesson: prompt injection). Safety does not come from asking the model nicely. It comes from the **program around it**:
+
+    - **Least privilege.** Give the agent only the tools and the folders it needs. Read-only unless writing is required.
+    - **An allow-list of tools** and of arguments, and a **deny-list** of dangerous text, enforced in code.
+    - **Limits**: maximum steps, maximum tool calls, time and cost budgets.
+    - **Safe tools.** A calculator must not `eval` the text it is given; a file tool must refuse paths outside its folder (the *path traversal* of the security unit); a shell tool must not run arbitrary commands.
+    - **Human approval** for irreversible actions: deleting, sending, paying, publishing.
+    - **Sandboxing**: run the agent in a container or a separate account, not with your own passwords.
+    - **Logs** of every call, so that you can see what happened.
+
+    Treat an agent like a very fast new intern with access to your computer: capable, eager, sometimes mistaken, and *never* given the keys to everything on the first day.
+examples:
+- title: Reading and running a tool call
+  intro: A reply with a request in the middle, a safe calculator, and three ways it can go wrong.
+  code: |
+    def parse_tool_call(reply):
+        """An AGENT is a loop in which the model can ask for TOOLS (functions) to be run. The model asks by writing JSON such as {"tool": "add", "args": {"a": 1, "b": 2}}, maybe surrounded by chatty text. Find the FIRST '{' in the reply and read one JSON value from there (json.JSONDecoder().raw_decode(text[start:]) reads one value and ignores the rest). Return (tool name, args dict); a missing 'args' means {}. Raise ValueError('not a tool call') if there is no '{', if the JSON is invalid, if it is not an object, if 'tool' is not a text or if 'args' is not an object."""
+        import json
+        start = reply.find("{")
+        if start < 0:
+            raise ValueError("not a tool call")
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(reply[start:])
+        except ValueError:
+            raise ValueError("not a tool call")
+        if not isinstance(obj, dict) or not isinstance(obj.get("tool"), str) or not isinstance(obj.get("args", {}), dict):
+            raise ValueError("not a tool call")
+        return obj["tool"], obj.get("args", {})
+
+
+    def run_tool(tools, name, args):
+        """Run one tool for the model, and NEVER crash: whatever happens becomes text that the model can read. `tools` is a dict {name: function}, `args` a dict of keyword arguments. Return: 'error: unknown tool NAME' if the name is not in tools; 'error: bad arguments' if the arguments do not fit the function (use inspect.signature(func).bind(**args) to test this BEFORE calling); otherwise str(result) of func(**args); and if the function raises an exception, 'error: ' + the exception type name + ': ' + its text."""
+        import inspect
+        if name not in tools:
+            return "error: unknown tool " + name
+        func = tools[name]
+        try:
+            inspect.signature(func).bind(**args)
+        except TypeError:
+            return "error: bad arguments"
+        try:
+            return str(func(**args))
+        except Exception as err:
+            return "error: " + type(err).__name__ + ": " + str(err)
+
+
+    def safe_calc(expr):
+        """A calculator tool must NEVER use eval on text that came from a model. Parse with ast.parse(expr, mode='eval') and evaluate the tree yourself. Allowed: numbers (int or float, not True/False), the binary operators + - * / // %, and a unary + or -, with any nesting (parentheses are only grouping). ValueError('too long') if the text is longer than 100 characters; ValueError('unsupported expression') for anything else, including a syntax error, names, calls, ** and strings. A division by zero raises the ordinary ZeroDivisionError. Return the number."""
+        import ast, operator
+        if len(expr) > 100:
+            raise ValueError("too long")
+        ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod}
+
+        def ev(node):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                return node.value
+            if isinstance(node, ast.BinOp) and type(node.op) in ops:
+                return ops[type(node.op)](ev(node.left), ev(node.right))
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+                value = ev(node.operand)
+                return -value if isinstance(node.op, ast.USub) else value
+            raise ValueError("unsupported expression")
+        try:
+            tree = ast.parse(expr.strip(), mode="eval")
+        except SyntaxError:
+            raise ValueError("unsupported expression")
+        return ev(tree.body)
+
+    reply = 'Let me check.\n{"tool": "calc", "args": {"expr": "12 * (3 + 4)"}}'
+    name, args = parse_tool_call(reply)
+    print(name, args)
+    tools = {"calc": safe_calc}
+    print(run_tool(tools, name, args))
+    print(run_tool(tools, "calc", {"expr": "__import__('os').getcwd()"}))
+    print(run_tool(tools, "calc", {"expression": "1+1"}))
+    print(run_tool(tools, "browse", {}))
+  output: |
+    calc {'expr': '12 * (3 + 4)'}
+    84
+    error: ValueError: unsupported expression
+    error: bad arguments
+    error: unknown tool browse
+  lines:
+  - line: 56
+    note: The request is found inside the chatty reply.
+  - line: 58
+    note: 84, calculated safely.
+  - line: 59
+    note: Hostile text is refused, not run.
+  - line: 60
+    note: A wrong argument name is reported, not crashed.
+  - line: 61
+    note: Unknown tools are reported too.
+- title: An agent with a policy
+  intro: The model uses the calculator, then tries to read a secret file, and the guardrail refuses.
+  code: |
+    def parse_tool_call(reply):
+        """An AGENT is a loop in which the model can ask for TOOLS (functions) to be run. The model asks by writing JSON such as {"tool": "add", "args": {"a": 1, "b": 2}}, maybe surrounded by chatty text. Find the FIRST '{' in the reply and read one JSON value from there (json.JSONDecoder().raw_decode(text[start:]) reads one value and ignores the rest). Return (tool name, args dict); a missing 'args' means {}. Raise ValueError('not a tool call') if there is no '{', if the JSON is invalid, if it is not an object, if 'tool' is not a text or if 'args' is not an object."""
+        import json
+        start = reply.find("{")
+        if start < 0:
+            raise ValueError("not a tool call")
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(reply[start:])
+        except ValueError:
+            raise ValueError("not a tool call")
+        if not isinstance(obj, dict) or not isinstance(obj.get("tool"), str) or not isinstance(obj.get("args", {}), dict):
+            raise ValueError("not a tool call")
+        return obj["tool"], obj.get("args", {})
+
+
+    def run_tool(tools, name, args):
+        """Run one tool for the model, and NEVER crash: whatever happens becomes text that the model can read. `tools` is a dict {name: function}, `args` a dict of keyword arguments. Return: 'error: unknown tool NAME' if the name is not in tools; 'error: bad arguments' if the arguments do not fit the function (use inspect.signature(func).bind(**args) to test this BEFORE calling); otherwise str(result) of func(**args); and if the function raises an exception, 'error: ' + the exception type name + ': ' + its text."""
+        import inspect
+        if name not in tools:
+            return "error: unknown tool " + name
+        func = tools[name]
+        try:
+            inspect.signature(func).bind(**args)
+        except TypeError:
+            return "error: bad arguments"
+        try:
+            return str(func(**args))
+        except Exception as err:
+            return "error: " + type(err).__name__ + ": " + str(err)
+
+
+    def safe_calc(expr):
+        """A calculator tool must NEVER use eval on text that came from a model. Parse with ast.parse(expr, mode='eval') and evaluate the tree yourself. Allowed: numbers (int or float, not True/False), the binary operators + - * / // %, and a unary + or -, with any nesting (parentheses are only grouping). ValueError('too long') if the text is longer than 100 characters; ValueError('unsupported expression') for anything else, including a syntax error, names, calls, ** and strings. A division by zero raises the ordinary ZeroDivisionError. Return the number."""
+        import ast, operator
+        if len(expr) > 100:
+            raise ValueError("too long")
+        ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod}
+
+        def ev(node):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                return node.value
+            if isinstance(node, ast.BinOp) and type(node.op) in ops:
+                return ops[type(node.op)](ev(node.left), ev(node.right))
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+                value = ev(node.operand)
+                return -value if isinstance(node.op, ast.USub) else value
+            raise ValueError("unsupported expression")
+        try:
+            tree = ast.parse(expr.strip(), mode="eval")
+        except SyntaxError:
+            raise ValueError("unsupported expression")
+        return ev(tree.body)
+
+
+    def check_policy(policy, history, name, args):
+        """GUARDRAILS decide what an agent may do. `policy` is a dict with the optional keys 'allowed' (the list of permitted tool names; missing means all), 'max_calls' (the most tool calls that may be executed in total; missing means no limit) and 'blocked' (a list of forbidden pieces of text; missing means none). `history` is the list of calls executed so far. Return the first reason in this order, or None if the call is allowed: 'tool not allowed' if the name is not in 'allowed'; 'too many calls' if len(history) >= max_calls; 'blocked argument' if any blocked text occurs in str(value) of any argument value (ignore upper and lower case)."""
+        if "allowed" in policy and name not in policy["allowed"]:
+            return "tool not allowed"
+        if "max_calls" in policy and len(history) >= policy["max_calls"]:
+            return "too many calls"
+        for value in args.values():
+            for bad in policy.get("blocked", []):
+                if bad.lower() in str(value).lower():
+                    return "blocked argument"
+        return None
+
+
+    def agent_loop(model, tools, task, policy, max_steps):
+        """The agent loop. Use the given parse_tool_call, check_policy and run_tool. ValueError('max_steps must be positive') if max_steps < 1. Repeat for step 1, 2, ... max_steps: the PROMPT is the task followed by one line '\nObservation: ' + text for every observation so far; the reply is model(prompt). If the stripped reply starts with 'FINAL:' stop and return the dict {'answer': the rest of the reply, stripped, 'steps': the step number, 'log': the log}. Otherwise try parse_tool_call: if that fails the observation is 'error: not a tool call' (log entry (None, None, observation)). If check_policy gives a reason the observation is 'refused: ' + reason and the call is NOT run; else the observation is run_tool(...) and the call is added to the history. Every tool attempt adds the log entry (name, args, observation). After max_steps without an answer return {'answer': None, 'steps': max_steps, 'log': log}."""
+        if max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        observations, log, history = [], [], []
+        for step in range(1, max_steps + 1):
+            prompt = task + "".join("\nObservation: " + o for o in observations)
+            reply = model(prompt)
+            if reply.strip().startswith("FINAL:"):
+                return {"answer": reply.strip()[len("FINAL:"):].strip(), "steps": step, "log": log}
+            try:
+                name, args = parse_tool_call(reply)
+            except ValueError:
+                observation = "error: not a tool call"
+                log.append((None, None, observation))
+                observations.append(observation)
+                continue
+            reason = check_policy(policy, history, name, args)
+            if reason:
+                observation = "refused: " + reason
+            else:
+                observation = run_tool(tools, name, args)
+                history.append((name, args))
+            log.append((name, args, observation))
+            observations.append(observation)
+        return {"answer": None, "steps": max_steps, "log": log}
+
+    script = ['{"tool": "calc", "args": {"expr": "19.99 * 3"}}', '{"tool": "read_file", "args": {"path": ".env"}}', "FINAL: Three books cost 59.97."]
+    calls = []
+    def model(prompt):
+        calls.append(prompt)
+        return script[len(calls) - 1]
+    tools = {"calc": safe_calc, "read_file": lambda path: "file text"}
+    policy = {"allowed": ["calc"], "max_calls": 3, "blocked": [".env"]}
+    result = agent_loop(model, tools, "What do 3 books at 19.99 cost?", policy, 6)
+    print(result["answer"])
+    for entry in result["log"]:
+        print(entry)
+  output: |
+    Three books cost 59.97.
+    ('calc', {'expr': '19.99 * 3'}, '59.97')
+    ('read_file', {'path': '.env'}, 'refused: tool not allowed')
+  lines:
+  - line: 103
+    note: The final answer of the model.
+  - line: 104
+    note: The log shows the refused file read.
+playground:
+  prompt: Make a tool table and run one tool by name.
+  code: |
+    tools = {'double': lambda n: n * 2}
+    name, args = 'double', {'n': 21}
+    print(tools[name](**args))
+exercises:
+- id: toolcall
+  title: Asking for a tool
+  difficulty: 4
+  prompt: 'A model can only produce text, so how can it *do* things? We let it **ask**: it writes a request in a fixed format, and our program carries it out and tells the model the result. That is a **tool call**. Write `parse_tool_call(reply)`. An AGENT is a loop in which the model can ask for TOOLS (functions) to be run. The model asks by writing JSON such as {"tool": "add", "args": {"a": 1, "b": 2}}, maybe surrounded by chatty text. Find the FIRST ''{'' in the reply and read one JSON value from there (json.JSONDecoder().raw_decode(text[start:]) reads one value and ignores the rest). Return (tool name, args dict); a missing ''args'' means {}. Raise ValueError(''not a tool call'') if there is no ''{'', if the JSON is invalid, if it is not an object, if ''tool'' is not a text or if ''args'' is not an object.'
+  starter: |-
+    def parse_tool_call(reply):
+        """An AGENT is a loop in which the model can ask for TOOLS (functions) to be run. The model asks by writing JSON such as {"tool": "add", "args": {"a": 1, "b": 2}}, maybe surrounded by chatty text. Find the FIRST '{' in the reply and read one JSON value from there (json.JSONDecoder().raw_decode(text[start:]) reads one value and ignores the rest). Return (tool name, args dict); a missing 'args' means {}. Raise ValueError('not a tool call') if there is no '{', if the JSON is invalid, if it is not an object, if 'tool' is not a text or if 'args' is not an object."""
+        pass
+  tests:
+  - name: reading requests
+    code: |
+      assert parse_tool_call('{"tool": "add", "args": {"a": 1, "b": 2}}') == ("add", {"a": 1, "b": 2})
+      assert parse_tool_call('Sure, I will look it up.\n{"tool": "search", "args": {"q": "cats"}}\nDone!') == ("search", {"q": "cats"}) and parse_tool_call('{"tool": "now"}') == ("now", {}) and parse_tool_call('```json\n{"tool": "x", "args": {}}\n```') == ("x", {})
+      assert parse_tool_call('{"tool": "a", "args": {"n": {"deep": [1, {"x": 2}]}}} trailing {junk') == ("a", {"n": {"deep": [1, {"x": 2}]}})
+  - name: refusing non-requests
+    code: |
+      for bad in ("", "no braces here", "{broken", '{"tool": 5}', '{"args": {}}', '{"tool": "x", "args": [1]}', '[1, 2]', 'text {not json} {"tool": "x"}', '{"tool": "x", "args": "no"}', "null {"):
+          try:
+              parse_tool_call(bad)
+              raise AssertionError("accepted " + bad)
+          except ValueError as e:
+              assert "not a tool call" in str(e)
+  hints:
+  - json.JSONDecoder().raw_decode(text) returns (value, end position).
+  - Check the types of the parts of the object before returning.
+  solution: |
+    def parse_tool_call(reply):
+        """An AGENT is a loop in which the model can ask for TOOLS (functions) to be run. The model asks by writing JSON such as {"tool": "add", "args": {"a": 1, "b": 2}}, maybe surrounded by chatty text. Find the FIRST '{' in the reply and read one JSON value from there (json.JSONDecoder().raw_decode(text[start:]) reads one value and ignores the rest). Return (tool name, args dict); a missing 'args' means {}. Raise ValueError('not a tool call') if there is no '{', if the JSON is invalid, if it is not an object, if 'tool' is not a text or if 'args' is not an object."""
+        import json
+        start = reply.find("{")
+        if start < 0:
+            raise ValueError("not a tool call")
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(reply[start:])
+        except ValueError:
+            raise ValueError("not a tool call")
+        if not isinstance(obj, dict) or not isinstance(obj.get("tool"), str) or not isinstance(obj.get("args", {}), dict):
+            raise ValueError("not a tool call")
+        return obj["tool"], obj.get("args", {})
+  explanation: This is the basic idea behind every AI agent and every plugin system. Real APIs use a more formal version, but the loop is the same.
+- id: runtool
+  title: Running a tool safely
+  difficulty: 4
+  prompt: 'The program that runs the model''s request must be **robust**: the model may ask for a tool that does not exist, give wrong arguments, or trigger an error. None of this may crash the loop; it must come back as text the model can learn from. Write `run_tool(tools, name, args)`. Run one tool for the model, and NEVER crash: whatever happens becomes text that the model can read. `tools` is a dict {name: function}, `args` a dict of keyword arguments. Return: ''error: unknown tool NAME'' if the name is not in tools; ''error: bad arguments'' if the arguments do not fit the function (use inspect.signature(func).bind(**args) to test this BEFORE calling); otherwise str(result) of func(**args); and if the function raises an exception, ''error: '' + the exception type name + '': '' + its text.'
+  starter: |-
+    def run_tool(tools, name, args):
+        """Run one tool for the model, and NEVER crash: whatever happens becomes text that the model can read. `tools` is a dict {name: function}, `args` a dict of keyword arguments. Return: 'error: unknown tool NAME' if the name is not in tools; 'error: bad arguments' if the arguments do not fit the function (use inspect.signature(func).bind(**args) to test this BEFORE calling); otherwise str(result) of func(**args); and if the function raises an exception, 'error: ' + the exception type name + ': ' + its text."""
+        pass
+  tests:
+  - name: success and mistakes
+    code: |
+      def add(a, b):
+          return a + b
+      def greet(name="world"):
+          return "hello " + name
+      tools = {"add": add, "greet": greet, "now": lambda: 42}
+      assert run_tool(tools, "add", {"a": 1, "b": 2}) == "3" and run_tool(tools, "greet", {}) == "hello world" and run_tool(tools, "greet", {"name": "Ada"}) == "hello Ada" and run_tool(tools, "now", {}) == "42"
+      assert run_tool(tools, "delete_all", {}) == "error: unknown tool delete_all" and run_tool(tools, "add", {"a": 1}) == "error: bad arguments" and run_tool(tools, "add", {"a": 1, "b": 2, "c": 3}) == "error: bad arguments" and run_tool(tools, "now", {"x": 1}) == "error: bad arguments"
+  - name: errors inside tools
+    code: |
+      def div(a, b):
+          return a / b
+      def lookup(key):
+          return {"a": 1}[key]
+      def bad_type():
+          return 1 + "x"
+      tools = {"div": div, "lookup": lookup, "bad": bad_type, "none": lambda: None, "lst": lambda: [1, 2]}
+      assert run_tool(tools, "div", {"a": 1, "b": 0}) == "error: ZeroDivisionError: division by zero" and run_tool(tools, "lookup", {"key": "z"}) == "error: KeyError: 'z'" and run_tool(tools, "bad", {}) == "error: TypeError: unsupported operand type(s) for +: 'int' and 'str'"
+      assert run_tool(tools, "none", {}) == "None" and run_tool(tools, "lst", {}) == "[1, 2]" and run_tool({}, "x", {}) == "error: unknown tool x"
+  hints:
+  - Check the name first, then the arguments with inspect.signature(func).bind(**args), then call.
+  - Convert the result with str.
+  solution: |
+    def run_tool(tools, name, args):
+        """Run one tool for the model, and NEVER crash: whatever happens becomes text that the model can read. `tools` is a dict {name: function}, `args` a dict of keyword arguments. Return: 'error: unknown tool NAME' if the name is not in tools; 'error: bad arguments' if the arguments do not fit the function (use inspect.signature(func).bind(**args) to test this BEFORE calling); otherwise str(result) of func(**args); and if the function raises an exception, 'error: ' + the exception type name + ': ' + its text."""
+        import inspect
+        if name not in tools:
+            return "error: unknown tool " + name
+        func = tools[name]
+        try:
+            inspect.signature(func).bind(**args)
+        except TypeError:
+            return "error: bad arguments"
+        try:
+            return str(func(**args))
+        except Exception as err:
+            return "error: " + type(err).__name__ + ": " + str(err)
+  explanation: 'The text of an error is useful for the model: it can often correct itself. That is why we return it instead of hiding it.'
+- id: calc
+  title: A calculator the model can use
+  difficulty: 5
+  prompt: 'One of the most useful tools is a calculator, because models are unreliable at arithmetic. Write `safe_calc(expr)`. A calculator tool must NEVER use eval on text that came from a model. Parse with ast.parse(expr, mode=''eval'') and evaluate the tree yourself. Allowed: numbers (int or float, not True/False), the binary operators + - * / // %, and a unary + or -, with any nesting (parentheses are only grouping). ValueError(''too long'') if the text is longer than 100 characters; ValueError(''unsupported expression'') for anything else, including a syntax error, names, calls, ** and strings. A division by zero raises the ordinary ZeroDivisionError. Return the number.'
+  starter: |-
+    def safe_calc(expr):
+        """A calculator tool must NEVER use eval on text that came from a model. Parse with ast.parse(expr, mode='eval') and evaluate the tree yourself. Allowed: numbers (int or float, not True/False), the binary operators + - * / // %, and a unary + or -, with any nesting (parentheses are only grouping). ValueError('too long') if the text is longer than 100 characters; ValueError('unsupported expression') for anything else, including a syntax error, names, calls, ** and strings. A division by zero raises the ordinary ZeroDivisionError. Return the number."""
+        pass
+  tests:
+  - name: arithmetic
+    code: |
+      assert safe_calc("1 + 2 * 3") == 7 and safe_calc("(1 + 2) * 3") == 9 and safe_calc("10 / 4") == 2.5 and safe_calc("7 // 2") == 3 and safe_calc("7 % 4") == 3 and safe_calc("-3 + +5") == 2 and safe_calc("  2 * (3 + (4 - 1))  ") == 12 and safe_calc("1.5 * 2") == 3.0 and safe_calc("--4") == 4 and safe_calc("5") == 5
+      try:
+          safe_calc("1 / 0")
+          raise AssertionError("accepted")
+      except ZeroDivisionError:
+          pass
+  - name: refusing everything else
+    code: |
+      for bad in ("2 ** 10", "__import__('os').system('ls')", "abs(-1)", "x + 1", "'a' * 3", "True + 1", "[1]", "1 +", "", "lambda: 1", "1 if 2 else 3", "(1, 2)", "1 < 2", "2 ** 99999999"):
+          try:
+              safe_calc(bad)
+              raise AssertionError("accepted " + bad)
+          except ValueError as e:
+              assert "unsupported expression" in str(e)
+      try:
+          safe_calc("1+" * 60 + "1")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "too long" in str(e)
+      assert safe_calc("1+" * 49 + "1") == 50
+  hints:
+  - Walk the tree with a small recursive function.
+  - Allow only the node types you list, and refuse the rest by default.
+  solution: |
+    def safe_calc(expr):
+        """A calculator tool must NEVER use eval on text that came from a model. Parse with ast.parse(expr, mode='eval') and evaluate the tree yourself. Allowed: numbers (int or float, not True/False), the binary operators + - * / // %, and a unary + or -, with any nesting (parentheses are only grouping). ValueError('too long') if the text is longer than 100 characters; ValueError('unsupported expression') for anything else, including a syntax error, names, calls, ** and strings. A division by zero raises the ordinary ZeroDivisionError. Return the number."""
+        import ast, operator
+        if len(expr) > 100:
+            raise ValueError("too long")
+        ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod}
+
+        def ev(node):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                return node.value
+            if isinstance(node, ast.BinOp) and type(node.op) in ops:
+                return ops[type(node.op)](ev(node.left), ev(node.right))
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+                value = ev(node.operand)
+                return -value if isinstance(node.op, ast.USub) else value
+            raise ValueError("unsupported expression")
+        try:
+            tree = ast.parse(expr.strip(), mode="eval")
+        except SyntaxError:
+            raise ValueError("unsupported expression")
+        return ev(tree.body)
+  explanation: 'Refusing by default is the secret of safe tools: you list what is allowed instead of trying to list everything that is dangerous.'
+- id: policy
+  title: Guardrails
+  difficulty: 4
+  prompt: 'An agent with tools can do harm: delete files, send money, leak data. **Guardrails** limit what it may do, **outside** the model (you cannot rely on the model to behave). Write `check_policy(policy, history, name, args)`. GUARDRAILS decide what an agent may do. `policy` is a dict with the optional keys ''allowed'' (the list of permitted tool names; missing means all), ''max_calls'' (the most tool calls that may be executed in total; missing means no limit) and ''blocked'' (a list of forbidden pieces of text; missing means none). `history` is the list of calls executed so far. Return the first reason in this order, or None if the call is allowed: ''tool not allowed'' if the name is not in ''allowed''; ''too many calls'' if len(history) >= max_calls; ''blocked argument'' if any blocked text occurs in str(value) of any argument value (ignore upper and lower case).'
+  starter: |-
+    def check_policy(policy, history, name, args):
+        """GUARDRAILS decide what an agent may do. `policy` is a dict with the optional keys 'allowed' (the list of permitted tool names; missing means all), 'max_calls' (the most tool calls that may be executed in total; missing means no limit) and 'blocked' (a list of forbidden pieces of text; missing means none). `history` is the list of calls executed so far. Return the first reason in this order, or None if the call is allowed: 'tool not allowed' if the name is not in 'allowed'; 'too many calls' if len(history) >= max_calls; 'blocked argument' if any blocked text occurs in str(value) of any argument value (ignore upper and lower case)."""
+        pass
+  tests:
+  - name: the three rules
+    code: |
+      policy = {"allowed": ["read", "search"], "max_calls": 2, "blocked": ["password", ".env"]}
+      assert check_policy(policy, [], "read", {"path": "notes.txt"}) is None and check_policy(policy, [], "delete", {}) == "tool not allowed" and check_policy(policy, [("read", {}), ("read", {})], "read", {}) == "too many calls" and check_policy(policy, [("read", {})], "search", {"q": "cats"}) is None
+      assert check_policy(policy, [], "read", {"path": "C:/.ENV"}) == "blocked argument" and check_policy(policy, [], "search", {"q": "my Password list"}) == "blocked argument" and check_policy(policy, [], "read", {"n": 5, "path": "ok"}) is None
+  - name: order and missing keys
+    code: |
+      assert check_policy({}, [1, 2, 3], "anything", {"x": "y"}) is None and check_policy({"max_calls": 0}, [], "x", {}) == "too many calls" and check_policy({"max_calls": 1}, [], "x", {}) is None
+      both = {"allowed": ["a"], "max_calls": 0, "blocked": ["x"]}
+      assert check_policy(both, [], "b", {"v": "x"}) == "tool not allowed" and check_policy(both, [], "a", {"v": "x"}) == "too many calls" and check_policy({"blocked": ["x"]}, [], "a", {"v": "x"}) == "blocked argument" and check_policy({"allowed": []}, [], "a", {}) == "tool not allowed" and check_policy({"blocked": ["12"]}, [], "a", {"n": 3123}) == "blocked argument"
+  hints:
+  - Check the rules in the stated order and return at the first reason.
+  - policy.get('blocked', []) handles a missing key.
+  solution: |
+    def check_policy(policy, history, name, args):
+        """GUARDRAILS decide what an agent may do. `policy` is a dict with the optional keys 'allowed' (the list of permitted tool names; missing means all), 'max_calls' (the most tool calls that may be executed in total; missing means no limit) and 'blocked' (a list of forbidden pieces of text; missing means none). `history` is the list of calls executed so far. Return the first reason in this order, or None if the call is allowed: 'tool not allowed' if the name is not in 'allowed'; 'too many calls' if len(history) >= max_calls; 'blocked argument' if any blocked text occurs in str(value) of any argument value (ignore upper and lower case)."""
+        if "allowed" in policy and name not in policy["allowed"]:
+            return "tool not allowed"
+        if "max_calls" in policy and len(history) >= policy["max_calls"]:
+            return "too many calls"
+        for value in args.values():
+            for bad in policy.get("blocked", []):
+                if bad.lower() in str(value).lower():
+                    return "blocked argument"
+        return None
+  explanation: 'Real systems add a human approval step for risky actions (sending an email, spending money) and run tools in a sandbox with only the access they need: least privilege again.'
+- id: agent
+  title: 'Capstone: an agent loop'
+  difficulty: 5
+  prompt: |-
+    Put everything together into an **agent**: a model that can think, ask for tools, read the results and decide when it is done. The functions `parse_tool_call`, `check_policy` and `run_tool` are given. Write `agent_loop(model, tools, task, policy, max_steps)`. The agent loop. Use the given parse_tool_call, check_policy and run_tool. ValueError('max_steps must be positive') if max_steps < 1. Repeat for step 1, 2, ... max_steps: the PROMPT is the task followed by one line '
+    Observation: ' + text for every observation so far; the reply is model(prompt). If the stripped reply starts with 'FINAL:' stop and return the dict {'answer': the rest of the reply, stripped, 'steps': the step number, 'log': the log}. Otherwise try parse_tool_call: if that fails the observation is 'error: not a tool call' (log entry (None, None, observation)). If check_policy gives a reason the observation is 'refused: ' + reason and the call is NOT run; else the observation is run_tool(...) and the call is added to the history. Every tool attempt adds the log entry (name, args, observation). After max_steps without an answer return {'answer': None, 'steps': max_steps, 'log': log}.
+  starter: |-
+    def parse_tool_call(reply):
+        """An AGENT is a loop in which the model can ask for TOOLS (functions) to be run. The model asks by writing JSON such as {"tool": "add", "args": {"a": 1, "b": 2}}, maybe surrounded by chatty text. Find the FIRST '{' in the reply and read one JSON value from there (json.JSONDecoder().raw_decode(text[start:]) reads one value and ignores the rest). Return (tool name, args dict); a missing 'args' means {}. Raise ValueError('not a tool call') if there is no '{', if the JSON is invalid, if it is not an object, if 'tool' is not a text or if 'args' is not an object."""
+        import json
+        start = reply.find("{")
+        if start < 0:
+            raise ValueError("not a tool call")
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(reply[start:])
+        except ValueError:
+            raise ValueError("not a tool call")
+        if not isinstance(obj, dict) or not isinstance(obj.get("tool"), str) or not isinstance(obj.get("args", {}), dict):
+            raise ValueError("not a tool call")
+        return obj["tool"], obj.get("args", {})
+
+
+    def run_tool(tools, name, args):
+        """Run one tool for the model, and NEVER crash: whatever happens becomes text that the model can read. `tools` is a dict {name: function}, `args` a dict of keyword arguments. Return: 'error: unknown tool NAME' if the name is not in tools; 'error: bad arguments' if the arguments do not fit the function (use inspect.signature(func).bind(**args) to test this BEFORE calling); otherwise str(result) of func(**args); and if the function raises an exception, 'error: ' + the exception type name + ': ' + its text."""
+        import inspect
+        if name not in tools:
+            return "error: unknown tool " + name
+        func = tools[name]
+        try:
+            inspect.signature(func).bind(**args)
+        except TypeError:
+            return "error: bad arguments"
+        try:
+            return str(func(**args))
+        except Exception as err:
+            return "error: " + type(err).__name__ + ": " + str(err)
+
+
+    def check_policy(policy, history, name, args):
+        """GUARDRAILS decide what an agent may do. `policy` is a dict with the optional keys 'allowed' (the list of permitted tool names; missing means all), 'max_calls' (the most tool calls that may be executed in total; missing means no limit) and 'blocked' (a list of forbidden pieces of text; missing means none). `history` is the list of calls executed so far. Return the first reason in this order, or None if the call is allowed: 'tool not allowed' if the name is not in 'allowed'; 'too many calls' if len(history) >= max_calls; 'blocked argument' if any blocked text occurs in str(value) of any argument value (ignore upper and lower case)."""
+        if "allowed" in policy and name not in policy["allowed"]:
+            return "tool not allowed"
+        if "max_calls" in policy and len(history) >= policy["max_calls"]:
+            return "too many calls"
+        for value in args.values():
+            for bad in policy.get("blocked", []):
+                if bad.lower() in str(value).lower():
+                    return "blocked argument"
+        return None
+
+
+
+
+    def agent_loop(model, tools, task, policy, max_steps):
+        """The agent loop. Use the given parse_tool_call, check_policy and run_tool. ValueError('max_steps must be positive') if max_steps < 1. Repeat for step 1, 2, ... max_steps: the PROMPT is the task followed by one line '\nObservation: ' + text for every observation so far; the reply is model(prompt). If the stripped reply starts with 'FINAL:' stop and return the dict {'answer': the rest of the reply, stripped, 'steps': the step number, 'log': the log}. Otherwise try parse_tool_call: if that fails the observation is 'error: not a tool call' (log entry (None, None, observation)). If check_policy gives a reason the observation is 'refused: ' + reason and the call is NOT run; else the observation is run_tool(...) and the call is added to the history. Every tool attempt adds the log entry (name, args, observation). After max_steps without an answer return {'answer': None, 'steps': max_steps, 'log': log}."""
+        pass
+  tests:
+  - name: using a tool
+    code: |
+      replies = ['I will calculate.\n{"tool": "calc", "args": {"expr": "6 * 7"}}', "FINAL: The answer is 42."]
+      seen = []
+      def model(prompt):
+          seen.append(prompt)
+          return replies[len(seen) - 1]
+      tools = {"calc": lambda expr: eval(expr)}
+      r = agent_loop(model, tools, "What is 6 * 7?", {}, 5)
+      assert r == {"answer": "The answer is 42.", "steps": 2, "log": [("calc", {"expr": "6 * 7"}, "42")]}
+      assert seen == ["What is 6 * 7?", "What is 6 * 7?\nObservation: 42"]
+  - name: trouble
+    code: |
+      replies = ["hmm, let me think", '{"tool": "delete", "args": {}}', '{"tool": "read", "args": {"path": "a"}}', '{"tool": "read", "args": {"path": "b"}}', '{"tool": "read", "args": {"path": "secret.env"}}', "  FINAL:   gave up  "]
+      seen = []
+      def model(prompt):
+          seen.append(prompt)
+          return replies[len(seen) - 1]
+      tools = {"read": lambda path: "text of " + path, "delete": lambda: "deleted"}
+      policy = {"allowed": ["read"], "max_calls": 2, "blocked": [".env"]}
+      r = agent_loop(model, tools, "T", policy, 10)
+      assert r["answer"] == "gave up" and r["steps"] == 6
+      assert r["log"] == [(None, None, "error: not a tool call"), ("delete", {}, "refused: tool not allowed"), ("read", {"path": "a"}, "text of a"), ("read", {"path": "b"}, "text of b"), ("read", {"path": "secret.env"}, "refused: too many calls")]
+      assert seen[2] == "T\nObservation: error: not a tool call\nObservation: refused: tool not allowed"
+  - name: step limit
+    code: |
+      n = []
+      def forever(prompt):
+          n.append(prompt)
+          return '{"tool": "ping", "args": {}}'
+      r = agent_loop(forever, {"ping": lambda: "pong"}, "T", {}, 3)
+      assert r["answer"] is None and r["steps"] == 3 and len(n) == 3 and r["log"] == [("ping", {}, "pong")] * 3
+      assert agent_loop(lambda p: "FINAL: now", {}, "T", {}, 1) == {"answer": "now", "steps": 1, "log": []}
+      try:
+          agent_loop(lambda p: "", {}, "T", {}, 0)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "max_steps must be positive" in str(e)
+  hints:
+  - Build the prompt from the task and all the observations each time.
+  - '`continue` after an unparsable reply jumps to the next step.'
+  solution: |
+    def parse_tool_call(reply):
+        """An AGENT is a loop in which the model can ask for TOOLS (functions) to be run. The model asks by writing JSON such as {"tool": "add", "args": {"a": 1, "b": 2}}, maybe surrounded by chatty text. Find the FIRST '{' in the reply and read one JSON value from there (json.JSONDecoder().raw_decode(text[start:]) reads one value and ignores the rest). Return (tool name, args dict); a missing 'args' means {}. Raise ValueError('not a tool call') if there is no '{', if the JSON is invalid, if it is not an object, if 'tool' is not a text or if 'args' is not an object."""
+        import json
+        start = reply.find("{")
+        if start < 0:
+            raise ValueError("not a tool call")
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(reply[start:])
+        except ValueError:
+            raise ValueError("not a tool call")
+        if not isinstance(obj, dict) or not isinstance(obj.get("tool"), str) or not isinstance(obj.get("args", {}), dict):
+            raise ValueError("not a tool call")
+        return obj["tool"], obj.get("args", {})
+
+
+    def run_tool(tools, name, args):
+        """Run one tool for the model, and NEVER crash: whatever happens becomes text that the model can read. `tools` is a dict {name: function}, `args` a dict of keyword arguments. Return: 'error: unknown tool NAME' if the name is not in tools; 'error: bad arguments' if the arguments do not fit the function (use inspect.signature(func).bind(**args) to test this BEFORE calling); otherwise str(result) of func(**args); and if the function raises an exception, 'error: ' + the exception type name + ': ' + its text."""
+        import inspect
+        if name not in tools:
+            return "error: unknown tool " + name
+        func = tools[name]
+        try:
+            inspect.signature(func).bind(**args)
+        except TypeError:
+            return "error: bad arguments"
+        try:
+            return str(func(**args))
+        except Exception as err:
+            return "error: " + type(err).__name__ + ": " + str(err)
+
+
+    def check_policy(policy, history, name, args):
+        """GUARDRAILS decide what an agent may do. `policy` is a dict with the optional keys 'allowed' (the list of permitted tool names; missing means all), 'max_calls' (the most tool calls that may be executed in total; missing means no limit) and 'blocked' (a list of forbidden pieces of text; missing means none). `history` is the list of calls executed so far. Return the first reason in this order, or None if the call is allowed: 'tool not allowed' if the name is not in 'allowed'; 'too many calls' if len(history) >= max_calls; 'blocked argument' if any blocked text occurs in str(value) of any argument value (ignore upper and lower case)."""
+        if "allowed" in policy and name not in policy["allowed"]:
+            return "tool not allowed"
+        if "max_calls" in policy and len(history) >= policy["max_calls"]:
+            return "too many calls"
+        for value in args.values():
+            for bad in policy.get("blocked", []):
+                if bad.lower() in str(value).lower():
+                    return "blocked argument"
+        return None
+
+
+
+
+    def agent_loop(model, tools, task, policy, max_steps):
+        """The agent loop. Use the given parse_tool_call, check_policy and run_tool. ValueError('max_steps must be positive') if max_steps < 1. Repeat for step 1, 2, ... max_steps: the PROMPT is the task followed by one line '\nObservation: ' + text for every observation so far; the reply is model(prompt). If the stripped reply starts with 'FINAL:' stop and return the dict {'answer': the rest of the reply, stripped, 'steps': the step number, 'log': the log}. Otherwise try parse_tool_call: if that fails the observation is 'error: not a tool call' (log entry (None, None, observation)). If check_policy gives a reason the observation is 'refused: ' + reason and the call is NOT run; else the observation is run_tool(...) and the call is added to the history. Every tool attempt adds the log entry (name, args, observation). After max_steps without an answer return {'answer': None, 'steps': max_steps, 'log': log}."""
+        if max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        observations, log, history = [], [], []
+        for step in range(1, max_steps + 1):
+            prompt = task + "".join("\nObservation: " + o for o in observations)
+            reply = model(prompt)
+            if reply.strip().startswith("FINAL:"):
+                return {"answer": reply.strip()[len("FINAL:"):].strip(), "steps": step, "log": log}
+            try:
+                name, args = parse_tool_call(reply)
+            except ValueError:
+                observation = "error: not a tool call"
+                log.append((None, None, observation))
+                observations.append(observation)
+                continue
+            reason = check_policy(policy, history, name, args)
+            if reason:
+                observation = "refused: " + reason
+            else:
+                observation = run_tool(tools, name, args)
+                history.append((name, args))
+            log.append((name, args, observation))
+            observations.append(observation)
+        return {"answer": None, "steps": max_steps, "log": log}
+  explanation: 'Every serious agent has these four parts: a model, tools, guardrails and a step limit. Everything else, from planning to memory, is built on top.'
+commonMistakes:
+- title: Using eval in a tool
+  explanation: Model text can contain anything.
+- title: Crashing on a bad request
+  explanation: Return the error as text instead.
+- title: No step limit
+  explanation: Loops can run for ever and cost money.
+- title: Safety only in the prompt
+  explanation: Enforce rules in code.
+- title: Giving full access
+  explanation: Least privilege limits the damage.
+summary:
+- 'An agent is a loop: model, tool call, observation.'
+- Tool requests are text that you parse and check.
+- Errors become observations, never crashes.
+- 'Guardrails live in code: allow-lists, limits, approval.'
+- Always set a step limit and keep logs.
+next: u32-risks
+quiz:
+- type: mcq
+  question: What is an agent?
+  options:
+  - A program that lets a model use tools in a loop
+  - A faster model
+  - A kind of database
+  - A prompt template
+  answer: 0
+  explanation: Model plus tools plus loop.
+- type: mcq
+  question: What is an observation?
+  options:
+  - The result of a tool call given back to the model
+  - A model's guess
+  - A log file
+  - A prompt
+  answer: 0
+  explanation: What the tool returned.
+- type: mcq
+  question: Why not use eval in a calculator tool?
+  options:
+  - The text comes from a model and can contain anything
+  - It is slow
+  - It is not in Python
+  - It cannot add
+  answer: 0
+  explanation: Parse and evaluate safely.
+- type: mcq
+  question: Where should safety rules be enforced?
+  options:
+  - In the program around the model
+  - Only in the prompt
+  - Nowhere
+  - In the user's head
+  answer: 0
+  explanation: A model can be tricked.
+- type: mcq
+  question: Why a step limit?
+  options:
+  - To stop endless loops and cost
+  - To make replies shorter
+  - To save disk
+  - To hide errors
+  answer: 0
+  explanation: Budget for steps.
+- type: mcq
+  question: What is least privilege?
+  options:
+  - Giving only the access that is needed
+  - Giving everything
+  - Giving nothing ever
+  - Using weak passwords
+  answer: 0
+  explanation: Limit the damage.
+- type: code
+  question: Write `tool_names(tools)` returning the sorted list of the names of the tools in the dict `tools` whose function takes NO required arguments (use `inspect.signature`; a parameter with a default value is not required).
+  starter: |
+    def tool_names(tools):
+        pass
+  tests:
+  - name: names
+    code: |
+      tools = {"now": lambda: 1, "add": lambda a, b: a + b, "greet": lambda name="x": name, "mix": lambda a, b=2: a}
+      assert tool_names(tools) == ["greet", "now"] and tool_names({}) == [] and tool_names({"f": lambda *args, **kw: 0}) == ["f"]
+  solution: |
+    import inspect
+
+
+    def tool_names(tools):
+        names = []
+        for name, func in tools.items():
+            params = inspect.signature(func).parameters.values()
+            if all(p.default is not p.empty or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in params):
+                names.append(name)
+        return sorted(names)
