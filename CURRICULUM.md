@@ -34,8 +34,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 26 | Computer Graphics (Version 2, elective) | ✅ Complete (Phase 26) | 7 | 35 | Mini 3D Renderer (rotation, perspective, normals and lighting, back-face culling, depth-buffered triangle fill, shaded cube) |
 | 27 | Human-Computer Interaction (Version 2, elective) | ✅ Complete (Phase 27) | 7 | 35 | Mini UI Toolkit (text layout, drawing, hit testing, keyboard focus, undo/redo state, accessibility audit, event session) |
 | 28 | Git and GitHub (Version 2, practice unit) | ✅ Complete (Phase 29) | 7 | 35 | Mini Git (commits, log, branches, safe switch, status, diff, merge base, fast-forward / three-way merge / conflicts, push with the fast-forward rule) |
+| 29 | Command Line (Version 2, practice unit) | ✅ Complete (Phase 30) | 6 | 30 | Mini Shell (prompt, quote-aware expansion of variables, braces and wildcards, cd/ls/cat/mkdir/cp/mv/rm and text commands, pipes and redirection, ; && ||, variables, history, scripts) |
 
-Totals: 230 lessons, 1103 practice exercises, 230 lesson quizzes (1380 multiple-choice questions + 230 coding questions), 28 unit projects, 2192 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 236 lessons, 1133 practice exercises, 236 lesson quizzes (1416 multiple-choice questions + 236 coding questions), 29 unit projects, 2237 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -641,6 +642,21 @@ Notes for later maintainers: example outputs must not start with spaces (a YAML 
 
 Note: the lessons teach the real commands in text blocks (`git init`, `git switch -c`, `git merge`, `git push`, and so on) and build the same machinery in Python so that nothing is magic. Practice units (28-31) are about real-world skills; later units can assume Git vocabulary.
 
+## Unit 29: Command Line (Version 2, practice unit) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 29.1 The Shell and the File System | `u29-shell` | path normalizing and resolving, a tiny file system, ls, tree, cd, tab completion |
+| 29.2 Files, Folders and Permissions | `u29-files` | cat, touch, mkdir, cp, rm, mv, octal permissions, chmod, can_access, disk usage |
+| 29.3 Text Tools | `u29-text` | head, tail, wc, cut, tr, sort, uniq, grep, sed s///, web-log analysis |
+| 29.4 Pipes, Redirection and Command Lines | `u29-pipes` | tokenizer with quotes, option parser, command runner, pipelines, < > >>, exit codes, ; && \|\| |
+| 29.5 Wildcards, Variables and Scripts | `u29-scripts` | glob matching and expansion, brace expansion, $variables, for loops and if in scripts |
+| 29.6 Processes, Search and Scheduling | `u29-system` | PATH and which, find, processes and kill (orphans), cron fields and next run times |
+
+**Project: Mini Shell.** Learners write `new_shell`, `prompt`, `expand_words`, `run_command` (all commands), `run_pipeline`, `run_line` and `run_script` (file system, text tools, tokenizer, expansion functions and the pipeline parser are given).
+
+Can assume: absolute/relative paths, pipes, redirection, exit status, wildcards, variables, permissions, processes, cron. Next practice units: 30 Testing and Debugging, 31 Security Basics.
+
 ## Plan for remaining units (to refine before each phase)
 
 Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction (electives) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
@@ -681,3 +697,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 27 (2026-11-15):** Version 2 continues. Complete Unit 27 Human-Computer Interaction elective (7 lessons, 35 exercises, 7 quizzes, Mini UI Toolkit project, 62 glossary terms). No framework changes; all Python.
 - **Phase 28 (2026-11-15):** Version 2 continues. Added the Capstones page (8 open-ended projects with self-graded rubrics and reflection notes) and the Reading page (33 items with read tracking). Framework change: two new pages, routes, nav links and progress keys.
 - **Phase 29 (2026-11-16):** Practice units begin (Jaden's approved additions). Complete Unit 28 Git and GitHub (7 lessons, 35 exercises, 7 quizzes, Mini Git project, 45 glossary terms). No framework changes; all Python.
+- **Phase 30 (2026-11-16):** Complete Unit 29 Command Line (6 lessons, 30 exercises, 6 quizzes, Mini Shell project, 45 glossary terms). No framework changes; all Python.

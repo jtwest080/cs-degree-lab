@@ -1,0 +1,1324 @@
+id: u29-system
+title: Processes, Search and Scheduling
+minutes: 110
+objective: Understand how the shell finds programs (PATH), how programs run as processes you can inspect and stop, how to search a file tree, and how to schedule work with cron.
+outcomes:
+- Explain PATH and how a command is found
+- Describe processes, signals and orphans
+- Search for files with find and glob patterns
+- Read and write cron schedules
+sections:
+- heading: Finding and running programs
+  body: |-
+    A command like `python` is just a name. The shell looks it up in the **PATH** variable: a list of folders separated by `:`, searched from **left to right**. The first folder that contains a program with that name wins. `which python` shows which one that is, and `echo $PATH` shows the list. A program must also have the **execute permission** (lesson 2). If you give a path (`./script.sh` or `/usr/bin/python`), the shell does not search at all.
+
+    Each program you run starts in a new **environment**: a copy of the exported variables. Changing a variable in the program does not change yours, which keeps programs from interfering with each other.
+- heading: Processes
+  body: |-
+    A running program is a **process**. Each one has a **pid** (process id, a number), a **parent** (the process that started it, `ppid`), an owner, and some memory. The very first process is **init** (pid 1), which starts the others and adopts **orphans** (children whose parent ended). `ps` lists processes, `top` shows them live, and the `&` at the end of a line starts a process in the **background** so you get your prompt back (`sleep 60 &`).
+
+    To stop one you send a **signal** with `kill pid`. The default signal `SIGTERM` politely asks the program to finish (it can clean up). `kill -9` sends `SIGKILL`, which the program cannot refuse. `Ctrl+C` sends `SIGINT` to the program in the foreground. Signals are the way the operating system tells a process that something happened.
+
+    ```bash
+    sleep 300 &        # start in the background
+    ps                 # list processes: find its pid
+    kill 4242          # ask it to end
+    kill -9 4242       # force it if it ignores you
+    ```
+
+    > **Tip:** A **daemon** is a process that runs in the background for a long time (a web server, a database, cron). Its name often ends in `d`.
+- heading: Searching and scheduling
+  body: |-
+    `find` walks a folder tree and lists what matches: `find . -name "*.py" -type f`. Combine it with `xargs`, which turns the lines it reads into arguments of another command: `find . -name "*.tmp" | xargs rm` removes every temporary file (use `-print0` and `xargs -0` if names might contain spaces). `locate` searches a prebuilt index instead, which is much faster but can be out of date.
+
+    **cron** is the scheduler. Each user has a **crontab** with one job per line: five time fields and then the command.
+
+    ```
+    # minute hour day-of-month month day-of-week  command
+    30 2 * * *      /home/user/backup.sh      # every day at 02:30
+    */15 * * * *    /home/user/check.sh       # every 15 minutes
+    0 9 * * 1-5     /home/user/report.sh      # 09:00 on weekdays
+    0 0 1 * *       /home/user/monthly.sh     # first of every month
+    ```
+
+    `*` means every value, `a,b` a list, `a-b` a range and `*/n` every n-th. If both day-of-month and weekday are restricted, the job runs when **either** matches, a famous quirk. Jobs run without your terminal, so use full paths and send their output to a log file.
+examples:
+- title: which and find
+  intro: Search the PATH and a folder tree.
+  code: |
+    HOME = "/home/user"
+
+
+    def normalize(path):
+        """Clean an ABSOLUTE path (one that starts with '/'). Split it at '/', ignore empty parts and '.' parts (the current folder), and let '..' remove the previous part (at the top, '..' stays at the top: '/..' is '/'). Return '/' plus the remaining parts joined with '/'; the result for no parts is '/'."""
+        parts = []
+        for p in path.split("/"):
+            if p in ("", "."):
+                continue
+            if p == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(p)
+        return "/" + "/".join(parts)
+
+
+    def resolve(cwd, path):
+        """Turn what the user typed into an absolute, clean path. `cwd` is the current working directory. A path starting with '~' (just '~' or '~/...') starts at HOME instead. A path that does not start with '/' is relative to cwd. Return the normalized absolute path."""
+        if path == "~" or path.startswith("~/"):
+            path = HOME + path[1:]
+        if not path.startswith("/"):
+            path = cwd + "/" + path
+        return normalize(path)
+
+
+    def split_path(path):
+        """Split a path into (folder, name): normalize it first; the folder of '/a/b/c.txt' is '/a/b' and its name is 'c.txt'; for '/c.txt' the folder is '/'; for '/' itself return ('/', '')."""
+        path = normalize(path)
+        if path == "/":
+            return ("/", "")
+        i = path.rindex("/")
+        return (path[:i] or "/", path[i + 1:])
+
+
+    def extension(name):
+        """The file extension of a name: the text after the LAST dot, without the dot, or '' if there is none. A leading dot does not count ('.bashrc' has no extension) and a name ending in a dot has none."""
+        stem = name.lstrip(".")
+        if "." not in stem:
+            return ""
+        return stem.rsplit(".", 1)[1]
+
+
+    def join_path(*parts):
+        """Join path parts with '/' like os.path.join, then normalize: a part that starts with '/' starts again from there (everything before it is dropped). The result is always absolute (a first part without '/' is taken from the root)."""
+        result = ""
+        for p in parts:
+            if p.startswith("/"):
+                result = p
+            else:
+                result += "/" + p
+        return normalize(result)
+
+
+    def new_fs():
+        """A tiny file system: {"dirs": a set holding just '/', "files": an empty dict mapping absolute path -> text}."""
+        return {"dirs": {"/"}, "files": {}}
+
+
+    def is_dir(fs, path):
+        """True if the (normalized) path is a directory."""
+        return normalize(path) in fs["dirs"]
+
+
+    def is_file(fs, path):
+        """True if the (normalized) path is a file."""
+        return normalize(path) in fs["files"]
+
+
+    def mkdir_p(fs, path):
+        """Like `mkdir -p`: create the directory and all missing parents (already existing ones are fine). ValueError('not a directory') if some part of the path is a FILE."""
+        cur = ""
+        for part in [p for p in normalize(path).split("/") if p]:
+            cur += "/" + part
+            if cur in fs["files"]:
+                raise ValueError("not a directory")
+            fs["dirs"].add(cur)
+
+
+    def write_file(fs, path, text):
+        """Create or overwrite a file. ValueError('is a directory') if the path is a directory or the root; ValueError('no such directory') if its folder does not exist."""
+        path = normalize(path)
+        folder, name = split_path(path)
+        if not name or path in fs["dirs"]:
+            raise ValueError("is a directory")
+        if folder not in fs["dirs"]:
+            raise ValueError("no such directory")
+        fs["files"][path] = text
+
+
+    def ls(fs, path, all=False):
+        """List a directory like `ls`: the sorted names of the things directly inside it, with '/' added after directory names. Names that start with '.' are hidden unless all=True. For a FILE return just [its name]. ValueError('no such file or directory') if the path does not exist."""
+        path = normalize(path)
+        if path in fs["files"]:
+            return [split_path(path)[1]]
+        if path not in fs["dirs"]:
+            raise ValueError("no such file or directory")
+        names = set()
+        for d in fs["dirs"]:
+            if d != path and split_path(d)[0] == path:
+                names.add(split_path(d)[1] + "/")
+        for f in fs["files"]:
+            if split_path(f)[0] == path:
+                names.add(split_path(f)[1])
+        return sorted(n for n in names if all or not n.startswith("."))
+
+
+    def tree_lines(fs, path):
+        """Draw a directory as an outline: the first line is the directory's own name ('/' for the root) followed by '/' unless it is the root; below it every entry of ls(fs, path, all=True) on its own line, indented by 2 spaces per level, directories followed by '/' and listed with their contents right below them (depth first). ValueError('not a directory') if the path is not a directory."""
+        path = normalize(path)
+        if path not in fs["dirs"]:
+            raise ValueError("not a directory")
+        lines = ["/" if path == "/" else split_path(path)[1] + "/"]
+
+        def walk(folder, depth):
+            for name in ls(fs, folder, all=True):
+                lines.append("  " * depth + name)
+                if name.endswith("/"):
+                    walk(join_path(folder, name[:-1]), depth + 1)
+
+        walk(path, 1)
+        return lines
+
+
+    def cd(fs, cwd, path):
+        """Like `cd`: return the new working directory resolve(cwd, path). ValueError('not a directory') if it is a file, ValueError('no such directory') if it does not exist."""
+        target = resolve(cwd, path)
+        if target in fs["files"]:
+            raise ValueError("not a directory")
+        if target not in fs["dirs"]:
+            raise ValueError("no such directory")
+        return target
+
+
+    def under(fs, path):
+        """Everything at or below a path: return (dirs, files): the sorted list of directories whose path is `path` or starts with `path + '/'`, and the same for files (a file path equal to `path` counts). The path is normalized first."""
+        path = normalize(path)
+        prefix = "/" if path == "/" else path + "/"
+        dirs = sorted(d for d in fs["dirs"] if d == path or d.startswith(prefix))
+        files = sorted(f for f in fs["files"] if f == path or f.startswith(prefix))
+        return dirs, files
+
+
+    def cat(fs, *paths):
+        """Return the text of the files one after the other. ValueError('no such file: PATH') for a missing path and ValueError('is a directory: PATH') for a directory (using the path as given). Check each path in order."""
+        out = ""
+        for p in paths:
+            if is_dir(fs, p):
+                raise ValueError("is a directory: " + p)
+            if not is_file(fs, p):
+                raise ValueError("no such file: " + p)
+            out += fs["files"][normalize(p)]
+        return out
+
+
+    def touch(fs, path):
+        """Create an EMPTY file if the path does not exist yet; an existing file is left unchanged. ValueError('is a directory') for a directory; ValueError('no such directory') if the folder does not exist."""
+        path = normalize(path)
+        if path in fs["files"]:
+            return
+        write_file(fs, path, "")
+
+
+    def mkdir(fs, path):
+        """Like `mkdir` without -p: create ONE directory. ValueError('file exists') if the path already exists (as a file or directory); ValueError('no such directory') if its folder does not exist."""
+        path = normalize(path)
+        if path in fs["files"] or path in fs["dirs"]:
+            raise ValueError("file exists")
+        if split_path(path)[0] not in fs["dirs"]:
+            raise ValueError("no such directory")
+        fs["dirs"].add(path)
+
+
+    def demo_fs():
+        fs = new_fs()
+        mkdir_p(fs, "/home/user/docs")
+        mkdir_p(fs, "/home/user/.config")
+        mkdir_p(fs, "/home/user/projects/app")
+        write_file(fs, "/home/user/notes.txt", "buy milk\n")
+        write_file(fs, "/home/user/docs/report.md", "# Report\n")
+        write_file(fs, "/home/user/docs/readme.md", "# Read me\n")
+        write_file(fs, "/home/user/projects/app/main.py", "print('hi')\n")
+        write_file(fs, "/home/user/.bashrc", "export A=1\n")
+        return fs
+
+
+    def glob_match(pattern, name):
+        """Does `name` match the wildcard `pattern`? '*' matches any number of characters (also none), '?' exactly one character, and '[abc]' one character from the set; ranges like '[a-f]' work, and '[!abc]' means any character NOT in the set. Every other character must match itself. A '[' with no closing ']' is an ordinary character. (Do not use the fnmatch module.)"""
+        if not pattern:
+            return not name
+        c = pattern[0]
+        if c == "*":
+            return any(glob_match(pattern[1:], name[i:]) for i in range(len(name) + 1))
+        if not name:
+            return False
+        if c == "?":
+            return glob_match(pattern[1:], name[1:])
+        if c == "[":
+            close = pattern.find("]", 2)
+            if close > 0:
+                body = pattern[1:close]
+                negate = body.startswith("!")
+                if negate:
+                    body = body[1:]
+                hit, i = False, 0
+                while i < len(body):
+                    if i + 2 < len(body) and body[i + 1] == "-":
+                        hit = hit or body[i] <= name[0] <= body[i + 2]
+                        i += 3
+                    else:
+                        hit = hit or body[i] == name[0]
+                        i += 1
+                return hit != negate and glob_match(pattern[close + 1:], name[1:])
+        return c == name[0] and glob_match(pattern[1:], name[1:])
+
+
+    def which(command, path_var, programs):
+        """Find which program the shell would run for `command`. `path_var` is the PATH text: folders separated by ':'. `programs` is a dict {folder: list of program names in it}. Look at the folders from LEFT to RIGHT (skip empty entries) and return folder + '/' + command for the first folder whose list contains the command, or None if there is none. A folder that is not in `programs` simply has no programs. (A command containing '/' is never searched: return None.)"""
+        if "/" in command:
+            return None
+        for folder in path_var.split(":"):
+            if folder and command in programs.get(folder, ()):
+                return folder.rstrip("/") + "/" + command
+        return None
+
+
+    def find(fs, start, name=None, kind=None, maxdepth=None):
+        """Like the `find` command: list everything under the folder `start` (an absolute path), including `start` itself. `name` is a wildcard that must match the LAST part of the path (use glob_match); `kind` is 'f' for files only or 'd' for folders only; `maxdepth` limits how deep to look (the start has depth 0, its children depth 1, and so on). Return the full paths sorted as text. ValueError('no such directory') if start is not a folder. Remember that '/' alone has an empty last part."""
+        if start not in fs["dirs"]:
+            raise ValueError("no such directory")
+        prefix = start.rstrip("/") + "/"
+        found = []
+        candidates = [(d, "d") for d in fs["dirs"]] + [(f, "f") for f in fs["files"]]
+        for path, k in candidates:
+            if path != start and not path.startswith(prefix):
+                continue
+            depth = 0 if path == start else path[len(prefix):].count("/") + 1
+            if maxdepth is not None and depth > maxdepth:
+                continue
+            if kind is not None and k != kind:
+                continue
+            if name is not None and not glob_match(name, path.rsplit("/", 1)[-1]):
+                continue
+            found.append(path)
+        return sorted(found)
+
+    programs = {"/usr/local/bin": ["python"], "/usr/bin": ["python", "ls", "grep"], "/bin": ["sh"]}
+    PATH = "/usr/local/bin:/usr/bin:/bin"
+    for cmd in ("python", "grep", "sh", "git"):
+        print(cmd, "->", which(cmd, PATH, programs))
+    fs = demo_fs()
+    mkdir_p(fs, "/home/user/work/app/src")
+    for p in ("app/src/main.py", "app/README.md", "app/src/util.py"):
+        write_file(fs, "/home/user/work/" + p, "x\n")
+    for path in find(fs, "/home/user/work", name="*.py"):
+        print(path)
+    print(find(fs, "/home/user/work", kind="d", maxdepth=1))
+  output: |
+    python -> /usr/local/bin/python
+    grep -> /usr/bin/grep
+    sh -> /bin/sh
+    git -> None
+    /home/user/work/app/src/main.py
+    /home/user/work/app/src/util.py
+    ['/home/user/work', '/home/user/work/app']
+  lines:
+  - line: 249
+    note: The first folder in PATH that has the program wins.
+  - line: 255
+    note: Only .py files, at any depth.
+  - line: 257
+    note: Only folders, at most one level down.
+- title: Kill and cron
+  intro: Orphans after a kill, and the next runs of a schedule.
+  code: |
+    def kill_process(procs, pid, kill_children=False):
+        """Simulate `kill`. `procs` is a dict {pid: {"ppid": parent pid, "name": text}} and is NOT changed. Return (killed, new_procs): `killed` is the sorted list of pids that ended and `new_procs` the table afterwards. Killing a process removes it. With kill_children=True all its descendants (children, their children, ...) end too. Otherwise its children become ORPHANS: they stay alive and their ppid is set to 1 (the init process). ValueError('no such process') if pid is not in the table and ValueError('cannot kill init') for pid 1."""
+        if pid == 1:
+            raise ValueError("cannot kill init")
+        if pid not in procs:
+            raise ValueError("no such process")
+        killed = {pid}
+        if kill_children:
+            grew = True
+            while grew:
+                grew = False
+                for p, info in procs.items():
+                    if info["ppid"] in killed and p not in killed:
+                        killed.add(p)
+                        grew = True
+        new = {}
+        for p, info in procs.items():
+            if p in killed:
+                continue
+            new[p] = {"ppid": 1 if info["ppid"] in killed else info["ppid"], "name": info["name"]}
+        return sorted(killed), new
+
+
+    def cron_values(field, lo, hi):
+        """Read ONE field of a cron schedule and return the sorted list of the numbers it allows, between lo and hi (both included). A field is a comma-separated list of parts; a part is '*' (every value from lo to hi), '*/n' (every n-th value starting at lo), 'a' (one number), 'a-b' (a range) or 'a-b/n' (a range in steps of n). ValueError('bad field') for anything else: not a number, a value outside lo..hi, a range with a > b, or a step n that is not a positive number."""
+        values = set()
+        for part in field.split(","):
+            rng, slash, step = part.partition("/")
+            if slash:
+                if not step.isdigit() or int(step) == 0:
+                    raise ValueError("bad field")
+                n = int(step)
+            else:
+                n = 1
+            if rng == "*":
+                a, b = lo, hi
+            elif rng.isdigit():
+                a = int(rng)
+                b = hi if slash else a
+            elif rng.count("-") == 1 and all(x.isdigit() for x in rng.split("-")):
+                a, b = (int(x) for x in rng.split("-"))
+            else:
+                raise ValueError("bad field")
+            if a > b or a < lo or b > hi:
+                raise ValueError("bad field")
+            values.update(range(a, b + 1, n))
+        return sorted(values)
+
+
+    def cron_next(expr, start, count):
+        """When will a cron job run? `expr` is the five fields 'minute hour day-of-month month day-of-week' (cron_values is given: minute 0-59, hour 0-23, day 1-31, month 1-12, weekday 0-6 with 0 = Sunday). `start` is a tuple (year, month, day, hour, minute); return the next `count` run times AFTER that minute (never the minute itself) as text 'YYYY-MM-DD HH:MM', in order. A day qualifies when its month matches and: if BOTH the day-of-month and the weekday fields are restricted (not a plain '*'), the day matches when EITHER of them does; otherwise when both do (a '*' always matches). Use the datetime module. ValueError('bad schedule') unless there are exactly five fields (and ValueError('bad field') comes from cron_values). Give up after looking ahead 5 years and return what you have."""
+        import datetime
+        parts = expr.split()
+        if len(parts) != 5:
+            raise ValueError("bad schedule")
+        minutes = cron_values(parts[0], 0, 59)
+        hours = cron_values(parts[1], 0, 23)
+        doms = cron_values(parts[2], 1, 31)
+        months = cron_values(parts[3], 1, 12)
+        dows = cron_values(parts[4], 0, 6)
+        both = parts[2] != "*" and parts[4] != "*"
+        y, mo, d, h, mi = start
+        first = datetime.datetime(y, mo, d, h, mi)
+        day = first.date()
+        out = []
+        limit = day + datetime.timedelta(days=366 * 5)
+        while len(out) < count and day <= limit:
+            weekday = (day.weekday() + 1) % 7
+            dom_ok, dow_ok = day.day in doms, weekday in dows
+            if day.month in months and ((dom_ok or dow_ok) if both else (dom_ok and dow_ok)):
+                for hh in hours:
+                    for mm in minutes:
+                        when = datetime.datetime(day.year, day.month, day.day, hh, mm)
+                        if when > first and len(out) < count:
+                            out.append(when.strftime("%Y-%m-%d %H:%M"))
+            day += datetime.timedelta(days=1)
+        return out
+
+    procs = {1: {"ppid": 0, "name": "init"}, 10: {"ppid": 1, "name": "bash"}, 11: {"ppid": 10, "name": "sleep"}, 12: {"ppid": 10, "name": "editor"}}
+    print(kill_process(procs, 10)[0], {p: i["ppid"] for p, i in kill_process(procs, 10)[1].items()})
+    print(kill_process(procs, 10, kill_children=True)[0])
+    print(cron_values("*/15", 0, 59), cron_values("1-5", 0, 6))
+    for when in cron_next("30 2 * * 1-5", (2026, 11, 20, 3, 0), 3):
+        print("next run:", when)
+  output: |
+    [10] {1: 0, 11: 1, 12: 1}
+    [10, 11, 12]
+    [0, 15, 30, 45] [1, 2, 3, 4, 5]
+    next run: 2026-11-23 02:30
+    next run: 2026-11-24 02:30
+    next run: 2026-11-25 02:30
+  lines:
+  - line: 80
+    note: The orphans' parent is now 1.
+  - line: 81
+    note: Killing the children too removes the whole tree.
+  - line: 83
+    note: 'Weekdays at 02:30: the next run skips the weekend.'
+playground:
+  prompt: Look at the real process and environment from Python.
+  code: |
+    import os
+    print(os.getpid() > 0)
+    print('PATH' in os.environ or True)
+exercises:
+- id: which
+  title: Finding the program
+  difficulty: 3
+  prompt: 'When you type `python`, the shell looks through the folders in the **PATH** variable, from left to right, for a program with that name. Write `which(command, path_var, programs)`. `path_var` is the PATH text: folders separated by `":"`. `programs` is a dict `{folder: list of program names in it}`. Return `folder + "/" + command` for the first folder whose list contains the command, or `None`. Skip empty entries; a folder that is not in `programs` simply has no programs; a command containing `"/"` is never searched (return `None`).'
+  starter: |-
+    def which(command, path_var, programs):
+        """Find which program the shell would run for `command`. `path_var` is the PATH text: folders separated by ':'. `programs` is a dict {folder: list of program names in it}. Look at the folders from LEFT to RIGHT (skip empty entries) and return folder + '/' + command for the first folder whose list contains the command, or None if there is none. A folder that is not in `programs` simply has no programs. (A command containing '/' is never searched: return None.)"""
+        pass
+  tests:
+  - name: search order
+    code: |
+      programs = {"/usr/local/bin": ["python", "node"], "/usr/bin": ["python", "ls", "grep"], "/bin": ["sh", "ls"]}
+      assert which("python", "/usr/local/bin:/usr/bin:/bin", programs) == "/usr/local/bin/python" and which("python", "/usr/bin:/usr/local/bin", programs) == "/usr/bin/python" and which("sh", "/usr/local/bin:/usr/bin:/bin", programs) == "/bin/sh" and which("ls", "/bin:/usr/bin", programs) == "/bin/ls"
+      assert which("git", "/usr/local/bin:/usr/bin:/bin", programs) is None and which("ls", "", programs) is None and which("ls", ":/usr/bin::", programs) == "/usr/bin/ls" and which("ls", "/nowhere:/bin", programs) == "/bin/ls"
+  - name: slashes
+    code: |
+      programs = {"/bin": ["ls"], "/": ["tool"]}
+      assert which("./ls", "/bin", programs) is None and which("/bin/ls", "/bin", programs) is None and which("tool", "/", programs) == "/tool"
+  hints:
+  - Split the PATH at ':' and try each folder in order.
+  - programs.get(folder, ()) avoids an error for a folder with no entry.
+  solution: |
+    def which(command, path_var, programs):
+        """Find which program the shell would run for `command`. `path_var` is the PATH text: folders separated by ':'. `programs` is a dict {folder: list of program names in it}. Look at the folders from LEFT to RIGHT (skip empty entries) and return folder + '/' + command for the first folder whose list contains the command, or None if there is none. A folder that is not in `programs` simply has no programs. (A command containing '/' is never searched: return None.)"""
+        if "/" in command:
+            return None
+        for folder in path_var.split(":"):
+            if folder and command in programs.get(folder, ()):
+                return folder.rstrip("/") + "/" + command
+        return None
+  explanation: If two programs share a name, the folder listed first in PATH wins. That is why putting your own folder at the front of PATH lets you override a system tool.
+- id: find
+  title: Searching the tree
+  difficulty: 5
+  prompt: Write `find(fs, start, name=None, kind=None, maxdepth=None)`, like the real **find** command. List everything under the folder `start` (an absolute path), **including `start` itself**. `name` is a wildcard that must match the **last part** of the path (`glob_match` is given); `kind` is `"f"` for files only or `"d"` for folders only; `maxdepth` limits how deep to look (the start has depth 0, its children depth 1, and so on). Return the full paths **sorted as text**. `ValueError("no such directory")` if `start` is not a folder.
+  starter: |-
+    HOME = "/home/user"
+
+
+    def normalize(path):
+        """Clean an ABSOLUTE path (one that starts with '/'). Split it at '/', ignore empty parts and '.' parts (the current folder), and let '..' remove the previous part (at the top, '..' stays at the top: '/..' is '/'). Return '/' plus the remaining parts joined with '/'; the result for no parts is '/'."""
+        parts = []
+        for p in path.split("/"):
+            if p in ("", "."):
+                continue
+            if p == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(p)
+        return "/" + "/".join(parts)
+
+
+    def resolve(cwd, path):
+        """Turn what the user typed into an absolute, clean path. `cwd` is the current working directory. A path starting with '~' (just '~' or '~/...') starts at HOME instead. A path that does not start with '/' is relative to cwd. Return the normalized absolute path."""
+        if path == "~" or path.startswith("~/"):
+            path = HOME + path[1:]
+        if not path.startswith("/"):
+            path = cwd + "/" + path
+        return normalize(path)
+
+
+    def split_path(path):
+        """Split a path into (folder, name): normalize it first; the folder of '/a/b/c.txt' is '/a/b' and its name is 'c.txt'; for '/c.txt' the folder is '/'; for '/' itself return ('/', '')."""
+        path = normalize(path)
+        if path == "/":
+            return ("/", "")
+        i = path.rindex("/")
+        return (path[:i] or "/", path[i + 1:])
+
+
+    def extension(name):
+        """The file extension of a name: the text after the LAST dot, without the dot, or '' if there is none. A leading dot does not count ('.bashrc' has no extension) and a name ending in a dot has none."""
+        stem = name.lstrip(".")
+        if "." not in stem:
+            return ""
+        return stem.rsplit(".", 1)[1]
+
+
+    def join_path(*parts):
+        """Join path parts with '/' like os.path.join, then normalize: a part that starts with '/' starts again from there (everything before it is dropped). The result is always absolute (a first part without '/' is taken from the root)."""
+        result = ""
+        for p in parts:
+            if p.startswith("/"):
+                result = p
+            else:
+                result += "/" + p
+        return normalize(result)
+
+
+    def new_fs():
+        """A tiny file system: {"dirs": a set holding just '/', "files": an empty dict mapping absolute path -> text}."""
+        return {"dirs": {"/"}, "files": {}}
+
+
+    def is_dir(fs, path):
+        """True if the (normalized) path is a directory."""
+        return normalize(path) in fs["dirs"]
+
+
+    def is_file(fs, path):
+        """True if the (normalized) path is a file."""
+        return normalize(path) in fs["files"]
+
+
+    def mkdir_p(fs, path):
+        """Like `mkdir -p`: create the directory and all missing parents (already existing ones are fine). ValueError('not a directory') if some part of the path is a FILE."""
+        cur = ""
+        for part in [p for p in normalize(path).split("/") if p]:
+            cur += "/" + part
+            if cur in fs["files"]:
+                raise ValueError("not a directory")
+            fs["dirs"].add(cur)
+
+
+    def write_file(fs, path, text):
+        """Create or overwrite a file. ValueError('is a directory') if the path is a directory or the root; ValueError('no such directory') if its folder does not exist."""
+        path = normalize(path)
+        folder, name = split_path(path)
+        if not name or path in fs["dirs"]:
+            raise ValueError("is a directory")
+        if folder not in fs["dirs"]:
+            raise ValueError("no such directory")
+        fs["files"][path] = text
+
+
+    def ls(fs, path, all=False):
+        """List a directory like `ls`: the sorted names of the things directly inside it, with '/' added after directory names. Names that start with '.' are hidden unless all=True. For a FILE return just [its name]. ValueError('no such file or directory') if the path does not exist."""
+        path = normalize(path)
+        if path in fs["files"]:
+            return [split_path(path)[1]]
+        if path not in fs["dirs"]:
+            raise ValueError("no such file or directory")
+        names = set()
+        for d in fs["dirs"]:
+            if d != path and split_path(d)[0] == path:
+                names.add(split_path(d)[1] + "/")
+        for f in fs["files"]:
+            if split_path(f)[0] == path:
+                names.add(split_path(f)[1])
+        return sorted(n for n in names if all or not n.startswith("."))
+
+
+    def tree_lines(fs, path):
+        """Draw a directory as an outline: the first line is the directory's own name ('/' for the root) followed by '/' unless it is the root; below it every entry of ls(fs, path, all=True) on its own line, indented by 2 spaces per level, directories followed by '/' and listed with their contents right below them (depth first). ValueError('not a directory') if the path is not a directory."""
+        path = normalize(path)
+        if path not in fs["dirs"]:
+            raise ValueError("not a directory")
+        lines = ["/" if path == "/" else split_path(path)[1] + "/"]
+
+        def walk(folder, depth):
+            for name in ls(fs, folder, all=True):
+                lines.append("  " * depth + name)
+                if name.endswith("/"):
+                    walk(join_path(folder, name[:-1]), depth + 1)
+
+        walk(path, 1)
+        return lines
+
+
+    def cd(fs, cwd, path):
+        """Like `cd`: return the new working directory resolve(cwd, path). ValueError('not a directory') if it is a file, ValueError('no such directory') if it does not exist."""
+        target = resolve(cwd, path)
+        if target in fs["files"]:
+            raise ValueError("not a directory")
+        if target not in fs["dirs"]:
+            raise ValueError("no such directory")
+        return target
+
+
+    def under(fs, path):
+        """Everything at or below a path: return (dirs, files): the sorted list of directories whose path is `path` or starts with `path + '/'`, and the same for files (a file path equal to `path` counts). The path is normalized first."""
+        path = normalize(path)
+        prefix = "/" if path == "/" else path + "/"
+        dirs = sorted(d for d in fs["dirs"] if d == path or d.startswith(prefix))
+        files = sorted(f for f in fs["files"] if f == path or f.startswith(prefix))
+        return dirs, files
+
+
+    def cat(fs, *paths):
+        """Return the text of the files one after the other. ValueError('no such file: PATH') for a missing path and ValueError('is a directory: PATH') for a directory (using the path as given). Check each path in order."""
+        out = ""
+        for p in paths:
+            if is_dir(fs, p):
+                raise ValueError("is a directory: " + p)
+            if not is_file(fs, p):
+                raise ValueError("no such file: " + p)
+            out += fs["files"][normalize(p)]
+        return out
+
+
+    def touch(fs, path):
+        """Create an EMPTY file if the path does not exist yet; an existing file is left unchanged. ValueError('is a directory') for a directory; ValueError('no such directory') if the folder does not exist."""
+        path = normalize(path)
+        if path in fs["files"]:
+            return
+        write_file(fs, path, "")
+
+
+    def mkdir(fs, path):
+        """Like `mkdir` without -p: create ONE directory. ValueError('file exists') if the path already exists (as a file or directory); ValueError('no such directory') if its folder does not exist."""
+        path = normalize(path)
+        if path in fs["files"] or path in fs["dirs"]:
+            raise ValueError("file exists")
+        if split_path(path)[0] not in fs["dirs"]:
+            raise ValueError("no such directory")
+        fs["dirs"].add(path)
+
+
+    def demo_fs():
+        fs = new_fs()
+        mkdir_p(fs, "/home/user/docs")
+        mkdir_p(fs, "/home/user/.config")
+        mkdir_p(fs, "/home/user/projects/app")
+        write_file(fs, "/home/user/notes.txt", "buy milk\n")
+        write_file(fs, "/home/user/docs/report.md", "# Report\n")
+        write_file(fs, "/home/user/docs/readme.md", "# Read me\n")
+        write_file(fs, "/home/user/projects/app/main.py", "print('hi')\n")
+        write_file(fs, "/home/user/.bashrc", "export A=1\n")
+        return fs
+
+
+    def glob_match(pattern, name):
+        """Does `name` match the wildcard `pattern`? '*' matches any number of characters (also none), '?' exactly one character, and '[abc]' one character from the set; ranges like '[a-f]' work, and '[!abc]' means any character NOT in the set. Every other character must match itself. A '[' with no closing ']' is an ordinary character. (Do not use the fnmatch module.)"""
+        if not pattern:
+            return not name
+        c = pattern[0]
+        if c == "*":
+            return any(glob_match(pattern[1:], name[i:]) for i in range(len(name) + 1))
+        if not name:
+            return False
+        if c == "?":
+            return glob_match(pattern[1:], name[1:])
+        if c == "[":
+            close = pattern.find("]", 2)
+            if close > 0:
+                body = pattern[1:close]
+                negate = body.startswith("!")
+                if negate:
+                    body = body[1:]
+                hit, i = False, 0
+                while i < len(body):
+                    if i + 2 < len(body) and body[i + 1] == "-":
+                        hit = hit or body[i] <= name[0] <= body[i + 2]
+                        i += 3
+                    else:
+                        hit = hit or body[i] == name[0]
+                        i += 1
+                return hit != negate and glob_match(pattern[close + 1:], name[1:])
+        return c == name[0] and glob_match(pattern[1:], name[1:])
+
+
+
+
+    def find(fs, start, name=None, kind=None, maxdepth=None):
+        """Like the `find` command: list everything under the folder `start` (an absolute path), including `start` itself. `name` is a wildcard that must match the LAST part of the path (use glob_match); `kind` is 'f' for files only or 'd' for folders only; `maxdepth` limits how deep to look (the start has depth 0, its children depth 1, and so on). Return the full paths sorted as text. ValueError('no such directory') if start is not a folder. Remember that '/' alone has an empty last part."""
+        pass
+  tests:
+  - name: everything
+    code: |
+      def demo_fs():
+          fs = new_fs()
+          mkdir_p(fs, "/home/user/docs")
+          mkdir_p(fs, "/home/user/.config")
+          mkdir_p(fs, "/home/user/projects/app")
+          write_file(fs, "/home/user/notes.txt", "buy milk\n")
+          write_file(fs, "/home/user/docs/report.md", "# Report\n")
+          write_file(fs, "/home/user/docs/readme.md", "# Read me\n")
+          write_file(fs, "/home/user/projects/app/main.py", "print('hi')\n")
+          write_file(fs, "/home/user/.bashrc", "export A=1\n")
+          return fs
+
+      fs = demo_fs()
+      mkdir_p(fs, "/home/user/work/app/src")
+      write_file(fs, "/home/user/work/app/src/main.py", "x\n")
+      write_file(fs, "/home/user/work/app/README.md", "x\n")
+      write_file(fs, "/home/user/work/app/src/util.py", "x\n")
+      got = find(fs, "/home/user/work")
+      assert got == ["/home/user/work", "/home/user/work/app", "/home/user/work/app/README.md", "/home/user/work/app/src", "/home/user/work/app/src/main.py", "/home/user/work/app/src/util.py"]
+      assert find(fs, "/home/user/work/app/src", kind="f") == ["/home/user/work/app/src/main.py", "/home/user/work/app/src/util.py"] and find(fs, "/home/user/work", kind="d") == ["/home/user/work", "/home/user/work/app", "/home/user/work/app/src"]
+  - name: filters
+    code: |
+      def demo_fs():
+          fs = new_fs()
+          mkdir_p(fs, "/home/user/docs")
+          mkdir_p(fs, "/home/user/.config")
+          mkdir_p(fs, "/home/user/projects/app")
+          write_file(fs, "/home/user/notes.txt", "buy milk\n")
+          write_file(fs, "/home/user/docs/report.md", "# Report\n")
+          write_file(fs, "/home/user/docs/readme.md", "# Read me\n")
+          write_file(fs, "/home/user/projects/app/main.py", "print('hi')\n")
+          write_file(fs, "/home/user/.bashrc", "export A=1\n")
+          return fs
+
+      fs = demo_fs()
+      mkdir_p(fs, "/home/user/work/app/src")
+      for p in ("app/src/main.py", "app/README.md", "app/src/util.py", "app/setup.py"):
+          write_file(fs, "/home/user/work/" + p, "x\n")
+      assert find(fs, "/home/user/work", name="*.py") == ["/home/user/work/app/setup.py", "/home/user/work/app/src/main.py", "/home/user/work/app/src/util.py"]
+      assert find(fs, "/home/user/work", name="src") == ["/home/user/work/app/src"] and find(fs, "/home/user/work", name="*.py", kind="d") == [] and find(fs, "/home/user/work", name="?pp") == ["/home/user/work/app"]
+      assert find(fs, "/home/user/work", maxdepth=0) == ["/home/user/work"] and find(fs, "/home/user/work", maxdepth=1) == ["/home/user/work", "/home/user/work/app"] and find(fs, "/home/user/work", maxdepth=2, kind="f") == ["/home/user/work/app/README.md", "/home/user/work/app/setup.py"]
+  - name: edges
+    code: |
+      def demo_fs():
+          fs = new_fs()
+          mkdir_p(fs, "/home/user/docs")
+          mkdir_p(fs, "/home/user/.config")
+          mkdir_p(fs, "/home/user/projects/app")
+          write_file(fs, "/home/user/notes.txt", "buy milk\n")
+          write_file(fs, "/home/user/docs/report.md", "# Report\n")
+          write_file(fs, "/home/user/docs/readme.md", "# Read me\n")
+          write_file(fs, "/home/user/projects/app/main.py", "print('hi')\n")
+          write_file(fs, "/home/user/.bashrc", "export A=1\n")
+          return fs
+
+      fs = demo_fs()
+      assert "/home/user/notes.txt" in find(fs, "/") and find(fs, "/")[0] == "/" and find(fs, "/", name="notes.txt") == ["/home/user/notes.txt"]
+      for bad in ("/nope", "/home/user/notes.txt"):
+          try:
+              find(fs, bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "no such directory" in str(e)
+      fs2 = new_fs()
+      mkdir_p(fs2, "/a")
+      mkdir_p(fs2, "/ab")
+      write_file(fs2, "/ab/x", "1\n")
+      assert find(fs2, "/a") == ["/a"] and find(fs2, "/ab") == ["/ab", "/ab/x"]
+  hints:
+  - Build the list of every folder and file, keep those under start, and compute each path's depth from the number of slashes after the start.
+  - Check that you match the folder prefix with a trailing slash, so /a does not include /ab.
+  solution: |
+    HOME = "/home/user"
+
+
+    def normalize(path):
+        """Clean an ABSOLUTE path (one that starts with '/'). Split it at '/', ignore empty parts and '.' parts (the current folder), and let '..' remove the previous part (at the top, '..' stays at the top: '/..' is '/'). Return '/' plus the remaining parts joined with '/'; the result for no parts is '/'."""
+        parts = []
+        for p in path.split("/"):
+            if p in ("", "."):
+                continue
+            if p == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(p)
+        return "/" + "/".join(parts)
+
+
+    def resolve(cwd, path):
+        """Turn what the user typed into an absolute, clean path. `cwd` is the current working directory. A path starting with '~' (just '~' or '~/...') starts at HOME instead. A path that does not start with '/' is relative to cwd. Return the normalized absolute path."""
+        if path == "~" or path.startswith("~/"):
+            path = HOME + path[1:]
+        if not path.startswith("/"):
+            path = cwd + "/" + path
+        return normalize(path)
+
+
+    def split_path(path):
+        """Split a path into (folder, name): normalize it first; the folder of '/a/b/c.txt' is '/a/b' and its name is 'c.txt'; for '/c.txt' the folder is '/'; for '/' itself return ('/', '')."""
+        path = normalize(path)
+        if path == "/":
+            return ("/", "")
+        i = path.rindex("/")
+        return (path[:i] or "/", path[i + 1:])
+
+
+    def extension(name):
+        """The file extension of a name: the text after the LAST dot, without the dot, or '' if there is none. A leading dot does not count ('.bashrc' has no extension) and a name ending in a dot has none."""
+        stem = name.lstrip(".")
+        if "." not in stem:
+            return ""
+        return stem.rsplit(".", 1)[1]
+
+
+    def join_path(*parts):
+        """Join path parts with '/' like os.path.join, then normalize: a part that starts with '/' starts again from there (everything before it is dropped). The result is always absolute (a first part without '/' is taken from the root)."""
+        result = ""
+        for p in parts:
+            if p.startswith("/"):
+                result = p
+            else:
+                result += "/" + p
+        return normalize(result)
+
+
+    def new_fs():
+        """A tiny file system: {"dirs": a set holding just '/', "files": an empty dict mapping absolute path -> text}."""
+        return {"dirs": {"/"}, "files": {}}
+
+
+    def is_dir(fs, path):
+        """True if the (normalized) path is a directory."""
+        return normalize(path) in fs["dirs"]
+
+
+    def is_file(fs, path):
+        """True if the (normalized) path is a file."""
+        return normalize(path) in fs["files"]
+
+
+    def mkdir_p(fs, path):
+        """Like `mkdir -p`: create the directory and all missing parents (already existing ones are fine). ValueError('not a directory') if some part of the path is a FILE."""
+        cur = ""
+        for part in [p for p in normalize(path).split("/") if p]:
+            cur += "/" + part
+            if cur in fs["files"]:
+                raise ValueError("not a directory")
+            fs["dirs"].add(cur)
+
+
+    def write_file(fs, path, text):
+        """Create or overwrite a file. ValueError('is a directory') if the path is a directory or the root; ValueError('no such directory') if its folder does not exist."""
+        path = normalize(path)
+        folder, name = split_path(path)
+        if not name or path in fs["dirs"]:
+            raise ValueError("is a directory")
+        if folder not in fs["dirs"]:
+            raise ValueError("no such directory")
+        fs["files"][path] = text
+
+
+    def ls(fs, path, all=False):
+        """List a directory like `ls`: the sorted names of the things directly inside it, with '/' added after directory names. Names that start with '.' are hidden unless all=True. For a FILE return just [its name]. ValueError('no such file or directory') if the path does not exist."""
+        path = normalize(path)
+        if path in fs["files"]:
+            return [split_path(path)[1]]
+        if path not in fs["dirs"]:
+            raise ValueError("no such file or directory")
+        names = set()
+        for d in fs["dirs"]:
+            if d != path and split_path(d)[0] == path:
+                names.add(split_path(d)[1] + "/")
+        for f in fs["files"]:
+            if split_path(f)[0] == path:
+                names.add(split_path(f)[1])
+        return sorted(n for n in names if all or not n.startswith("."))
+
+
+    def tree_lines(fs, path):
+        """Draw a directory as an outline: the first line is the directory's own name ('/' for the root) followed by '/' unless it is the root; below it every entry of ls(fs, path, all=True) on its own line, indented by 2 spaces per level, directories followed by '/' and listed with their contents right below them (depth first). ValueError('not a directory') if the path is not a directory."""
+        path = normalize(path)
+        if path not in fs["dirs"]:
+            raise ValueError("not a directory")
+        lines = ["/" if path == "/" else split_path(path)[1] + "/"]
+
+        def walk(folder, depth):
+            for name in ls(fs, folder, all=True):
+                lines.append("  " * depth + name)
+                if name.endswith("/"):
+                    walk(join_path(folder, name[:-1]), depth + 1)
+
+        walk(path, 1)
+        return lines
+
+
+    def cd(fs, cwd, path):
+        """Like `cd`: return the new working directory resolve(cwd, path). ValueError('not a directory') if it is a file, ValueError('no such directory') if it does not exist."""
+        target = resolve(cwd, path)
+        if target in fs["files"]:
+            raise ValueError("not a directory")
+        if target not in fs["dirs"]:
+            raise ValueError("no such directory")
+        return target
+
+
+    def under(fs, path):
+        """Everything at or below a path: return (dirs, files): the sorted list of directories whose path is `path` or starts with `path + '/'`, and the same for files (a file path equal to `path` counts). The path is normalized first."""
+        path = normalize(path)
+        prefix = "/" if path == "/" else path + "/"
+        dirs = sorted(d for d in fs["dirs"] if d == path or d.startswith(prefix))
+        files = sorted(f for f in fs["files"] if f == path or f.startswith(prefix))
+        return dirs, files
+
+
+    def cat(fs, *paths):
+        """Return the text of the files one after the other. ValueError('no such file: PATH') for a missing path and ValueError('is a directory: PATH') for a directory (using the path as given). Check each path in order."""
+        out = ""
+        for p in paths:
+            if is_dir(fs, p):
+                raise ValueError("is a directory: " + p)
+            if not is_file(fs, p):
+                raise ValueError("no such file: " + p)
+            out += fs["files"][normalize(p)]
+        return out
+
+
+    def touch(fs, path):
+        """Create an EMPTY file if the path does not exist yet; an existing file is left unchanged. ValueError('is a directory') for a directory; ValueError('no such directory') if the folder does not exist."""
+        path = normalize(path)
+        if path in fs["files"]:
+            return
+        write_file(fs, path, "")
+
+
+    def mkdir(fs, path):
+        """Like `mkdir` without -p: create ONE directory. ValueError('file exists') if the path already exists (as a file or directory); ValueError('no such directory') if its folder does not exist."""
+        path = normalize(path)
+        if path in fs["files"] or path in fs["dirs"]:
+            raise ValueError("file exists")
+        if split_path(path)[0] not in fs["dirs"]:
+            raise ValueError("no such directory")
+        fs["dirs"].add(path)
+
+
+    def demo_fs():
+        fs = new_fs()
+        mkdir_p(fs, "/home/user/docs")
+        mkdir_p(fs, "/home/user/.config")
+        mkdir_p(fs, "/home/user/projects/app")
+        write_file(fs, "/home/user/notes.txt", "buy milk\n")
+        write_file(fs, "/home/user/docs/report.md", "# Report\n")
+        write_file(fs, "/home/user/docs/readme.md", "# Read me\n")
+        write_file(fs, "/home/user/projects/app/main.py", "print('hi')\n")
+        write_file(fs, "/home/user/.bashrc", "export A=1\n")
+        return fs
+
+
+    def glob_match(pattern, name):
+        """Does `name` match the wildcard `pattern`? '*' matches any number of characters (also none), '?' exactly one character, and '[abc]' one character from the set; ranges like '[a-f]' work, and '[!abc]' means any character NOT in the set. Every other character must match itself. A '[' with no closing ']' is an ordinary character. (Do not use the fnmatch module.)"""
+        if not pattern:
+            return not name
+        c = pattern[0]
+        if c == "*":
+            return any(glob_match(pattern[1:], name[i:]) for i in range(len(name) + 1))
+        if not name:
+            return False
+        if c == "?":
+            return glob_match(pattern[1:], name[1:])
+        if c == "[":
+            close = pattern.find("]", 2)
+            if close > 0:
+                body = pattern[1:close]
+                negate = body.startswith("!")
+                if negate:
+                    body = body[1:]
+                hit, i = False, 0
+                while i < len(body):
+                    if i + 2 < len(body) and body[i + 1] == "-":
+                        hit = hit or body[i] <= name[0] <= body[i + 2]
+                        i += 3
+                    else:
+                        hit = hit or body[i] == name[0]
+                        i += 1
+                return hit != negate and glob_match(pattern[close + 1:], name[1:])
+        return c == name[0] and glob_match(pattern[1:], name[1:])
+
+
+
+
+    def find(fs, start, name=None, kind=None, maxdepth=None):
+        """Like the `find` command: list everything under the folder `start` (an absolute path), including `start` itself. `name` is a wildcard that must match the LAST part of the path (use glob_match); `kind` is 'f' for files only or 'd' for folders only; `maxdepth` limits how deep to look (the start has depth 0, its children depth 1, and so on). Return the full paths sorted as text. ValueError('no such directory') if start is not a folder. Remember that '/' alone has an empty last part."""
+        if start not in fs["dirs"]:
+            raise ValueError("no such directory")
+        prefix = start.rstrip("/") + "/"
+        found = []
+        candidates = [(d, "d") for d in fs["dirs"]] + [(f, "f") for f in fs["files"]]
+        for path, k in candidates:
+            if path != start and not path.startswith(prefix):
+                continue
+            depth = 0 if path == start else path[len(prefix):].count("/") + 1
+            if maxdepth is not None and depth > maxdepth:
+                continue
+            if kind is not None and k != kind:
+                continue
+            if name is not None and not glob_match(name, path.rsplit("/", 1)[-1]):
+                continue
+            found.append(path)
+        return sorted(found)
+  explanation: Real find can also test sizes, dates and owners, and run a command on each result with -exec.
+- id: kill
+  title: Processes and signals
+  difficulty: 4
+  prompt: 'A **process** is a running program with a number (**pid**) and a **parent** (**ppid**). Write `kill_process(procs, pid, kill_children=False)`. `procs` is a dict `{pid: {"ppid": parent pid, "name": text}}` and must **not** be changed. Return `(killed, new_procs)`: `killed` is the sorted list of pids that ended and `new_procs` the table afterwards. Killing a process removes it. With `kill_children=True` all its descendants (children, their children, ...) end too. Otherwise its children become **orphans**: they stay alive and their `ppid` is set to `1` (the **init** process). `ValueError("no such process")` if `pid` is not in the table and `ValueError("cannot kill init")` for pid 1.'
+  starter: |-
+    def kill_process(procs, pid, kill_children=False):
+        """Simulate `kill`. `procs` is a dict {pid: {"ppid": parent pid, "name": text}} and is NOT changed. Return (killed, new_procs): `killed` is the sorted list of pids that ended and `new_procs` the table afterwards. Killing a process removes it. With kill_children=True all its descendants (children, their children, ...) end too. Otherwise its children become ORPHANS: they stay alive and their ppid is set to 1 (the init process). ValueError('no such process') if pid is not in the table and ValueError('cannot kill init') for pid 1."""
+        pass
+  tests:
+  - name: single process
+    code: |
+      procs = {1: {"ppid": 0, "name": "init"}, 10: {"ppid": 1, "name": "bash"}, 11: {"ppid": 10, "name": "sleep"}, 12: {"ppid": 10, "name": "editor"}, 20: {"ppid": 1, "name": "cron"}}
+      before = {p: dict(i) for p, i in procs.items()}
+      killed, new = kill_process(procs, 20)
+      assert killed == [20] and sorted(new) == [1, 10, 11, 12] and new[11]["ppid"] == 10 and procs == before
+      killed, new = kill_process(procs, 11)
+      assert killed == [11] and sorted(new) == [1, 10, 12, 20] and new[12] == {"ppid": 10, "name": "editor"} and procs == before
+  - name: orphans and trees
+    code: |
+      procs = {1: {"ppid": 0, "name": "init"}, 10: {"ppid": 1, "name": "bash"}, 11: {"ppid": 10, "name": "sleep"}, 12: {"ppid": 10, "name": "editor"}, 13: {"ppid": 12, "name": "linter"}}
+      killed, new = kill_process(procs, 10)
+      assert killed == [10] and sorted(new) == [1, 11, 12, 13] and new[11]["ppid"] == 1 and new[12]["ppid"] == 1 and new[13]["ppid"] == 12
+      killed, new = kill_process(procs, 10, kill_children=True)
+      assert killed == [10, 11, 12, 13] and sorted(new) == [1] and killed == sorted(killed)
+      killed, new = kill_process(procs, 12, True)
+      assert killed == [12, 13] and sorted(new) == [1, 10, 11]
+  - name: errors
+    code: |
+      procs = {1: {"ppid": 0, "name": "init"}, 5: {"ppid": 1, "name": "x"}}
+      for pid, msg in ((1, "cannot kill init"), (99, "no such process")):
+          try:
+              kill_process(procs, pid)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+          try:
+              kill_process(procs, pid, True)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert msg in str(e)
+  hints:
+  - Collect the pids to remove first, then build the new table without changing the old one.
+  - For descendants keep adding any process whose parent is already in the set until nothing new appears.
+  solution: |
+    def kill_process(procs, pid, kill_children=False):
+        """Simulate `kill`. `procs` is a dict {pid: {"ppid": parent pid, "name": text}} and is NOT changed. Return (killed, new_procs): `killed` is the sorted list of pids that ended and `new_procs` the table afterwards. Killing a process removes it. With kill_children=True all its descendants (children, their children, ...) end too. Otherwise its children become ORPHANS: they stay alive and their ppid is set to 1 (the init process). ValueError('no such process') if pid is not in the table and ValueError('cannot kill init') for pid 1."""
+        if pid == 1:
+            raise ValueError("cannot kill init")
+        if pid not in procs:
+            raise ValueError("no such process")
+        killed = {pid}
+        if kill_children:
+            grew = True
+            while grew:
+                grew = False
+                for p, info in procs.items():
+                    if info["ppid"] in killed and p not in killed:
+                        killed.add(p)
+                        grew = True
+        new = {}
+        for p, info in procs.items():
+            if p in killed:
+                continue
+            new[p] = {"ppid": 1 if info["ppid"] in killed else info["ppid"], "name": info["name"]}
+        return sorted(killed), new
+  explanation: Most programs reacting to the default kill (SIGTERM) clean up and exit; kill -9 (SIGKILL) cannot be ignored, which is why it is the last resort.
+- id: cronfield
+  title: Reading a schedule field
+  difficulty: 5
+  prompt: '**Cron** runs commands on a schedule, written as five fields: `minute hour day-of-month month day-of-week`. Write `cron_values(field, lo, hi)`: read **one** field and return the sorted list of the numbers it allows, between `lo` and `hi` (both included). A field is a comma-separated list of parts; a part is `*` (every value from `lo` to `hi`), `*/n` (every n-th value starting at `lo`), `a` (one number), `a-b` (a range) or `a-b/n` (a range in steps of `n`; a plain `a/n` counts from `a` up to `hi`). `ValueError("bad field")` for anything else: not a number, a value outside `lo..hi`, a range with `a > b`, or a step that is not a positive number.'
+  starter: |-
+    def cron_values(field, lo, hi):
+        """Read ONE field of a cron schedule and return the sorted list of the numbers it allows, between lo and hi (both included). A field is a comma-separated list of parts; a part is '*' (every value from lo to hi), '*/n' (every n-th value starting at lo), 'a' (one number), 'a-b' (a range) or 'a-b/n' (a range in steps of n). ValueError('bad field') for anything else: not a number, a value outside lo..hi, a range with a > b, or a step n that is not a positive number."""
+        pass
+  tests:
+  - name: parts
+    code: |
+      assert cron_values("*", 0, 5) == [0, 1, 2, 3, 4, 5] and cron_values("5", 0, 59) == [5] and cron_values("1,3,5", 0, 59) == [1, 3, 5] and cron_values("2-4", 0, 59) == [2, 3, 4] and cron_values("3,1,3", 0, 9) == [1, 3]
+      assert cron_values("*/15", 0, 59) == [0, 15, 30, 45] and cron_values("*/5", 1, 12) == [1, 6, 11] and cron_values("1-10/3", 0, 59) == [1, 4, 7, 10] and cron_values("0-23/6", 0, 23) == [0, 6, 12, 18] and cron_values("10/20", 0, 59) == [10, 30, 50] and cron_values("9-17,22", 0, 23) == [9, 10, 11, 12, 13, 14, 15, 16, 17, 22]
+  - name: errors
+    code: |
+      for bad in ("", "x", "1-", "-3", "60", "5-3", "*/0", "*/x", "1,,2", "1-2-3", "0", "1.5", "*/", "1/0"):
+          try:
+              cron_values(bad, 1 if bad == "0" else 0, 59)
+              raise AssertionError("accepted " + repr(bad))
+          except ValueError as e:
+              assert "bad field" in str(e)
+      assert cron_values("0", 0, 0) == [0]
+  hints:
+  - Split at commas, then split each part at '/' and then handle *, a number or a range.
+  - Check the limits after you know a and b.
+  solution: |
+    def cron_values(field, lo, hi):
+        """Read ONE field of a cron schedule and return the sorted list of the numbers it allows, between lo and hi (both included). A field is a comma-separated list of parts; a part is '*' (every value from lo to hi), '*/n' (every n-th value starting at lo), 'a' (one number), 'a-b' (a range) or 'a-b/n' (a range in steps of n). ValueError('bad field') for anything else: not a number, a value outside lo..hi, a range with a > b, or a step n that is not a positive number."""
+        values = set()
+        for part in field.split(","):
+            rng, slash, step = part.partition("/")
+            if slash:
+                if not step.isdigit() or int(step) == 0:
+                    raise ValueError("bad field")
+                n = int(step)
+            else:
+                n = 1
+            if rng == "*":
+                a, b = lo, hi
+            elif rng.isdigit():
+                a = int(rng)
+                b = hi if slash else a
+            elif rng.count("-") == 1 and all(x.isdigit() for x in rng.split("-")):
+                a, b = (int(x) for x in rng.split("-"))
+            else:
+                raise ValueError("bad field")
+            if a > b or a < lo or b > hi:
+                raise ValueError("bad field")
+            values.update(range(a, b + 1, n))
+        return sorted(values)
+  explanation: The five-field format is from the 1970s and is still how most servers schedule backups, reports and clean-up jobs.
+- id: cronnext
+  title: 'Capstone: when does it run?'
+  difficulty: 5
+  prompt: 'Write `cron_next(expr, start, count)`. `expr` is the five fields `minute hour day-of-month month day-of-week` (`cron_values` is given: minutes 0-59, hours 0-23, days 1-31, months 1-12, weekday 0-6 with 0 = **Sunday**). `start` is a tuple `(year, month, day, hour, minute)`; return the next `count` run times **after** that minute (never the minute itself) as text `"YYYY-MM-DD HH:MM"`, in order. A day qualifies when its month matches and: if **both** the day-of-month and the weekday fields are restricted (not a plain `*`), the day matches when **either** of them does; otherwise when both do (a `*` always matches). Use the `datetime` module (`date.weekday()` is 0 for Monday). `ValueError("bad schedule")` unless there are exactly five fields (`cron_values` raises `"bad field"`). Give up after looking ahead five years and return what you have.'
+  starter: |-
+    def cron_values(field, lo, hi):
+        """Read ONE field of a cron schedule and return the sorted list of the numbers it allows, between lo and hi (both included). A field is a comma-separated list of parts; a part is '*' (every value from lo to hi), '*/n' (every n-th value starting at lo), 'a' (one number), 'a-b' (a range) or 'a-b/n' (a range in steps of n). ValueError('bad field') for anything else: not a number, a value outside lo..hi, a range with a > b, or a step n that is not a positive number."""
+        values = set()
+        for part in field.split(","):
+            rng, slash, step = part.partition("/")
+            if slash:
+                if not step.isdigit() or int(step) == 0:
+                    raise ValueError("bad field")
+                n = int(step)
+            else:
+                n = 1
+            if rng == "*":
+                a, b = lo, hi
+            elif rng.isdigit():
+                a = int(rng)
+                b = hi if slash else a
+            elif rng.count("-") == 1 and all(x.isdigit() for x in rng.split("-")):
+                a, b = (int(x) for x in rng.split("-"))
+            else:
+                raise ValueError("bad field")
+            if a > b or a < lo or b > hi:
+                raise ValueError("bad field")
+            values.update(range(a, b + 1, n))
+        return sorted(values)
+
+
+
+
+    def cron_next(expr, start, count):
+        """When will a cron job run? `expr` is the five fields 'minute hour day-of-month month day-of-week' (cron_values is given: minute 0-59, hour 0-23, day 1-31, month 1-12, weekday 0-6 with 0 = Sunday). `start` is a tuple (year, month, day, hour, minute); return the next `count` run times AFTER that minute (never the minute itself) as text 'YYYY-MM-DD HH:MM', in order. A day qualifies when its month matches and: if BOTH the day-of-month and the weekday fields are restricted (not a plain '*'), the day matches when EITHER of them does; otherwise when both do (a '*' always matches). Use the datetime module. ValueError('bad schedule') unless there are exactly five fields (and ValueError('bad field') comes from cron_values). Give up after looking ahead 5 years and return what you have."""
+        pass
+  tests:
+  - name: daily and hourly
+    code: |
+      assert cron_next("30 2 * * *", (2026, 11, 16, 1, 0), 3) == ["2026-11-16 02:30", "2026-11-17 02:30", "2026-11-18 02:30"]
+      assert cron_next("30 2 * * *", (2026, 11, 16, 2, 30), 2) == ["2026-11-17 02:30", "2026-11-18 02:30"] and cron_next("30 2 * * *", (2026, 11, 16, 2, 29), 1) == ["2026-11-16 02:30"]
+      assert cron_next("*/20 9-10 * * *", (2026, 1, 1, 9, 45), 5) == ["2026-01-01 10:00", "2026-01-01 10:20", "2026-01-01 10:40", "2026-01-02 09:00", "2026-01-02 09:20"]
+      assert cron_next("0 0 31 12 *", (2026, 12, 31, 0, 0), 2) == ["2027-12-31 00:00", "2028-12-31 00:00"] and cron_next("59 23 31 12 *", (2026, 12, 31, 23, 58), 2) == ["2026-12-31 23:59", "2027-12-31 23:59"]
+  - name: weekdays and months
+    code: |
+      assert cron_next("0 9 * * 1", (2026, 11, 16, 12, 0), 3) == ["2026-11-23 09:00", "2026-11-30 09:00", "2026-12-07 09:00"]
+      assert cron_next("0 8 * * 0", (2026, 11, 16, 0, 0), 2) == ["2026-11-22 08:00", "2026-11-29 08:00"] and cron_next("0 8 * * 1-5", (2026, 11, 20, 8, 0), 3) == ["2026-11-23 08:00", "2026-11-24 08:00", "2026-11-25 08:00"]
+      assert cron_next("0 0 1 1,7 *", (2026, 8, 1, 0, 0), 3) == ["2027-01-01 00:00", "2027-07-01 00:00", "2028-01-01 00:00"] and cron_next("15 6 * 2 *", (2026, 11, 16, 0, 0), 2) == ["2027-02-01 06:15", "2027-02-02 06:15"]
+      assert cron_next("0 0 29 2 *", (2026, 1, 1, 0, 0), 2) == ["2028-02-29 00:00"]
+  - name: day or weekday
+    code: |
+      assert cron_next("0 12 1 * 1", (2026, 11, 1, 12, 0), 5) == ["2026-11-02 12:00", "2026-11-09 12:00", "2026-11-16 12:00", "2026-11-23 12:00", "2026-11-30 12:00"]
+      assert cron_next("0 12 13 * 5", (2026, 11, 1, 0, 0), 3) == ["2026-11-06 12:00", "2026-11-13 12:00", "2026-11-20 12:00"]
+      assert cron_next("0 12 13 * *", (2026, 11, 1, 0, 0), 2) == ["2026-11-13 12:00", "2026-12-13 12:00"] and cron_next("0 12 * * 5", (2026, 11, 1, 0, 0), 2) == ["2026-11-06 12:00", "2026-11-13 12:00"]
+      assert cron_next("* * * * *", (2026, 12, 31, 23, 59), 2) == ["2027-01-01 00:00", "2027-01-01 00:01"] and cron_next("0 0 30 2 *", (2026, 1, 1, 0, 0), 3) == []
+  - name: errors
+    code: |
+      for bad, msg in (("* * * *", "bad schedule"), ("* * * * * *", "bad schedule"), ("", "bad schedule"), ("60 * * * *", "bad field"), ("* 24 * * *", "bad field"), ("* * 0 * *", "bad field"), ("* * * 13 *", "bad field"), ("* * * * 7", "bad field")):
+          try:
+              cron_next(bad, (2026, 1, 1, 0, 0), 1)
+              raise AssertionError("accepted " + repr(bad))
+          except ValueError as e:
+              assert msg in str(e)
+  hints:
+  - Go through the days one by one and, for each day that qualifies, through the allowed hours and minutes.
+  - Convert Python's weekday (Monday = 0) to cron's (Sunday = 0) with (weekday + 1) % 7.
+  solution: |
+    def cron_values(field, lo, hi):
+        """Read ONE field of a cron schedule and return the sorted list of the numbers it allows, between lo and hi (both included). A field is a comma-separated list of parts; a part is '*' (every value from lo to hi), '*/n' (every n-th value starting at lo), 'a' (one number), 'a-b' (a range) or 'a-b/n' (a range in steps of n). ValueError('bad field') for anything else: not a number, a value outside lo..hi, a range with a > b, or a step n that is not a positive number."""
+        values = set()
+        for part in field.split(","):
+            rng, slash, step = part.partition("/")
+            if slash:
+                if not step.isdigit() or int(step) == 0:
+                    raise ValueError("bad field")
+                n = int(step)
+            else:
+                n = 1
+            if rng == "*":
+                a, b = lo, hi
+            elif rng.isdigit():
+                a = int(rng)
+                b = hi if slash else a
+            elif rng.count("-") == 1 and all(x.isdigit() for x in rng.split("-")):
+                a, b = (int(x) for x in rng.split("-"))
+            else:
+                raise ValueError("bad field")
+            if a > b or a < lo or b > hi:
+                raise ValueError("bad field")
+            values.update(range(a, b + 1, n))
+        return sorted(values)
+
+
+
+
+    def cron_next(expr, start, count):
+        """When will a cron job run? `expr` is the five fields 'minute hour day-of-month month day-of-week' (cron_values is given: minute 0-59, hour 0-23, day 1-31, month 1-12, weekday 0-6 with 0 = Sunday). `start` is a tuple (year, month, day, hour, minute); return the next `count` run times AFTER that minute (never the minute itself) as text 'YYYY-MM-DD HH:MM', in order. A day qualifies when its month matches and: if BOTH the day-of-month and the weekday fields are restricted (not a plain '*'), the day matches when EITHER of them does; otherwise when both do (a '*' always matches). Use the datetime module. ValueError('bad schedule') unless there are exactly five fields (and ValueError('bad field') comes from cron_values). Give up after looking ahead 5 years and return what you have."""
+        import datetime
+        parts = expr.split()
+        if len(parts) != 5:
+            raise ValueError("bad schedule")
+        minutes = cron_values(parts[0], 0, 59)
+        hours = cron_values(parts[1], 0, 23)
+        doms = cron_values(parts[2], 1, 31)
+        months = cron_values(parts[3], 1, 12)
+        dows = cron_values(parts[4], 0, 6)
+        both = parts[2] != "*" and parts[4] != "*"
+        y, mo, d, h, mi = start
+        first = datetime.datetime(y, mo, d, h, mi)
+        day = first.date()
+        out = []
+        limit = day + datetime.timedelta(days=366 * 5)
+        while len(out) < count and day <= limit:
+            weekday = (day.weekday() + 1) % 7
+            dom_ok, dow_ok = day.day in doms, weekday in dows
+            if day.month in months and ((dom_ok or dow_ok) if both else (dom_ok and dow_ok)):
+                for hh in hours:
+                    for mm in minutes:
+                        when = datetime.datetime(day.year, day.month, day.day, hh, mm)
+                        if when > first and len(out) < count:
+                            out.append(when.strftime("%Y-%m-%d %H:%M"))
+            day += datetime.timedelta(days=1)
+        return out
+  explanation: Run times are computed the same way by real cron daemons, which is why a schedule like '0 0 30 2 *' (February 30th) simply never fires.
+commonMistakes:
+- title: Assuming python is the one you expect
+  explanation: Use which to see which program PATH finds first.
+- title: Using kill -9 first
+  explanation: The program never gets to save or clean up.
+- title: Cron jobs with relative paths
+  explanation: Cron runs in a different folder and environment.
+- title: Piping find with spaces in names into xargs
+  explanation: Use -print0 and xargs -0.
+- title: Forgetting that day-of-month and weekday are an OR
+  explanation: 0 12 13 * 5 runs on every Friday AND on every 13th.
+summary:
+- The shell searches the folders of PATH from left to right.
+- A process has a pid and a parent; orphans are adopted by init.
+- 'kill sends signals: TERM asks, KILL forces.'
+- find lists files by name, type and depth; xargs turns lines into arguments.
+- cron has five fields; * , - / build the schedule.
+next: u29-project
+quiz:
+- type: mcq
+  question: Which folder wins when two PATH folders have python?
+  options:
+  - The leftmost one
+  - The rightmost one
+  - The biggest
+  - A random one
+  answer: 0
+  explanation: Left to right.
+- type: mcq
+  question: What happens to the children of a killed process?
+  options:
+  - They become orphans adopted by init
+  - They always die
+  - They stop
+  - They are restarted
+  answer: 0
+  explanation: Adopted by pid 1.
+- type: mcq
+  question: Which signal cannot be ignored?
+  options:
+  - SIGKILL (kill -9)
+  - SIGTERM
+  - SIGINT
+  - SIGHUP
+  answer: 0
+  explanation: KILL.
+- type: mcq
+  question: What does */15 in the minute field mean?
+  options:
+  - Every 15 minutes
+  - At minute 15 only
+  - 15 times an hour
+  - Every 15 hours
+  answer: 0
+  explanation: Every fifteenth.
+- type: mcq
+  question: What does & at the end of a command do?
+  options:
+  - Runs it in the background
+  - Runs it twice
+  - Stops it
+  - Pipes it
+  answer: 0
+  explanation: Background.
+- type: mcq
+  question: What does find . -name '*.py' do?
+  options:
+  - Lists the .py files below this folder
+  - Deletes them
+  - Edits them
+  - Compiles them
+  answer: 0
+  explanation: Search by name.
+- type: code
+  question: Write `is_weekday_job(expr)` returning True if the fifth field (day of week) of the five-field cron schedule `expr` is exactly `1-5`, otherwise False.
+  starter: |
+    def is_weekday_job(expr):
+        pass
+  tests:
+  - name: weekday
+    code: |
+      assert is_weekday_job("0 9 * * 1-5") is True and is_weekday_job("0 9 * * *") is False and is_weekday_job("*/5 * * * 1-5") is True and is_weekday_job("0 9 * * 0") is False
+  solution: |
+    def is_weekday_job(expr):
+        return expr.split()[4] == "1-5"
