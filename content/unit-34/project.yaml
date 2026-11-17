@@ -1,0 +1,1057 @@
+title: Mini Network Doctor
+language: python
+brief: 'Build the first thing a network engineer runs when ''the internet is broken'': a health check
+  that reads the output of the tools from this unit. The parsers are given to you: ping, traceroute, curl
+  timings, HTTP, cookies, zone files, DNS answers, firewall rules and scans. Your job is to **combine**
+  them into six checks and a report, with one rule that real tools need: *one broken input must never
+  stop the whole check*. It all runs on plain text, so you can test it with output that you invent.'
+steps:
+- title: The link
+  body: 'Write `check_link`: no reply, packet loss and the first trouble on the path.'
+- title: The web answer
+  body: 'Write `check_web`: status, cookies, cache policy and the slow phase.'
+- title: The domain
+  body: 'Write `check_dns`: mistakes in the zone and lookups that fail.'
+- title: The firewall and the logs
+  body: Write `check_firewall` (test the rules against what should happen) and `check_scans`.
+- title: The doctor
+  body: Write `diagnose_network` (run only the checks whose data is present, survive bad input, decide
+    the severity) and `format_report`.
+checklist:
+- text: Finds a dead link, packet loss and path trouble
+  test: link findings
+- text: 'Reviews a web answer: status, cookies, caching, timing'
+  test: web findings
+- text: Finds zone mistakes and failing lookups
+  test: dns findings
+- text: Tests firewall rules and finds port scans
+  test: firewall and scans
+- text: Combines all checks with the right severity
+  test: the whole network
+- text: Survives broken input
+  test: broken input
+- text: Formats a readable report
+  test: the report
+starter: |-
+  def parse_ping(text):
+      """The command `ping host` sends small test messages and prints one line per reply, such as '64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms', and at the end a statistics line such as '4 packets transmitted, 3 received, 25% packet loss, time 3004ms' (the words 'packets received' may also be written 'received' only). Parse the text. Return a dict {'sent', 'received' (both ints from the statistics line), 'loss' (the percentage of lost messages computed from sent and received, rounded to 1 decimal, 0.0 if nothing was sent), 'times' (the list of all numbers in 'time=... ms' in order, as floats), 'min', 'avg', 'max' (of the times, rounded to 1 decimal, or None if there are no times)}. ValueError('no statistics') if the statistics line is missing."""
+      import re
+      m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", text)
+      if not m:
+          raise ValueError("no statistics")
+      sent, received = int(m.group(1)), int(m.group(2))
+      times = [float(t) for t in re.findall(r"time=([0-9.]+) ?ms", text)]
+      loss = round((sent - received) / sent * 100, 1) if sent else 0.0
+      return {"sent": sent, "received": received, "loss": loss, "times": times,
+              "min": round(min(times), 1) if times else None, "avg": round(sum(times) / len(times), 1) if times else None, "max": round(max(times), 1) if times else None}
+
+
+  def parse_traceroute(text):
+      """The command `traceroute host` shows the routers on the way, one line per hop (a hop is one router), for example '1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms' or '4  10.0.0.2  5.1 ms * 5.3 ms' (a star means that one probe got no reply) or '5  * * *'. Lines that do not start with a number (such as the header 'traceroute to ...') are ignored. Return a list of dicts {'hop' (int), 'host' (the first word that is not a star and not a time, or None if there is none), 'rtts' (the list of times in ms as floats, in order) and 'lost' (the number of stars)}. A time is a number that is followed by the word ms."""
+      hops = []
+      for line in text.split("\n"):
+          parts = line.split()
+          if not parts or not parts[0].isdigit():
+              continue
+          host, rtts, lost = None, [], 0
+          rest = parts[1:]
+          for i, tok in enumerate(rest):
+              if tok == "*":
+                  lost += 1
+              elif tok == "ms":
+                  continue
+              elif i + 1 < len(rest) and rest[i + 1] == "ms":
+                  rtts.append(float(tok))
+              elif host is None:
+                  host = tok
+          hops.append({"hop": int(parts[0]), "host": host, "rtts": rtts, "lost": lost})
+      return hops
+
+
+  def trace_report(hops, jump_ms):
+      """Read a traceroute for the first sign of trouble. `hops` comes from parse_traceroute. The typical time of a hop is the MEDIAN of its rtts (for an even count the mean of the two middle ones); a hop without any time has none. Return a list of text lines: first, if a hop's typical time is at least `jump_ms` MORE than the typical time of the nearest earlier hop that has one (the first hop needs an earlier hop to compare with), 'latency jumps at hop N (+X ms)' for the FIRST such hop, where X is the difference rounded to 1 decimal; then, if the list ends with one or more hops that have no rtts at all, 'no reply from hop N onward' where N is the first hop of that final run. An empty list gives ['no hops']. A healthy path gives []."""
+      if not hops:
+          return ["no hops"]
+
+      def median(values):
+          v = sorted(values)
+          mid = len(v) // 2
+          return v[mid] if len(v) % 2 else (v[mid - 1] + v[mid]) / 2
+      lines, prev = [], None
+      for h in hops:
+          if not h["rtts"]:
+              continue
+          typical = median(h["rtts"])
+          if prev is not None and typical - prev >= jump_ms:
+              lines.append("latency jumps at hop " + str(h["hop"]) + " (+" + str(round(typical - prev, 1)) + " ms)")
+              break
+          prev = typical
+      end = len(hops)
+      while end > 0 and not hops[end - 1]["rtts"]:
+          end -= 1
+      if end < len(hops):
+          lines.append("no reply from hop " + str(hops[end]["hop"]) + " onward")
+      return lines
+
+
+  def timing_report(t):
+      """A web request has phases: looking up the name (DNS), opening the connection (TCP), the encryption handshake (TLS, only for https), waiting for the server to start answering, and downloading. The tool `curl -w` prints CUMULATIVE times in seconds since the start: namelookup, connect, appconnect (0 for plain http), starttransfer and total. Given them as a dict with these five keys, return {'dns', 'tcp', 'tls', 'wait', 'transfer', 'slowest'} where the first five are the DURATION of each phase in milliseconds rounded to a whole number (dns = namelookup; tcp = connect - namelookup; tls = appconnect - connect, or 0 if appconnect is 0; wait = starttransfer - the later one of connect and appconnect; transfer = total - starttransfer) and 'slowest' is the name of the longest phase (the first in the order dns, tcp, tls, wait, transfer if there is a tie). Compute with the unrounded values, then round."""
+      ac = t["appconnect"]
+      d = {"dns": t["namelookup"], "tcp": t["connect"] - t["namelookup"], "tls": (ac - t["connect"]) if ac else 0.0,
+           "wait": t["starttransfer"] - max(t["connect"], ac), "transfer": t["total"] - t["starttransfer"]}
+      out = {k: int(round(v * 1000)) for k, v in d.items()}
+      order = ["dns", "tcp", "tls", "wait", "transfer"]
+      out["slowest"] = max(order, key=lambda k: (d[k], -order.index(k)))
+      return out
+
+
+  def parse_query(qs):
+      """The part of a web address after the '?' is the **query string**, such as 'q=hello+world&tag=a&tag=b%26c'. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by '&' (empty pairs are ignored) and name and value by the FIRST '=' (a pair without '=' has the value ''). Decode names and values: a plus sign means a blank, and '%' followed by two hexadecimal digits is one byte (so %26 is '&', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter 'é'). A '%' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character '\\ufffd' (use errors='replace')."""
+      def decode(text):
+          raw = bytearray()
+          i, text = 0, text.replace("+", " ")
+          while i < len(text):
+              ch = text[i]
+              if ch == "%" and len(text[i + 1:i + 3]) == 2 and all(c in "0123456789abcdefABCDEF" for c in text[i + 1:i + 3]):
+                  raw.append(int(text[i + 1:i + 3], 16))
+                  i += 3
+              else:
+                  raw.extend(ch.encode("utf-8"))
+                  i += 1
+          return raw.decode("utf-8", errors="replace")
+      result = {}
+      for pair in qs.split("&"):
+          if not pair:
+              continue
+          name, _, value = pair.partition("=")
+          result.setdefault(decode(name), []).append(decode(value))
+      return result
+
+
+  def parse_http(text):
+      """Every web page is fetched with a text conversation. A REQUEST looks like 'GET /search?q=cats HTTP/1.1' then header lines 'Host: example.com', a blank line and an optional body. A RESPONSE starts with 'HTTP/1.1 404 Not Found' (the reason may be missing) then headers, a blank line and the body. Lines end with '\\n' or '\\r\\n' (treat both the same). Parse the text. The first line decides: if it starts with 'HTTP/' it is a response, else a request. Header lines are 'Name: value' (split at the FIRST colon, strip both sides); names are turned into lower case; a name that occurs twice gets its values joined with ', '. The headers end at the first blank line; everything after it (unchanged) is the 'body' ('' if there is none). Return for a request {'kind': 'request', 'method', 'path' (without the query), 'query' (parse_query of the text after the first '?', {} if none), 'version', 'headers', 'body'}; for a response {'kind': 'response', 'version', 'status' (int), 'reason' (the rest of the line, '' if none), 'headers', 'body'}. ValueError('bad request line') if a request line does not have exactly three parts separated by blanks or its version does not start with 'HTTP/'; ValueError('bad status line') if the status is not a whole number; ValueError('bad header line N') for a header line without a colon (N counts the lines of the whole text from 1)."""
+      text = text.replace("\r\n", "\n")
+      head, sep, body = text.partition("\n\n")
+      lines = head.split("\n")
+      first = lines[0].split()
+      headers = {}
+      for n, line in enumerate(lines[1:], 2):
+          name, colon, value = line.partition(":")
+          if not colon or not name.strip():
+              raise ValueError("bad header line " + str(n))
+          key = name.strip().lower()
+          headers[key] = headers[key] + ", " + value.strip() if key in headers else value.strip()
+      if lines[0].startswith("HTTP/"):
+          parts = lines[0].split(None, 2)
+          if len(parts) < 2 or not parts[1].isdigit():
+              raise ValueError("bad status line")
+          return {"kind": "response", "version": parts[0], "status": int(parts[1]), "reason": parts[2].strip() if len(parts) > 2 else "", "headers": headers, "body": body}
+      if len(first) != 3 or not first[2].startswith("HTTP/"):
+          raise ValueError("bad request line")
+      path, _, qs = first[1].partition("?")
+      return {"kind": "request", "method": first[0], "path": path, "query": parse_query(qs), "version": first[2], "headers": headers, "body": body}
+
+
+  def audit_cookie(header):
+      """A server sets a cookie with a header value such as 'session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax': first name=value (split at the first '='), then attributes separated by ';' which are either flags (Secure) or Name=value pairs; attribute names are not case sensitive. Return {'name', 'value', 'problems'} where problems is the list of texts, in this order: 'missing Secure' (the cookie would also travel over unencrypted http), 'missing HttpOnly' (scripts on the page could read it), 'missing SameSite' (no protection against forged requests from other sites) and 'SameSite=None needs Secure' (SameSite is None but Secure is missing). ValueError('bad cookie') if the first part has no '=' or an empty name."""
+      parts = [p.strip() for p in header.split(";")]
+      name, eq, value = parts[0].partition("=")
+      if not eq or not name.strip():
+          raise ValueError("bad cookie")
+      attrs = {}
+      for p in parts[1:]:
+          if not p:
+              continue
+          k, _, v = p.partition("=")
+          attrs[k.strip().lower()] = v.strip()
+      problems = []
+      if "secure" not in attrs:
+          problems.append("missing Secure")
+      if "httponly" not in attrs:
+          problems.append("missing HttpOnly")
+      if "samesite" not in attrs:
+          problems.append("missing SameSite")
+      elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+          problems.append("SameSite=None needs Secure")
+      return {"name": name.strip(), "value": value.strip(), "problems": problems}
+
+
+  def parse_zone(text):
+      """The records of a domain are kept in a **zone file**, for example:
+
+  $ORIGIN example.com.
+  $TTL 3600
+  @        IN MX 10 mail
+  www  300 IN CNAME @
+  mail     IN A 192.0.2.25
+           IN TXT "v=spf1 -all"
+
+  Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+      origin, default_ttl, last, records = "", 3600, None, []
+
+      def full(name):
+          if name == "@":
+              return origin
+          if name.endswith("."):
+              return name[:-1].lower()
+          return (name + "." + origin).lower() if origin else name.lower()
+      for n, raw in enumerate(text.split("\n"), 1):
+          line = raw.split(";", 1)[0].rstrip()
+          if not line.strip():
+              continue
+          words = line.split()
+          bad = ValueError("line %d: bad record" % n)
+          if words[0] == "$ORIGIN":
+              if len(words) != 2:
+                  raise bad
+              origin = words[1].rstrip(".").lower()
+              continue
+          if words[0] == "$TTL":
+              if len(words) != 2 or not words[1].isdigit():
+                  raise bad
+              default_ttl = int(words[1])
+              continue
+          if line[0] in " \t":
+              if last is None:
+                  raise bad
+              name, rest = last, words
+          else:
+              name, rest = full(words[0]), words[1:]
+          ttl = default_ttl
+          while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+              if rest[0].isdigit():
+                  ttl = int(rest[0])
+              rest = rest[1:]
+          if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+              raise bad
+          rtype, args = rest[0].upper(), rest[1:]
+          if rtype in ("CNAME", "NS"):
+              if len(args) != 1:
+                  raise bad
+              value = full(args[0])
+          elif rtype == "MX":
+              if len(args) != 2 or not args[0].isdigit():
+                  raise bad
+              value = args[0] + " " + full(args[1])
+          elif rtype == "TXT":
+              value = " ".join(args)
+              if len(value) >= 2 and value[0] == value[-1] == '"':
+                  value = value[1:-1]
+          else:
+              if len(args) != 1:
+                  raise bad
+              value = args[0]
+          records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+          last = name
+      return records
+
+
+  def resolve(records, name, rtype):
+      """A **resolver** answers 'what is the rtype record of this name?' from the records (a list as returned by parse_zone). Names are compared in lower case without a trailing dot. If the name has records of the wanted type, those are the answer (their values in order of the list). If it has none but has a CNAME (an alias) and the wanted type is not CNAME, follow the alias: look for the same type at the target name, and so on. Return {'status', 'chain' (the names visited, the asked name first), 'answers' (the list of values), 'ttl' (the SMALLEST ttl of the records that were used: the final answers and all CNAMEs followed; None without an answer)}. The status is 'NOERROR' with answers; 'NODATA' if the final name exists (has any record) but has none of the wanted type; 'NXDOMAIN' if the final name has no record at all (this includes an alias to a name that does not exist); 'LOOP' if an alias leads back to a name already in the chain (that name is not added again); 'TOO LONG' if more than 8 aliases would have to be followed."""
+      cur = name.lower().rstrip(".")
+      chain, ttls, follows = [cur], [], 0
+      while True:
+          here = [r for r in records if r["name"] == cur]
+          if not here:
+              return {"status": "NXDOMAIN", "chain": chain, "answers": [], "ttl": None}
+          direct = [r for r in here if r["type"] == rtype]
+          if direct:
+              return {"status": "NOERROR", "chain": chain, "answers": [r["value"] for r in direct], "ttl": min([r["ttl"] for r in direct] + ttls)}
+          alias = next((r for r in here if r["type"] == "CNAME"), None)
+          if alias is None or rtype == "CNAME":
+              return {"status": "NODATA", "chain": chain, "answers": [], "ttl": None}
+          if follows >= 8:
+              return {"status": "TOO LONG", "chain": chain, "answers": [], "ttl": None}
+          follows += 1
+          ttls.append(alias["ttl"])
+          cur = alias["value"]
+          if cur in chain:
+              return {"status": "LOOP", "chain": chain, "answers": [], "ttl": None}
+          chain.append(cur)
+
+
+  def validate_zone(records):
+      """Typical mistakes in a zone can break a website or lose mail. Check a list of records (from parse_zone) and return the list of problem texts in this order: first, for every name (sorted) that has a CNAME record AND any record of another type, 'CNAME and other data at NAME' (an alias must stand alone); then, for every MX record in the order of the list, if its host is the name of a CNAME record, 'MX target HOST is a CNAME'; otherwise, if the host has no A and no AAAA record in the list, 'MX target HOST has no address' (the MX value is 'PRIORITY HOST')."""
+      problems = []
+      names = sorted({r["name"] for r in records})
+      for n in names:
+          types = {r["type"] for r in records if r["name"] == n}
+          if "CNAME" in types and len(types - {"CNAME"}) > 0:
+              problems.append("CNAME and other data at " + n)
+      cnames = {r["name"] for r in records if r["type"] == "CNAME"}
+      for r in records:
+          if r["type"] != "MX":
+              continue
+          host = r["value"].split(" ", 1)[1]
+          if host in cnames:
+              problems.append("MX target " + host + " is a CNAME")
+          elif not any(x["name"] == host and x["type"] in ("A", "AAAA") for x in records):
+              problems.append("MX target " + host + " has no address")
+      return problems
+
+
+  def in_network(ip, cidr):
+      """An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation 'address/length', for example '10.0.0.0/8' or '192.168.1.0/24': the first `length` bits are the network part, and every address that has the same network part belongs to the network ('/32' is one single address, '/0' is every address). A cidr without '/length' means '/32'. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored ('192.168.1.77/24' is the same network as '192.168.1.0/24'). ValueError('bad address') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError('bad length') if the length is not a whole number from 0 to 32."""
+      def to_int(text):
+          parts = text.split(".")
+          if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+              raise ValueError("bad address")
+          n = 0
+          for p in parts:
+              n = n * 256 + int(p)
+          return n
+      value = to_int(ip)
+      addr, slash, length = cidr.partition("/")
+      base = to_int(addr)
+      if slash:
+          if not length.isdigit() or int(length) > 32:
+              raise ValueError("bad length")
+          bits = int(length)
+      else:
+          bits = 32
+      shift = 32 - bits
+      return (value >> shift) == (base >> shift)
+
+
+  def parse_rules(text):
+      """A **firewall** is an ordered list of rules. Here each rule is one line 'ACTION PROTO from SOURCE to DESTINATION [port PORTS]', for example 'ALLOW tcp from 10.0.0.0/8 to any port 22' or 'DENY any from any to any'. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are 'any' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range 'first-last' (first <= last, numbers 0 to 65535); without 'port' the rule applies to every port. Blank lines and everything after a '#' are ignored. Return a list of dicts {'action', 'proto', 'src', 'dst', 'ports'} where ports is None or a tuple (first, last). ValueError('line N: bad rule') for anything else (N counts all lines from 1)."""
+      rules = []
+      for n, raw in enumerate(text.split("\n"), 1):
+          line = raw.split("#", 1)[0].strip()
+          if not line:
+              continue
+          w = line.split()
+          bad = ValueError("line %d: bad rule" % n)
+          if len(w) not in (6, 8) or w[2].lower() != "from" or w[4].lower() != "to":
+              raise bad
+          action, proto = w[0].upper(), w[1].lower()
+          if action not in ("ALLOW", "DENY") or proto not in ("tcp", "udp", "icmp", "any"):
+              raise bad
+          ports = None
+          if len(w) == 8:
+              if w[6].lower() != "port":
+                  raise bad
+              a, dash, b = w[7].partition("-")
+              if not a.isdigit() or (dash and not b.isdigit()):
+                  raise bad
+              first, last = int(a), int(b) if dash else int(a)
+              if not (0 <= first <= last <= 65535):
+                  raise bad
+              ports = (first, last)
+          rules.append({"action": action, "proto": proto, "src": w[3], "dst": w[5], "ports": ports})
+      return rules
+
+
+  def check_packet(rules, packet):
+      """Decide what the firewall does with a packet, a dict {'proto', 'src', 'dst', 'port'} (the port is None for packets without ports such as icmp). The rules are tried IN ORDER and the FIRST rule that matches decides. A rule matches if its proto is 'any' or equals the packet's proto, its src is 'any' or contains the packet's source address (in_network), its dst is 'any' or contains the destination, and its ports are None or contain the packet's port (a packet without a port does not match a rule that has ports). Return a tuple (action, number) where the number is the position of the winning rule in the list counted from 1. If no rule matches, the firewall DENIES everything that is not explicitly allowed: return ('DENY', 0)."""
+      for i, r in enumerate(rules, 1):
+          if r["proto"] != "any" and r["proto"] != packet["proto"]:
+              continue
+          if r["src"] != "any" and not in_network(packet["src"], r["src"]):
+              continue
+          if r["dst"] != "any" and not in_network(packet["dst"], r["dst"]):
+              continue
+          if r["ports"] is not None:
+              p = packet.get("port")
+              if p is None or not r["ports"][0] <= p <= r["ports"][1]:
+                  continue
+          return (r["action"], i)
+      return ("DENY", 0)
+
+
+  def find_scanners(events, threshold, window):
+      """A **port scan** knocks on many ports of a computer to find open doors, the first step of many attacks. `events` is a list of (time, source, port) with times in seconds, in time order. A source is a scanner if, within ANY time span of `window` seconds (from a time t up to and including t + window), it touched at least `threshold` DIFFERENT ports. Return the sorted list of (source, most) where `most` is the largest number of different ports that source touched in one such span, for the scanners only (sorted by source name)."""
+      by_source = {}
+      for t, src, port in events:
+          by_source.setdefault(src, []).append((t, port))
+      found = []
+      for src in sorted(by_source):
+          items = by_source[src]
+          best = 0
+          for i, (t0, _) in enumerate(items):
+              ports = {p for t, p in items[i:] if t0 <= t <= t0 + window}
+              best = max(best, len(ports))
+          if best >= threshold:
+              found.append((src, best))
+      return found
+
+
+  def diagnose_connection(facts):
+      """Put the detective method of the unit into one function. `facts` is a dict with some of these keys (a missing key means 'not tested yet'): 'link_up' (bool: the cable or Wi-Fi works), 'has_ip' (bool), 'gateway_ping' (bool: the router answers), 'internet_ping' (bool: an address on the internet answers), 'dns_ok' (bool: names can be looked up), 'port' ('open', 'refused' or 'timeout': what happened when connecting to the service) and 'http_status' (int). Go through the tests in this order and return the text for the FIRST one that has failed (a test that is missing is skipped): link_up False: 'no link'; has_ip False: 'no IP address'; gateway_ping False: 'cannot reach the router'; internet_ping False: 'no internet access'; dns_ok False: 'DNS failure'; port 'refused': 'nothing listens on the port'; port 'timeout': 'blocked by a firewall or lost on the way'; http_status of 500 or more: 'server error'; http_status of 400 to 499: 'request refused or not found'. If nothing failed return 'all tests passed'."""
+      checks = [("link_up", lambda v: v is False, "no link"), ("has_ip", lambda v: v is False, "no IP address"),
+                ("gateway_ping", lambda v: v is False, "cannot reach the router"), ("internet_ping", lambda v: v is False, "no internet access"),
+                ("dns_ok", lambda v: v is False, "DNS failure"), ("port", lambda v: v == "refused", "nothing listens on the port"),
+                ("port", lambda v: v == "timeout", "blocked by a firewall or lost on the way"),
+                ("http_status", lambda v: v >= 500, "server error"), ("http_status", lambda v: 400 <= v < 500, "request refused or not found")]
+      for key, failed, text in checks:
+          if key in facts and facts[key] is not None and failed(facts[key]):
+              return text
+      return "all tests passed"
+
+
+  def check_link(ping_text, trace_text, max_loss, jump_ms):
+      """Is the other end reachable and is the road healthy? Use parse_ping(ping_text) and trace_report(parse_traceroute(trace_text), jump_ms). Return a list of findings (texts): 'no reply to ping' if nothing was received; otherwise 'packet loss P%' if the loss is MORE than max_loss (P is the loss number exactly as the parser gives it, for example 'packet loss 25.0%'); then every line of the trace report as 'path: LINE'. A healthy link gives an empty list."""
+      pass
+
+
+  def check_web(response_text, timings, slow_ms):
+      """Check one web answer. parse_http(response_text) must be a response, otherwise ValueError('not a response'). Return a list of findings, in this order: 'server error N' for a status of 500 or more, or 'client error N' for 400 to 499, or 'redirect to LOCATION' for 300 to 399 (the 'location' header, or 'redirect without location' if it is missing); then, if there is a 'set-cookie' header, 'cookie NAME: PROBLEM' for every problem that audit_cookie finds; then 'no Cache-Control header' if the headers have no 'cache-control'; and last 'slow phase: NAME (X ms)' if the SLOWEST phase of timing_report(timings) took at least slow_ms (X is that phase's milliseconds)."""
+      pass
+
+
+  def check_dns(zone_text, lookups):
+      """Check a domain's zone. Parse it with parse_zone. Return a list of findings: first 'zone: PROBLEM' for every problem of validate_zone; then, for every (name, rtype) pair of `lookups` in order, if resolve(...) has a status other than 'NOERROR', 'NAME RTYPE: STATUS' (for example 'blog.example.com A: NXDOMAIN')."""
+      pass
+
+
+  def check_firewall(rules_text, expectations):
+      """Test a firewall against what it SHOULD do. rules = parse_rules(rules_text). `expectations` is a list of (packet, expected_action) pairs (a packet is the dict that check_packet takes, the action is 'ALLOW' or 'DENY'). For every pair, in order, whose real action (the first part of check_packet's result) differs from the expected one, add 'test N: expected X but got Y (rule R)' where N counts the pairs from 1 and R is the rule number, or '(no rule)' instead of '(rule R)' when no rule matched (rule number 0). A correct firewall gives an empty list."""
+      pass
+
+
+  def check_scans(events, threshold, window):
+      """Look for port scans in a connection log with find_scanners(events, threshold, window). Return 'possible scan from SOURCE (N ports)' for every scanner found, in the order of find_scanners."""
+      pass
+
+
+  def diagnose_network(snapshot):
+      """Check a whole network setup. `snapshot` is a dict that may contain: 'facts' (a dict for diagnose_connection); 'ping' and 'trace' (texts) with 'max_loss' (default 5) and 'jump_ms' (default 80) for check_link; 'response' and 'timings' with 'slow_ms' (default 300) for check_web; 'zone' with 'lookups' (default []) for check_dns; 'rules' with 'expectations' (default []) for check_firewall; 'events' with 'scan_threshold' (default 4) and 'scan_window' (default 10) for check_scans. The areas are 'basics' (needs 'facts'; its only finding is the text of diagnose_connection if that is not 'all tests passed'), 'link', 'web', 'dns', 'firewall', 'scans' (each needs the keys named first), always in this order; an area whose required keys are missing is not checked. If a check raises ValueError, the area's only finding is 'could not check (MESSAGE)'. Return {'severity', 'checked', 'findings'} with findings written 'AREA: finding'. The severity is 'critical' if any finding starts with 'basics:' or contains 'no reply', 'server error' or 'NXDOMAIN'; otherwise 'warning' if there is any finding; otherwise 'ok'."""
+      pass
+
+
+  def format_report(result):
+      """Turn the result of diagnose_network into the lines of a report: 'Network health: SEVERITY' (the severity in capitals), then 'Checked: A, B' (the areas joined by ', ', or 'Checked: nothing' if there are none), then either 'No problems found.' or one line '- FINDING' for every finding."""
+      pass
+tests:
+- name: link findings
+  code: |
+    PING = "64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\n"
+    GOOD_PING = "64 bytes from a: time=10 ms\n64 bytes from a: time=12 ms\n4 packets transmitted, 4 received, 0% packet loss\n"
+    DEAD_PING = "4 packets transmitted, 0 received, 100% packet loss, time 3070ms\n"
+    TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  120.5 ms * 118.0 ms\n 4  * * *\n"
+    GOOD_TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  12.5 ms  11.0 ms  13.0 ms\n"
+    RESP = "HTTP/1.1 503 Service Unavailable\nSet-Cookie: id=7; Path=/\nContent-Type: text/html\n\noops"
+    TM = {"namelookup": 0.02, "connect": 0.045, "appconnect": 0.12, "starttransfer": 0.7, "total": 0.75}
+    FAST = {"namelookup": 0.001, "connect": 0.002, "appconnect": 0, "starttransfer": 0.003, "total": 0.004}
+    ZONE = "$ORIGIN example.com.\n@ IN MX 10 backup.example.net.\nwww IN CNAME @\nwww IN A 1.1.1.1\nblog IN CNAME nowhere\n"
+    GOOD_ZONE = "$ORIGIN example.com.\n@ IN MX 10 mail\nmail IN A 192.0.2.25\nwww IN CNAME @\n@ IN A 192.0.2.1\n"
+    RULES = "ALLOW tcp from any to any port 80\nDENY any from 203.0.113.0/24 to any\n"
+    def pk(p, s, d, po=None):
+        return {"proto": p, "src": s, "dst": d, "port": po}
+    EXP = [(pk("tcp", "203.0.113.5", "1.1.1.1", 80), "DENY"), (pk("tcp", "1.1.1.1", "2.2.2.2", 22), "ALLOW"), (pk("tcp", "1.1.1.1", "2.2.2.2", 80), "ALLOW")]
+    EV = [(0, "10.9.9.9", 21), (1, "10.9.9.9", 22), (2, "10.9.9.9", 23), (3, "10.9.9.9", 25), (4, "10.1.1.1", 443)]
+
+    assert check_link(PING, TR, 5, 80) == ["packet loss 25.0%", "path: latency jumps at hop 3 (+110.8 ms)", "path: no reply from hop 4 onward"]
+    assert check_link(PING, TR, 30, 500) == ["path: no reply from hop 4 onward"]
+    assert check_link(GOOD_PING, GOOD_TR, 5, 80) == [] and check_link(DEAD_PING, GOOD_TR, 5, 80) == ["no reply to ping"]
+    assert check_link(GOOD_PING, "", 5, 80) == ["path: no hops"]
+    try:
+        check_link("nothing", GOOD_TR, 5, 80)
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert str(e) == "no statistics"
+- name: web findings
+  code: |
+    PING = "64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\n"
+    GOOD_PING = "64 bytes from a: time=10 ms\n64 bytes from a: time=12 ms\n4 packets transmitted, 4 received, 0% packet loss\n"
+    DEAD_PING = "4 packets transmitted, 0 received, 100% packet loss, time 3070ms\n"
+    TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  120.5 ms * 118.0 ms\n 4  * * *\n"
+    GOOD_TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  12.5 ms  11.0 ms  13.0 ms\n"
+    RESP = "HTTP/1.1 503 Service Unavailable\nSet-Cookie: id=7; Path=/\nContent-Type: text/html\n\noops"
+    TM = {"namelookup": 0.02, "connect": 0.045, "appconnect": 0.12, "starttransfer": 0.7, "total": 0.75}
+    FAST = {"namelookup": 0.001, "connect": 0.002, "appconnect": 0, "starttransfer": 0.003, "total": 0.004}
+    ZONE = "$ORIGIN example.com.\n@ IN MX 10 backup.example.net.\nwww IN CNAME @\nwww IN A 1.1.1.1\nblog IN CNAME nowhere\n"
+    GOOD_ZONE = "$ORIGIN example.com.\n@ IN MX 10 mail\nmail IN A 192.0.2.25\nwww IN CNAME @\n@ IN A 192.0.2.1\n"
+    RULES = "ALLOW tcp from any to any port 80\nDENY any from 203.0.113.0/24 to any\n"
+    def pk(p, s, d, po=None):
+        return {"proto": p, "src": s, "dst": d, "port": po}
+    EXP = [(pk("tcp", "203.0.113.5", "1.1.1.1", 80), "DENY"), (pk("tcp", "1.1.1.1", "2.2.2.2", 22), "ALLOW"), (pk("tcp", "1.1.1.1", "2.2.2.2", 80), "ALLOW")]
+    EV = [(0, "10.9.9.9", 21), (1, "10.9.9.9", 22), (2, "10.9.9.9", 23), (3, "10.9.9.9", 25), (4, "10.1.1.1", 443)]
+
+    assert check_web(RESP, TM, 300) == ["server error 503", "cookie id: missing Secure", "cookie id: missing HttpOnly", "cookie id: missing SameSite", "no Cache-Control header", "slow phase: wait (580 ms)"]
+    assert check_web("HTTP/1.1 301 Moved\nLocation: https://x/\n\n", FAST, 300) == ["redirect to https://x/", "no Cache-Control header"]
+    assert check_web("HTTP/1.1 302 Found\nCache-Control: max-age=5\n\n", FAST, 300) == ["redirect without location"]
+    assert check_web("HTTP/1.1 200 OK\nCache-Control: no-store\n\n", FAST, 300) == []
+    assert check_web("HTTP/1.1 404 NF\nCache-Control: no-store\n\n", FAST, 3) == ["client error 404"]
+    assert check_web("HTTP/1.1 200 OK\nCache-Control: no-store\n\n", FAST, 1) == ["slow phase: dns (1 ms)"]
+    try:
+        check_web("GET / HTTP/1.1\n\n", FAST, 300)
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert str(e) == "not a response"
+- name: dns findings
+  code: |
+    PING = "64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\n"
+    GOOD_PING = "64 bytes from a: time=10 ms\n64 bytes from a: time=12 ms\n4 packets transmitted, 4 received, 0% packet loss\n"
+    DEAD_PING = "4 packets transmitted, 0 received, 100% packet loss, time 3070ms\n"
+    TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  120.5 ms * 118.0 ms\n 4  * * *\n"
+    GOOD_TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  12.5 ms  11.0 ms  13.0 ms\n"
+    RESP = "HTTP/1.1 503 Service Unavailable\nSet-Cookie: id=7; Path=/\nContent-Type: text/html\n\noops"
+    TM = {"namelookup": 0.02, "connect": 0.045, "appconnect": 0.12, "starttransfer": 0.7, "total": 0.75}
+    FAST = {"namelookup": 0.001, "connect": 0.002, "appconnect": 0, "starttransfer": 0.003, "total": 0.004}
+    ZONE = "$ORIGIN example.com.\n@ IN MX 10 backup.example.net.\nwww IN CNAME @\nwww IN A 1.1.1.1\nblog IN CNAME nowhere\n"
+    GOOD_ZONE = "$ORIGIN example.com.\n@ IN MX 10 mail\nmail IN A 192.0.2.25\nwww IN CNAME @\n@ IN A 192.0.2.1\n"
+    RULES = "ALLOW tcp from any to any port 80\nDENY any from 203.0.113.0/24 to any\n"
+    def pk(p, s, d, po=None):
+        return {"proto": p, "src": s, "dst": d, "port": po}
+    EXP = [(pk("tcp", "203.0.113.5", "1.1.1.1", 80), "DENY"), (pk("tcp", "1.1.1.1", "2.2.2.2", 22), "ALLOW"), (pk("tcp", "1.1.1.1", "2.2.2.2", 80), "ALLOW")]
+    EV = [(0, "10.9.9.9", 21), (1, "10.9.9.9", 22), (2, "10.9.9.9", 23), (3, "10.9.9.9", 25), (4, "10.1.1.1", 443)]
+
+    assert check_dns(ZONE, [("www.example.com", "A"), ("blog.example.com", "A")]) == ["zone: CNAME and other data at www.example.com", "zone: MX target backup.example.net has no address", "blog.example.com A: NXDOMAIN"]
+    assert check_dns(GOOD_ZONE, [("www.example.com", "A"), ("example.com", "MX")]) == []
+    assert check_dns(GOOD_ZONE, [("mail.example.com", "MX"), ("nope.example.com", "A")]) == ["mail.example.com MX: NODATA", "nope.example.com A: NXDOMAIN"]
+    assert check_dns("", [("x.org", "A")]) == ["x.org A: NXDOMAIN"]
+    try:
+        check_dns("a IN FOO 1", [])
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert str(e) == "line 1: bad record"
+- name: firewall and scans
+  code: |
+    PING = "64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\n"
+    GOOD_PING = "64 bytes from a: time=10 ms\n64 bytes from a: time=12 ms\n4 packets transmitted, 4 received, 0% packet loss\n"
+    DEAD_PING = "4 packets transmitted, 0 received, 100% packet loss, time 3070ms\n"
+    TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  120.5 ms * 118.0 ms\n 4  * * *\n"
+    GOOD_TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  12.5 ms  11.0 ms  13.0 ms\n"
+    RESP = "HTTP/1.1 503 Service Unavailable\nSet-Cookie: id=7; Path=/\nContent-Type: text/html\n\noops"
+    TM = {"namelookup": 0.02, "connect": 0.045, "appconnect": 0.12, "starttransfer": 0.7, "total": 0.75}
+    FAST = {"namelookup": 0.001, "connect": 0.002, "appconnect": 0, "starttransfer": 0.003, "total": 0.004}
+    ZONE = "$ORIGIN example.com.\n@ IN MX 10 backup.example.net.\nwww IN CNAME @\nwww IN A 1.1.1.1\nblog IN CNAME nowhere\n"
+    GOOD_ZONE = "$ORIGIN example.com.\n@ IN MX 10 mail\nmail IN A 192.0.2.25\nwww IN CNAME @\n@ IN A 192.0.2.1\n"
+    RULES = "ALLOW tcp from any to any port 80\nDENY any from 203.0.113.0/24 to any\n"
+    def pk(p, s, d, po=None):
+        return {"proto": p, "src": s, "dst": d, "port": po}
+    EXP = [(pk("tcp", "203.0.113.5", "1.1.1.1", 80), "DENY"), (pk("tcp", "1.1.1.1", "2.2.2.2", 22), "ALLOW"), (pk("tcp", "1.1.1.1", "2.2.2.2", 80), "ALLOW")]
+    EV = [(0, "10.9.9.9", 21), (1, "10.9.9.9", 22), (2, "10.9.9.9", 23), (3, "10.9.9.9", 25), (4, "10.1.1.1", 443)]
+
+    assert check_firewall(RULES, EXP) == ["test 1: expected DENY but got ALLOW (rule 1)", "test 2: expected ALLOW but got DENY (no rule)"]
+    assert check_firewall(RULES, [EXP[2]]) == [] and check_firewall(RULES, []) == []
+    assert check_firewall("DENY any from any to any", [(pk("udp", "1.1.1.1", "2.2.2.2", 53), "ALLOW")]) == ["test 1: expected ALLOW but got DENY (rule 1)"]
+    assert check_scans(EV, 4, 10) == ["possible scan from 10.9.9.9 (4 ports)"] and check_scans(EV, 5, 10) == [] and check_scans([], 1, 1) == []
+    assert check_scans(EV + [(5, "10.1.1.1", 80)], 2, 2) == ["possible scan from 10.1.1.1 (2 ports)", "possible scan from 10.9.9.9 (3 ports)"]
+- name: the whole network
+  code: |
+    PING = "64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\n"
+    GOOD_PING = "64 bytes from a: time=10 ms\n64 bytes from a: time=12 ms\n4 packets transmitted, 4 received, 0% packet loss\n"
+    DEAD_PING = "4 packets transmitted, 0 received, 100% packet loss, time 3070ms\n"
+    TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  120.5 ms * 118.0 ms\n 4  * * *\n"
+    GOOD_TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  12.5 ms  11.0 ms  13.0 ms\n"
+    RESP = "HTTP/1.1 503 Service Unavailable\nSet-Cookie: id=7; Path=/\nContent-Type: text/html\n\noops"
+    TM = {"namelookup": 0.02, "connect": 0.045, "appconnect": 0.12, "starttransfer": 0.7, "total": 0.75}
+    FAST = {"namelookup": 0.001, "connect": 0.002, "appconnect": 0, "starttransfer": 0.003, "total": 0.004}
+    ZONE = "$ORIGIN example.com.\n@ IN MX 10 backup.example.net.\nwww IN CNAME @\nwww IN A 1.1.1.1\nblog IN CNAME nowhere\n"
+    GOOD_ZONE = "$ORIGIN example.com.\n@ IN MX 10 mail\nmail IN A 192.0.2.25\nwww IN CNAME @\n@ IN A 192.0.2.1\n"
+    RULES = "ALLOW tcp from any to any port 80\nDENY any from 203.0.113.0/24 to any\n"
+    def pk(p, s, d, po=None):
+        return {"proto": p, "src": s, "dst": d, "port": po}
+    EXP = [(pk("tcp", "203.0.113.5", "1.1.1.1", 80), "DENY"), (pk("tcp", "1.1.1.1", "2.2.2.2", 22), "ALLOW"), (pk("tcp", "1.1.1.1", "2.2.2.2", 80), "ALLOW")]
+    EV = [(0, "10.9.9.9", 21), (1, "10.9.9.9", 22), (2, "10.9.9.9", 23), (3, "10.9.9.9", 25), (4, "10.1.1.1", 443)]
+
+    snap = {"facts": {"dns_ok": False}, "ping": PING, "trace": TR, "response": RESP, "timings": TM, "zone": ZONE, "lookups": [("blog.example.com", "A")], "rules": RULES, "expectations": EXP, "events": EV}
+    r = diagnose_network(snap)
+    assert r["severity"] == "critical" and r["checked"] == ["basics", "link", "web", "dns", "firewall", "scans"]
+    assert r["findings"] == ["basics: DNS failure", "link: packet loss 25.0%", "link: path: latency jumps at hop 3 (+110.8 ms)", "link: path: no reply from hop 4 onward", "web: server error 503", "web: cookie id: missing Secure", "web: cookie id: missing HttpOnly", "web: cookie id: missing SameSite", "web: no Cache-Control header", "web: slow phase: wait (580 ms)", "dns: zone: CNAME and other data at www.example.com", "dns: zone: MX target backup.example.net has no address", "dns: blog.example.com A: NXDOMAIN", "firewall: test 1: expected DENY but got ALLOW (rule 1)", "firewall: test 2: expected ALLOW but got DENY (no rule)", "scans: possible scan from 10.9.9.9 (4 ports)"]
+    assert diagnose_network({}) == {"severity": "ok", "checked": [], "findings": []} and diagnose_network({"ping": PING}) == {"severity": "ok", "checked": [], "findings": []}
+    fine = {"facts": {"link_up": True, "dns_ok": True}, "ping": GOOD_PING, "trace": GOOD_TR, "zone": GOOD_ZONE, "rules": RULES, "expectations": [EXP[2]], "events": []}
+    assert diagnose_network(fine) == {"severity": "ok", "checked": ["basics", "link", "dns", "firewall", "scans"], "findings": []}
+    w = diagnose_network({"ping": PING, "trace": GOOD_TR, "max_loss": 50})
+    assert w == {"severity": "ok", "checked": ["link"], "findings": []}
+    w = diagnose_network({"ping": PING, "trace": GOOD_TR})
+    assert w == {"severity": "warning", "checked": ["link"], "findings": ["link: packet loss 25.0%"]}
+- name: broken input
+  code: |
+    PING = "64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\n"
+    GOOD_PING = "64 bytes from a: time=10 ms\n64 bytes from a: time=12 ms\n4 packets transmitted, 4 received, 0% packet loss\n"
+    DEAD_PING = "4 packets transmitted, 0 received, 100% packet loss, time 3070ms\n"
+    TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  120.5 ms * 118.0 ms\n 4  * * *\n"
+    GOOD_TR = " 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1  8.0 ms  8.5 ms  9.0 ms\n 3  core.isp.net  12.5 ms  11.0 ms  13.0 ms\n"
+    RESP = "HTTP/1.1 503 Service Unavailable\nSet-Cookie: id=7; Path=/\nContent-Type: text/html\n\noops"
+    TM = {"namelookup": 0.02, "connect": 0.045, "appconnect": 0.12, "starttransfer": 0.7, "total": 0.75}
+    FAST = {"namelookup": 0.001, "connect": 0.002, "appconnect": 0, "starttransfer": 0.003, "total": 0.004}
+    ZONE = "$ORIGIN example.com.\n@ IN MX 10 backup.example.net.\nwww IN CNAME @\nwww IN A 1.1.1.1\nblog IN CNAME nowhere\n"
+    GOOD_ZONE = "$ORIGIN example.com.\n@ IN MX 10 mail\nmail IN A 192.0.2.25\nwww IN CNAME @\n@ IN A 192.0.2.1\n"
+    RULES = "ALLOW tcp from any to any port 80\nDENY any from 203.0.113.0/24 to any\n"
+    def pk(p, s, d, po=None):
+        return {"proto": p, "src": s, "dst": d, "port": po}
+    EXP = [(pk("tcp", "203.0.113.5", "1.1.1.1", 80), "DENY"), (pk("tcp", "1.1.1.1", "2.2.2.2", 22), "ALLOW"), (pk("tcp", "1.1.1.1", "2.2.2.2", 80), "ALLOW")]
+    EV = [(0, "10.9.9.9", 21), (1, "10.9.9.9", 22), (2, "10.9.9.9", 23), (3, "10.9.9.9", 25), (4, "10.1.1.1", 443)]
+
+    r = diagnose_network({"ping": "x", "trace": "", "zone": "a IN FOO 1", "rules": "x", "response": "GET / HTTP/1.1\n\n", "timings": TM})
+    assert r == {"severity": "warning", "checked": ["link", "web", "dns", "firewall"], "findings": ["link: could not check (no statistics)", "web: could not check (not a response)", "dns: could not check (line 1: bad record)", "firewall: could not check (line 1: bad rule)"]}
+    r = diagnose_network({"ping": DEAD_PING, "trace": GOOD_TR})
+    assert r["severity"] == "critical" and r["findings"] == ["link: no reply to ping"]
+    r = diagnose_network({"zone": "", "lookups": [("a.org", "A")]})
+    assert r["severity"] == "critical" and r["findings"] == ["dns: a.org A: NXDOMAIN"]
+    assert diagnose_network({"facts": {"link_up": False}})["findings"] == ["basics: no link"]
+- name: the report
+  code: |
+    assert format_report({"severity": "ok", "checked": ["link", "dns"], "findings": []}) == ["Network health: OK", "Checked: link, dns", "No problems found."]
+    assert format_report({"severity": "warning", "checked": ["link"], "findings": ["link: packet loss 25.0%"]}) == ["Network health: WARNING", "Checked: link", "- link: packet loss 25.0%"]
+    assert format_report({"severity": "ok", "checked": [], "findings": []}) == ["Network health: OK", "Checked: nothing", "No problems found."]
+    assert format_report({"severity": "critical", "checked": ["web", "dns"], "findings": ["a", "b"]}) == ["Network health: CRITICAL", "Checked: web, dns", "- a", "- b"]
+solution: |
+  def parse_ping(text):
+      """The command `ping host` sends small test messages and prints one line per reply, such as '64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms', and at the end a statistics line such as '4 packets transmitted, 3 received, 25% packet loss, time 3004ms' (the words 'packets received' may also be written 'received' only). Parse the text. Return a dict {'sent', 'received' (both ints from the statistics line), 'loss' (the percentage of lost messages computed from sent and received, rounded to 1 decimal, 0.0 if nothing was sent), 'times' (the list of all numbers in 'time=... ms' in order, as floats), 'min', 'avg', 'max' (of the times, rounded to 1 decimal, or None if there are no times)}. ValueError('no statistics') if the statistics line is missing."""
+      import re
+      m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", text)
+      if not m:
+          raise ValueError("no statistics")
+      sent, received = int(m.group(1)), int(m.group(2))
+      times = [float(t) for t in re.findall(r"time=([0-9.]+) ?ms", text)]
+      loss = round((sent - received) / sent * 100, 1) if sent else 0.0
+      return {"sent": sent, "received": received, "loss": loss, "times": times,
+              "min": round(min(times), 1) if times else None, "avg": round(sum(times) / len(times), 1) if times else None, "max": round(max(times), 1) if times else None}
+
+
+  def parse_traceroute(text):
+      """The command `traceroute host` shows the routers on the way, one line per hop (a hop is one router), for example '1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms' or '4  10.0.0.2  5.1 ms * 5.3 ms' (a star means that one probe got no reply) or '5  * * *'. Lines that do not start with a number (such as the header 'traceroute to ...') are ignored. Return a list of dicts {'hop' (int), 'host' (the first word that is not a star and not a time, or None if there is none), 'rtts' (the list of times in ms as floats, in order) and 'lost' (the number of stars)}. A time is a number that is followed by the word ms."""
+      hops = []
+      for line in text.split("\n"):
+          parts = line.split()
+          if not parts or not parts[0].isdigit():
+              continue
+          host, rtts, lost = None, [], 0
+          rest = parts[1:]
+          for i, tok in enumerate(rest):
+              if tok == "*":
+                  lost += 1
+              elif tok == "ms":
+                  continue
+              elif i + 1 < len(rest) and rest[i + 1] == "ms":
+                  rtts.append(float(tok))
+              elif host is None:
+                  host = tok
+          hops.append({"hop": int(parts[0]), "host": host, "rtts": rtts, "lost": lost})
+      return hops
+
+
+  def trace_report(hops, jump_ms):
+      """Read a traceroute for the first sign of trouble. `hops` comes from parse_traceroute. The typical time of a hop is the MEDIAN of its rtts (for an even count the mean of the two middle ones); a hop without any time has none. Return a list of text lines: first, if a hop's typical time is at least `jump_ms` MORE than the typical time of the nearest earlier hop that has one (the first hop needs an earlier hop to compare with), 'latency jumps at hop N (+X ms)' for the FIRST such hop, where X is the difference rounded to 1 decimal; then, if the list ends with one or more hops that have no rtts at all, 'no reply from hop N onward' where N is the first hop of that final run. An empty list gives ['no hops']. A healthy path gives []."""
+      if not hops:
+          return ["no hops"]
+
+      def median(values):
+          v = sorted(values)
+          mid = len(v) // 2
+          return v[mid] if len(v) % 2 else (v[mid - 1] + v[mid]) / 2
+      lines, prev = [], None
+      for h in hops:
+          if not h["rtts"]:
+              continue
+          typical = median(h["rtts"])
+          if prev is not None and typical - prev >= jump_ms:
+              lines.append("latency jumps at hop " + str(h["hop"]) + " (+" + str(round(typical - prev, 1)) + " ms)")
+              break
+          prev = typical
+      end = len(hops)
+      while end > 0 and not hops[end - 1]["rtts"]:
+          end -= 1
+      if end < len(hops):
+          lines.append("no reply from hop " + str(hops[end]["hop"]) + " onward")
+      return lines
+
+
+  def timing_report(t):
+      """A web request has phases: looking up the name (DNS), opening the connection (TCP), the encryption handshake (TLS, only for https), waiting for the server to start answering, and downloading. The tool `curl -w` prints CUMULATIVE times in seconds since the start: namelookup, connect, appconnect (0 for plain http), starttransfer and total. Given them as a dict with these five keys, return {'dns', 'tcp', 'tls', 'wait', 'transfer', 'slowest'} where the first five are the DURATION of each phase in milliseconds rounded to a whole number (dns = namelookup; tcp = connect - namelookup; tls = appconnect - connect, or 0 if appconnect is 0; wait = starttransfer - the later one of connect and appconnect; transfer = total - starttransfer) and 'slowest' is the name of the longest phase (the first in the order dns, tcp, tls, wait, transfer if there is a tie). Compute with the unrounded values, then round."""
+      ac = t["appconnect"]
+      d = {"dns": t["namelookup"], "tcp": t["connect"] - t["namelookup"], "tls": (ac - t["connect"]) if ac else 0.0,
+           "wait": t["starttransfer"] - max(t["connect"], ac), "transfer": t["total"] - t["starttransfer"]}
+      out = {k: int(round(v * 1000)) for k, v in d.items()}
+      order = ["dns", "tcp", "tls", "wait", "transfer"]
+      out["slowest"] = max(order, key=lambda k: (d[k], -order.index(k)))
+      return out
+
+
+  def parse_query(qs):
+      """The part of a web address after the '?' is the **query string**, such as 'q=hello+world&tag=a&tag=b%26c'. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by '&' (empty pairs are ignored) and name and value by the FIRST '=' (a pair without '=' has the value ''). Decode names and values: a plus sign means a blank, and '%' followed by two hexadecimal digits is one byte (so %26 is '&', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter 'é'). A '%' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character '\\ufffd' (use errors='replace')."""
+      def decode(text):
+          raw = bytearray()
+          i, text = 0, text.replace("+", " ")
+          while i < len(text):
+              ch = text[i]
+              if ch == "%" and len(text[i + 1:i + 3]) == 2 and all(c in "0123456789abcdefABCDEF" for c in text[i + 1:i + 3]):
+                  raw.append(int(text[i + 1:i + 3], 16))
+                  i += 3
+              else:
+                  raw.extend(ch.encode("utf-8"))
+                  i += 1
+          return raw.decode("utf-8", errors="replace")
+      result = {}
+      for pair in qs.split("&"):
+          if not pair:
+              continue
+          name, _, value = pair.partition("=")
+          result.setdefault(decode(name), []).append(decode(value))
+      return result
+
+
+  def parse_http(text):
+      """Every web page is fetched with a text conversation. A REQUEST looks like 'GET /search?q=cats HTTP/1.1' then header lines 'Host: example.com', a blank line and an optional body. A RESPONSE starts with 'HTTP/1.1 404 Not Found' (the reason may be missing) then headers, a blank line and the body. Lines end with '\\n' or '\\r\\n' (treat both the same). Parse the text. The first line decides: if it starts with 'HTTP/' it is a response, else a request. Header lines are 'Name: value' (split at the FIRST colon, strip both sides); names are turned into lower case; a name that occurs twice gets its values joined with ', '. The headers end at the first blank line; everything after it (unchanged) is the 'body' ('' if there is none). Return for a request {'kind': 'request', 'method', 'path' (without the query), 'query' (parse_query of the text after the first '?', {} if none), 'version', 'headers', 'body'}; for a response {'kind': 'response', 'version', 'status' (int), 'reason' (the rest of the line, '' if none), 'headers', 'body'}. ValueError('bad request line') if a request line does not have exactly three parts separated by blanks or its version does not start with 'HTTP/'; ValueError('bad status line') if the status is not a whole number; ValueError('bad header line N') for a header line without a colon (N counts the lines of the whole text from 1)."""
+      text = text.replace("\r\n", "\n")
+      head, sep, body = text.partition("\n\n")
+      lines = head.split("\n")
+      first = lines[0].split()
+      headers = {}
+      for n, line in enumerate(lines[1:], 2):
+          name, colon, value = line.partition(":")
+          if not colon or not name.strip():
+              raise ValueError("bad header line " + str(n))
+          key = name.strip().lower()
+          headers[key] = headers[key] + ", " + value.strip() if key in headers else value.strip()
+      if lines[0].startswith("HTTP/"):
+          parts = lines[0].split(None, 2)
+          if len(parts) < 2 or not parts[1].isdigit():
+              raise ValueError("bad status line")
+          return {"kind": "response", "version": parts[0], "status": int(parts[1]), "reason": parts[2].strip() if len(parts) > 2 else "", "headers": headers, "body": body}
+      if len(first) != 3 or not first[2].startswith("HTTP/"):
+          raise ValueError("bad request line")
+      path, _, qs = first[1].partition("?")
+      return {"kind": "request", "method": first[0], "path": path, "query": parse_query(qs), "version": first[2], "headers": headers, "body": body}
+
+
+  def audit_cookie(header):
+      """A server sets a cookie with a header value such as 'session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax': first name=value (split at the first '='), then attributes separated by ';' which are either flags (Secure) or Name=value pairs; attribute names are not case sensitive. Return {'name', 'value', 'problems'} where problems is the list of texts, in this order: 'missing Secure' (the cookie would also travel over unencrypted http), 'missing HttpOnly' (scripts on the page could read it), 'missing SameSite' (no protection against forged requests from other sites) and 'SameSite=None needs Secure' (SameSite is None but Secure is missing). ValueError('bad cookie') if the first part has no '=' or an empty name."""
+      parts = [p.strip() for p in header.split(";")]
+      name, eq, value = parts[0].partition("=")
+      if not eq or not name.strip():
+          raise ValueError("bad cookie")
+      attrs = {}
+      for p in parts[1:]:
+          if not p:
+              continue
+          k, _, v = p.partition("=")
+          attrs[k.strip().lower()] = v.strip()
+      problems = []
+      if "secure" not in attrs:
+          problems.append("missing Secure")
+      if "httponly" not in attrs:
+          problems.append("missing HttpOnly")
+      if "samesite" not in attrs:
+          problems.append("missing SameSite")
+      elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+          problems.append("SameSite=None needs Secure")
+      return {"name": name.strip(), "value": value.strip(), "problems": problems}
+
+
+  def parse_zone(text):
+      """The records of a domain are kept in a **zone file**, for example:
+
+  $ORIGIN example.com.
+  $TTL 3600
+  @        IN MX 10 mail
+  www  300 IN CNAME @
+  mail     IN A 192.0.2.25
+           IN TXT "v=spf1 -all"
+
+  Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+      origin, default_ttl, last, records = "", 3600, None, []
+
+      def full(name):
+          if name == "@":
+              return origin
+          if name.endswith("."):
+              return name[:-1].lower()
+          return (name + "." + origin).lower() if origin else name.lower()
+      for n, raw in enumerate(text.split("\n"), 1):
+          line = raw.split(";", 1)[0].rstrip()
+          if not line.strip():
+              continue
+          words = line.split()
+          bad = ValueError("line %d: bad record" % n)
+          if words[0] == "$ORIGIN":
+              if len(words) != 2:
+                  raise bad
+              origin = words[1].rstrip(".").lower()
+              continue
+          if words[0] == "$TTL":
+              if len(words) != 2 or not words[1].isdigit():
+                  raise bad
+              default_ttl = int(words[1])
+              continue
+          if line[0] in " \t":
+              if last is None:
+                  raise bad
+              name, rest = last, words
+          else:
+              name, rest = full(words[0]), words[1:]
+          ttl = default_ttl
+          while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+              if rest[0].isdigit():
+                  ttl = int(rest[0])
+              rest = rest[1:]
+          if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+              raise bad
+          rtype, args = rest[0].upper(), rest[1:]
+          if rtype in ("CNAME", "NS"):
+              if len(args) != 1:
+                  raise bad
+              value = full(args[0])
+          elif rtype == "MX":
+              if len(args) != 2 or not args[0].isdigit():
+                  raise bad
+              value = args[0] + " " + full(args[1])
+          elif rtype == "TXT":
+              value = " ".join(args)
+              if len(value) >= 2 and value[0] == value[-1] == '"':
+                  value = value[1:-1]
+          else:
+              if len(args) != 1:
+                  raise bad
+              value = args[0]
+          records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+          last = name
+      return records
+
+
+  def resolve(records, name, rtype):
+      """A **resolver** answers 'what is the rtype record of this name?' from the records (a list as returned by parse_zone). Names are compared in lower case without a trailing dot. If the name has records of the wanted type, those are the answer (their values in order of the list). If it has none but has a CNAME (an alias) and the wanted type is not CNAME, follow the alias: look for the same type at the target name, and so on. Return {'status', 'chain' (the names visited, the asked name first), 'answers' (the list of values), 'ttl' (the SMALLEST ttl of the records that were used: the final answers and all CNAMEs followed; None without an answer)}. The status is 'NOERROR' with answers; 'NODATA' if the final name exists (has any record) but has none of the wanted type; 'NXDOMAIN' if the final name has no record at all (this includes an alias to a name that does not exist); 'LOOP' if an alias leads back to a name already in the chain (that name is not added again); 'TOO LONG' if more than 8 aliases would have to be followed."""
+      cur = name.lower().rstrip(".")
+      chain, ttls, follows = [cur], [], 0
+      while True:
+          here = [r for r in records if r["name"] == cur]
+          if not here:
+              return {"status": "NXDOMAIN", "chain": chain, "answers": [], "ttl": None}
+          direct = [r for r in here if r["type"] == rtype]
+          if direct:
+              return {"status": "NOERROR", "chain": chain, "answers": [r["value"] for r in direct], "ttl": min([r["ttl"] for r in direct] + ttls)}
+          alias = next((r for r in here if r["type"] == "CNAME"), None)
+          if alias is None or rtype == "CNAME":
+              return {"status": "NODATA", "chain": chain, "answers": [], "ttl": None}
+          if follows >= 8:
+              return {"status": "TOO LONG", "chain": chain, "answers": [], "ttl": None}
+          follows += 1
+          ttls.append(alias["ttl"])
+          cur = alias["value"]
+          if cur in chain:
+              return {"status": "LOOP", "chain": chain, "answers": [], "ttl": None}
+          chain.append(cur)
+
+
+  def validate_zone(records):
+      """Typical mistakes in a zone can break a website or lose mail. Check a list of records (from parse_zone) and return the list of problem texts in this order: first, for every name (sorted) that has a CNAME record AND any record of another type, 'CNAME and other data at NAME' (an alias must stand alone); then, for every MX record in the order of the list, if its host is the name of a CNAME record, 'MX target HOST is a CNAME'; otherwise, if the host has no A and no AAAA record in the list, 'MX target HOST has no address' (the MX value is 'PRIORITY HOST')."""
+      problems = []
+      names = sorted({r["name"] for r in records})
+      for n in names:
+          types = {r["type"] for r in records if r["name"] == n}
+          if "CNAME" in types and len(types - {"CNAME"}) > 0:
+              problems.append("CNAME and other data at " + n)
+      cnames = {r["name"] for r in records if r["type"] == "CNAME"}
+      for r in records:
+          if r["type"] != "MX":
+              continue
+          host = r["value"].split(" ", 1)[1]
+          if host in cnames:
+              problems.append("MX target " + host + " is a CNAME")
+          elif not any(x["name"] == host and x["type"] in ("A", "AAAA") for x in records):
+              problems.append("MX target " + host + " has no address")
+      return problems
+
+
+  def in_network(ip, cidr):
+      """An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation 'address/length', for example '10.0.0.0/8' or '192.168.1.0/24': the first `length` bits are the network part, and every address that has the same network part belongs to the network ('/32' is one single address, '/0' is every address). A cidr without '/length' means '/32'. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored ('192.168.1.77/24' is the same network as '192.168.1.0/24'). ValueError('bad address') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError('bad length') if the length is not a whole number from 0 to 32."""
+      def to_int(text):
+          parts = text.split(".")
+          if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+              raise ValueError("bad address")
+          n = 0
+          for p in parts:
+              n = n * 256 + int(p)
+          return n
+      value = to_int(ip)
+      addr, slash, length = cidr.partition("/")
+      base = to_int(addr)
+      if slash:
+          if not length.isdigit() or int(length) > 32:
+              raise ValueError("bad length")
+          bits = int(length)
+      else:
+          bits = 32
+      shift = 32 - bits
+      return (value >> shift) == (base >> shift)
+
+
+  def parse_rules(text):
+      """A **firewall** is an ordered list of rules. Here each rule is one line 'ACTION PROTO from SOURCE to DESTINATION [port PORTS]', for example 'ALLOW tcp from 10.0.0.0/8 to any port 22' or 'DENY any from any to any'. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are 'any' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range 'first-last' (first <= last, numbers 0 to 65535); without 'port' the rule applies to every port. Blank lines and everything after a '#' are ignored. Return a list of dicts {'action', 'proto', 'src', 'dst', 'ports'} where ports is None or a tuple (first, last). ValueError('line N: bad rule') for anything else (N counts all lines from 1)."""
+      rules = []
+      for n, raw in enumerate(text.split("\n"), 1):
+          line = raw.split("#", 1)[0].strip()
+          if not line:
+              continue
+          w = line.split()
+          bad = ValueError("line %d: bad rule" % n)
+          if len(w) not in (6, 8) or w[2].lower() != "from" or w[4].lower() != "to":
+              raise bad
+          action, proto = w[0].upper(), w[1].lower()
+          if action not in ("ALLOW", "DENY") or proto not in ("tcp", "udp", "icmp", "any"):
+              raise bad
+          ports = None
+          if len(w) == 8:
+              if w[6].lower() != "port":
+                  raise bad
+              a, dash, b = w[7].partition("-")
+              if not a.isdigit() or (dash and not b.isdigit()):
+                  raise bad
+              first, last = int(a), int(b) if dash else int(a)
+              if not (0 <= first <= last <= 65535):
+                  raise bad
+              ports = (first, last)
+          rules.append({"action": action, "proto": proto, "src": w[3], "dst": w[5], "ports": ports})
+      return rules
+
+
+  def check_packet(rules, packet):
+      """Decide what the firewall does with a packet, a dict {'proto', 'src', 'dst', 'port'} (the port is None for packets without ports such as icmp). The rules are tried IN ORDER and the FIRST rule that matches decides. A rule matches if its proto is 'any' or equals the packet's proto, its src is 'any' or contains the packet's source address (in_network), its dst is 'any' or contains the destination, and its ports are None or contain the packet's port (a packet without a port does not match a rule that has ports). Return a tuple (action, number) where the number is the position of the winning rule in the list counted from 1. If no rule matches, the firewall DENIES everything that is not explicitly allowed: return ('DENY', 0)."""
+      for i, r in enumerate(rules, 1):
+          if r["proto"] != "any" and r["proto"] != packet["proto"]:
+              continue
+          if r["src"] != "any" and not in_network(packet["src"], r["src"]):
+              continue
+          if r["dst"] != "any" and not in_network(packet["dst"], r["dst"]):
+              continue
+          if r["ports"] is not None:
+              p = packet.get("port")
+              if p is None or not r["ports"][0] <= p <= r["ports"][1]:
+                  continue
+          return (r["action"], i)
+      return ("DENY", 0)
+
+
+  def find_scanners(events, threshold, window):
+      """A **port scan** knocks on many ports of a computer to find open doors, the first step of many attacks. `events` is a list of (time, source, port) with times in seconds, in time order. A source is a scanner if, within ANY time span of `window` seconds (from a time t up to and including t + window), it touched at least `threshold` DIFFERENT ports. Return the sorted list of (source, most) where `most` is the largest number of different ports that source touched in one such span, for the scanners only (sorted by source name)."""
+      by_source = {}
+      for t, src, port in events:
+          by_source.setdefault(src, []).append((t, port))
+      found = []
+      for src in sorted(by_source):
+          items = by_source[src]
+          best = 0
+          for i, (t0, _) in enumerate(items):
+              ports = {p for t, p in items[i:] if t0 <= t <= t0 + window}
+              best = max(best, len(ports))
+          if best >= threshold:
+              found.append((src, best))
+      return found
+
+
+  def diagnose_connection(facts):
+      """Put the detective method of the unit into one function. `facts` is a dict with some of these keys (a missing key means 'not tested yet'): 'link_up' (bool: the cable or Wi-Fi works), 'has_ip' (bool), 'gateway_ping' (bool: the router answers), 'internet_ping' (bool: an address on the internet answers), 'dns_ok' (bool: names can be looked up), 'port' ('open', 'refused' or 'timeout': what happened when connecting to the service) and 'http_status' (int). Go through the tests in this order and return the text for the FIRST one that has failed (a test that is missing is skipped): link_up False: 'no link'; has_ip False: 'no IP address'; gateway_ping False: 'cannot reach the router'; internet_ping False: 'no internet access'; dns_ok False: 'DNS failure'; port 'refused': 'nothing listens on the port'; port 'timeout': 'blocked by a firewall or lost on the way'; http_status of 500 or more: 'server error'; http_status of 400 to 499: 'request refused or not found'. If nothing failed return 'all tests passed'."""
+      checks = [("link_up", lambda v: v is False, "no link"), ("has_ip", lambda v: v is False, "no IP address"),
+                ("gateway_ping", lambda v: v is False, "cannot reach the router"), ("internet_ping", lambda v: v is False, "no internet access"),
+                ("dns_ok", lambda v: v is False, "DNS failure"), ("port", lambda v: v == "refused", "nothing listens on the port"),
+                ("port", lambda v: v == "timeout", "blocked by a firewall or lost on the way"),
+                ("http_status", lambda v: v >= 500, "server error"), ("http_status", lambda v: 400 <= v < 500, "request refused or not found")]
+      for key, failed, text in checks:
+          if key in facts and facts[key] is not None and failed(facts[key]):
+              return text
+      return "all tests passed"
+
+
+  def check_link(ping_text, trace_text, max_loss, jump_ms):
+      """Is the other end reachable and is the road healthy? Use parse_ping(ping_text) and trace_report(parse_traceroute(trace_text), jump_ms). Return a list of findings (texts): 'no reply to ping' if nothing was received; otherwise 'packet loss P%' if the loss is MORE than max_loss (P is the loss number exactly as the parser gives it, for example 'packet loss 25.0%'); then every line of the trace report as 'path: LINE'. A healthy link gives an empty list."""
+      findings = []
+      ping = parse_ping(ping_text)
+      if ping["received"] == 0:
+          findings.append("no reply to ping")
+      elif ping["loss"] > max_loss:
+          findings.append("packet loss " + str(ping["loss"]) + "%")
+      for line in trace_report(parse_traceroute(trace_text), jump_ms):
+          findings.append("path: " + line)
+      return findings
+
+
+  def check_web(response_text, timings, slow_ms):
+      """Check one web answer. parse_http(response_text) must be a response, otherwise ValueError('not a response'). Return a list of findings, in this order: 'server error N' for a status of 500 or more, or 'client error N' for 400 to 499, or 'redirect to LOCATION' for 300 to 399 (the 'location' header, or 'redirect without location' if it is missing); then, if there is a 'set-cookie' header, 'cookie NAME: PROBLEM' for every problem that audit_cookie finds; then 'no Cache-Control header' if the headers have no 'cache-control'; and last 'slow phase: NAME (X ms)' if the SLOWEST phase of timing_report(timings) took at least slow_ms (X is that phase's milliseconds)."""
+      resp = parse_http(response_text)
+      if resp["kind"] != "response":
+          raise ValueError("not a response")
+      findings = []
+      status, headers = resp["status"], resp["headers"]
+      if status >= 500:
+          findings.append("server error " + str(status))
+      elif status >= 400:
+          findings.append("client error " + str(status))
+      elif status >= 300:
+          findings.append("redirect to " + headers["location"] if "location" in headers else "redirect without location")
+      if "set-cookie" in headers:
+          cookie = audit_cookie(headers["set-cookie"])
+          for problem in cookie["problems"]:
+              findings.append("cookie " + cookie["name"] + ": " + problem)
+      if "cache-control" not in headers:
+          findings.append("no Cache-Control header")
+      report = timing_report(timings)
+      if report[report["slowest"]] >= slow_ms:
+          findings.append("slow phase: " + report["slowest"] + " (" + str(report[report["slowest"]]) + " ms)")
+      return findings
+
+
+  def check_dns(zone_text, lookups):
+      """Check a domain's zone. Parse it with parse_zone. Return a list of findings: first 'zone: PROBLEM' for every problem of validate_zone; then, for every (name, rtype) pair of `lookups` in order, if resolve(...) has a status other than 'NOERROR', 'NAME RTYPE: STATUS' (for example 'blog.example.com A: NXDOMAIN')."""
+      records = parse_zone(zone_text)
+      findings = ["zone: " + p for p in validate_zone(records)]
+      for name, rtype in lookups:
+          status = resolve(records, name, rtype)["status"]
+          if status != "NOERROR":
+              findings.append(name + " " + rtype + ": " + status)
+      return findings
+
+
+  def check_firewall(rules_text, expectations):
+      """Test a firewall against what it SHOULD do. rules = parse_rules(rules_text). `expectations` is a list of (packet, expected_action) pairs (a packet is the dict that check_packet takes, the action is 'ALLOW' or 'DENY'). For every pair, in order, whose real action (the first part of check_packet's result) differs from the expected one, add 'test N: expected X but got Y (rule R)' where N counts the pairs from 1 and R is the rule number, or '(no rule)' instead of '(rule R)' when no rule matched (rule number 0). A correct firewall gives an empty list."""
+      rules = parse_rules(rules_text)
+      findings = []
+      for n, (packet, expected) in enumerate(expectations, 1):
+          action, number = check_packet(rules, packet)
+          if action != expected:
+              where = "(rule " + str(number) + ")" if number else "(no rule)"
+              findings.append("test " + str(n) + ": expected " + expected + " but got " + action + " " + where)
+      return findings
+
+
+  def check_scans(events, threshold, window):
+      """Look for port scans in a connection log with find_scanners(events, threshold, window). Return 'possible scan from SOURCE (N ports)' for every scanner found, in the order of find_scanners."""
+      return ["possible scan from " + src + " (" + str(count) + " ports)" for src, count in find_scanners(events, threshold, window)]
+
+
+  def diagnose_network(snapshot):
+      """Check a whole network setup. `snapshot` is a dict that may contain: 'facts' (a dict for diagnose_connection); 'ping' and 'trace' (texts) with 'max_loss' (default 5) and 'jump_ms' (default 80) for check_link; 'response' and 'timings' with 'slow_ms' (default 300) for check_web; 'zone' with 'lookups' (default []) for check_dns; 'rules' with 'expectations' (default []) for check_firewall; 'events' with 'scan_threshold' (default 4) and 'scan_window' (default 10) for check_scans. The areas are 'basics' (needs 'facts'; its only finding is the text of diagnose_connection if that is not 'all tests passed'), 'link', 'web', 'dns', 'firewall', 'scans' (each needs the keys named first), always in this order; an area whose required keys are missing is not checked. If a check raises ValueError, the area's only finding is 'could not check (MESSAGE)'. Return {'severity', 'checked', 'findings'} with findings written 'AREA: finding'. The severity is 'critical' if any finding starts with 'basics:' or contains 'no reply', 'server error' or 'NXDOMAIN'; otherwise 'warning' if there is any finding; otherwise 'ok'."""
+      def basics(s):
+          text = diagnose_connection(s["facts"])
+          return [] if text == "all tests passed" else [text]
+      checks = [
+          ("basics", ("facts",), basics),
+          ("link", ("ping", "trace"), lambda s: check_link(s["ping"], s["trace"], s.get("max_loss", 5), s.get("jump_ms", 80))),
+          ("web", ("response", "timings"), lambda s: check_web(s["response"], s["timings"], s.get("slow_ms", 300))),
+          ("dns", ("zone",), lambda s: check_dns(s["zone"], s.get("lookups", []))),
+          ("firewall", ("rules",), lambda s: check_firewall(s["rules"], s.get("expectations", []))),
+          ("scans", ("events",), lambda s: check_scans(s["events"], s.get("scan_threshold", 4), s.get("scan_window", 10))),
+      ]
+      checked, findings = [], []
+      for area, needs, run_check in checks:
+          if not all(k in snapshot for k in needs):
+              continue
+          checked.append(area)
+          try:
+              found = run_check(snapshot)
+          except ValueError as e:
+              found = ["could not check (" + str(e) + ")"]
+          findings.extend(area + ": " + f for f in found)
+      if any(f.startswith("basics:") or "no reply" in f or "server error" in f or "NXDOMAIN" in f for f in findings):
+          severity = "critical"
+      else:
+          severity = "warning" if findings else "ok"
+      return {"severity": severity, "checked": checked, "findings": findings}
+
+
+  def format_report(result):
+      """Turn the result of diagnose_network into the lines of a report: 'Network health: SEVERITY' (the severity in capitals), then 'Checked: A, B' (the areas joined by ', ', or 'Checked: nothing' if there are none), then either 'No problems found.' or one line '- FINDING' for every finding."""
+      lines = ["Network health: " + result["severity"].upper(), "Checked: " + (", ".join(result["checked"]) if result["checked"] else "nothing")]
+      if result["findings"]:
+          lines.extend("- " + f for f in result["findings"])
+      else:
+          lines.append("No problems found.")
+      return lines
+stretch: 'Run the doctor on real output: save the result of `ping -c 4 example.com`, `traceroute example.com`
+  and `dig example.com` to files and read them in, call the commands with `subprocess.run`, send a real
+  HTTP request with `urllib.request` and feed the response to `check_web`, add a check for the expiry
+  date of a TLS certificate, keep the results of each run in a file and report only what changed since
+  the last run, or draw the path of a traceroute as a text picture.'

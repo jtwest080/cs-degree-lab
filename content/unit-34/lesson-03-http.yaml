@@ -1,0 +1,579 @@
+id: u34-http
+title: HTTP, Cookies and Caching
+minutes: 110
+objective: Read the plain-text conversation behind every web page. You will decode query strings, parse requests and responses, audit a cookie, decide whether a cached copy can be reused and follow a chain of redirects.
+outcomes:
+- Read an HTTP request and response
+- Decode a query string with percent escapes
+- Explain status codes and common headers
+- Judge the safety of a cookie
+- Use Cache-Control to decide if a copy is fresh
+- Follow redirects and spot loops
+sections:
+- heading: A conversation of text
+  body: |-
+    **HTTP** (HyperText Transfer Protocol) is the language of the web, and at heart it is text. The client (your **browser**, or a program) sends a **request**:
+
+    `GET /search?q=cats HTTP/1.1` ← the **method** (GET, POST, PUT, DELETE), the **path** and **query**, and the version
+    `Host: example.com` ← **headers**, one `Name: value` per line
+    (a blank line, and then an optional **body**, for example the data of a form)
+
+    and the server sends a **response**: a **status line** (`HTTP/1.1 200 OK`), headers (`Content-Type: text/html`, `Content-Length: 5120`) and the body, the page itself. **Status codes** are grouped by their first digit: **2xx** success (200 OK, 201 Created, 204 No Content), **3xx** go elsewhere (301 Moved Permanently, 302 and 307 temporary, 304 Not Modified), **4xx** *your* mistake (400 Bad Request, 401 not logged in, 403 not allowed, 404 Not Found, 429 Too Many Requests) and **5xx** *the server's* mistake (500 Internal Server Error, 502 Bad Gateway, 503 Unavailable).
+
+    GET asks for something and must not change anything (so it can be repeated and cached); POST sends data that changes things. Special characters in addresses are written as **percent escapes** (`%20` is a blank, `%26` is `&`, a letter like é becomes the UTF-8 bytes `%C3%A9`) and in a query string a `+` means a blank.
+
+    Plain **HTTP** can be read by anybody on the path. **HTTPS** wraps the same text in encryption (**TLS**), which also proves the identity of the server with a **certificate**. HTTP/2 and HTTP/3 carry the same ideas in a more efficient binary form.
+- heading: Cookies, caches and redirects
+  body: |-
+    HTTP has no memory: every request stands alone. A **cookie** adds one. The server sends `Set-Cookie: session=abc123; Secure; HttpOnly; SameSite=Lax`, and the browser sends `Cookie: session=abc123` with every later request to that site. The attributes matter: **Secure** (only over HTTPS), **HttpOnly** (scripts cannot read it, which limits the harm of a cross-site scripting bug), **SameSite** (not sent along with requests that come from other sites, a defence against forged requests), **Max-Age** or **Expires** (how long it lives), **Domain** and **Path** (where it is sent). A session cookie is as good as a password while it lives, so protect it like one.
+
+    **Caching** saves time and money. `Cache-Control: max-age=3600` says "reuse this for an hour without asking". `no-cache` means "ask me before you reuse it" (the server may answer *304 Not Modified*, with no body, if the **ETag**, a fingerprint of the content, still matches), `no-store` means "never keep it" and `private` means "only the browser may keep it, not shared caches". Caches exist in the browser, in **proxies** and in a **CDN** (content delivery network, servers all over the world that keep copies close to the visitors). The famous joke says there are only two hard things in computing: cache invalidation and naming things; the usual cure is to give a file a new name (`app.3f9a.js`) whenever its content changes.
+
+    **Redirects** (3xx with a `Location` header) tell the browser to go to another address: from `http` to `https`, from `www` to the bare name, or from an old page to a new one. Chains are slow and loops (A to B to A) never end, so browsers give up after a limit and show an error such as `ERR_TOO_MANY_REDIRECTS`.
+examples:
+- title: Reading a request and a response
+  intro: Parse both directions of a conversation and audit the cookie that the server sets.
+  code: |
+    def parse_query(qs):
+        """The part of a web address after the '?' is the **query string**, such as 'q=hello+world&tag=a&tag=b%26c'. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by '&' (empty pairs are ignored) and name and value by the FIRST '=' (a pair without '=' has the value ''). Decode names and values: a plus sign means a blank, and '%' followed by two hexadecimal digits is one byte (so %26 is '&', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter 'é'). A '%' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character '\\ufffd' (use errors='replace')."""
+        def decode(text):
+            raw = bytearray()
+            i, text = 0, text.replace("+", " ")
+            while i < len(text):
+                ch = text[i]
+                if ch == "%" and len(text[i + 1:i + 3]) == 2 and all(c in "0123456789abcdefABCDEF" for c in text[i + 1:i + 3]):
+                    raw.append(int(text[i + 1:i + 3], 16))
+                    i += 3
+                else:
+                    raw.extend(ch.encode("utf-8"))
+                    i += 1
+            return raw.decode("utf-8", errors="replace")
+        result = {}
+        for pair in qs.split("&"):
+            if not pair:
+                continue
+            name, _, value = pair.partition("=")
+            result.setdefault(decode(name), []).append(decode(value))
+        return result
+
+
+    def parse_http(text):
+        """Every web page is fetched with a text conversation. A REQUEST looks like 'GET /search?q=cats HTTP/1.1' then header lines 'Host: example.com', a blank line and an optional body. A RESPONSE starts with 'HTTP/1.1 404 Not Found' (the reason may be missing) then headers, a blank line and the body. Lines end with '\\n' or '\\r\\n' (treat both the same). Parse the text. The first line decides: if it starts with 'HTTP/' it is a response, else a request. Header lines are 'Name: value' (split at the FIRST colon, strip both sides); names are turned into lower case; a name that occurs twice gets its values joined with ', '. The headers end at the first blank line; everything after it (unchanged) is the 'body' ('' if there is none). Return for a request {'kind': 'request', 'method', 'path' (without the query), 'query' (parse_query of the text after the first '?', {} if none), 'version', 'headers', 'body'}; for a response {'kind': 'response', 'version', 'status' (int), 'reason' (the rest of the line, '' if none), 'headers', 'body'}. ValueError('bad request line') if a request line does not have exactly three parts separated by blanks or its version does not start with 'HTTP/'; ValueError('bad status line') if the status is not a whole number; ValueError('bad header line N') for a header line without a colon (N counts the lines of the whole text from 1)."""
+        text = text.replace("\r\n", "\n")
+        head, sep, body = text.partition("\n\n")
+        lines = head.split("\n")
+        first = lines[0].split()
+        headers = {}
+        for n, line in enumerate(lines[1:], 2):
+            name, colon, value = line.partition(":")
+            if not colon or not name.strip():
+                raise ValueError("bad header line " + str(n))
+            key = name.strip().lower()
+            headers[key] = headers[key] + ", " + value.strip() if key in headers else value.strip()
+        if lines[0].startswith("HTTP/"):
+            parts = lines[0].split(None, 2)
+            if len(parts) < 2 or not parts[1].isdigit():
+                raise ValueError("bad status line")
+            return {"kind": "response", "version": parts[0], "status": int(parts[1]), "reason": parts[2].strip() if len(parts) > 2 else "", "headers": headers, "body": body}
+        if len(first) != 3 or not first[2].startswith("HTTP/"):
+            raise ValueError("bad request line")
+        path, _, qs = first[1].partition("?")
+        return {"kind": "request", "method": first[0], "path": path, "query": parse_query(qs), "version": first[2], "headers": headers, "body": body}
+
+
+    def audit_cookie(header):
+        """A server sets a cookie with a header value such as 'session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax': first name=value (split at the first '='), then attributes separated by ';' which are either flags (Secure) or Name=value pairs; attribute names are not case sensitive. Return {'name', 'value', 'problems'} where problems is the list of texts, in this order: 'missing Secure' (the cookie would also travel over unencrypted http), 'missing HttpOnly' (scripts on the page could read it), 'missing SameSite' (no protection against forged requests from other sites) and 'SameSite=None needs Secure' (SameSite is None but Secure is missing). ValueError('bad cookie') if the first part has no '=' or an empty name."""
+        parts = [p.strip() for p in header.split(";")]
+        name, eq, value = parts[0].partition("=")
+        if not eq or not name.strip():
+            raise ValueError("bad cookie")
+        attrs = {}
+        for p in parts[1:]:
+            if not p:
+                continue
+            k, _, v = p.partition("=")
+            attrs[k.strip().lower()] = v.strip()
+        problems = []
+        if "secure" not in attrs:
+            problems.append("missing Secure")
+        if "httponly" not in attrs:
+            problems.append("missing HttpOnly")
+        if "samesite" not in attrs:
+            problems.append("missing SameSite")
+        elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+            problems.append("SameSite=None needs Secure")
+        return {"name": name.strip(), "value": value.strip(), "problems": problems}
+
+    raw = "GET /search?q=cats+%26+dogs&page=2 HTTP/1.1\r\nHost: example.com\r\nCookie: id=7\r\n\r\n"
+    req = parse_http(raw)
+    print(req["method"], req["path"], req["query"])
+    print(req["headers"]["host"])
+    resp = parse_http("HTTP/1.1 200 OK\nSet-Cookie: id=7; Path=/\nContent-Length: 5\n\nhello")
+    print(resp["status"], resp["reason"], resp["body"])
+    print(audit_cookie(resp["headers"]["set-cookie"]))
+  output: |
+    GET /search {'q': ['cats & dogs'], 'page': ['2']}
+    example.com
+    200 OK hello
+    {'name': 'id', 'value': '7', 'problems': ['missing Secure', 'missing HttpOnly', 'missing SameSite']}
+  lines:
+  - line: 73
+    note: 'The query is decoded: the plus sign and %26.'
+  - line: 74
+    note: Header names are lower case.
+  - line: 76
+    note: The response is split into its parts.
+  - line: 77
+    note: 'The cookie has no Secure, HttpOnly or SameSite attribute: three problems.'
+- title: Cache and redirect decisions
+  intro: Decide whether a copy may be reused and follow a chain of signposts.
+  code: |
+    def cache_check(headers, age):
+        """Browsers and servers in between keep copies of answers (a **cache**) so that they do not have to ask again. The header Cache-Control says how. `headers` is a dict with lower case names. Take the value of 'cache-control' (it may be missing), split it at commas, strip the blanks and ignore the case. Decide, for a copy that is `age` seconds old: 'uncacheable' if the directive no-store is present; else 'revalidate' if no-cache is present (the copy may only be used after asking the server whether it is still current); else, if max-age=N is present, 'fresh' when age < N and 'stale' otherwise; else (no information about freshness) 'stale'."""
+        value = headers.get("cache-control", "")
+        parts = [p.strip().lower() for p in value.split(",") if p.strip()]
+        if "no-store" in parts:
+            return "uncacheable"
+        if "no-cache" in parts:
+            return "revalidate"
+        for p in parts:
+            if p.startswith("max-age="):
+                try:
+                    return "fresh" if age < int(p[8:]) else "stale"
+                except ValueError:
+                    return "stale"
+        return "stale"
+
+
+    def follow_redirects(pages, start, max_hops):
+        """A web address often answers 'go there instead'. `pages` is a dict {address: (status, location)} (location is None when there is none). Follow the chain from `start`. The redirect statuses are 301, 302, 303, 307 and 308; a redirect needs a location, which may be relative (use urllib.parse.urljoin(current, location)). Return {'chain' (the list of addresses visited, start first), 'final' (the last address), 'result'}. The result is: 'missing' if the current address is not in pages (it is still the last in the chain); 'loop' if the next address is already in the chain (add it to the chain, then stop); 'ok' if the status is 200 to 299; 'error N' (N is the status) for any other status without redirect, including a redirect without location; 'too many redirects' if the chain would need more than max_hops redirects (stop after following max_hops redirects and finding yet another)."""
+        from urllib.parse import urljoin
+        chain, cur, hops = [start], start, 0
+        while True:
+            if cur not in pages:
+                return {"chain": chain, "final": cur, "result": "missing"}
+            status, loc = pages[cur]
+            if status in (301, 302, 303, 307, 308) and loc:
+                if hops >= max_hops:
+                    return {"chain": chain, "final": cur, "result": "too many redirects"}
+                nxt = urljoin(cur, loc)
+                hops += 1
+                if nxt in chain:
+                    chain.append(nxt)
+                    return {"chain": chain, "final": nxt, "result": "loop"}
+                chain.append(nxt)
+                cur = nxt
+                continue
+            return {"chain": chain, "final": cur, "result": "ok" if 200 <= status < 300 else "error " + str(status)}
+
+    print(cache_check({"cache-control": "public, max-age=3600"}, 100))
+    print(cache_check({"cache-control": "no-store"}, 0))
+    pages = {"http://site.org/": (301, "https://site.org/"), "https://site.org/": (302, "/home"), "https://site.org/home": (200, None)}
+    result = follow_redirects(pages, "http://site.org/", 5)
+    print(result["result"], len(result["chain"]))
+    print(result["final"])
+  output: |
+    fresh
+    uncacheable
+    ok 3
+    https://site.org/home
+  lines:
+  - line: 39
+    note: '100 seconds are less than 3600: fresh.'
+  - line: 40
+    note: The page must never be kept.
+  - line: 43
+    note: Two redirects led to the final page.
+  - line: 44
+    note: The relative address /home was resolved against the current page.
+playground:
+  prompt: 'Percent-encode a text yourself: keep letters and digits, write everything else as % and two hexadecimal digits.'
+  code: |
+    text = 'cats & dogs'
+    out = ''
+    for b in text.encode():
+        ch = chr(b)
+        out += ch if ch.isalnum() else '%%%02X' % b
+    print(out)
+exercises:
+- id: query
+  title: The text after the question mark
+  difficulty: 4
+  prompt: 'When you search for ''cats & dogs'' your browser asks for `/search?q=cats+%26+dogs`: special characters are written as a percent sign and two hexadecimal digits. Write `parse_query(qs)`. The part of a web address after the ''?'' is the **query string**, such as ''q=hello+world&tag=a&tag=b%26c''. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by ''&'' (empty pairs are ignored) and name and value by the FIRST ''='' (a pair without ''='' has the value ''''). Decode names and values: a plus sign means a blank, and ''%'' followed by two hexadecimal digits is one byte (so %26 is ''&'', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter ''é''). A ''%'' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character ''\ufffd'' (use errors=''replace'').'
+  starter: |-
+    def parse_query(qs):
+        """The part of a web address after the '?' is the **query string**, such as 'q=hello+world&tag=a&tag=b%26c'. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by '&' (empty pairs are ignored) and name and value by the FIRST '=' (a pair without '=' has the value ''). Decode names and values: a plus sign means a blank, and '%' followed by two hexadecimal digits is one byte (so %26 is '&', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter 'é'). A '%' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character '\\ufffd' (use errors='replace')."""
+        pass
+  tests:
+  - name: decoding
+    code: |
+      r = parse_query("q=hello+world&tag=a&tag=b%26c&&x&y=%C3%A9&z=%zz&w=100%&e=%FF")
+      assert r == {"q": ["hello world"], "tag": ["a", "b&c"], "x": [""], "y": ["\u00e9"], "z": ["%zz"], "w": ["100%"], "e": ["\ufffd"]}
+      assert parse_query("") == {} and parse_query("&&") == {} and parse_query("a=1=2") == {"a": ["1=2"]}
+  - name: names and repeats
+    code: |
+      assert parse_query("a=1&a=2&b=3&a=") == {"a": ["1", "2", ""], "b": ["3"]}
+      assert parse_query("n%61me=v%41lue") == {"name": ["vAlue"]} and parse_query("%41") == {"A": [""]} and parse_query("a=%4") == {"a": ["%4"]}
+      assert parse_query("a+b=c+d") == {"a b": ["c d"]} and parse_query("k=%E2%82%AC") == {"k": ["\u20ac"]}
+  hints:
+  - Collect the bytes of the decoded text in a bytearray, then decode them as UTF-8.
+  - str.partition('=') splits at the first equals sign only.
+  solution: |
+    def parse_query(qs):
+        """The part of a web address after the '?' is the **query string**, such as 'q=hello+world&tag=a&tag=b%26c'. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by '&' (empty pairs are ignored) and name and value by the FIRST '=' (a pair without '=' has the value ''). Decode names and values: a plus sign means a blank, and '%' followed by two hexadecimal digits is one byte (so %26 is '&', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter 'é'). A '%' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character '\\ufffd' (use errors='replace')."""
+        def decode(text):
+            raw = bytearray()
+            i, text = 0, text.replace("+", " ")
+            while i < len(text):
+                ch = text[i]
+                if ch == "%" and len(text[i + 1:i + 3]) == 2 and all(c in "0123456789abcdefABCDEF" for c in text[i + 1:i + 3]):
+                    raw.append(int(text[i + 1:i + 3], 16))
+                    i += 3
+                else:
+                    raw.extend(ch.encode("utf-8"))
+                    i += 1
+            return raw.decode("utf-8", errors="replace")
+        result = {}
+        for pair in qs.split("&"):
+            if not pair:
+                continue
+            name, _, value = pair.partition("=")
+            result.setdefault(decode(name), []).append(decode(value))
+        return result
+  explanation: 'Never build a query string by gluing text together: a value with an & in it would change the meaning. Use a library function that encodes (urllib.parse.urlencode in Python).'
+- id: http
+  title: A web conversation as text
+  difficulty: 5
+  prompt: 'Under all the pictures and buttons, the web is plain text sent back and forth. Write `parse_http(text)`. Every web page is fetched with a text conversation. A REQUEST looks like ''GET /search?q=cats HTTP/1.1'' then header lines ''Host: example.com'', a blank line and an optional body. A RESPONSE starts with ''HTTP/1.1 404 Not Found'' (the reason may be missing) then headers, a blank line and the body. Lines end with ''\n'' or ''\r\n'' (treat both the same). Parse the text. The first line decides: if it starts with ''HTTP/'' it is a response, else a request. Header lines are ''Name: value'' (split at the FIRST colon, strip both sides); names are turned into lower case; a name that occurs twice gets its values joined with '', ''. The headers end at the first blank line; everything after it (unchanged) is the ''body'' ('''' if there is none). Return for a request {''kind'': ''request'', ''method'', ''path'' (without the query), ''query'' (parse_query of the text after the first ''?'', {} if none), ''version'', ''headers'', ''body''}; for a response {''kind'': ''response'', ''version'', ''status'' (int), ''reason'' (the rest of the line, '''' if none), ''headers'', ''body''}. ValueError(''bad request line'') if a request line does not have exactly three parts separated by blanks or its version does not start with ''HTTP/''; ValueError(''bad status line'') if the status is not a whole number; ValueError(''bad header line N'') for a header line without a colon (N counts the lines of the whole text from 1).'
+  starter: |-
+    def parse_query(qs):
+        """The part of a web address after the '?' is the **query string**, such as 'q=hello+world&tag=a&tag=b%26c'. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by '&' (empty pairs are ignored) and name and value by the FIRST '=' (a pair without '=' has the value ''). Decode names and values: a plus sign means a blank, and '%' followed by two hexadecimal digits is one byte (so %26 is '&', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter 'é'). A '%' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character '\\ufffd' (use errors='replace')."""
+        def decode(text):
+            raw = bytearray()
+            i, text = 0, text.replace("+", " ")
+            while i < len(text):
+                ch = text[i]
+                if ch == "%" and len(text[i + 1:i + 3]) == 2 and all(c in "0123456789abcdefABCDEF" for c in text[i + 1:i + 3]):
+                    raw.append(int(text[i + 1:i + 3], 16))
+                    i += 3
+                else:
+                    raw.extend(ch.encode("utf-8"))
+                    i += 1
+            return raw.decode("utf-8", errors="replace")
+        result = {}
+        for pair in qs.split("&"):
+            if not pair:
+                continue
+            name, _, value = pair.partition("=")
+            result.setdefault(decode(name), []).append(decode(value))
+        return result
+
+
+
+
+    def parse_http(text):
+        """Every web page is fetched with a text conversation. A REQUEST looks like 'GET /search?q=cats HTTP/1.1' then header lines 'Host: example.com', a blank line and an optional body. A RESPONSE starts with 'HTTP/1.1 404 Not Found' (the reason may be missing) then headers, a blank line and the body. Lines end with '\\n' or '\\r\\n' (treat both the same). Parse the text. The first line decides: if it starts with 'HTTP/' it is a response, else a request. Header lines are 'Name: value' (split at the FIRST colon, strip both sides); names are turned into lower case; a name that occurs twice gets its values joined with ', '. The headers end at the first blank line; everything after it (unchanged) is the 'body' ('' if there is none). Return for a request {'kind': 'request', 'method', 'path' (without the query), 'query' (parse_query of the text after the first '?', {} if none), 'version', 'headers', 'body'}; for a response {'kind': 'response', 'version', 'status' (int), 'reason' (the rest of the line, '' if none), 'headers', 'body'}. ValueError('bad request line') if a request line does not have exactly three parts separated by blanks or its version does not start with 'HTTP/'; ValueError('bad status line') if the status is not a whole number; ValueError('bad header line N') for a header line without a colon (N counts the lines of the whole text from 1)."""
+        pass
+  tests:
+  - name: request and response
+    code: |
+      req = "GET /search?q=cats&page=2 HTTP/1.1\r\nHost: example.com\r\nAccept: a\r\naccept: b\r\n\r\nbody here\n"
+      assert parse_http(req) == {"kind": "request", "method": "GET", "path": "/search", "query": {"q": ["cats"], "page": ["2"]}, "version": "HTTP/1.1", "headers": {"host": "example.com", "accept": "a, b"}, "body": "body here\n"}
+      r = parse_http("HTTP/1.1 404 Not Found\nContent-Type: text/html\n\n<h1>x</h1>")
+      assert r == {"kind": "response", "version": "HTTP/1.1", "status": 404, "reason": "Not Found", "headers": {"content-type": "text/html"}, "body": "<h1>x</h1>"}
+      assert parse_http("HTTP/2 204\n\n") == {"kind": "response", "version": "HTTP/2", "status": 204, "reason": "", "headers": {}, "body": ""}
+  - name: errors and shapes
+    code: |
+      for text, msg in (("GET /", "bad request line"), ("GET / FTP/1", "bad request line"), ("", "bad request line"), ("HTTP/1.1 abc", "bad status line"), ("HTTP/1.1", "bad status line"), ("GET / HTTP/1.1\nbadheader\n\n", "bad header line 2"), ("GET / HTTP/1.1\nA: b\n: c\n", "bad header line 3")):
+          try:
+              parse_http(text)
+              raise AssertionError("accepted " + repr(text))
+          except ValueError as e:
+              assert str(e) == msg, (text, str(e))
+      r = parse_http("POST /api HTTP/1.1\nContent-Type: a: b\n\nx=1&y=2\n\nmore")
+      assert r["method"] == "POST" and r["query"] == {} and r["headers"] == {"content-type": "a: b"} and r["body"] == "x=1&y=2\n\nmore"
+      assert parse_http("GET /a?b HTTP/1.0")["query"] == {"b": [""]} and parse_http("GET / HTTP/1.1")["body"] == ""
+  hints:
+  - Replace '\r\n' by '\n' first, then partition at the first blank line '\n\n'.
+  - Collect the headers in a dict and join repeated names.
+  solution: |
+    def parse_query(qs):
+        """The part of a web address after the '?' is the **query string**, such as 'q=hello+world&tag=a&tag=b%26c'. Return a dict {name: [values]} in which every name has the list of all its values in order. Pairs are separated by '&' (empty pairs are ignored) and name and value by the FIRST '=' (a pair without '=' has the value ''). Decode names and values: a plus sign means a blank, and '%' followed by two hexadecimal digits is one byte (so %26 is '&', and several %XX in a row form UTF-8 text, for example %C3%A9 is the letter 'é'). A '%' that is not followed by two hexadecimal digits stays as it is. Bytes that are not valid UTF-8 are replaced by the character '\\ufffd' (use errors='replace')."""
+        def decode(text):
+            raw = bytearray()
+            i, text = 0, text.replace("+", " ")
+            while i < len(text):
+                ch = text[i]
+                if ch == "%" and len(text[i + 1:i + 3]) == 2 and all(c in "0123456789abcdefABCDEF" for c in text[i + 1:i + 3]):
+                    raw.append(int(text[i + 1:i + 3], 16))
+                    i += 3
+                else:
+                    raw.extend(ch.encode("utf-8"))
+                    i += 1
+            return raw.decode("utf-8", errors="replace")
+        result = {}
+        for pair in qs.split("&"):
+            if not pair:
+                continue
+            name, _, value = pair.partition("=")
+            result.setdefault(decode(name), []).append(decode(value))
+        return result
+
+
+
+
+    def parse_http(text):
+        """Every web page is fetched with a text conversation. A REQUEST looks like 'GET /search?q=cats HTTP/1.1' then header lines 'Host: example.com', a blank line and an optional body. A RESPONSE starts with 'HTTP/1.1 404 Not Found' (the reason may be missing) then headers, a blank line and the body. Lines end with '\\n' or '\\r\\n' (treat both the same). Parse the text. The first line decides: if it starts with 'HTTP/' it is a response, else a request. Header lines are 'Name: value' (split at the FIRST colon, strip both sides); names are turned into lower case; a name that occurs twice gets its values joined with ', '. The headers end at the first blank line; everything after it (unchanged) is the 'body' ('' if there is none). Return for a request {'kind': 'request', 'method', 'path' (without the query), 'query' (parse_query of the text after the first '?', {} if none), 'version', 'headers', 'body'}; for a response {'kind': 'response', 'version', 'status' (int), 'reason' (the rest of the line, '' if none), 'headers', 'body'}. ValueError('bad request line') if a request line does not have exactly three parts separated by blanks or its version does not start with 'HTTP/'; ValueError('bad status line') if the status is not a whole number; ValueError('bad header line N') for a header line without a colon (N counts the lines of the whole text from 1)."""
+        text = text.replace("\r\n", "\n")
+        head, sep, body = text.partition("\n\n")
+        lines = head.split("\n")
+        first = lines[0].split()
+        headers = {}
+        for n, line in enumerate(lines[1:], 2):
+            name, colon, value = line.partition(":")
+            if not colon or not name.strip():
+                raise ValueError("bad header line " + str(n))
+            key = name.strip().lower()
+            headers[key] = headers[key] + ", " + value.strip() if key in headers else value.strip()
+        if lines[0].startswith("HTTP/"):
+            parts = lines[0].split(None, 2)
+            if len(parts) < 2 or not parts[1].isdigit():
+                raise ValueError("bad status line")
+            return {"kind": "response", "version": parts[0], "status": int(parts[1]), "reason": parts[2].strip() if len(parts) > 2 else "", "headers": headers, "body": body}
+        if len(first) != 3 or not first[2].startswith("HTTP/"):
+            raise ValueError("bad request line")
+        path, _, qs = first[1].partition("?")
+        return {"kind": "request", "method": first[0], "path": path, "query": parse_query(qs), "version": first[2], "headers": headers, "body": body}
+  explanation: 'The headers carry the agreements: who you ask (Host), what you can read (Accept), what you send (Content-Type, Content-Length), who you are (Cookie, Authorization) and how long to keep the answer (Cache-Control).'
+- id: cookie
+  title: Is this cookie safe?
+  difficulty: 4
+  prompt: 'HTTP forgets you after every request, so the server hands you a **cookie** that you show again next time. A careless cookie is a security hole, so reviewers check its attributes. Write `audit_cookie(header)`. A server sets a cookie with a header value such as ''session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax'': first name=value (split at the first ''=''), then attributes separated by '';'' which are either flags (Secure) or Name=value pairs; attribute names are not case sensitive. Return {''name'', ''value'', ''problems''} where problems is the list of texts, in this order: ''missing Secure'' (the cookie would also travel over unencrypted http), ''missing HttpOnly'' (scripts on the page could read it), ''missing SameSite'' (no protection against forged requests from other sites) and ''SameSite=None needs Secure'' (SameSite is None but Secure is missing). ValueError(''bad cookie'') if the first part has no ''='' or an empty name.'
+  starter: |-
+    def audit_cookie(header):
+        """A server sets a cookie with a header value such as 'session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax': first name=value (split at the first '='), then attributes separated by ';' which are either flags (Secure) or Name=value pairs; attribute names are not case sensitive. Return {'name', 'value', 'problems'} where problems is the list of texts, in this order: 'missing Secure' (the cookie would also travel over unencrypted http), 'missing HttpOnly' (scripts on the page could read it), 'missing SameSite' (no protection against forged requests from other sites) and 'SameSite=None needs Secure' (SameSite is None but Secure is missing). ValueError('bad cookie') if the first part has no '=' or an empty name."""
+        pass
+  tests:
+  - name: audit
+    code: |
+      assert audit_cookie("session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax") == {"name": "session", "value": "abc123", "problems": []}
+      assert audit_cookie("a=b; samesite=None") == {"name": "a", "value": "b", "problems": ["missing Secure", "missing HttpOnly", "SameSite=None needs Secure"]}
+      assert audit_cookie("x=; SECURE; httponly") == {"name": "x", "value": "", "problems": ["missing SameSite"]}
+  - name: odd shapes
+    code: |
+      assert audit_cookie("id=a=b=c; Secure; HttpOnly; SameSite=None")["value"] == "a=b=c" and audit_cookie("id=a=b=c; Secure; HttpOnly; SameSite=None")["problems"] == []
+      assert audit_cookie("t=1;;Secure;HttpOnly;SameSite=Strict") == {"name": "t", "value": "1", "problems": []}
+      assert audit_cookie("  n = v ; Secure")["name"] == "n" and audit_cookie("n=v")["problems"] == ["missing Secure", "missing HttpOnly", "missing SameSite"]
+      for text in ("novalue", "=x", "", "; Secure"):
+          try:
+              audit_cookie(text)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "bad cookie"
+  hints:
+  - Split at ';', then split the first part at the first '='.
+  - Store the attribute names in lower case in a dict.
+  solution: |
+    def audit_cookie(header):
+        """A server sets a cookie with a header value such as 'session=abc123; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax': first name=value (split at the first '='), then attributes separated by ';' which are either flags (Secure) or Name=value pairs; attribute names are not case sensitive. Return {'name', 'value', 'problems'} where problems is the list of texts, in this order: 'missing Secure' (the cookie would also travel over unencrypted http), 'missing HttpOnly' (scripts on the page could read it), 'missing SameSite' (no protection against forged requests from other sites) and 'SameSite=None needs Secure' (SameSite is None but Secure is missing). ValueError('bad cookie') if the first part has no '=' or an empty name."""
+        parts = [p.strip() for p in header.split(";")]
+        name, eq, value = parts[0].partition("=")
+        if not eq or not name.strip():
+            raise ValueError("bad cookie")
+        attrs = {}
+        for p in parts[1:]:
+            if not p:
+                continue
+            k, _, v = p.partition("=")
+            attrs[k.strip().lower()] = v.strip()
+        problems = []
+        if "secure" not in attrs:
+            problems.append("missing Secure")
+        if "httponly" not in attrs:
+            problems.append("missing HttpOnly")
+        if "samesite" not in attrs:
+            problems.append("missing SameSite")
+        elif attrs["samesite"].lower() == "none" and "secure" not in attrs:
+            problems.append("SameSite=None needs Secure")
+        return {"name": name.strip(), "value": value.strip(), "problems": problems}
+  explanation: Secure keeps the cookie off plain http, HttpOnly hides it from scripts (so a cross-site scripting bug cannot steal it) and SameSite stops other sites from making your browser send it along.
+- id: cache
+  title: Can I reuse my copy?
+  difficulty: 3
+  prompt: 'The fastest request is the one that is never made. Write `cache_check(headers, age)`. Browsers and servers in between keep copies of answers (a **cache**) so that they do not have to ask again. The header Cache-Control says how. `headers` is a dict with lower case names. Take the value of ''cache-control'' (it may be missing), split it at commas, strip the blanks and ignore the case. Decide, for a copy that is `age` seconds old: ''uncacheable'' if the directive no-store is present; else ''revalidate'' if no-cache is present (the copy may only be used after asking the server whether it is still current); else, if max-age=N is present, ''fresh'' when age < N and ''stale'' otherwise; else (no information about freshness) ''stale''.'
+  starter: |-
+    def cache_check(headers, age):
+        """Browsers and servers in between keep copies of answers (a **cache**) so that they do not have to ask again. The header Cache-Control says how. `headers` is a dict with lower case names. Take the value of 'cache-control' (it may be missing), split it at commas, strip the blanks and ignore the case. Decide, for a copy that is `age` seconds old: 'uncacheable' if the directive no-store is present; else 'revalidate' if no-cache is present (the copy may only be used after asking the server whether it is still current); else, if max-age=N is present, 'fresh' when age < N and 'stale' otherwise; else (no information about freshness) 'stale'."""
+        pass
+  tests:
+  - name: directives
+    code: |
+      assert [cache_check({"cache-control": v}, 50) for v in ("max-age=60", "max-age=50", "No-Cache, max-age=60", "no-store", "public, max-age=abc", "private")] == ["fresh", "stale", "revalidate", "uncacheable", "stale", "stale"]
+      assert cache_check({}, 0) == "stale" and cache_check({"content-type": "x"}, 5) == "stale"
+  - name: details
+    code: |
+      assert cache_check({"cache-control": "public, max-age=3600"}, 0) == "fresh" and cache_check({"cache-control": "max-age=0"}, 0) == "stale"
+      assert cache_check({"cache-control": " max-age=10 ,  no-store "}, 1) == "uncacheable" and cache_check({"cache-control": "NO-STORE"}, 1) == "uncacheable"
+      assert cache_check({"cache-control": "no-cache"}, 10 ** 9) == "revalidate" and cache_check({"cache-control": "max-age=60,"}, 59) == "fresh"
+  hints:
+  - Turn the header into a list of lower case directives.
+  - Check no-store first, then no-cache, then max-age.
+  solution: |
+    def cache_check(headers, age):
+        """Browsers and servers in between keep copies of answers (a **cache**) so that they do not have to ask again. The header Cache-Control says how. `headers` is a dict with lower case names. Take the value of 'cache-control' (it may be missing), split it at commas, strip the blanks and ignore the case. Decide, for a copy that is `age` seconds old: 'uncacheable' if the directive no-store is present; else 'revalidate' if no-cache is present (the copy may only be used after asking the server whether it is still current); else, if max-age=N is present, 'fresh' when age < N and 'stale' otherwise; else (no information about freshness) 'stale'."""
+        value = headers.get("cache-control", "")
+        parts = [p.strip().lower() for p in value.split(",") if p.strip()]
+        if "no-store" in parts:
+            return "uncacheable"
+        if "no-cache" in parts:
+            return "revalidate"
+        for p in parts:
+            if p.startswith("max-age="):
+                try:
+                    return "fresh" if age < int(p[8:]) else "stale"
+                except ValueError:
+                    return "stale"
+        return "stale"
+  explanation: Static files (images, scripts) get a long max-age and a new file name when they change; pages with personal data get private or no-store, so that a shared cache never keeps them.
+- id: redirects
+  title: Following the signposts
+  difficulty: 4
+  prompt: 'Addresses move, sites switch from http to https and links get shortened. Write `follow_redirects(pages, start, max_hops)`. A web address often answers ''go there instead''. `pages` is a dict {address: (status, location)} (location is None when there is none). Follow the chain from `start`. The redirect statuses are 301, 302, 303, 307 and 308; a redirect needs a location, which may be relative (use urllib.parse.urljoin(current, location)). Return {''chain'' (the list of addresses visited, start first), ''final'' (the last address), ''result''}. The result is: ''missing'' if the current address is not in pages (it is still the last in the chain); ''loop'' if the next address is already in the chain (add it to the chain, then stop); ''ok'' if the status is 200 to 299; ''error N'' (N is the status) for any other status without redirect, including a redirect without location; ''too many redirects'' if the chain would need more than max_hops redirects (stop after following max_hops redirects and finding yet another).'
+  starter: |-
+    def follow_redirects(pages, start, max_hops):
+        """A web address often answers 'go there instead'. `pages` is a dict {address: (status, location)} (location is None when there is none). Follow the chain from `start`. The redirect statuses are 301, 302, 303, 307 and 308; a redirect needs a location, which may be relative (use urllib.parse.urljoin(current, location)). Return {'chain' (the list of addresses visited, start first), 'final' (the last address), 'result'}. The result is: 'missing' if the current address is not in pages (it is still the last in the chain); 'loop' if the next address is already in the chain (add it to the chain, then stop); 'ok' if the status is 200 to 299; 'error N' (N is the status) for any other status without redirect, including a redirect without location; 'too many redirects' if the chain would need more than max_hops redirects (stop after following max_hops redirects and finding yet another)."""
+        pass
+  tests:
+  - name: chains
+    code: |
+      P = {"http://a.com/old": (301, "/new"), "http://a.com/new": (302, "https://b.com/x"), "https://b.com/x": (200, None), "http://a.com/loop1": (302, "/loop2"), "http://a.com/loop2": (302, "/loop1"), "http://a.com/nf": (404, None), "http://a.com/nol": (302, None)}
+      assert follow_redirects(P, "http://a.com/old", 5) == {"chain": ["http://a.com/old", "http://a.com/new", "https://b.com/x"], "final": "https://b.com/x", "result": "ok"}
+      assert follow_redirects(P, "http://a.com/loop1", 5) == {"chain": ["http://a.com/loop1", "http://a.com/loop2", "http://a.com/loop1"], "final": "http://a.com/loop1", "result": "loop"}
+      assert follow_redirects(P, "http://a.com/nf", 5) == {"chain": ["http://a.com/nf"], "final": "http://a.com/nf", "result": "error 404"}
+      assert follow_redirects(P, "http://a.com/nol", 5)["result"] == "error 302" and follow_redirects(P, "http://zzz/", 5) == {"chain": ["http://zzz/"], "final": "http://zzz/", "result": "missing"}
+  - name: limits
+    code: |
+      P = {"http://a.com/old": (301, "/new"), "http://a.com/new": (302, "https://b.com/x"), "https://b.com/x": (200, None)}
+      assert follow_redirects(P, "http://a.com/old", 1) == {"chain": ["http://a.com/old", "http://a.com/new"], "final": "http://a.com/new", "result": "too many redirects"}
+      assert follow_redirects(P, "http://a.com/old", 2)["result"] == "ok" and follow_redirects(P, "http://a.com/old", 0)["chain"] == ["http://a.com/old"]
+      Q = {"http://x/a": (307, "b"), "http://x/b": (308, "http://x/c?q=1"), "http://x/c?q=1": (204, None), "http://x/self": (301, "self")}
+      assert follow_redirects(Q, "http://x/a", 3) == {"chain": ["http://x/a", "http://x/b", "http://x/c?q=1"], "final": "http://x/c?q=1", "result": "ok"}
+      assert follow_redirects(Q, "http://x/self", 3) == {"chain": ["http://x/self", "http://x/self"], "final": "http://x/self", "result": "loop"}
+  hints:
+  - urllib.parse.urljoin(current, location) resolves relative addresses.
+  - Count the redirects you have followed and compare with max_hops before following another.
+  solution: |
+    def follow_redirects(pages, start, max_hops):
+        """A web address often answers 'go there instead'. `pages` is a dict {address: (status, location)} (location is None when there is none). Follow the chain from `start`. The redirect statuses are 301, 302, 303, 307 and 308; a redirect needs a location, which may be relative (use urllib.parse.urljoin(current, location)). Return {'chain' (the list of addresses visited, start first), 'final' (the last address), 'result'}. The result is: 'missing' if the current address is not in pages (it is still the last in the chain); 'loop' if the next address is already in the chain (add it to the chain, then stop); 'ok' if the status is 200 to 299; 'error N' (N is the status) for any other status without redirect, including a redirect without location; 'too many redirects' if the chain would need more than max_hops redirects (stop after following max_hops redirects and finding yet another)."""
+        from urllib.parse import urljoin
+        chain, cur, hops = [start], start, 0
+        while True:
+            if cur not in pages:
+                return {"chain": chain, "final": cur, "result": "missing"}
+            status, loc = pages[cur]
+            if status in (301, 302, 303, 307, 308) and loc:
+                if hops >= max_hops:
+                    return {"chain": chain, "final": cur, "result": "too many redirects"}
+                nxt = urljoin(cur, loc)
+                hops += 1
+                if nxt in chain:
+                    chain.append(nxt)
+                    return {"chain": chain, "final": nxt, "result": "loop"}
+                chain.append(nxt)
+                cur = nxt
+                continue
+            return {"chain": chain, "final": cur, "result": "ok" if 200 <= status < 300 else "error " + str(status)}
+  explanation: Browsers stop after about 20 redirects. A redirect from http to https is how most sites force an encrypted connection; 301 and 308 are permanent (cached), 302 and 307 temporary.
+commonMistakes:
+- title: Building a query string by gluing text
+  explanation: An & or = inside a value changes the meaning.
+- title: Changing data with GET
+  explanation: Caches, crawlers and prefetching repeat GET requests.
+- title: Cookies without Secure and HttpOnly
+  explanation: They can be stolen from the network or by a script.
+- title: Caching private pages in shared caches
+  explanation: Another person could see them.
+- title: Endless redirect loops
+  explanation: Two rules that send the visitor to each other.
+summary:
+- HTTP is a text conversation of requests and responses.
+- The first digit of a status code tells who made the mistake.
+- Percent escapes carry special characters in addresses.
+- Cookies need Secure, HttpOnly and SameSite.
+- Cache-Control decides if a copy may be reused, and redirects can loop.
+next: u34-proxy
+quiz:
+- type: mcq
+  question: What does the status 404 mean?
+  options:
+  - The page was not found
+  - The server crashed
+  - You must log in
+  - Success
+  answer: 0
+  explanation: A 4xx code is the client's mistake.
+- type: mcq
+  question: Which codes show a problem on the server side?
+  options:
+  - 5xx
+  - 2xx
+  - 3xx
+  - 1xx
+  answer: 0
+  explanation: 500 and above.
+- type: mcq
+  question: What does HttpOnly do for a cookie?
+  options:
+  - Scripts on the page cannot read it
+  - It lives forever
+  - It is sent only to other sites
+  - It is encrypted
+  answer: 0
+  explanation: It limits cross-site scripting damage.
+- type: mcq
+  question: 'What does Cache-Control: no-store mean?'
+  options:
+  - Never keep a copy
+  - Keep it for ever
+  - Ask before reuse
+  - Keep it only in the browser
+  answer: 0
+  explanation: no-cache means ask first.
+- type: mcq
+  question: What is %26 in an address?
+  options:
+  - The character &
+  - A percent sign
+  - A blank
+  - A letter
+  answer: 0
+  explanation: 26 in hexadecimal is 38, the code of &.
+- type: mcq
+  question: Why should GET not change data?
+  options:
+  - It can be repeated, cached and prefetched
+  - It is slower
+  - It cannot carry data
+  - It is forbidden
+  answer: 0
+  explanation: POST is for changes.
+- type: code
+  question: Write `status_group(code)` returning 'success' for 200-299, 'redirect' for 300-399, 'client error' for 400-499, 'server error' for 500-599 and 'other' for anything else.
+  starter: |
+    def status_group(code):
+        pass
+  tests:
+  - name: groups
+    code: |
+      assert status_group(200) == "success" and status_group(299) == "success" and status_group(301) == "redirect" and status_group(404) == "client error" and status_group(503) == "server error" and status_group(100) == "other" and status_group(600) == "other"
+  solution: |
+    def status_group(code):
+        if 200 <= code < 300:
+            return "success"
+        if 300 <= code < 400:
+            return "redirect"
+        if 400 <= code < 500:
+            return "client error"
+        if 500 <= code < 600:
+            return "server error"
+        return "other"

@@ -1,0 +1,540 @@
+id: u34-packets
+title: Packets and TCP in Detail
+minutes: 110
+objective: Look at what really travels on the wire. You will read an IP header and a TCP header from hexadecimal bytes, compute the internet checksum, put out-of-order segments back together and read a connection's story from its flags.
+outcomes:
+- Explain what is in an IP header and a TCP header
+- Read numbers and flags from bytes
+- Compute the internet checksum
+- Explain how TCP repairs lost, late and repeated packets
+- Tell 'refused', 'timed out' and 'reset' apart
+sections:
+- heading: Layers of headers
+  body: |-
+    Everything on a network travels in **packets**: a small **header** (the address label) plus a **payload** (the content). Headers are nested like envelopes inside envelopes: an **Ethernet frame** (for the local network, with the hardware addresses of the **network cards**) contains an **IP packet** (addresses across the internet) contains a **TCP segment** or **UDP datagram** (ports and reliability) contains the **application data** (for example an HTTP request). Each layer reads only its own header.
+
+    The **IPv4 header** has at least 20 bytes. The first byte holds the *version* (4) and the *header length*; later come the total length, the **TTL**, the *protocol* number (6 = TCP, 17 = UDP, 1 = ICMP, the family of ping), a **checksum** and the 4-byte **source** and **destination** addresses (`10.0.0.1` is just four bytes written as decimal numbers). Computers write such bytes in **hexadecimal** (base 16: two digits per byte, `ff` = 255). Multi-byte numbers use **big-endian** order on networks: the high byte comes first.
+
+    The **checksum** is a sum of all 16-bit words with the carries folded back in and then flipped; the receiver adds everything *including* the checksum and must get all ones (so the complement is 0). It finds accidents, not attacks.
+- heading: 'TCP: a reliable stream on an unreliable network'
+  body: |-
+    IP only does its best: packets can be lost, repeated or arrive in any order. **TCP** builds a reliable **stream** of bytes on top, and **UDP** does not (it is faster and lets the application decide, used for video calls, games and DNS).
+
+    TCP numbers every byte with a **sequence number** and the receiver answers with an **acknowledgment number** (ACK): *the next byte I expect*. Missing data is sent again, duplicates are dropped and the receiver puts the segments in order, which is exactly what you will code. The **window** field says how much more data the receiver can take (flow control), and the sender slows down when packets are lost (**congestion control**).
+
+    A connection starts with the **three-way handshake**: the client sends **SYN**, the server answers **SYN+ACK**, the client sends **ACK**. It ends politely with **FIN** from both sides, or abruptly with **RST** (reset). Ports identify programs: 80 is HTTP, 443 is HTTPS, 22 is SSH. The tools `tcpdump` and **Wireshark** capture packets and show these fields.
+
+    Reading failures: *connection refused* means a computer answered with RST (nobody is listening on that port). *Connection timed out* means silence: a firewall drops the packets, the computer is off, or the route is broken. A flood of SYNs that are never completed is a **SYN flood** attack, answered with SYN cookies and rate limits.
+examples:
+- title: Headers from bytes
+  intro: Read an IP header and a TCP header from hexadecimal text and check the checksum.
+  code: |
+    def internet_checksum(hexstr):
+        """Every IP header carries a 16-bit **checksum** so that a router can notice damage. The method (the 'internet checksum'): read the bytes as 16-bit numbers (two bytes each, the first one is the high one; if the number of bytes is odd, add a zero byte at the end), add them all up, then 'fold' every carry back in (while the sum is above 0xFFFF, add the high part to the low part: (s & 0xFFFF) + (s >> 16)) and finally return the bitwise complement within 16 bits (0xFFFF - s). Input: a text of hexadecimal digits, blanks allowed anywhere. ValueError('bad hex') if it is not valid hexadecimal (an odd number of digits counts as not valid)."""
+        try:
+            data = bytes.fromhex(hexstr)
+        except ValueError:
+            raise ValueError("bad hex")
+        if len(data) % 2:
+            data += b"\x00"
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) | data[i + 1]
+        while total > 0xFFFF:
+            total = (total & 0xFFFF) + (total >> 16)
+        return 0xFFFF - total
+
+
+    def parse_ipv4(hexstr):
+        """An IPv4 packet starts with a header. Its first byte holds the version (the high 4 bits, always 4) and the header length in 32-bit words (the low 4 bits, at least 5). Then: byte 2-3 total length; byte 8 TTL (time to live); byte 9 protocol (1 = 'ICMP', 6 = 'TCP', 17 = 'UDP', anything else the number as text); byte 10-11 the checksum; byte 12-15 the source address; byte 16-19 the destination address (each written as four numbers separated by dots). The input is the packet as hexadecimal text (blanks allowed). Return {'version', 'header_bytes' (the header length in bytes), 'total_length', 'ttl', 'protocol', 'src', 'dst', 'checksum_ok'} where checksum_ok is True if the internet_checksum of the header bytes (all header_bytes, including the checksum field) is 0. Errors (ValueError): 'too short' if there are fewer than 20 bytes or fewer bytes than the header length says, 'not IPv4' if the version is not 4, 'bad header length' if the length is below 5 words. Check in this order: too short (20), version, header length, too short (header)."""
+        data = bytes.fromhex(hexstr)
+        if len(data) < 20:
+            raise ValueError("too short")
+        if data[0] >> 4 != 4:
+            raise ValueError("not IPv4")
+        words = data[0] & 15
+        if words < 5:
+            raise ValueError("bad header length")
+        if len(data) < words * 4:
+            raise ValueError("too short")
+        protocols = {1: "ICMP", 6: "TCP", 17: "UDP"}
+        header = data[:words * 4]
+        return {"version": 4, "header_bytes": words * 4, "total_length": (data[2] << 8) | data[3], "ttl": data[8],
+                "protocol": protocols.get(data[9], str(data[9])), "src": ".".join(str(b) for b in data[12:16]),
+                "dst": ".".join(str(b) for b in data[16:20]), "checksum_ok": internet_checksum(header.hex()) == 0}
+
+
+    def parse_tcp(hexstr):
+        """A TCP segment starts with its header (hexadecimal text, blanks allowed): bytes 0-1 source port, 2-3 destination port, 4-7 sequence number, 8-11 acknowledgment number (all big-endian, the high byte first), byte 12 the header length in 32-bit words in its high 4 bits (at least 5), byte 13 the flags, bytes 14-15 the window size. The flag bits, from the lowest: FIN (1), SYN (2), RST (4), PSH (8), ACK (16), URG (32). Return {'src_port', 'dst_port', 'seq', 'ack', 'header_bytes', 'flags' (the list of the names of the set flags in the order FIN, SYN, RST, PSH, ACK, URG), 'window'}. ValueError('too short') for fewer than 20 bytes, ValueError('bad header length') for a header length below 5 words (check the length of the data first)."""
+        data = bytes.fromhex(hexstr)
+        if len(data) < 20:
+            raise ValueError("too short")
+        words = data[12] >> 4
+        if words < 5:
+            raise ValueError("bad header length")
+        names = ["FIN", "SYN", "RST", "PSH", "ACK", "URG"]
+        flags = [n for i, n in enumerate(names) if data[13] & (1 << i)]
+        return {"src_port": (data[0] << 8) | data[1], "dst_port": (data[2] << 8) | data[3],
+                "seq": int.from_bytes(data[4:8], "big"), "ack": int.from_bytes(data[8:12], "big"),
+                "header_bytes": words * 4, "flags": flags, "window": (data[14] << 8) | data[15]}
+
+    pkt = "45000054000040004006fac80a0000015db8d822"
+    ip = parse_ipv4(pkt)
+    print(ip["src"], "->", ip["dst"], ip["protocol"], "ttl", ip["ttl"], ip["checksum_ok"])
+    syn = "c350" + "01bb" + "00000064" + "00000000" + "5002" + "ffff" + "0000" + "0000"
+    tcp = parse_tcp(syn)
+    print(tcp["src_port"], "->", tcp["dst_port"], tcp["flags"])
+    print(hex(internet_checksum("4500005400004000400600000a0000015db8d822")))
+  output: |
+    10.0.0.1 -> 93.184.216.34 TCP ttl 64 True
+    50000 -> 443 ['SYN']
+    0xfac8
+  lines:
+  - line: 52
+    note: Source, destination, protocol, TTL and a valid checksum.
+  - line: 55
+    note: The client port 50000 connects to port 443 with a SYN.
+  - line: 56
+    note: With the checksum field set to zero, the function computes 0xfac8, which the header then contains.
+- title: Segments and connections
+  intro: Rebuild a stream from out-of-order pieces and classify a connection.
+  code: |
+    def reassemble(segments, start):
+        """TCP cuts a stream of bytes into segments that may arrive late, twice or in the wrong order, and puts them back together. Each segment is a pair (seq, text): the position of its first character in the stream and its characters (one character = one byte). The stream starts at position `start`. Return {'data', 'next', 'gaps'}: 'data' is the text that is complete from `start` on without a hole (for overlapping or repeated segments the segment that comes first in the list wins for the overlap; characters before `start` are ignored), 'next' is start + len(data) (the next position the receiver waits for, which it would put in its acknowledgment), and 'gaps' is the list of (first, end) pairs for every stretch of missing positions between `start` and the end of the highest segment ('end' is exclusive), in order."""
+        chars = {}
+        for seq, text in segments:
+            for i, ch in enumerate(text):
+                pos = seq + i
+                if pos >= start and pos not in chars:
+                    chars[pos] = ch
+        data = ""
+        pos = start
+        while pos in chars:
+            data += chars[pos]
+            pos += 1
+        gaps = []
+        if chars:
+            top = max(chars) + 1
+            p = start
+            while p < top:
+                if p in chars:
+                    p += 1
+                    continue
+                q = p
+                while q < top and q not in chars:
+                    q += 1
+                gaps.append((p, q))
+                p = q
+        return {"data": data, "next": start + len(data), "gaps": gaps}
+
+
+    def classify_connection(packets):
+        """Read a list of packets of ONE TCP connection, each a pair (who, flags): who is 'c' (the client, who started it) or 's' (the server), flags is a list of flag names such as ['SYN'] or ['SYN', 'ACK']. Return one of these words, checking in this order: 'none' for an empty list; 'refused' if the first packet is a client SYN and the second packet is a server RST; 'reset' if any other packet has the flag RST; then look at the three-way handshake, which is: a client packet with exactly the flags SYN, later a server packet with exactly SYN and ACK, later a client packet that has ACK (and not SYN): 'no handshake' if there is no client SYN-only packet at all; 'no answer' if there is a SYN but no server SYN+ACK after it; 'half-open' if the SYN+ACK came but no client ACK after it; otherwise the connection is established: 'closed' if after the handshake BOTH sides sent a packet with FIN, 'closing' if only one side did, else 'established'."""
+        if not packets:
+            return "none"
+        if len(packets) >= 2 and packets[0] == ("c", ["SYN"]) and packets[1][0] == "s" and "RST" in packets[1][1]:
+            return "refused"
+        if any("RST" in flags for _, flags in packets):
+            return "reset"
+        syn = next((i for i, (w, f) in enumerate(packets) if w == "c" and sorted(f) == ["SYN"]), None)
+        if syn is None:
+            return "no handshake"
+        synack = next((i for i in range(syn + 1, len(packets)) if packets[i][0] == "s" and sorted(packets[i][1]) == ["ACK", "SYN"]), None)
+        if synack is None:
+            return "no answer"
+        ack = next((i for i in range(synack + 1, len(packets)) if packets[i][0] == "c" and "ACK" in packets[i][1] and "SYN" not in packets[i][1]), None)
+        if ack is None:
+            return "half-open"
+        fins = {w for w, f in packets[ack + 1:] if "FIN" in f}
+        return "closed" if len(fins) == 2 else "closing" if fins else "established"
+
+    r = reassemble([(1005, "world"), (1000, "hello"), (1015, "!!")], 1000)
+    print(r["data"], r["next"], r["gaps"])
+    trace = [("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"]), ("c", ["FIN", "ACK"])]
+    print(classify_connection(trace))
+    print(classify_connection(trace[:1]))
+  output: |
+    helloworld 1010 [(1010, 1015)]
+    closing
+    no answer
+  lines:
+  - line: 51
+    note: Two pieces were joined; the stream is complete up to 1010 and the segment at 1015 waits behind a gap.
+  - line: 53
+    note: The handshake finished and one side sent FIN, so the connection is closing.
+  - line: 54
+    note: A SYN without any answer.
+playground:
+  prompt: Turn four numbers into a dotted IP address, and an address back into a hexadecimal text.
+  code: |
+    nums = [192, 168, 0, 1]
+    print('.'.join(str(n) for n in nums))
+    print(''.join('%02x' % n for n in nums))
+exercises:
+- id: checksum
+  title: The internet checksum
+  difficulty: 4
+  prompt: 'Cables and routers make mistakes. To notice, every packet carries a small number computed from its content. Write `internet_checksum(hexstr)`. Every IP header carries a 16-bit **checksum** so that a router can notice damage. The method (the ''internet checksum''): read the bytes as 16-bit numbers (two bytes each, the first one is the high one; if the number of bytes is odd, add a zero byte at the end), add them all up, then ''fold'' every carry back in (while the sum is above 0xFFFF, add the high part to the low part: (s & 0xFFFF) + (s >> 16)) and finally return the bitwise complement within 16 bits (0xFFFF - s). Input: a text of hexadecimal digits, blanks allowed anywhere. ValueError(''bad hex'') if it is not valid hexadecimal (an odd number of digits counts as not valid).'
+  starter: |-
+    def internet_checksum(hexstr):
+        """Every IP header carries a 16-bit **checksum** so that a router can notice damage. The method (the 'internet checksum'): read the bytes as 16-bit numbers (two bytes each, the first one is the high one; if the number of bytes is odd, add a zero byte at the end), add them all up, then 'fold' every carry back in (while the sum is above 0xFFFF, add the high part to the low part: (s & 0xFFFF) + (s >> 16)) and finally return the bitwise complement within 16 bits (0xFFFF - s). Input: a text of hexadecimal digits, blanks allowed anywhere. ValueError('bad hex') if it is not valid hexadecimal (an odd number of digits counts as not valid)."""
+        pass
+  tests:
+  - name: known values
+    code: |
+      assert internet_checksum("45 00 00 73 00 00 40 00 40 11 00 00 c0 a8 00 01 c0 a8 00 c7") == 0xB861
+      assert internet_checksum("") == 0xFFFF and internet_checksum("0000") == 0xFFFF and internet_checksum("ffff") == 0 and internet_checksum("0001") == 0xFFFE
+  - name: carries, padding and errors
+    code: |
+      assert internet_checksum("ffff0001") == 0xFFFE and internet_checksum("ff") == 0x00FF and internet_checksum("0102 03") == 0xFBFD
+      assert internet_checksum("4500005400004000400600000a0000015db8d822") == 0xFAC8
+      assert internet_checksum("45000054000040004006fac80a0000015db8d822") == 0
+      for text in ("zz", "123", "0x12"):
+          try:
+              internet_checksum(text)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "bad hex"
+  hints:
+  - bytes.fromhex turns hexadecimal text into bytes (and ignores blanks).
+  - 'Add bytes two at a time: (high << 8) | low.'
+  solution: |
+    def internet_checksum(hexstr):
+        """Every IP header carries a 16-bit **checksum** so that a router can notice damage. The method (the 'internet checksum'): read the bytes as 16-bit numbers (two bytes each, the first one is the high one; if the number of bytes is odd, add a zero byte at the end), add them all up, then 'fold' every carry back in (while the sum is above 0xFFFF, add the high part to the low part: (s & 0xFFFF) + (s >> 16)) and finally return the bitwise complement within 16 bits (0xFFFF - s). Input: a text of hexadecimal digits, blanks allowed anywhere. ValueError('bad hex') if it is not valid hexadecimal (an odd number of digits counts as not valid)."""
+        try:
+            data = bytes.fromhex(hexstr)
+        except ValueError:
+            raise ValueError("bad hex")
+        if len(data) % 2:
+            data += b"\x00"
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) | data[i + 1]
+        while total > 0xFFFF:
+            total = (total & 0xFFFF) + (total >> 16)
+        return 0xFFFF - total
+  explanation: A checksum only finds accidents. It cannot stop an attacker, who can simply compute a new one. Security needs cryptography (see the Security unit).
+- id: ipv4
+  title: Reading an IP header
+  difficulty: 5
+  prompt: 'Every packet on the internet begins with an IP header, a few bytes in an exact layout that every router reads. Write `parse_ipv4(hexstr)`. An IPv4 packet starts with a header. Its first byte holds the version (the high 4 bits, always 4) and the header length in 32-bit words (the low 4 bits, at least 5). Then: byte 2-3 total length; byte 8 TTL (time to live); byte 9 protocol (1 = ''ICMP'', 6 = ''TCP'', 17 = ''UDP'', anything else the number as text); byte 10-11 the checksum; byte 12-15 the source address; byte 16-19 the destination address (each written as four numbers separated by dots). The input is the packet as hexadecimal text (blanks allowed). Return {''version'', ''header_bytes'' (the header length in bytes), ''total_length'', ''ttl'', ''protocol'', ''src'', ''dst'', ''checksum_ok''} where checksum_ok is True if the internet_checksum of the header bytes (all header_bytes, including the checksum field) is 0. Errors (ValueError): ''too short'' if there are fewer than 20 bytes or fewer bytes than the header length says, ''not IPv4'' if the version is not 4, ''bad header length'' if the length is below 5 words. Check in this order: too short (20), version, header length, too short (header).'
+  starter: |-
+    def internet_checksum(hexstr):
+        """Every IP header carries a 16-bit **checksum** so that a router can notice damage. The method (the 'internet checksum'): read the bytes as 16-bit numbers (two bytes each, the first one is the high one; if the number of bytes is odd, add a zero byte at the end), add them all up, then 'fold' every carry back in (while the sum is above 0xFFFF, add the high part to the low part: (s & 0xFFFF) + (s >> 16)) and finally return the bitwise complement within 16 bits (0xFFFF - s). Input: a text of hexadecimal digits, blanks allowed anywhere. ValueError('bad hex') if it is not valid hexadecimal (an odd number of digits counts as not valid)."""
+        try:
+            data = bytes.fromhex(hexstr)
+        except ValueError:
+            raise ValueError("bad hex")
+        if len(data) % 2:
+            data += b"\x00"
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) | data[i + 1]
+        while total > 0xFFFF:
+            total = (total & 0xFFFF) + (total >> 16)
+        return 0xFFFF - total
+
+
+
+
+    def parse_ipv4(hexstr):
+        """An IPv4 packet starts with a header. Its first byte holds the version (the high 4 bits, always 4) and the header length in 32-bit words (the low 4 bits, at least 5). Then: byte 2-3 total length; byte 8 TTL (time to live); byte 9 protocol (1 = 'ICMP', 6 = 'TCP', 17 = 'UDP', anything else the number as text); byte 10-11 the checksum; byte 12-15 the source address; byte 16-19 the destination address (each written as four numbers separated by dots). The input is the packet as hexadecimal text (blanks allowed). Return {'version', 'header_bytes' (the header length in bytes), 'total_length', 'ttl', 'protocol', 'src', 'dst', 'checksum_ok'} where checksum_ok is True if the internet_checksum of the header bytes (all header_bytes, including the checksum field) is 0. Errors (ValueError): 'too short' if there are fewer than 20 bytes or fewer bytes than the header length says, 'not IPv4' if the version is not 4, 'bad header length' if the length is below 5 words. Check in this order: too short (20), version, header length, too short (header)."""
+        pass
+  tests:
+  - name: a good packet
+    code: |
+      pkt = "45000054000040004006fac80a0000015db8d822"
+      assert parse_ipv4(pkt) == {"version": 4, "header_bytes": 20, "total_length": 84, "ttl": 64, "protocol": "TCP", "src": "10.0.0.1", "dst": "93.184.216.34", "checksum_ok": True}
+      bad = "45000054000040003f06fac80a0000015db8d822"
+      r = parse_ipv4(bad)
+      assert r["ttl"] == 63 and r["checksum_ok"] is False
+      udp = "4500001c000040004011" + "0000" + "c0a80001c0a800c7"
+      udp = udp[:20] + "%04x" % internet_checksum(udp) + udp[24:]
+      assert parse_ipv4(udp)["protocol"] == "UDP" and parse_ipv4(udp)["checksum_ok"] is True and parse_ipv4(udp)["src"] == "192.168.0.1"
+      assert parse_ipv4(pkt.replace("4006", "4001"))["protocol"] == "ICMP" and parse_ipv4(pkt.replace("4006", "402f"))["protocol"] == "47"
+  - name: errors
+    code: |
+      cases = (("45", "too short"), ("60" + "00" * 19, "not IPv4"), ("41" + "00" * 19, "bad header length"), ("46" + "00" * 19, "too short"), ("", "too short"))
+      for text, msg in cases:
+          try:
+              parse_ipv4(text)
+              raise AssertionError("accepted " + text)
+          except ValueError as e:
+              assert str(e) == msg, (text, str(e))
+      long = "46000018" + "00" * 8 + "0a000001" + "5db8d822" + "00000000"
+      r = parse_ipv4(long)
+      assert r["header_bytes"] == 24 and r["dst"] == "93.184.216.34"
+  hints:
+  - bytes.fromhex(text) gives numbers 0-255 to index.
+  - The checksum of a correct header, including its checksum field, is 0.
+  solution: |
+    def internet_checksum(hexstr):
+        """Every IP header carries a 16-bit **checksum** so that a router can notice damage. The method (the 'internet checksum'): read the bytes as 16-bit numbers (two bytes each, the first one is the high one; if the number of bytes is odd, add a zero byte at the end), add them all up, then 'fold' every carry back in (while the sum is above 0xFFFF, add the high part to the low part: (s & 0xFFFF) + (s >> 16)) and finally return the bitwise complement within 16 bits (0xFFFF - s). Input: a text of hexadecimal digits, blanks allowed anywhere. ValueError('bad hex') if it is not valid hexadecimal (an odd number of digits counts as not valid)."""
+        try:
+            data = bytes.fromhex(hexstr)
+        except ValueError:
+            raise ValueError("bad hex")
+        if len(data) % 2:
+            data += b"\x00"
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) | data[i + 1]
+        while total > 0xFFFF:
+            total = (total & 0xFFFF) + (total >> 16)
+        return 0xFFFF - total
+
+
+
+
+    def parse_ipv4(hexstr):
+        """An IPv4 packet starts with a header. Its first byte holds the version (the high 4 bits, always 4) and the header length in 32-bit words (the low 4 bits, at least 5). Then: byte 2-3 total length; byte 8 TTL (time to live); byte 9 protocol (1 = 'ICMP', 6 = 'TCP', 17 = 'UDP', anything else the number as text); byte 10-11 the checksum; byte 12-15 the source address; byte 16-19 the destination address (each written as four numbers separated by dots). The input is the packet as hexadecimal text (blanks allowed). Return {'version', 'header_bytes' (the header length in bytes), 'total_length', 'ttl', 'protocol', 'src', 'dst', 'checksum_ok'} where checksum_ok is True if the internet_checksum of the header bytes (all header_bytes, including the checksum field) is 0. Errors (ValueError): 'too short' if there are fewer than 20 bytes or fewer bytes than the header length says, 'not IPv4' if the version is not 4, 'bad header length' if the length is below 5 words. Check in this order: too short (20), version, header length, too short (header)."""
+        data = bytes.fromhex(hexstr)
+        if len(data) < 20:
+            raise ValueError("too short")
+        if data[0] >> 4 != 4:
+            raise ValueError("not IPv4")
+        words = data[0] & 15
+        if words < 5:
+            raise ValueError("bad header length")
+        if len(data) < words * 4:
+            raise ValueError("too short")
+        protocols = {1: "ICMP", 6: "TCP", 17: "UDP"}
+        header = data[:words * 4]
+        return {"version": 4, "header_bytes": words * 4, "total_length": (data[2] << 8) | data[3], "ttl": data[8],
+                "protocol": protocols.get(data[9], str(data[9])), "src": ".".join(str(b) for b in data[12:16]),
+                "dst": ".".join(str(b) for b in data[16:20]), "checksum_ok": internet_checksum(header.hex()) == 0}
+  explanation: The TTL starts at about 64 and each router subtracts one. A packet with TTL 0 is thrown away, so a routing loop cannot go on forever. This is how traceroute works.
+- id: tcpheader
+  title: Reading a TCP header
+  difficulty: 4
+  prompt: 'Inside the IP packet sits the TCP segment, with its own header that makes the connection reliable. Write `parse_tcp(hexstr)`. A TCP segment starts with its header (hexadecimal text, blanks allowed): bytes 0-1 source port, 2-3 destination port, 4-7 sequence number, 8-11 acknowledgment number (all big-endian, the high byte first), byte 12 the header length in 32-bit words in its high 4 bits (at least 5), byte 13 the flags, bytes 14-15 the window size. The flag bits, from the lowest: FIN (1), SYN (2), RST (4), PSH (8), ACK (16), URG (32). Return {''src_port'', ''dst_port'', ''seq'', ''ack'', ''header_bytes'', ''flags'' (the list of the names of the set flags in the order FIN, SYN, RST, PSH, ACK, URG), ''window''}. ValueError(''too short'') for fewer than 20 bytes, ValueError(''bad header length'') for a header length below 5 words (check the length of the data first).'
+  starter: |-
+    def parse_tcp(hexstr):
+        """A TCP segment starts with its header (hexadecimal text, blanks allowed): bytes 0-1 source port, 2-3 destination port, 4-7 sequence number, 8-11 acknowledgment number (all big-endian, the high byte first), byte 12 the header length in 32-bit words in its high 4 bits (at least 5), byte 13 the flags, bytes 14-15 the window size. The flag bits, from the lowest: FIN (1), SYN (2), RST (4), PSH (8), ACK (16), URG (32). Return {'src_port', 'dst_port', 'seq', 'ack', 'header_bytes', 'flags' (the list of the names of the set flags in the order FIN, SYN, RST, PSH, ACK, URG), 'window'}. ValueError('too short') for fewer than 20 bytes, ValueError('bad header length') for a header length below 5 words (check the length of the data first)."""
+        pass
+  tests:
+  - name: flags
+    code: |
+      syn = "c350" + "01bb" + "00000064" + "00000000" + "5002" + "ffff" + "0000" + "0000"
+      assert parse_tcp(syn) == {"src_port": 50000, "dst_port": 443, "seq": 100, "ack": 0, "header_bytes": 20, "flags": ["SYN"], "window": 65535}
+      pa = "01bb" + "c350" + "000000c8" + "00000065" + "5018" + "0400" + "0000" + "0000"
+      r = parse_tcp(pa)
+      assert r["flags"] == ["PSH", "ACK"] and r["src_port"] == 443 and r["ack"] == 101 and r["window"] == 1024
+      assert parse_tcp("c350 01bb 00000064 00000000 5012 ffff 0000 0000")["flags"] == ["SYN", "ACK"]
+  - name: all bits and errors
+    code: |
+      allflags = "0000" + "0050" + "ffffffff" + "00000000" + "603f" + "0001" + "0000" + "0000" + "00000000"
+      r = parse_tcp(allflags)
+      assert r["flags"] == ["FIN", "SYN", "RST", "PSH", "ACK", "URG"] and r["header_bytes"] == 24 and r["seq"] == 4294967295 and r["dst_port"] == 80
+      assert parse_tcp("0000" * 6 + "5000" + "0000" * 3)["flags"] == []
+      for text, msg in (("0000", "too short"), ("0000" * 6 + "4000" + "0000" * 3, "bad header length"), ("", "too short")):
+          try:
+              parse_tcp(text)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == msg
+  hints:
+  - int.from_bytes(data[4:8], 'big') reads a number.
+  - Test a flag with data[13] & (1 << i).
+  solution: |
+    def parse_tcp(hexstr):
+        """A TCP segment starts with its header (hexadecimal text, blanks allowed): bytes 0-1 source port, 2-3 destination port, 4-7 sequence number, 8-11 acknowledgment number (all big-endian, the high byte first), byte 12 the header length in 32-bit words in its high 4 bits (at least 5), byte 13 the flags, bytes 14-15 the window size. The flag bits, from the lowest: FIN (1), SYN (2), RST (4), PSH (8), ACK (16), URG (32). Return {'src_port', 'dst_port', 'seq', 'ack', 'header_bytes', 'flags' (the list of the names of the set flags in the order FIN, SYN, RST, PSH, ACK, URG), 'window'}. ValueError('too short') for fewer than 20 bytes, ValueError('bad header length') for a header length below 5 words (check the length of the data first)."""
+        data = bytes.fromhex(hexstr)
+        if len(data) < 20:
+            raise ValueError("too short")
+        words = data[12] >> 4
+        if words < 5:
+            raise ValueError("bad header length")
+        names = ["FIN", "SYN", "RST", "PSH", "ACK", "URG"]
+        flags = [n for i, n in enumerate(names) if data[13] & (1 << i)]
+        return {"src_port": (data[0] << 8) | data[1], "dst_port": (data[2] << 8) | data[3],
+                "seq": int.from_bytes(data[4:8], "big"), "ack": int.from_bytes(data[8:12], "big"),
+                "header_bytes": words * 4, "flags": flags, "window": (data[14] << 8) | data[15]}
+  explanation: SYN opens a connection, ACK confirms, FIN closes politely, RST slams the door, PSH asks to deliver data at once. A SYN without ACK arriving in huge numbers is a 'SYN flood' attack.
+- id: reassemble
+  title: Putting the stream back together
+  difficulty: 5
+  prompt: 'The internet delivers packets late, twice and in the wrong order, yet your download arrives correct. Write `reassemble(segments, start)`. TCP cuts a stream of bytes into segments that may arrive late, twice or in the wrong order, and puts them back together. Each segment is a pair (seq, text): the position of its first character in the stream and its characters (one character = one byte). The stream starts at position `start`. Return {''data'', ''next'', ''gaps''}: ''data'' is the text that is complete from `start` on without a hole (for overlapping or repeated segments the segment that comes first in the list wins for the overlap; characters before `start` are ignored), ''next'' is start + len(data) (the next position the receiver waits for, which it would put in its acknowledgment), and ''gaps'' is the list of (first, end) pairs for every stretch of missing positions between `start` and the end of the highest segment (''end'' is exclusive), in order.'
+  starter: |-
+    def reassemble(segments, start):
+        """TCP cuts a stream of bytes into segments that may arrive late, twice or in the wrong order, and puts them back together. Each segment is a pair (seq, text): the position of its first character in the stream and its characters (one character = one byte). The stream starts at position `start`. Return {'data', 'next', 'gaps'}: 'data' is the text that is complete from `start` on without a hole (for overlapping or repeated segments the segment that comes first in the list wins for the overlap; characters before `start` are ignored), 'next' is start + len(data) (the next position the receiver waits for, which it would put in its acknowledgment), and 'gaps' is the list of (first, end) pairs for every stretch of missing positions between `start` and the end of the highest segment ('end' is exclusive), in order."""
+        pass
+  tests:
+  - name: order, duplicates, holes
+    code: |
+      r = reassemble([(1005, "world"), (1000, "hello"), (1000, "hello"), (1015, "!!")], 1000)
+      assert r == {"data": "helloworld", "next": 1010, "gaps": [(1010, 1015)]}
+      r = reassemble([(1010, "-again"), (1000, "hello"), (1005, "world")], 1000)
+      assert r == {"data": "helloworld-again", "next": 1016, "gaps": []}
+      assert reassemble([(7, "x")], 5) == {"data": "", "next": 5, "gaps": [(5, 7)]}
+  - name: overlaps and old data
+    code: |
+      assert reassemble([], 5) == {"data": "", "next": 5, "gaps": []}
+      assert reassemble([(3, "abcdef")], 5) == {"data": "cdef", "next": 9, "gaps": []}
+      r = reassemble([(0, "abc"), (2, "XYZ")], 0)
+      assert r == {"data": "abcYZ", "next": 5, "gaps": []}
+      r = reassemble([(10, "b"), (20, "c"), (0, "aa")], 0)
+      assert r == {"data": "aa", "next": 2, "gaps": [(2, 10), (11, 20)]}
+  hints:
+  - A dict from position to character handles overlaps (first one wins).
+  - Walk from `start` while the position is in the dict.
+  solution: |
+    def reassemble(segments, start):
+        """TCP cuts a stream of bytes into segments that may arrive late, twice or in the wrong order, and puts them back together. Each segment is a pair (seq, text): the position of its first character in the stream and its characters (one character = one byte). The stream starts at position `start`. Return {'data', 'next', 'gaps'}: 'data' is the text that is complete from `start` on without a hole (for overlapping or repeated segments the segment that comes first in the list wins for the overlap; characters before `start` are ignored), 'next' is start + len(data) (the next position the receiver waits for, which it would put in its acknowledgment), and 'gaps' is the list of (first, end) pairs for every stretch of missing positions between `start` and the end of the highest segment ('end' is exclusive), in order."""
+        chars = {}
+        for seq, text in segments:
+            for i, ch in enumerate(text):
+                pos = seq + i
+                if pos >= start and pos not in chars:
+                    chars[pos] = ch
+        data = ""
+        pos = start
+        while pos in chars:
+            data += chars[pos]
+            pos += 1
+        gaps = []
+        if chars:
+            top = max(chars) + 1
+            p = start
+            while p < top:
+                if p in chars:
+                    p += 1
+                    continue
+                q = p
+                while q < top and q not in chars:
+                    q += 1
+                gaps.append((p, q))
+                p = q
+        return {"data": data, "next": start + len(data), "gaps": gaps}
+  explanation: 'Real TCP receivers do exactly this, with byte numbers instead of characters. The ''next'' value is the ACK number: it tells the sender what to send again.'
+- id: handshake
+  title: Reading a connection
+  difficulty: 4
+  prompt: 'Support people read connection traces all day: the word for what happened is more useful than the raw list. Write `classify_connection(packets)`. Read a list of packets of ONE TCP connection, each a pair (who, flags): who is ''c'' (the client, who started it) or ''s'' (the server), flags is a list of flag names such as [''SYN''] or [''SYN'', ''ACK'']. Return one of these words, checking in this order: ''none'' for an empty list; ''refused'' if the first packet is a client SYN and the second packet is a server RST; ''reset'' if any other packet has the flag RST; then look at the three-way handshake, which is: a client packet with exactly the flags SYN, later a server packet with exactly SYN and ACK, later a client packet that has ACK (and not SYN): ''no handshake'' if there is no client SYN-only packet at all; ''no answer'' if there is a SYN but no server SYN+ACK after it; ''half-open'' if the SYN+ACK came but no client ACK after it; otherwise the connection is established: ''closed'' if after the handshake BOTH sides sent a packet with FIN, ''closing'' if only one side did, else ''established''.'
+  starter: |-
+    def classify_connection(packets):
+        """Read a list of packets of ONE TCP connection, each a pair (who, flags): who is 'c' (the client, who started it) or 's' (the server), flags is a list of flag names such as ['SYN'] or ['SYN', 'ACK']. Return one of these words, checking in this order: 'none' for an empty list; 'refused' if the first packet is a client SYN and the second packet is a server RST; 'reset' if any other packet has the flag RST; then look at the three-way handshake, which is: a client packet with exactly the flags SYN, later a server packet with exactly SYN and ACK, later a client packet that has ACK (and not SYN): 'no handshake' if there is no client SYN-only packet at all; 'no answer' if there is a SYN but no server SYN+ACK after it; 'half-open' if the SYN+ACK came but no client ACK after it; otherwise the connection is established: 'closed' if after the handshake BOTH sides sent a packet with FIN, 'closing' if only one side did, else 'established'."""
+        pass
+  tests:
+  - name: normal and broken
+    code: |
+      C = [("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"]), ("c", ["PSH", "ACK"]), ("c", ["FIN", "ACK"]), ("s", ["FIN", "ACK"]), ("c", ["ACK"])]
+      assert classify_connection(C) == "closed" and classify_connection(C[:5]) == "closing" and classify_connection(C[:4]) == "established" and classify_connection(C[:3]) == "established"
+      assert classify_connection(C[:2]) == "half-open" and classify_connection(C[:1]) == "no answer" and classify_connection([]) == "none"
+  - name: resets
+    code: |
+      assert classify_connection([("c", ["SYN"]), ("s", ["RST", "ACK"])]) == "refused"
+      C = [("c", ["SYN"]), ("s", ["SYN", "ACK"]), ("c", ["ACK"])]
+      assert classify_connection(C + [("s", ["RST"])]) == "reset" and classify_connection(C[:2] + [("c", ["RST"])]) == "reset"
+      assert classify_connection([("s", ["ACK"])]) == "no handshake" and classify_connection([("c", ["SYN", "ACK"]), ("s", ["ACK"])]) == "no handshake"
+      assert classify_connection([("c", ["SYN"]), ("c", ["SYN"]), ("s", ["ACK", "SYN"])]) == "half-open"
+      assert classify_connection(C + [("c", ["FIN"]), ("c", ["FIN"])]) == "closing"
+  hints:
+  - Use next(..., None) with a generator to find the first matching packet.
+  - Compare sorted(flags) with ['ACK', 'SYN'] so that the order does not matter.
+  solution: |
+    def classify_connection(packets):
+        """Read a list of packets of ONE TCP connection, each a pair (who, flags): who is 'c' (the client, who started it) or 's' (the server), flags is a list of flag names such as ['SYN'] or ['SYN', 'ACK']. Return one of these words, checking in this order: 'none' for an empty list; 'refused' if the first packet is a client SYN and the second packet is a server RST; 'reset' if any other packet has the flag RST; then look at the three-way handshake, which is: a client packet with exactly the flags SYN, later a server packet with exactly SYN and ACK, later a client packet that has ACK (and not SYN): 'no handshake' if there is no client SYN-only packet at all; 'no answer' if there is a SYN but no server SYN+ACK after it; 'half-open' if the SYN+ACK came but no client ACK after it; otherwise the connection is established: 'closed' if after the handshake BOTH sides sent a packet with FIN, 'closing' if only one side did, else 'established'."""
+        if not packets:
+            return "none"
+        if len(packets) >= 2 and packets[0] == ("c", ["SYN"]) and packets[1][0] == "s" and "RST" in packets[1][1]:
+            return "refused"
+        if any("RST" in flags for _, flags in packets):
+            return "reset"
+        syn = next((i for i, (w, f) in enumerate(packets) if w == "c" and sorted(f) == ["SYN"]), None)
+        if syn is None:
+            return "no handshake"
+        synack = next((i for i in range(syn + 1, len(packets)) if packets[i][0] == "s" and sorted(packets[i][1]) == ["ACK", "SYN"]), None)
+        if synack is None:
+            return "no answer"
+        ack = next((i for i in range(synack + 1, len(packets)) if packets[i][0] == "c" and "ACK" in packets[i][1] and "SYN" not in packets[i][1]), None)
+        if ack is None:
+            return "half-open"
+        fins = {w for w, f in packets[ack + 1:] if "FIN" in f}
+        return "closed" if len(fins) == 2 else "closing" if fins else "established"
+  explanation: '''Connection refused'' means somebody answered that nobody listens on that port. ''Timed out'' means no answer at all, often a firewall that silently drops packets.'
+commonMistakes:
+- title: Mixing up the byte order
+  explanation: Networks put the high byte first.
+- title: Forgetting to pad an odd number of bytes
+  explanation: The checksum adds a zero byte.
+- title: Reading 'timed out' as 'refused'
+  explanation: Refused is an answer, a time-out is silence.
+- title: Thinking the checksum protects against attackers
+  explanation: Anyone can recompute it.
+- title: Assuming UDP is reliable
+  explanation: It never resends lost packets.
+summary:
+- 'Packets nest: frame, IP packet, TCP segment, data.'
+- Headers are bytes at fixed places, written in hexadecimal.
+- The checksum finds accidental damage.
+- TCP numbers bytes, acknowledges them and reorders segments.
+- The handshake is SYN, SYN+ACK, ACK.
+next: u34-http
+quiz:
+- type: mcq
+  question: What are the three steps of the TCP handshake?
+  options:
+  - SYN, SYN+ACK, ACK
+  - GET, POST, PUT
+  - HELLO, WORLD, BYE
+  - DNS, TCP, TLS
+  answer: 0
+  explanation: Client, server, client.
+- type: mcq
+  question: What does the ACK number tell the sender?
+  options:
+  - The next byte the receiver expects
+  - The packet size
+  - The IP address
+  - The speed
+  answer: 0
+  explanation: It lets missing data be resent.
+- type: mcq
+  question: What does connection refused mean?
+  options:
+  - 'Something answered with RST: no program listens'
+  - The packets were lost
+  - The server is slow
+  - The password is wrong
+  answer: 0
+  explanation: Refused is an answer.
+- type: mcq
+  question: Which is the protocol number of TCP in an IP header?
+  options:
+  - '6'
+  - '80'
+  - '443'
+  - '17'
+  answer: 0
+  explanation: 17 is UDP.
+- type: mcq
+  question: Which protocol does not resend lost packets?
+  options:
+  - UDP
+  - TCP
+  - HTTP
+  - SSH
+  answer: 0
+  explanation: It is fast and unreliable.
+- type: mcq
+  question: What does the TTL protect against?
+  options:
+  - Packets that circle forever
+  - Viruses
+  - Slow servers
+  - Wrong passwords
+  answer: 0
+  explanation: Each router subtracts 1.
+- type: code
+  question: Write `ip_from_hex(h)` that turns 8 hexadecimal digits such as 'c0a80001' into the dotted address '192.168.0.1'.
+  starter: |
+    def ip_from_hex(h):
+        pass
+  tests:
+  - name: ip
+    code: |
+      assert ip_from_hex("c0a80001") == "192.168.0.1" and ip_from_hex("00000000") == "0.0.0.0" and ip_from_hex("ffffffff") == "255.255.255.255" and ip_from_hex("5db8d822") == "93.184.216.34"
+  solution: |
+    def ip_from_hex(h):
+        return ".".join(str(int(h[i:i + 2], 16)) for i in range(0, 8, 2))

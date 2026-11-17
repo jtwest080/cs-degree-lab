@@ -1,0 +1,662 @@
+id: u34-proxy
+title: Proxies and Load Balancing
+minutes: 110
+objective: Understand the machines that sit between you and a website. You will read a reverse proxy configuration, route requests by longest prefix, share load by weights, spread keys with consistent hashing and decide when a server counts as down.
+outcomes:
+- Explain proxies, reverse proxies and load balancers
+- Read a proxy configuration
+- Balance requests with weights
+- Explain consistent hashing and why it moves few keys
+- Use health checks without flapping
+sections:
+- heading: Machines in the middle
+  body: |-
+    A **proxy** is a computer that passes requests along. A **forward proxy** works for the *client* (a company proxy that filters and caches the web for its staff, or a VPN). A **reverse proxy** works for the *server*: it is the public face of a website, receives every request and forwards it to the right server behind it, and the visitor never learns who answered. Famous ones: nginx, HAProxy, Caddy, and the **CDN** of a big company.
+
+    Why put one in front? **TLS termination** (it does the encryption once, so the servers behind need no certificates), **caching** of static files, **compression**, **routing** by address (`/api/` to the programmers' servers, `/files/` straight from disk), **protection** (rate limits, blocking attackers, hiding the real servers) and **load balancing**.
+
+    **Load balancing** spreads the work over several servers so that one failing server does not take down the service, and so that adding capacity is just adding a machine (**horizontal scaling**). Rules: **round robin** (one after the other), **weighted** (a strong machine gets more), **least connections**, **IP hash** (the same visitor, the same server, useful when a server keeps a user's data) and **consistent hashing**. A **load balancer** works at layer 4 (it only moves TCP connections, fast and blind) or layer 7 (it reads HTTP and can route by address or cookie).
+- heading: Keys, health and failure
+  body: |-
+    Some services must send the **same key to the same server** every time: a cache that holds the data for `user42` must be asked, not a random machine. The naive rule `hash(key) mod N` fails when N changes: adding the fourth server changes the answer for about three quarters of all keys, which empties the cache at once and floods the database behind it (a *cache stampede*). **Consistent hashing** puts servers and keys on the same **circle** of hash values; a key belongs to the next server clockwise. Adding or removing a server moves only the keys in its own stretch of the circle, about 1/N of them. Each server appears at many points (**virtual nodes**, the `replicas`) so that the shares are even.
+
+    A balancer must know which servers work. **Health checks** probe each server regularly (a TCP connection, or an HTTP request to `/health` that must answer 200). To avoid **flapping** (on, off, on, off...), a server is only marked *down* after several failures in a row and *up* again after several successes in a row. Good balancers also use **connection draining** (let current requests finish before a server is taken out for an update), **timeouts** and **retries** (but only for requests that are safe to repeat) and **backup servers**.
+
+    The proxy itself is now a **single point of failure**, so it too is doubled: two balancers share one address, and when one dies the other takes over (**failover**, e.g. with VRRP or with DNS). Every layer you add needs the same question: *what if this one fails?*
+examples:
+- title: Routing with a configuration
+  intro: Read a proxy file and find which rule answers each address.
+  code: |
+    def parse_proxy(text):
+        """A **reverse proxy** such as nginx stands in front of the real servers, receives all requests and passes them on. Its configuration is a text with blocks in braces, for example:
+
+    upstream app {
+        server 10.0.0.1:8080 weight=3;
+        server 10.0.0.2:8080 backup;
+    }
+    server {
+        location /api/ { proxy_pass http://app; }
+        location /files/ { root /var/www; }
+        location /old/ { return 410; }
+    }
+
+    Parse it. Everything after a '#' on a line is a comment; blank lines are ignored; a line ends with ';' (a directive), or with '{' (it opens a block: 'upstream NAME {' at the top level, 'server {' at the top level, 'location PREFIX {' inside a server block), or is '}' (it closes the innermost block). Directives: inside an upstream 'server ADDRESS [weight=N] [backup];' (the weight is a whole number, default 1; backup is a flag); inside a location exactly one of 'proxy_pass http://NAME;', 'root DIRECTORY;' or 'return CODE;'. A block may also be written on ONE line, as in the example ('location /api/ { proxy_pass http://app; }'): treat the text between '{' and '}' as directives of that block. Return {'upstreams': {name: [{'addr', 'weight', 'backup'}, ...]}, 'routes': [(prefix, target)]} where the target is ('proxy', NAME), ('static', DIRECTORY) or ('return', CODE as an int) and the routes are in the order of the text. ValueError messages: 'line N: bad directive' for anything else (N counts all lines from 1), 'line N: bad weight' for a weight that is not a positive whole number, 'line N: unexpected }' for a closing brace without a block, 'line N: empty location' for a location without a directive (N is the line of its closing brace), 'unclosed block' if blocks are open at the end, and 'unknown upstream NAME' if a proxy_pass names an upstream that was not defined (checked at the end, first such route)."""
+        import re
+        upstreams, routes, stack = {}, [], []
+        current = {"routes": None}
+
+        def directive(n, stmt):
+            stmt = stmt.strip()
+            if not stmt:
+                return
+            if not stmt.endswith(";") or not stack:
+                raise ValueError("line %d: bad directive" % n)
+            words = stmt[:-1].split()
+            kind = stack[-1][0]
+            if kind == "upstream" and words and words[0] == "server" and len(words) >= 2:
+                weight, backup = 1, False
+                for w in words[2:]:
+                    if w == "backup":
+                        backup = True
+                    elif w.startswith("weight="):
+                        if not w[7:].isdigit() or int(w[7:]) < 1:
+                            raise ValueError("line %d: bad weight" % n)
+                        weight = int(w[7:])
+                    else:
+                        raise ValueError("line %d: bad directive" % n)
+                upstreams[stack[-1][1]].append({"addr": words[1], "weight": weight, "backup": backup})
+            elif kind == "location" and len(words) == 2 and stack[-1][2] is None:
+                if words[0] == "proxy_pass" and re.fullmatch(r"http://[\w.-]+", words[1]):
+                    stack[-1][2] = ("proxy", words[1][7:])
+                elif words[0] == "root":
+                    stack[-1][2] = ("static", words[1])
+                elif words[0] == "return" and words[1].isdigit():
+                    stack[-1][2] = ("return", int(words[1]))
+                else:
+                    raise ValueError("line %d: bad directive" % n)
+            else:
+                raise ValueError("line %d: bad directive" % n)
+
+        def close(n):
+            if not stack:
+                raise ValueError("line %d: unexpected }" % n)
+            kind = stack.pop()
+            if kind[0] == "location":
+                if kind[2] is None:
+                    raise ValueError("line %d: empty location" % n)
+                routes.append((kind[1], kind[2]))
+
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            while line:
+                if line[0] == "}":
+                    close(n)
+                    line = line[1:].strip()
+                    continue
+                cut = min([i for i in (line.find(";"), line.find("{"), line.find("}")) if i >= 0] or [len(line)])
+                if cut < len(line) and line[cut] == "{":
+                    head = line[:cut].split()
+                    if len(head) == 2 and head[0] == "upstream" and not stack:
+                        stack.append(["upstream", head[1]])
+                        upstreams[head[1]] = []
+                    elif head == ["server"] and not stack:
+                        stack.append(["server", None])
+                    elif len(head) == 2 and head[0] == "location" and stack and stack[-1][0] == "server":
+                        stack.append(["location", head[1], None])
+                    else:
+                        raise ValueError("line %d: bad directive" % n)
+                    line = line[cut + 1:].strip()
+                elif cut < len(line) and line[cut] == ";":
+                    directive(n, line[:cut + 1])
+                    line = line[cut + 1:].strip()
+                elif cut < len(line):
+                    directive(n, line[:cut])
+                    line = line[cut:].strip()
+                else:
+                    directive(n, line)
+                    line = ""
+        if stack:
+            raise ValueError("unclosed block")
+        for prefix, target in routes:
+            if target[0] == "proxy" and target[1] not in upstreams:
+                raise ValueError("unknown upstream " + target[1])
+        return {"upstreams": upstreams, "routes": routes}
+
+
+    def route(routes, path):
+        """The proxy must decide which rule handles a request. `routes` is the list of (prefix, target) from parse_proxy. The rule whose prefix is the LONGEST one that the path starts with wins (the first of equal prefixes). Anything after a '?' in the path is not part of the path. If no prefix matches the result is ('return', 404). Return the target of the winning rule."""
+        path = path.split("?", 1)[0]
+        best = None
+        for prefix, target in routes:
+            if path.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+                best = (prefix, target)
+        return best[1] if best else ("return", 404)
+    CONF = "upstream app {\n    server 10.0.0.1:8080 weight=3;\n    server 10.0.0.2:8080 backup;\n}\nserver {\n    location /api/ { proxy_pass http://app; }\n    location /files/ {\n        root /var/www;\n    }\n    location /old/ { return 410; }\n    location / { return 404; }\n}\n"
+
+    config = parse_proxy(CONF)
+    print(len(config["upstreams"]["app"]), "servers in the upstream")
+    for path in ["/api/users", "/files/logo.png", "/old/page", "/nothing"]:
+        print(path, route(config["routes"], path))
+  output: |
+    2 servers in the upstream
+    /api/users ('proxy', 'app')
+    /files/logo.png ('static', '/var/www')
+    /old/page ('return', 410)
+    /nothing ('return', 404)
+  lines:
+  - line: 110
+    note: The upstream has two servers, one is a backup.
+  - line: 111
+    note: The longest matching prefix wins; /nothing matches only the rule for / that returns 404.
+- title: Weights, rings and health
+  intro: Share requests by weights, see that only a few keys move, and judge a failing server.
+  code: |
+    def smooth_wrr(servers, n):
+        """Spreading requests over several servers is **load balancing**. The simplest rule, round robin (one after the other), ignores that a big server can take more work than a small one. **Weighted** round robin gives each server a share by its weight. The 'smooth' method of nginx avoids bursts: keep a counter 'current' per server, starting at 0. For each of the n requests: add every server's weight to its counter; pick the server with the HIGHEST counter (the first one in the list for equal counters); subtract the total of all weights from the chosen server's counter. `servers` is a list of (name, weight) pairs. Return the list of the n chosen names. ValueError('no servers') for an empty list, ValueError('bad weight') if any weight is not a positive whole number (check no servers first)."""
+        if not servers:
+            raise ValueError("no servers")
+        if any(not isinstance(w, int) or w < 1 for _, w in servers):
+            raise ValueError("bad weight")
+        total = sum(w for _, w in servers)
+        current = [0] * len(servers)
+        chosen = []
+        for _ in range(n):
+            for i, (_, w) in enumerate(servers):
+                current[i] += w
+            best = max(range(len(servers)), key=lambda i: (current[i], -i))
+            current[best] -= total
+            chosen.append(servers[best][0])
+        return chosen
+
+
+    def assign_keys(servers, keys, replicas):
+        """If a cache or database is spread over servers by 'key mod number of servers', adding one server moves almost every key. **Consistent hashing** moves only a few. Method: the hash of a text is the integer value of the first 8 hexadecimal digits of its MD5 digest (hashlib.md5(text.encode()).hexdigest()[:8], read in base 16). Put every server on a circle at `replicas` points: the points of the server S are the hashes of 'S#0', 'S#1', ... 'S#(replicas-1)'. A key belongs to the first point at or after the hash of the key, going around in the direction of growing numbers and wrapping from the largest point to the smallest (for equal points the server whose name comes first alphabetically wins). Return the dict {key: server}. ValueError('no servers') if the list is empty (keys may be empty), ValueError('bad replicas') if replicas < 1 (check in this order)."""
+        import hashlib
+        if not servers:
+            raise ValueError("no servers")
+        if replicas < 1:
+            raise ValueError("bad replicas")
+
+        def h(text):
+            return int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
+        ring = sorted((h("%s#%d" % (s, i)), s) for s in servers for i in range(replicas))
+        points = [p for p, _ in ring]
+        result = {}
+        for key in keys:
+            k = h(key)
+            lo, hi = 0, len(points)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if points[mid] < k:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            result[key] = ring[lo % len(ring)][1]
+        return result
+
+
+    def health_states(results, fail_after, pass_after):
+        """A load balancer must stop sending requests to a server that has failed, and start again when it is back, without flapping on one single lost probe. `results` is the list of probe results over time (True = the server answered). The server starts as 'up'. While it is 'up', `fail_after` failed probes IN A ROW make it 'down'; while it is 'down', `pass_after` successful probes IN A ROW make it 'up' again (a result of the other kind resets the count; the count also starts again after every change of state). Return {'state': the final state, 'changes': a list of (index, new_state) where the index (from 0) is the position of the probe that caused the change}."""
+        state, streak, changes = "up", 0, []
+        for i, ok in enumerate(results):
+            if state == "up":
+                streak = 0 if ok else streak + 1
+                if streak >= fail_after:
+                    state, streak = "down", 0
+                    changes.append((i, "down"))
+            else:
+                streak = streak + 1 if ok else 0
+                if streak >= pass_after:
+                    state, streak = "up", 0
+                    changes.append((i, "up"))
+        return {"state": state, "changes": changes}
+
+    print(smooth_wrr([("big", 3), ("small", 1)], 8))
+    keys = ["user1", "user2", "user3", "user4", "user5", "user6"]
+    three = assign_keys(["a", "b", "c"], keys, 50)
+    two = assign_keys(["a", "b"], keys, 50)
+    print(sorted(k for k in keys if three[k] != two[k]) == sorted(k for k in keys if three[k] == "c"))
+    print(health_states([True, False, False, False, True, True], 3, 2))
+  output: |
+    ['big', 'big', 'small', 'big', 'big', 'big', 'small', 'big']
+    True
+    {'state': 'up', 'changes': [(3, 'down'), (5, 'up')]}
+  lines:
+  - line: 61
+    note: The big server gets three out of four requests, in a smooth rhythm.
+  - line: 65
+    note: 'True: the only keys that moved are those that now live on the new server.'
+  - line: 66
+    note: Three failures in a row mark the server down, and two successes bring it back.
+playground:
+  prompt: 'Plain round robin: give 7 requests one after the other to three servers.'
+  code: |
+    servers = ['a', 'b', 'c']
+    for i in range(7):
+        print(i, servers[i % len(servers)])
+exercises:
+- id: config
+  title: Reading a proxy configuration
+  difficulty: 5
+  prompt: |-
+    One public address can hide many servers. A **reverse proxy** receives every request and decides where it goes, and the rules are written in a configuration file. Write `parse_proxy(text)`. A **reverse proxy** such as nginx stands in front of the real servers, receives all requests and passes them on. Its configuration is a text with blocks in braces, for example:
+
+    ```
+    upstream app {
+        server 10.0.0.1:8080 weight=3;
+        server 10.0.0.2:8080 backup;
+    }
+    server {
+        location /api/ { proxy_pass http://app; }
+        location /files/ { root /var/www; }
+        location /old/ { return 410; }
+    }
+    ```
+
+    Parse it. Everything after a '#' on a line is a comment; blank lines are ignored; a line ends with ';' (a directive), or with '{' (it opens a block: 'upstream NAME {' at the top level, 'server {' at the top level, 'location PREFIX {' inside a server block), or is '}' (it closes the innermost block). Directives: inside an upstream 'server ADDRESS [weight=N] [backup];' (the weight is a whole number, default 1; backup is a flag); inside a location exactly one of 'proxy_pass http://NAME;', 'root DIRECTORY;' or 'return CODE;'. A block may also be written on ONE line, as in the example ('location /api/ { proxy_pass http://app; }'): treat the text between '{' and '}' as directives of that block. Return {'upstreams': {name: [{'addr', 'weight', 'backup'}, ...]}, 'routes': [(prefix, target)]} where the target is ('proxy', NAME), ('static', DIRECTORY) or ('return', CODE as an int) and the routes are in the order of the text. ValueError messages: 'line N: bad directive' for anything else (N counts all lines from 1), 'line N: bad weight' for a weight that is not a positive whole number, 'line N: unexpected }' for a closing brace without a block, 'line N: empty location' for a location without a directive (N is the line of its closing brace), 'unclosed block' if blocks are open at the end, and 'unknown upstream NAME' if a proxy_pass names an upstream that was not defined (checked at the end, first such route).
+  starter: |-
+    def parse_proxy(text):
+        """A **reverse proxy** such as nginx stands in front of the real servers, receives all requests and passes them on. Its configuration is a text with blocks in braces, for example:
+
+    upstream app {
+        server 10.0.0.1:8080 weight=3;
+        server 10.0.0.2:8080 backup;
+    }
+    server {
+        location /api/ { proxy_pass http://app; }
+        location /files/ { root /var/www; }
+        location /old/ { return 410; }
+    }
+
+    Parse it. Everything after a '#' on a line is a comment; blank lines are ignored; a line ends with ';' (a directive), or with '{' (it opens a block: 'upstream NAME {' at the top level, 'server {' at the top level, 'location PREFIX {' inside a server block), or is '}' (it closes the innermost block). Directives: inside an upstream 'server ADDRESS [weight=N] [backup];' (the weight is a whole number, default 1; backup is a flag); inside a location exactly one of 'proxy_pass http://NAME;', 'root DIRECTORY;' or 'return CODE;'. A block may also be written on ONE line, as in the example ('location /api/ { proxy_pass http://app; }'): treat the text between '{' and '}' as directives of that block. Return {'upstreams': {name: [{'addr', 'weight', 'backup'}, ...]}, 'routes': [(prefix, target)]} where the target is ('proxy', NAME), ('static', DIRECTORY) or ('return', CODE as an int) and the routes are in the order of the text. ValueError messages: 'line N: bad directive' for anything else (N counts all lines from 1), 'line N: bad weight' for a weight that is not a positive whole number, 'line N: unexpected }' for a closing brace without a block, 'line N: empty location' for a location without a directive (N is the line of its closing brace), 'unclosed block' if blocks are open at the end, and 'unknown upstream NAME' if a proxy_pass names an upstream that was not defined (checked at the end, first such route)."""
+        pass
+  tests:
+  - name: a normal file
+    code: |
+      CONF = "upstream app {\n    server 10.0.0.1:8080 weight=3;\n    server 10.0.0.2:8080 backup;\n}\nserver {\n    location /api/ { proxy_pass http://app; }\n    location /files/ {\n        root /var/www;\n    }\n    location /old/ { return 410; }\n    location / { return 404; }\n}\n"
+
+      r = parse_proxy(CONF)
+      assert r == {"upstreams": {"app": [{"addr": "10.0.0.1:8080", "weight": 3, "backup": False}, {"addr": "10.0.0.2:8080", "weight": 1, "backup": True}]}, "routes": [("/api/", ("proxy", "app")), ("/files/", ("static", "/var/www")), ("/old/", ("return", 410)), ("/", ("return", 404))]}
+      assert parse_proxy("") == {"upstreams": {}, "routes": []} and parse_proxy("# nothing\n\n") == {"upstreams": {}, "routes": []}
+      r = parse_proxy("upstream a { server x:1; }  # one line\nupstream b {\n}\n")
+      assert r == {"upstreams": {"a": [{"addr": "x:1", "weight": 1, "backup": False}], "b": []}, "routes": []}
+  - name: errors
+    code: |
+      cases = (("upstream a {\n server x weight=0;\n}", "line 2: bad weight"), ("upstream a {\n server x weight=two;\n}", "line 2: bad weight"), ("}", "line 1: unexpected }"), ("upstream a {", "unclosed block"), ("server {\nlocation / {\n}\n}", "line 3: empty location"), ("server {\nlocation / { proxy_pass http://nope; }\n}", "unknown upstream nope"), ("foo bar;", "line 1: bad directive"), ("server {\n location / { root /a; root /b; }\n}", "line 2: bad directive"), ("upstream a {\n server x;\n}\nupstream b {\n location / { return 1; }\n}", "line 5: bad directive"), ("server {\n location / { return abc; }\n}", "line 2: bad directive"), ("upstream a {\n server x backup fast;\n}", "line 2: bad directive"))
+      for text, msg in cases:
+          try:
+              parse_proxy(text)
+              raise AssertionError("accepted " + repr(text))
+          except ValueError as e:
+              assert str(e) == msg, (text, str(e))
+  hints:
+  - 'Handle each line: cut off comments, then look at whether it opens a block, closes one or is a directive.'
+  - Keep a stack of the open blocks; a location's directive is stored in its stack entry until the block closes.
+  solution: |
+    def parse_proxy(text):
+        """A **reverse proxy** such as nginx stands in front of the real servers, receives all requests and passes them on. Its configuration is a text with blocks in braces, for example:
+
+    upstream app {
+        server 10.0.0.1:8080 weight=3;
+        server 10.0.0.2:8080 backup;
+    }
+    server {
+        location /api/ { proxy_pass http://app; }
+        location /files/ { root /var/www; }
+        location /old/ { return 410; }
+    }
+
+    Parse it. Everything after a '#' on a line is a comment; blank lines are ignored; a line ends with ';' (a directive), or with '{' (it opens a block: 'upstream NAME {' at the top level, 'server {' at the top level, 'location PREFIX {' inside a server block), or is '}' (it closes the innermost block). Directives: inside an upstream 'server ADDRESS [weight=N] [backup];' (the weight is a whole number, default 1; backup is a flag); inside a location exactly one of 'proxy_pass http://NAME;', 'root DIRECTORY;' or 'return CODE;'. A block may also be written on ONE line, as in the example ('location /api/ { proxy_pass http://app; }'): treat the text between '{' and '}' as directives of that block. Return {'upstreams': {name: [{'addr', 'weight', 'backup'}, ...]}, 'routes': [(prefix, target)]} where the target is ('proxy', NAME), ('static', DIRECTORY) or ('return', CODE as an int) and the routes are in the order of the text. ValueError messages: 'line N: bad directive' for anything else (N counts all lines from 1), 'line N: bad weight' for a weight that is not a positive whole number, 'line N: unexpected }' for a closing brace without a block, 'line N: empty location' for a location without a directive (N is the line of its closing brace), 'unclosed block' if blocks are open at the end, and 'unknown upstream NAME' if a proxy_pass names an upstream that was not defined (checked at the end, first such route)."""
+        import re
+        upstreams, routes, stack = {}, [], []
+        current = {"routes": None}
+
+        def directive(n, stmt):
+            stmt = stmt.strip()
+            if not stmt:
+                return
+            if not stmt.endswith(";") or not stack:
+                raise ValueError("line %d: bad directive" % n)
+            words = stmt[:-1].split()
+            kind = stack[-1][0]
+            if kind == "upstream" and words and words[0] == "server" and len(words) >= 2:
+                weight, backup = 1, False
+                for w in words[2:]:
+                    if w == "backup":
+                        backup = True
+                    elif w.startswith("weight="):
+                        if not w[7:].isdigit() or int(w[7:]) < 1:
+                            raise ValueError("line %d: bad weight" % n)
+                        weight = int(w[7:])
+                    else:
+                        raise ValueError("line %d: bad directive" % n)
+                upstreams[stack[-1][1]].append({"addr": words[1], "weight": weight, "backup": backup})
+            elif kind == "location" and len(words) == 2 and stack[-1][2] is None:
+                if words[0] == "proxy_pass" and re.fullmatch(r"http://[\w.-]+", words[1]):
+                    stack[-1][2] = ("proxy", words[1][7:])
+                elif words[0] == "root":
+                    stack[-1][2] = ("static", words[1])
+                elif words[0] == "return" and words[1].isdigit():
+                    stack[-1][2] = ("return", int(words[1]))
+                else:
+                    raise ValueError("line %d: bad directive" % n)
+            else:
+                raise ValueError("line %d: bad directive" % n)
+
+        def close(n):
+            if not stack:
+                raise ValueError("line %d: unexpected }" % n)
+            kind = stack.pop()
+            if kind[0] == "location":
+                if kind[2] is None:
+                    raise ValueError("line %d: empty location" % n)
+                routes.append((kind[1], kind[2]))
+
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            while line:
+                if line[0] == "}":
+                    close(n)
+                    line = line[1:].strip()
+                    continue
+                cut = min([i for i in (line.find(";"), line.find("{"), line.find("}")) if i >= 0] or [len(line)])
+                if cut < len(line) and line[cut] == "{":
+                    head = line[:cut].split()
+                    if len(head) == 2 and head[0] == "upstream" and not stack:
+                        stack.append(["upstream", head[1]])
+                        upstreams[head[1]] = []
+                    elif head == ["server"] and not stack:
+                        stack.append(["server", None])
+                    elif len(head) == 2 and head[0] == "location" and stack and stack[-1][0] == "server":
+                        stack.append(["location", head[1], None])
+                    else:
+                        raise ValueError("line %d: bad directive" % n)
+                    line = line[cut + 1:].strip()
+                elif cut < len(line) and line[cut] == ";":
+                    directive(n, line[:cut + 1])
+                    line = line[cut + 1:].strip()
+                elif cut < len(line):
+                    directive(n, line[:cut])
+                    line = line[cut:].strip()
+                else:
+                    directive(n, line)
+                    line = ""
+        if stack:
+            raise ValueError("unclosed block")
+        for prefix, target in routes:
+            if target[0] == "proxy" and target[1] not in upstreams:
+                raise ValueError("unknown upstream " + target[1])
+        return {"upstreams": upstreams, "routes": routes}
+  explanation: 'Real nginx files have hundreds of directives. What matters here is the idea: a few rules, matched against the request, decide where it goes.'
+- id: route
+  title: Which rule answers?
+  difficulty: 3
+  prompt: The proxy has the rules; now it needs to pick one for every request. Write `route(routes, path)`. The proxy must decide which rule handles a request. `routes` is the list of (prefix, target) from parse_proxy. The rule whose prefix is the LONGEST one that the path starts with wins (the first of equal prefixes). Anything after a '?' in the path is not part of the path. If no prefix matches the result is ('return', 404). Return the target of the winning rule.
+  starter: |-
+    def route(routes, path):
+        """The proxy must decide which rule handles a request. `routes` is the list of (prefix, target) from parse_proxy. The rule whose prefix is the LONGEST one that the path starts with wins (the first of equal prefixes). Anything after a '?' in the path is not part of the path. If no prefix matches the result is ('return', 404). Return the target of the winning rule."""
+        pass
+  tests:
+  - name: longest prefix
+    code: |
+      routes = [("/api/", ("proxy", "app")), ("/files/", ("static", "/var/www")), ("/old/", ("return", 410)), ("/", ("return", 200))]
+      assert [route(routes, p) for p in ("/api/x?y=1", "/files/a.png", "/old", "/old/", "/zzz", "/")] == [("proxy", "app"), ("static", "/var/www"), ("return", 200), ("return", 410), ("return", 200), ("return", 200)]
+      assert route(routes[:3], "/nothing") == ("return", 404) and route([], "/") == ("return", 404)
+  - name: ties and queries
+    code: |
+      routes = [("/a/", ("proxy", "one")), ("/a/b/", ("proxy", "two")), ("/a/", ("proxy", "three"))]
+      assert route(routes, "/a/b/c") == ("proxy", "two") and route(routes, "/a/x") == ("proxy", "one") and route(routes, "/a") == ("return", 404)
+      assert route(routes, "/a/b?next=/zzz") == ("proxy", "one") and route(routes, "/a/b/?x=/q") == ("proxy", "two") and route(routes, "/?/a/") == ("return", 404)
+  hints:
+  - Strip the query with path.split('?', 1)[0].
+  - Keep the best match so far and replace it only by a longer prefix.
+  solution: |
+    def route(routes, path):
+        """The proxy must decide which rule handles a request. `routes` is the list of (prefix, target) from parse_proxy. The rule whose prefix is the LONGEST one that the path starts with wins (the first of equal prefixes). Anything after a '?' in the path is not part of the path. If no prefix matches the result is ('return', 404). Return the target of the winning rule."""
+        path = path.split("?", 1)[0]
+        best = None
+        for prefix, target in routes:
+            if path.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+                best = (prefix, target)
+        return best[1] if best else ("return", 404)
+  explanation: The same longest-match idea is used by routing tables (the longest network prefix) and by web frameworks that match URL patterns.
+- id: wrr
+  title: A fair share for big and small
+  difficulty: 4
+  prompt: 'A strong server should get more requests than a weak one, but in a smooth rhythm rather than in bursts. Write `smooth_wrr(servers, n)`. Spreading requests over several servers is **load balancing**. The simplest rule, round robin (one after the other), ignores that a big server can take more work than a small one. **Weighted** round robin gives each server a share by its weight. The ''smooth'' method of nginx avoids bursts: keep a counter ''current'' per server, starting at 0. For each of the n requests: add every server''s weight to its counter; pick the server with the HIGHEST counter (the first one in the list for equal counters); subtract the total of all weights from the chosen server''s counter. `servers` is a list of (name, weight) pairs. Return the list of the n chosen names. ValueError(''no servers'') for an empty list, ValueError(''bad weight'') if any weight is not a positive whole number (check no servers first).'
+  starter: |-
+    def smooth_wrr(servers, n):
+        """Spreading requests over several servers is **load balancing**. The simplest rule, round robin (one after the other), ignores that a big server can take more work than a small one. **Weighted** round robin gives each server a share by its weight. The 'smooth' method of nginx avoids bursts: keep a counter 'current' per server, starting at 0. For each of the n requests: add every server's weight to its counter; pick the server with the HIGHEST counter (the first one in the list for equal counters); subtract the total of all weights from the chosen server's counter. `servers` is a list of (name, weight) pairs. Return the list of the n chosen names. ValueError('no servers') for an empty list, ValueError('bad weight') if any weight is not a positive whole number (check no servers first)."""
+        pass
+  tests:
+  - name: rhythm
+    code: |
+      assert smooth_wrr([("a", 5), ("b", 1), ("c", 1)], 7) == ["a", "a", "b", "a", "c", "a", "a"]
+      assert smooth_wrr([("a", 1), ("b", 1)], 5) == ["a", "b", "a", "b", "a"] and smooth_wrr([("x", 2)], 3) == ["x", "x", "x"] and smooth_wrr([("a", 1)], 0) == []
+      r = smooth_wrr([("big", 3), ("small", 1)], 8)
+      assert r.count("big") == 6 and r.count("small") == 2
+  - name: errors and fairness
+    code: |
+      for servers, msg in (([], "no servers"), ([("a", 0)], "bad weight"), ([("a", 1.5)], "bad weight"), ([("a", 2), ("b", -1)], "bad weight")):
+          try:
+              smooth_wrr(servers, 1)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == msg
+      r = smooth_wrr([("a", 2), ("b", 3), ("c", 5)], 100)
+      assert (r.count("a"), r.count("b"), r.count("c")) == (20, 30, 50)
+      assert "".join(smooth_wrr([("x", 1), ("y", 1), ("z", 1)], 6)) == "xyzxyz"
+  hints:
+  - Keep a list of counters with the same length as the servers.
+  - Choose the maximum counter; for ties max() with key (counter, -index) prefers the first server.
+  solution: |
+    def smooth_wrr(servers, n):
+        """Spreading requests over several servers is **load balancing**. The simplest rule, round robin (one after the other), ignores that a big server can take more work than a small one. **Weighted** round robin gives each server a share by its weight. The 'smooth' method of nginx avoids bursts: keep a counter 'current' per server, starting at 0. For each of the n requests: add every server's weight to its counter; pick the server with the HIGHEST counter (the first one in the list for equal counters); subtract the total of all weights from the chosen server's counter. `servers` is a list of (name, weight) pairs. Return the list of the n chosen names. ValueError('no servers') for an empty list, ValueError('bad weight') if any weight is not a positive whole number (check no servers first)."""
+        if not servers:
+            raise ValueError("no servers")
+        if any(not isinstance(w, int) or w < 1 for _, w in servers):
+            raise ValueError("bad weight")
+        total = sum(w for _, w in servers)
+        current = [0] * len(servers)
+        chosen = []
+        for _ in range(n):
+            for i, (_, w) in enumerate(servers):
+                current[i] += w
+            best = max(range(len(servers)), key=lambda i: (current[i], -i))
+            current[best] -= total
+            chosen.append(servers[best][0])
+        return chosen
+  explanation: 'Other balancing rules: least connections (send to the server with the fewest open requests), IP hash (the same visitor always reaches the same server) and random with two choices (pick two at random and take the less busy one).'
+- id: ring
+  title: Consistent hashing
+  difficulty: 5
+  prompt: 'A cache is spread over several servers, and the question ''which server has this key?'' must have the same answer for everybody. Write `assign_keys(servers, keys, replicas)`. If a cache or database is spread over servers by ''key mod number of servers'', adding one server moves almost every key. **Consistent hashing** moves only a few. Method: the hash of a text is the integer value of the first 8 hexadecimal digits of its MD5 digest (hashlib.md5(text.encode()).hexdigest()[:8], read in base 16). Put every server on a circle at `replicas` points: the points of the server S are the hashes of ''S#0'', ''S#1'', ... ''S#(replicas-1)''. A key belongs to the first point at or after the hash of the key, going around in the direction of growing numbers and wrapping from the largest point to the smallest (for equal points the server whose name comes first alphabetically wins). Return the dict {key: server}. ValueError(''no servers'') if the list is empty (keys may be empty), ValueError(''bad replicas'') if replicas < 1 (check in this order).'
+  starter: |-
+    def assign_keys(servers, keys, replicas):
+        """If a cache or database is spread over servers by 'key mod number of servers', adding one server moves almost every key. **Consistent hashing** moves only a few. Method: the hash of a text is the integer value of the first 8 hexadecimal digits of its MD5 digest (hashlib.md5(text.encode()).hexdigest()[:8], read in base 16). Put every server on a circle at `replicas` points: the points of the server S are the hashes of 'S#0', 'S#1', ... 'S#(replicas-1)'. A key belongs to the first point at or after the hash of the key, going around in the direction of growing numbers and wrapping from the largest point to the smallest (for equal points the server whose name comes first alphabetically wins). Return the dict {key: server}. ValueError('no servers') if the list is empty (keys may be empty), ValueError('bad replicas') if replicas < 1 (check in this order)."""
+        pass
+  tests:
+  - name: simple cases
+    code: |
+      assert assign_keys(["a"], ["x", "y"], 1) == {"x": "a", "y": "a"} and assign_keys(["a", "b"], [], 3) == {}
+      keys = ["k%d" % i for i in range(40)]
+      m = assign_keys(["s1", "s2", "s3"], keys, 50)
+      assert set(m) == set(keys) and set(m.values()) == {"s1", "s2", "s3"} and m == assign_keys(["s3", "s1", "s2"], keys, 50)
+      for text, args, msg in (("no servers", ([], ["x"], 3), "no servers"), ("replicas", (["a"], ["x"], 0), "bad replicas")):
+          try:
+              assign_keys(*args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == msg
+  - name: few keys move
+    code: |
+      keys = ["key%d" % i for i in range(200)]
+      three = assign_keys(["a", "b", "c"], keys, 100)
+      two = assign_keys(["a", "b"], keys, 100)
+      moved = [k for k in keys if three[k] != two[k]]
+      assert all(three[k] == "c" for k in moved) and len(moved) == len([k for k in keys if three[k] == "c"])
+      assert all(two[k] == three[k] for k in keys if three[k] != "c")
+      assert 20 < len(moved) < 120
+      four = assign_keys(["a", "b", "c", "d"], keys, 100)
+      assert all(four[k] == "d" or four[k] == three[k] for k in keys)
+  hints:
+  - Sort the points of the circle as (number, server) pairs and look for the first point that is not smaller than the key's hash.
+  - hashlib.md5(text.encode()).hexdigest()[:8] gives eight hex digits.
+  solution: |
+    def assign_keys(servers, keys, replicas):
+        """If a cache or database is spread over servers by 'key mod number of servers', adding one server moves almost every key. **Consistent hashing** moves only a few. Method: the hash of a text is the integer value of the first 8 hexadecimal digits of its MD5 digest (hashlib.md5(text.encode()).hexdigest()[:8], read in base 16). Put every server on a circle at `replicas` points: the points of the server S are the hashes of 'S#0', 'S#1', ... 'S#(replicas-1)'. A key belongs to the first point at or after the hash of the key, going around in the direction of growing numbers and wrapping from the largest point to the smallest (for equal points the server whose name comes first alphabetically wins). Return the dict {key: server}. ValueError('no servers') if the list is empty (keys may be empty), ValueError('bad replicas') if replicas < 1 (check in this order)."""
+        import hashlib
+        if not servers:
+            raise ValueError("no servers")
+        if replicas < 1:
+            raise ValueError("bad replicas")
+
+        def h(text):
+            return int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
+        ring = sorted((h("%s#%d" % (s, i)), s) for s in servers for i in range(replicas))
+        points = [p for p, _ in ring]
+        result = {}
+        for key in keys:
+            k = h(key)
+            lo, hi = 0, len(points)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if points[mid] < k:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            result[key] = ring[lo % len(ring)][1]
+        return result
+  explanation: The trick is used by caches such as memcached clients, by databases such as Cassandra and by content networks. Without it, one added server would empty almost every cache at the same moment.
+- id: health
+  title: Is the server really down?
+  difficulty: 4
+  prompt: 'A balancer that reacts to one lost probe would switch servers on and off all day. Write `health_states(results, fail_after, pass_after)`. A load balancer must stop sending requests to a server that has failed, and start again when it is back, without flapping on one single lost probe. `results` is the list of probe results over time (True = the server answered). The server starts as ''up''. While it is ''up'', `fail_after` failed probes IN A ROW make it ''down''; while it is ''down'', `pass_after` successful probes IN A ROW make it ''up'' again (a result of the other kind resets the count; the count also starts again after every change of state). Return {''state'': the final state, ''changes'': a list of (index, new_state) where the index (from 0) is the position of the probe that caused the change}.'
+  starter: |-
+    def health_states(results, fail_after, pass_after):
+        """A load balancer must stop sending requests to a server that has failed, and start again when it is back, without flapping on one single lost probe. `results` is the list of probe results over time (True = the server answered). The server starts as 'up'. While it is 'up', `fail_after` failed probes IN A ROW make it 'down'; while it is 'down', `pass_after` successful probes IN A ROW make it 'up' again (a result of the other kind resets the count; the count also starts again after every change of state). Return {'state': the final state, 'changes': a list of (index, new_state) where the index (from 0) is the position of the probe that caused the change}."""
+        pass
+  tests:
+  - name: flapping and recovery
+    code: |
+      r = [True, False, False, True, False, False, False, True, False, True, True, True]
+      assert health_states(r, 3, 2) == {"state": "up", "changes": [(6, "down"), (10, "up")]}
+      assert health_states([], 3, 2) == {"state": "up", "changes": []} and health_states([False] * 3, 2, 2) == {"state": "down", "changes": [(1, "down")]}
+      assert health_states([False, False, True, False, True, True, False], 2, 2) == {"state": "up", "changes": [(1, "down"), (5, "up")]}
+  - name: edges
+    code: |
+      assert health_states([False, True] * 10, 2, 1) == {"state": "up", "changes": []}
+      assert health_states([False, False, False, False, True], 1, 1) == {"state": "up", "changes": [(0, "down"), (4, "up")]}
+      assert health_states([True] * 5, 1, 1) == {"state": "up", "changes": []}
+      assert health_states([False, False, False, True], 2, 5) == {"state": "down", "changes": [(1, "down")]}
+  hints:
+  - Remember the state and a counter of results in a row.
+  - Reset the counter after every change of state.
+  solution: |
+    def health_states(results, fail_after, pass_after):
+        """A load balancer must stop sending requests to a server that has failed, and start again when it is back, without flapping on one single lost probe. `results` is the list of probe results over time (True = the server answered). The server starts as 'up'. While it is 'up', `fail_after` failed probes IN A ROW make it 'down'; while it is 'down', `pass_after` successful probes IN A ROW make it 'up' again (a result of the other kind resets the count; the count also starts again after every change of state). Return {'state': the final state, 'changes': a list of (index, new_state) where the index (from 0) is the position of the probe that caused the change}."""
+        state, streak, changes = "up", 0, []
+        for i, ok in enumerate(results):
+            if state == "up":
+                streak = 0 if ok else streak + 1
+                if streak >= fail_after:
+                    state, streak = "down", 0
+                    changes.append((i, "down"))
+            else:
+                streak = streak + 1 if ok else 0
+                if streak >= pass_after:
+                    state, streak = "up", 0
+                    changes.append((i, "up"))
+        return {"state": state, "changes": changes}
+  explanation: Real systems add a grace period when a server starts, slow start (increase the share step by step) and a limit that keeps at least some servers in service even if all checks fail.
+commonMistakes:
+- title: Using hash mod N for caches
+  explanation: A change of N moves nearly all keys.
+- title: Marking a server down after one failed probe
+  explanation: It makes the service flap.
+- title: Forgetting that the balancer can fail too
+  explanation: It needs a partner.
+- title: Retrying requests that change data
+  explanation: A payment could be made twice.
+- title: Sending users of a session to different servers
+  explanation: Session data may be on one server only.
+summary:
+- A reverse proxy is the public face of many servers.
+- Routing picks the rule with the longest matching prefix.
+- Weights give strong servers a bigger and smooth share.
+- Consistent hashing moves only a few keys when servers change.
+- Health checks need several results in a row.
+next: u34-dns
+quiz:
+- type: mcq
+  question: What does a reverse proxy do?
+  options:
+  - Receives requests for servers and forwards them
+  - Hides the user's identity
+  - Stores passwords
+  - Prints pages
+  answer: 0
+  explanation: A forward proxy works for the client.
+- type: mcq
+  question: What is load balancing for?
+  options:
+  - Sharing work and surviving a failed server
+  - Making pages prettier
+  - Encrypting data
+  - Saving paper
+  answer: 0
+  explanation: It also allows growth by adding machines.
+- type: mcq
+  question: Why does hash(key) mod N fail when servers are added?
+  options:
+  - Most keys get a different server
+  - The hash gets slower
+  - The keys get longer
+  - The servers forget
+  answer: 0
+  explanation: Consistent hashing fixes it.
+- type: mcq
+  question: What is flapping?
+  options:
+  - A server that switches between up and down
+  - A fast server
+  - A paused server
+  - A backup server
+  answer: 0
+  explanation: Require several results in a row.
+- type: mcq
+  question: What is a single point of failure?
+  options:
+  - One part whose failure stops everything
+  - A fast server
+  - An error message
+  - A backup
+  answer: 0
+  explanation: Double the balancer too.
+- type: mcq
+  question: What is TLS termination?
+  options:
+  - The proxy does the encryption for the servers
+  - The end of a session
+  - A kind of attack
+  - A cable end
+  answer: 0
+  explanation: The servers behind need no certificates.
+- type: code
+  question: Write `round_robin(servers, n)` returning a list of n names, giving the servers in order and starting again after the last one. An empty server list gives [].
+  starter: |
+    def round_robin(servers, n):
+        pass
+  tests:
+  - name: rr
+    code: |
+      assert round_robin(["a", "b", "c"], 7) == ["a", "b", "c", "a", "b", "c", "a"] and round_robin([], 3) == [] and round_robin(["a"], 2) == ["a", "a"] and round_robin(["a", "b"], 0) == []
+  solution: |
+    def round_robin(servers, n):
+        if not servers:
+            return []
+        return [servers[i % len(servers)] for i in range(n)]

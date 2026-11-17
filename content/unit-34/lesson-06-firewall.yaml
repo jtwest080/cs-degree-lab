@@ -1,0 +1,633 @@
+id: u34-firewall
+title: Firewalls, NAT and Troubleshooting
+minutes: 110
+objective: Learn how networks are protected and how addresses are shared. You will check addresses against CIDR networks, read and apply firewall rules, simulate NAT, spot port scans and follow a detective's order of checks to find a fault.
+outcomes:
+- Use CIDR notation to decide if an address is in a network
+- Read a firewall rule list and know why order matters
+- Explain what NAT does and why inbound traffic is dropped
+- Recognize a port scan
+- Troubleshoot a network problem from the bottom up
+sections:
+- heading: Networks, subnets and firewalls
+  body: |-
+    An IPv4 address is 32 bits, written as four numbers. A **network** is a block of addresses that share the first bits, written in **CIDR** notation: `192.168.1.0/24` means "the first 24 bits are fixed", leaving 8 bits (256 addresses) for devices. The **subnet mask** is the same idea written as `255.255.255.0`. Some blocks are **private** and never used on the public internet: `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`; your home devices use them. `127.0.0.1` ("localhost") always means *this computer*. IPv6 has 128 bits, so addresses never run out.
+
+    A **firewall** decides which packets may pass, by rules about **protocol**, **source**, **destination** and **port**. Two rules matter above all. **First, default deny**: everything not explicitly allowed is blocked. **Second, order**: the rules are tried from the top and the *first* match wins, so a broad ALLOW above a specific DENY silently cancels it. A good rule set is short, allows only the ports a service needs (`443` for the website, `22` for administrators, from known addresses only) and is written down, because the rules of a firewall are also the documentation of what the server is meant to do.
+
+    Firewalls sit at several places: on the **router** at the edge of the network, in the **operating system** (iptables and nftables on Linux, the Windows firewall), and in the **cloud** (security groups). A **DMZ** is a separate network zone for servers that the public may reach, kept away from the internal network. **Stateful** firewalls remember connections, so the answers to *your* requests are let in without a rule for every port.
+- heading: NAT, scans and the troubleshooting order
+  body: |-
+    **NAT** (network address translation) lets many devices with private addresses share one public address. The router rewrites the source of every outgoing packet to its own address and a fresh port, and keeps a table: *public port 40001 means laptop 192.168.0.5, port 5000*. An answer that arrives at port 40001 is rewritten back. A packet from outside for which the table has no entry is **dropped**, so NAT acts as a crude firewall, but it also means that nobody can connect *to* a device behind it unless you set up **port forwarding** (a fixed table entry). NAT was a patch for the shortage of IPv4 addresses; with IPv6 every device can have its own public address and the firewall does the protecting.
+
+    A **port scan** knocks on many ports to find open doors (tools such as `nmap`; admins use them on their own machines too). Seen from the logs it looks like one source address touching many different ports within seconds. Defences: close what you do not need, rate limit, and alert on scans. Remember that scanning other people's machines can be a crime, so only scan your own.
+
+    **Troubleshooting** is a method, not a talent. Work from the bottom up: *link* (cable, Wi-Fi), *address* (DHCP), *router*, *internet*, *name lookup*, *port*, *application*; stop at the first failure and fix that one; change one thing at a time; write down what you did. The questions to ask: *what changed?* (most outages follow a change), *who is affected?* (one person, one office, everybody) and *can I reproduce it?*. A calm, written order of checks beats clever guessing, which is exactly what you will code in this lesson and in the project.
+examples:
+- title: Firewall rules at work
+  intro: Parse a rule list and see which rule decides for two packets.
+  code: |
+    def in_network(ip, cidr):
+        """An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation 'address/length', for example '10.0.0.0/8' or '192.168.1.0/24': the first `length` bits are the network part, and every address that has the same network part belongs to the network ('/32' is one single address, '/0' is every address). A cidr without '/length' means '/32'. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored ('192.168.1.77/24' is the same network as '192.168.1.0/24'). ValueError('bad address') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError('bad length') if the length is not a whole number from 0 to 32."""
+        def to_int(text):
+            parts = text.split(".")
+            if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+                raise ValueError("bad address")
+            n = 0
+            for p in parts:
+                n = n * 256 + int(p)
+            return n
+        value = to_int(ip)
+        addr, slash, length = cidr.partition("/")
+        base = to_int(addr)
+        if slash:
+            if not length.isdigit() or int(length) > 32:
+                raise ValueError("bad length")
+            bits = int(length)
+        else:
+            bits = 32
+        shift = 32 - bits
+        return (value >> shift) == (base >> shift)
+
+
+    def parse_rules(text):
+        """A **firewall** is an ordered list of rules. Here each rule is one line 'ACTION PROTO from SOURCE to DESTINATION [port PORTS]', for example 'ALLOW tcp from 10.0.0.0/8 to any port 22' or 'DENY any from any to any'. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are 'any' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range 'first-last' (first <= last, numbers 0 to 65535); without 'port' the rule applies to every port. Blank lines and everything after a '#' are ignored. Return a list of dicts {'action', 'proto', 'src', 'dst', 'ports'} where ports is None or a tuple (first, last). ValueError('line N: bad rule') for anything else (N counts all lines from 1)."""
+        rules = []
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            w = line.split()
+            bad = ValueError("line %d: bad rule" % n)
+            if len(w) not in (6, 8) or w[2].lower() != "from" or w[4].lower() != "to":
+                raise bad
+            action, proto = w[0].upper(), w[1].lower()
+            if action not in ("ALLOW", "DENY") or proto not in ("tcp", "udp", "icmp", "any"):
+                raise bad
+            ports = None
+            if len(w) == 8:
+                if w[6].lower() != "port":
+                    raise bad
+                a, dash, b = w[7].partition("-")
+                if not a.isdigit() or (dash and not b.isdigit()):
+                    raise bad
+                first, last = int(a), int(b) if dash else int(a)
+                if not (0 <= first <= last <= 65535):
+                    raise bad
+                ports = (first, last)
+            rules.append({"action": action, "proto": proto, "src": w[3], "dst": w[5], "ports": ports})
+        return rules
+
+
+    def check_packet(rules, packet):
+        """Decide what the firewall does with a packet, a dict {'proto', 'src', 'dst', 'port'} (the port is None for packets without ports such as icmp). The rules are tried IN ORDER and the FIRST rule that matches decides. A rule matches if its proto is 'any' or equals the packet's proto, its src is 'any' or contains the packet's source address (in_network), its dst is 'any' or contains the destination, and its ports are None or contain the packet's port (a packet without a port does not match a rule that has ports). Return a tuple (action, number) where the number is the position of the winning rule in the list counted from 1. If no rule matches, the firewall DENIES everything that is not explicitly allowed: return ('DENY', 0)."""
+        for i, r in enumerate(rules, 1):
+            if r["proto"] != "any" and r["proto"] != packet["proto"]:
+                continue
+            if r["src"] != "any" and not in_network(packet["src"], r["src"]):
+                continue
+            if r["dst"] != "any" and not in_network(packet["dst"], r["dst"]):
+                continue
+            if r["ports"] is not None:
+                p = packet.get("port")
+                if p is None or not r["ports"][0] <= p <= r["ports"][1]:
+                    continue
+            return (r["action"], i)
+        return ("DENY", 0)
+    RULES = "# office firewall\nALLOW tcp from 10.0.0.0/8 to any port 22\nallow tcp from any to 192.0.2.10 port 80-443   # web\nDENY any from 203.0.113.0/24 to any\nALLOW icmp from any to any\nDENY any from any to any\n"
+
+    rules = parse_rules(RULES)
+    print(len(rules), "rules")
+    web = {"proto": "tcp", "src": "198.51.100.7", "dst": "192.0.2.10", "port": 443}
+    print(check_packet(rules, web))
+    ssh = {"proto": "tcp", "src": "198.51.100.7", "dst": "192.0.2.10", "port": 22}
+    print(check_packet(rules, ssh))
+    print(in_network("192.168.1.77", "192.168.1.0/24"))
+  output: |
+    5 rules
+    ('ALLOW', 2)
+    ('DENY', 5)
+    True
+  lines:
+  - line: 71
+    note: Five rules.
+  - line: 73
+    note: Rule 2 allows web traffic to the server.
+  - line: 75
+    note: SSH from an outside address matches no ALLOW and ends at the final DENY (rule 5).
+  - line: 76
+    note: 'True: the address is in the /24 network.'
+- title: NAT, scans and diagnosis
+  intro: Translate addresses, find a scanner in a log and walk the detective's checks.
+  code: |
+    def simulate_nat(public_ip, events, first_port):
+        """Your home has many devices but your provider gives ONE public address. **NAT** (network address translation) in the router lets them share it: for an outgoing connection it picks a public port and remembers which device and port it belongs to. Simulate the router. `events` is a list; every event is a tuple. ('out', src_ip, src_port, remote) is a packet that leaves for the remote 'host:port'. If the pair (src_ip, src_port) already has a public port, use it; otherwise give it the next free public port (the first one is `first_port`, then one more each time). The result of the event is the text 'PUBLIC_IP:PORT'. ('in', public_port, remote) is a packet that arrives from a remote at the public address. If the public port is in the table AND the remote is the same remote that the device contacted (the one of its LATEST 'out' event), the result is 'SRC_IP:SRC_PORT' of the device; otherwise 'dropped' (unsolicited traffic is not let in). Return the list of results, one per event."""
+        ports, owner, remote_of, nxt, results = {}, {}, {}, first_port, []
+        for ev in events:
+            if ev[0] == "out":
+                _, ip, port, remote = ev
+                if (ip, port) not in ports:
+                    ports[(ip, port)] = nxt
+                    owner[nxt] = (ip, port)
+                    nxt += 1
+                pub = ports[(ip, port)]
+                remote_of[pub] = remote
+                results.append("%s:%d" % (public_ip, pub))
+            else:
+                _, pub, remote = ev
+                if pub in owner and remote_of.get(pub) == remote:
+                    results.append("%s:%d" % owner[pub])
+                else:
+                    results.append("dropped")
+        return results
+
+
+    def find_scanners(events, threshold, window):
+        """A **port scan** knocks on many ports of a computer to find open doors, the first step of many attacks. `events` is a list of (time, source, port) with times in seconds, in time order. A source is a scanner if, within ANY time span of `window` seconds (from a time t up to and including t + window), it touched at least `threshold` DIFFERENT ports. Return the sorted list of (source, most) where `most` is the largest number of different ports that source touched in one such span, for the scanners only (sorted by source name)."""
+        by_source = {}
+        for t, src, port in events:
+            by_source.setdefault(src, []).append((t, port))
+        found = []
+        for src in sorted(by_source):
+            items = by_source[src]
+            best = 0
+            for i, (t0, _) in enumerate(items):
+                ports = {p for t, p in items[i:] if t0 <= t <= t0 + window}
+                best = max(best, len(ports))
+            if best >= threshold:
+                found.append((src, best))
+        return found
+
+
+    def diagnose_connection(facts):
+        """Put the detective method of the unit into one function. `facts` is a dict with some of these keys (a missing key means 'not tested yet'): 'link_up' (bool: the cable or Wi-Fi works), 'has_ip' (bool), 'gateway_ping' (bool: the router answers), 'internet_ping' (bool: an address on the internet answers), 'dns_ok' (bool: names can be looked up), 'port' ('open', 'refused' or 'timeout': what happened when connecting to the service) and 'http_status' (int). Go through the tests in this order and return the text for the FIRST one that has failed (a test that is missing is skipped): link_up False: 'no link'; has_ip False: 'no IP address'; gateway_ping False: 'cannot reach the router'; internet_ping False: 'no internet access'; dns_ok False: 'DNS failure'; port 'refused': 'nothing listens on the port'; port 'timeout': 'blocked by a firewall or lost on the way'; http_status of 500 or more: 'server error'; http_status of 400 to 499: 'request refused or not found'. If nothing failed return 'all tests passed'."""
+        checks = [("link_up", lambda v: v is False, "no link"), ("has_ip", lambda v: v is False, "no IP address"),
+                  ("gateway_ping", lambda v: v is False, "cannot reach the router"), ("internet_ping", lambda v: v is False, "no internet access"),
+                  ("dns_ok", lambda v: v is False, "DNS failure"), ("port", lambda v: v == "refused", "nothing listens on the port"),
+                  ("port", lambda v: v == "timeout", "blocked by a firewall or lost on the way"),
+                  ("http_status", lambda v: v >= 500, "server error"), ("http_status", lambda v: 400 <= v < 500, "request refused or not found")]
+        for key, failed, text in checks:
+            if key in facts and facts[key] is not None and failed(facts[key]):
+                return text
+        return "all tests passed"
+
+    events = [("out", "192.168.0.5", 5000, "93.184.216.34:443"), ("in", 40000, "93.184.216.34:443"), ("in", 40000, "6.6.6.6:443")]
+    print(simulate_nat("203.0.113.9", events, 40000))
+    log = [(0, "10.9.9.9", 21), (1, "10.9.9.9", 22), (2, "10.9.9.9", 23), (3, "10.9.9.9", 25), (4, "10.1.1.1", 443), (60, "10.1.1.1", 443)]
+    print(find_scanners(log, 4, 5))
+    print(diagnose_connection({"link_up": True, "has_ip": True, "gateway_ping": True, "internet_ping": True, "dns_ok": False}))
+  output: |
+    ['203.0.113.9:40000', '192.168.0.5:5000', 'dropped']
+    [('10.9.9.9', 4)]
+    DNS failure
+  lines:
+  - line: 53
+    note: The device gets public port 40000; the answer from the right remote is let in, the one from another remote is dropped.
+  - line: 55
+    note: 10.9.9.9 touched four different ports within four seconds.
+  - line: 56
+    note: The first failed test is the name lookup.
+playground:
+  prompt: How many addresses are in a /24 network and in a /16 network?
+  code: |
+    for length in (24, 16):
+        print('/' + str(length), 2 ** (32 - length))
+exercises:
+- id: cidr
+  title: Does this address belong to the network?
+  difficulty: 4
+  prompt: 'Firewalls, routers and cloud settings all talk about networks as `10.0.0.0/8` or `192.168.1.0/24`. Write `in_network(ip, cidr)`. An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation ''address/length'', for example ''10.0.0.0/8'' or ''192.168.1.0/24'': the first `length` bits are the network part, and every address that has the same network part belongs to the network (''/32'' is one single address, ''/0'' is every address). A cidr without ''/length'' means ''/32''. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored (''192.168.1.77/24'' is the same network as ''192.168.1.0/24''). ValueError(''bad address'') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError(''bad length'') if the length is not a whole number from 0 to 32.'
+  starter: |-
+    def in_network(ip, cidr):
+        """An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation 'address/length', for example '10.0.0.0/8' or '192.168.1.0/24': the first `length` bits are the network part, and every address that has the same network part belongs to the network ('/32' is one single address, '/0' is every address). A cidr without '/length' means '/32'. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored ('192.168.1.77/24' is the same network as '192.168.1.0/24'). ValueError('bad address') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError('bad length') if the length is not a whole number from 0 to 32."""
+        pass
+  tests:
+  - name: membership
+    code: |
+      assert in_network("10.1.2.3", "10.0.0.0/8") and not in_network("11.1.2.3", "10.0.0.0/8")
+      assert in_network("192.168.1.77", "192.168.1.0/24") and not in_network("192.168.2.1", "192.168.1.0/24")
+      assert in_network("1.2.3.4", "0.0.0.0/0") and in_network("1.2.3.4", "1.2.3.4") and not in_network("1.2.3.5", "1.2.3.4/32")
+      assert in_network("192.168.1.77", "192.168.1.64/26") and not in_network("192.168.1.130", "192.168.1.64/26") and in_network("192.168.1.100", "192.168.1.77/24")
+  - name: errors
+    code: |
+      for args, msg in ((("1.2.3", "1.2.3.4/8"), "bad address"), (("1.2.3.4", "1.2.3/8"), "bad address"), (("1.2.3.4", "1.2.3.4/33"), "bad length"), (("1.2.3.4", "1.2.3.4/x"), "bad length"), (("256.1.1.1", "1.1.1.1"), "bad address"), (("1.1.1.1", "1.1.1.1/"), "bad length"), (("1.2.3.-4", "1.1.1.1"), "bad address"), (("a.b.c.d", "bad/99"), "bad address")):
+          try:
+              in_network(*args)
+              raise AssertionError("accepted " + str(args))
+          except ValueError as e:
+              assert str(e) == msg, (args, str(e))
+  hints:
+  - 'Turn each address into one number: n = n * 256 + part.'
+  - Shift both numbers right by 32 - length bits and compare them.
+  solution: |
+    def in_network(ip, cidr):
+        """An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation 'address/length', for example '10.0.0.0/8' or '192.168.1.0/24': the first `length` bits are the network part, and every address that has the same network part belongs to the network ('/32' is one single address, '/0' is every address). A cidr without '/length' means '/32'. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored ('192.168.1.77/24' is the same network as '192.168.1.0/24'). ValueError('bad address') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError('bad length') if the length is not a whole number from 0 to 32."""
+        def to_int(text):
+            parts = text.split(".")
+            if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+                raise ValueError("bad address")
+            n = 0
+            for p in parts:
+                n = n * 256 + int(p)
+            return n
+        value = to_int(ip)
+        addr, slash, length = cidr.partition("/")
+        base = to_int(addr)
+        if slash:
+            if not length.isdigit() or int(length) > 32:
+                raise ValueError("bad length")
+            bits = int(length)
+        else:
+            bits = 32
+        shift = 32 - bits
+        return (value >> shift) == (base >> shift)
+  explanation: A /24 holds 256 addresses (254 usable for devices), a /16 holds 65,536 and a /8 holds more than 16 million. Splitting a network into smaller ones is called subnetting.
+- id: rules
+  title: Reading firewall rules
+  difficulty: 4
+  prompt: 'A firewall is a short list of rules that someone wrote in a hurry, so reading it correctly is a daily skill. Write `parse_rules(text)`. A **firewall** is an ordered list of rules. Here each rule is one line ''ACTION PROTO from SOURCE to DESTINATION [port PORTS]'', for example ''ALLOW tcp from 10.0.0.0/8 to any port 22'' or ''DENY any from any to any''. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are ''any'' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range ''first-last'' (first <= last, numbers 0 to 65535); without ''port'' the rule applies to every port. Blank lines and everything after a ''#'' are ignored. Return a list of dicts {''action'', ''proto'', ''src'', ''dst'', ''ports''} where ports is None or a tuple (first, last). ValueError(''line N: bad rule'') for anything else (N counts all lines from 1).'
+  starter: |-
+    def parse_rules(text):
+        """A **firewall** is an ordered list of rules. Here each rule is one line 'ACTION PROTO from SOURCE to DESTINATION [port PORTS]', for example 'ALLOW tcp from 10.0.0.0/8 to any port 22' or 'DENY any from any to any'. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are 'any' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range 'first-last' (first <= last, numbers 0 to 65535); without 'port' the rule applies to every port. Blank lines and everything after a '#' are ignored. Return a list of dicts {'action', 'proto', 'src', 'dst', 'ports'} where ports is None or a tuple (first, last). ValueError('line N: bad rule') for anything else (N counts all lines from 1)."""
+        pass
+  tests:
+  - name: rules
+    code: |
+      RULES = "# office firewall\nALLOW tcp from 10.0.0.0/8 to any port 22\nallow tcp from any to 192.0.2.10 port 80-443   # web\nDENY any from 203.0.113.0/24 to any\nALLOW icmp from any to any\nDENY any from any to any\n"
+
+      r = parse_rules(RULES)
+      assert r == [{"action": "ALLOW", "proto": "tcp", "src": "10.0.0.0/8", "dst": "any", "ports": (22, 22)}, {"action": "ALLOW", "proto": "tcp", "src": "any", "dst": "192.0.2.10", "ports": (80, 443)}, {"action": "DENY", "proto": "any", "src": "203.0.113.0/24", "dst": "any", "ports": None}, {"action": "ALLOW", "proto": "icmp", "src": "any", "dst": "any", "ports": None}, {"action": "DENY", "proto": "any", "src": "any", "dst": "any", "ports": None}]
+      assert parse_rules("") == [] and parse_rules("# nothing\n\n   \n") == []
+  - name: errors
+    code: |
+      for text in ("ALLOW tcp from a to b port", "FOO tcp from a to b", "ALLOW tcp from any to any port 70000", "ALLOW tcp from any to any port 9-3", "ALLOW tcp from any to any prt 22", "ALLOW sctp from any to any", "ALLOW tcp to any from any", "ALLOW tcp from any to any port x", "ALLOW tcp from any to any port 1-", "ALLOW tcp from any"):
+          try:
+              parse_rules(text)
+              raise AssertionError("accepted " + text)
+          except ValueError as e:
+              assert str(e) == "line 1: bad rule", (text, str(e))
+      try:
+          parse_rules("DENY any from any to any\n\nDENY\n")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert str(e) == "line 3: bad rule"
+      assert parse_rules("Deny UDP From any To 1.2.3.4 Port 0-65535")[0] == {"action": "DENY", "proto": "udp", "src": "any", "dst": "1.2.3.4", "ports": (0, 65535)}
+  hints:
+  - Cut off the comment with split('#', 1)[0], then split() into words.
+  - A rule has 6 words, or 8 with a port part.
+  solution: |
+    def parse_rules(text):
+        """A **firewall** is an ordered list of rules. Here each rule is one line 'ACTION PROTO from SOURCE to DESTINATION [port PORTS]', for example 'ALLOW tcp from 10.0.0.0/8 to any port 22' or 'DENY any from any to any'. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are 'any' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range 'first-last' (first <= last, numbers 0 to 65535); without 'port' the rule applies to every port. Blank lines and everything after a '#' are ignored. Return a list of dicts {'action', 'proto', 'src', 'dst', 'ports'} where ports is None or a tuple (first, last). ValueError('line N: bad rule') for anything else (N counts all lines from 1)."""
+        rules = []
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            w = line.split()
+            bad = ValueError("line %d: bad rule" % n)
+            if len(w) not in (6, 8) or w[2].lower() != "from" or w[4].lower() != "to":
+                raise bad
+            action, proto = w[0].upper(), w[1].lower()
+            if action not in ("ALLOW", "DENY") or proto not in ("tcp", "udp", "icmp", "any"):
+                raise bad
+            ports = None
+            if len(w) == 8:
+                if w[6].lower() != "port":
+                    raise bad
+                a, dash, b = w[7].partition("-")
+                if not a.isdigit() or (dash and not b.isdigit()):
+                    raise bad
+                first, last = int(a), int(b) if dash else int(a)
+                if not (0 <= first <= last <= 65535):
+                    raise bad
+                ports = (first, last)
+            rules.append({"action": action, "proto": proto, "src": w[3], "dst": w[5], "ports": ports})
+        return rules
+  explanation: Real firewalls (iptables, nftables, cloud security groups) have more features, such as connection tracking, logging and rate limits, but the core is this list.
+- id: packet
+  title: Allowed or denied?
+  difficulty: 4
+  prompt: 'The rules of the last exercise are only useful if something applies them to every packet. Write `check_packet(rules, packet)`. Decide what the firewall does with a packet, a dict {''proto'', ''src'', ''dst'', ''port''} (the port is None for packets without ports such as icmp). The rules are tried IN ORDER and the FIRST rule that matches decides. A rule matches if its proto is ''any'' or equals the packet''s proto, its src is ''any'' or contains the packet''s source address (in_network), its dst is ''any'' or contains the destination, and its ports are None or contain the packet''s port (a packet without a port does not match a rule that has ports). Return a tuple (action, number) where the number is the position of the winning rule in the list counted from 1. If no rule matches, the firewall DENIES everything that is not explicitly allowed: return (''DENY'', 0).'
+  starter: |-
+    def in_network(ip, cidr):
+        """An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation 'address/length', for example '10.0.0.0/8' or '192.168.1.0/24': the first `length` bits are the network part, and every address that has the same network part belongs to the network ('/32' is one single address, '/0' is every address). A cidr without '/length' means '/32'. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored ('192.168.1.77/24' is the same network as '192.168.1.0/24'). ValueError('bad address') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError('bad length') if the length is not a whole number from 0 to 32."""
+        def to_int(text):
+            parts = text.split(".")
+            if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+                raise ValueError("bad address")
+            n = 0
+            for p in parts:
+                n = n * 256 + int(p)
+            return n
+        value = to_int(ip)
+        addr, slash, length = cidr.partition("/")
+        base = to_int(addr)
+        if slash:
+            if not length.isdigit() or int(length) > 32:
+                raise ValueError("bad length")
+            bits = int(length)
+        else:
+            bits = 32
+        shift = 32 - bits
+        return (value >> shift) == (base >> shift)
+
+
+    def parse_rules(text):
+        """A **firewall** is an ordered list of rules. Here each rule is one line 'ACTION PROTO from SOURCE to DESTINATION [port PORTS]', for example 'ALLOW tcp from 10.0.0.0/8 to any port 22' or 'DENY any from any to any'. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are 'any' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range 'first-last' (first <= last, numbers 0 to 65535); without 'port' the rule applies to every port. Blank lines and everything after a '#' are ignored. Return a list of dicts {'action', 'proto', 'src', 'dst', 'ports'} where ports is None or a tuple (first, last). ValueError('line N: bad rule') for anything else (N counts all lines from 1)."""
+        rules = []
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            w = line.split()
+            bad = ValueError("line %d: bad rule" % n)
+            if len(w) not in (6, 8) or w[2].lower() != "from" or w[4].lower() != "to":
+                raise bad
+            action, proto = w[0].upper(), w[1].lower()
+            if action not in ("ALLOW", "DENY") or proto not in ("tcp", "udp", "icmp", "any"):
+                raise bad
+            ports = None
+            if len(w) == 8:
+                if w[6].lower() != "port":
+                    raise bad
+                a, dash, b = w[7].partition("-")
+                if not a.isdigit() or (dash and not b.isdigit()):
+                    raise bad
+                first, last = int(a), int(b) if dash else int(a)
+                if not (0 <= first <= last <= 65535):
+                    raise bad
+                ports = (first, last)
+            rules.append({"action": action, "proto": proto, "src": w[3], "dst": w[5], "ports": ports})
+        return rules
+
+
+
+
+    def check_packet(rules, packet):
+        """Decide what the firewall does with a packet, a dict {'proto', 'src', 'dst', 'port'} (the port is None for packets without ports such as icmp). The rules are tried IN ORDER and the FIRST rule that matches decides. A rule matches if its proto is 'any' or equals the packet's proto, its src is 'any' or contains the packet's source address (in_network), its dst is 'any' or contains the destination, and its ports are None or contain the packet's port (a packet without a port does not match a rule that has ports). Return a tuple (action, number) where the number is the position of the winning rule in the list counted from 1. If no rule matches, the firewall DENIES everything that is not explicitly allowed: return ('DENY', 0)."""
+        pass
+  tests:
+  - name: first match wins
+    code: |
+      RULES = "# office firewall\nALLOW tcp from 10.0.0.0/8 to any port 22\nallow tcp from any to 192.0.2.10 port 80-443   # web\nDENY any from 203.0.113.0/24 to any\nALLOW icmp from any to any\nDENY any from any to any\n"
+
+      r = parse_rules(RULES)
+      pk = lambda p, s, d, po=None: {"proto": p, "src": s, "dst": d, "port": po}
+      assert check_packet(r, pk("tcp", "10.1.1.1", "192.0.2.10", 22)) == ("ALLOW", 1)
+      assert check_packet(r, pk("tcp", "8.8.8.8", "192.0.2.10", 443)) == ("ALLOW", 2)
+      assert check_packet(r, pk("tcp", "203.0.113.5", "192.0.2.10", 80)) == ("ALLOW", 2)
+      assert check_packet(r, pk("udp", "203.0.113.5", "192.0.2.10", 53)) == ("DENY", 3)
+      assert check_packet(r, pk("icmp", "8.8.8.8", "192.0.2.10")) == ("ALLOW", 4)
+      assert check_packet(r, pk("tcp", "8.8.8.8", "192.0.2.10", 22)) == ("DENY", 5)
+  - name: default deny
+    code: |
+      pk = lambda p, s, d, po=None: {"proto": p, "src": s, "dst": d, "port": po}
+      assert check_packet([], pk("tcp", "1.1.1.1", "2.2.2.2", 1)) == ("DENY", 0)
+      r = parse_rules("ALLOW tcp from 10.0.0.0/8 to any port 20-30\nALLOW udp from any to 9.9.9.9")
+      assert check_packet(r, pk("tcp", "10.0.0.1", "1.1.1.1")) == ("DENY", 0) and check_packet(r, pk("tcp", "10.0.0.1", "1.1.1.1", 31)) == ("DENY", 0)
+      assert check_packet(r, pk("tcp", "10.0.0.1", "1.1.1.1", 20)) == ("ALLOW", 1) and check_packet(r, pk("tcp", "10.0.0.1", "1.1.1.1", 30)) == ("ALLOW", 1)
+      assert check_packet(r, pk("udp", "5.5.5.5", "9.9.9.9", 53)) == ("ALLOW", 2) and check_packet(r, pk("udp", "5.5.5.5", "9.9.9.8", 53)) == ("DENY", 0)
+  hints:
+  - Check the conditions one after another and use continue when a rule does not match.
+  - packet['port'] can be None.
+  solution: |
+    def in_network(ip, cidr):
+        """An IPv4 address is four numbers from 0 to 255 separated by dots; it is really one 32-bit number (the first number is the highest 8 bits). A network is written in **CIDR** notation 'address/length', for example '10.0.0.0/8' or '192.168.1.0/24': the first `length` bits are the network part, and every address that has the same network part belongs to the network ('/32' is one single address, '/0' is every address). A cidr without '/length' means '/32'. Return True if `ip` belongs to the network, else False; the host bits of the cidr address are ignored ('192.168.1.77/24' is the same network as '192.168.1.0/24'). ValueError('bad address') if the address of either argument is not four whole numbers 0-255 (check ip first), ValueError('bad length') if the length is not a whole number from 0 to 32."""
+        def to_int(text):
+            parts = text.split(".")
+            if len(parts) != 4 or not all(p.isdigit() and int(p) <= 255 for p in parts):
+                raise ValueError("bad address")
+            n = 0
+            for p in parts:
+                n = n * 256 + int(p)
+            return n
+        value = to_int(ip)
+        addr, slash, length = cidr.partition("/")
+        base = to_int(addr)
+        if slash:
+            if not length.isdigit() or int(length) > 32:
+                raise ValueError("bad length")
+            bits = int(length)
+        else:
+            bits = 32
+        shift = 32 - bits
+        return (value >> shift) == (base >> shift)
+
+
+    def parse_rules(text):
+        """A **firewall** is an ordered list of rules. Here each rule is one line 'ACTION PROTO from SOURCE to DESTINATION [port PORTS]', for example 'ALLOW tcp from 10.0.0.0/8 to any port 22' or 'DENY any from any to any'. ACTION is ALLOW or DENY, PROTO is tcp, udp, icmp or any (all in any case, turned to lower case for proto and upper case for action), SOURCE and DESTINATION are 'any' or an address or CIDR as in in_network (keep the text), and PORTS is a whole number or a range 'first-last' (first <= last, numbers 0 to 65535); without 'port' the rule applies to every port. Blank lines and everything after a '#' are ignored. Return a list of dicts {'action', 'proto', 'src', 'dst', 'ports'} where ports is None or a tuple (first, last). ValueError('line N: bad rule') for anything else (N counts all lines from 1)."""
+        rules = []
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            w = line.split()
+            bad = ValueError("line %d: bad rule" % n)
+            if len(w) not in (6, 8) or w[2].lower() != "from" or w[4].lower() != "to":
+                raise bad
+            action, proto = w[0].upper(), w[1].lower()
+            if action not in ("ALLOW", "DENY") or proto not in ("tcp", "udp", "icmp", "any"):
+                raise bad
+            ports = None
+            if len(w) == 8:
+                if w[6].lower() != "port":
+                    raise bad
+                a, dash, b = w[7].partition("-")
+                if not a.isdigit() or (dash and not b.isdigit()):
+                    raise bad
+                first, last = int(a), int(b) if dash else int(a)
+                if not (0 <= first <= last <= 65535):
+                    raise bad
+                ports = (first, last)
+            rules.append({"action": action, "proto": proto, "src": w[3], "dst": w[5], "ports": ports})
+        return rules
+
+
+
+
+    def check_packet(rules, packet):
+        """Decide what the firewall does with a packet, a dict {'proto', 'src', 'dst', 'port'} (the port is None for packets without ports such as icmp). The rules are tried IN ORDER and the FIRST rule that matches decides. A rule matches if its proto is 'any' or equals the packet's proto, its src is 'any' or contains the packet's source address (in_network), its dst is 'any' or contains the destination, and its ports are None or contain the packet's port (a packet without a port does not match a rule that has ports). Return a tuple (action, number) where the number is the position of the winning rule in the list counted from 1. If no rule matches, the firewall DENIES everything that is not explicitly allowed: return ('DENY', 0)."""
+        for i, r in enumerate(rules, 1):
+            if r["proto"] != "any" and r["proto"] != packet["proto"]:
+                continue
+            if r["src"] != "any" and not in_network(packet["src"], r["src"]):
+                continue
+            if r["dst"] != "any" and not in_network(packet["dst"], r["dst"]):
+                continue
+            if r["ports"] is not None:
+                p = packet.get("port")
+                if p is None or not r["ports"][0] <= p <= r["ports"][1]:
+                    continue
+            return (r["action"], i)
+        return ("DENY", 0)
+  explanation: 'Notice the third test of the first example: a broad ALLOW above a specific DENY makes the DENY useless. Rule order is the most common firewall mistake, so put the specific rules first.'
+- id: nat
+  title: One address for the whole house
+  difficulty: 5
+  prompt: 'IPv4 ran out of addresses, and **NAT** is the trick that kept the internet working: hundreds of devices behind one public address. Write `simulate_nat(public_ip, events, first_port)`. Your home has many devices but your provider gives ONE public address. **NAT** (network address translation) in the router lets them share it: for an outgoing connection it picks a public port and remembers which device and port it belongs to. Simulate the router. `events` is a list; every event is a tuple. (''out'', src_ip, src_port, remote) is a packet that leaves for the remote ''host:port''. If the pair (src_ip, src_port) already has a public port, use it; otherwise give it the next free public port (the first one is `first_port`, then one more each time). The result of the event is the text ''PUBLIC_IP:PORT''. (''in'', public_port, remote) is a packet that arrives from a remote at the public address. If the public port is in the table AND the remote is the same remote that the device contacted (the one of its LATEST ''out'' event), the result is ''SRC_IP:SRC_PORT'' of the device; otherwise ''dropped'' (unsolicited traffic is not let in). Return the list of results, one per event.'
+  starter: |-
+    def simulate_nat(public_ip, events, first_port):
+        """Your home has many devices but your provider gives ONE public address. **NAT** (network address translation) in the router lets them share it: for an outgoing connection it picks a public port and remembers which device and port it belongs to. Simulate the router. `events` is a list; every event is a tuple. ('out', src_ip, src_port, remote) is a packet that leaves for the remote 'host:port'. If the pair (src_ip, src_port) already has a public port, use it; otherwise give it the next free public port (the first one is `first_port`, then one more each time). The result of the event is the text 'PUBLIC_IP:PORT'. ('in', public_port, remote) is a packet that arrives from a remote at the public address. If the public port is in the table AND the remote is the same remote that the device contacted (the one of its LATEST 'out' event), the result is 'SRC_IP:SRC_PORT' of the device; otherwise 'dropped' (unsolicited traffic is not let in). Return the list of results, one per event."""
+        pass
+  tests:
+  - name: a router at work
+    code: |
+      ev = [("out", "192.168.0.5", 5000, "93.184.216.34:443"), ("out", "192.168.0.6", 5000, "93.184.216.34:443"), ("in", 40000, "93.184.216.34:443"), ("in", 40001, "93.184.216.34:443"), ("in", 40000, "6.6.6.6:443"), ("in", 50000, "9.9.9.9:1")]
+      assert simulate_nat("203.0.113.9", ev, 40000) == ["203.0.113.9:40000", "203.0.113.9:40001", "192.168.0.5:5000", "192.168.0.6:5000", "dropped", "dropped"]
+      assert simulate_nat("1.1.1.1", [], 1000) == []
+  - name: reuse and the latest remote
+    code: |
+      ev = [("out", "10.0.0.5", 5000, "a:1"), ("out", "10.0.0.5", 5001, "a:1"), ("out", "10.0.0.5", 5000, "b:2"), ("in", 40000, "a:1"), ("in", 40000, "b:2"), ("out", "10.0.0.9", 5000, "a:1"), ("in", 40002, "a:1"), ("in", 40001, "a:1")]
+      assert simulate_nat("2.2.2.2", ev, 40000) == ["2.2.2.2:40000", "2.2.2.2:40001", "2.2.2.2:40000", "dropped", "10.0.0.5:5000", "2.2.2.2:40002", "10.0.0.9:5000", "10.0.0.5:5001"]
+      assert simulate_nat("3.3.3.3", [("in", 1, "x")], 1) == ["dropped"]
+  hints:
+  - 'Keep two dicts: (ip, port) to public port, and public port to (ip, port).'
+  - Remember the latest remote of each public port in a third dict.
+  solution: |
+    def simulate_nat(public_ip, events, first_port):
+        """Your home has many devices but your provider gives ONE public address. **NAT** (network address translation) in the router lets them share it: for an outgoing connection it picks a public port and remembers which device and port it belongs to. Simulate the router. `events` is a list; every event is a tuple. ('out', src_ip, src_port, remote) is a packet that leaves for the remote 'host:port'. If the pair (src_ip, src_port) already has a public port, use it; otherwise give it the next free public port (the first one is `first_port`, then one more each time). The result of the event is the text 'PUBLIC_IP:PORT'. ('in', public_port, remote) is a packet that arrives from a remote at the public address. If the public port is in the table AND the remote is the same remote that the device contacted (the one of its LATEST 'out' event), the result is 'SRC_IP:SRC_PORT' of the device; otherwise 'dropped' (unsolicited traffic is not let in). Return the list of results, one per event."""
+        ports, owner, remote_of, nxt, results = {}, {}, {}, first_port, []
+        for ev in events:
+            if ev[0] == "out":
+                _, ip, port, remote = ev
+                if (ip, port) not in ports:
+                    ports[(ip, port)] = nxt
+                    owner[nxt] = (ip, port)
+                    nxt += 1
+                pub = ports[(ip, port)]
+                remote_of[pub] = remote
+                results.append("%s:%d" % (public_ip, pub))
+            else:
+                _, pub, remote = ev
+                if pub in owner and remote_of.get(pub) == remote:
+                    results.append("%s:%d" % owner[pub])
+                else:
+                    results.append("dropped")
+        return results
+  explanation: 'This is why you cannot simply run a server at home: nobody can start a connection inward unless you set up port forwarding. It is also a (weak) protection, because unsolicited packets find no entry in the table.'
+- id: diagnose
+  title: The detective's order of checks
+  difficulty: 3
+  prompt: 'Put the method of this unit into one function: test from the bottom up and report the first thing that broke. Write `diagnose_connection(facts)`. Put the detective method of the unit into one function. `facts` is a dict with some of these keys (a missing key means ''not tested yet''): ''link_up'' (bool: the cable or Wi-Fi works), ''has_ip'' (bool), ''gateway_ping'' (bool: the router answers), ''internet_ping'' (bool: an address on the internet answers), ''dns_ok'' (bool: names can be looked up), ''port'' (''open'', ''refused'' or ''timeout'': what happened when connecting to the service) and ''http_status'' (int). Go through the tests in this order and return the text for the FIRST one that has failed (a test that is missing is skipped): link_up False: ''no link''; has_ip False: ''no IP address''; gateway_ping False: ''cannot reach the router''; internet_ping False: ''no internet access''; dns_ok False: ''DNS failure''; port ''refused'': ''nothing listens on the port''; port ''timeout'': ''blocked by a firewall or lost on the way''; http_status of 500 or more: ''server error''; http_status of 400 to 499: ''request refused or not found''. If nothing failed return ''all tests passed''.'
+  starter: |-
+    def diagnose_connection(facts):
+        """Put the detective method of the unit into one function. `facts` is a dict with some of these keys (a missing key means 'not tested yet'): 'link_up' (bool: the cable or Wi-Fi works), 'has_ip' (bool), 'gateway_ping' (bool: the router answers), 'internet_ping' (bool: an address on the internet answers), 'dns_ok' (bool: names can be looked up), 'port' ('open', 'refused' or 'timeout': what happened when connecting to the service) and 'http_status' (int). Go through the tests in this order and return the text for the FIRST one that has failed (a test that is missing is skipped): link_up False: 'no link'; has_ip False: 'no IP address'; gateway_ping False: 'cannot reach the router'; internet_ping False: 'no internet access'; dns_ok False: 'DNS failure'; port 'refused': 'nothing listens on the port'; port 'timeout': 'blocked by a firewall or lost on the way'; http_status of 500 or more: 'server error'; http_status of 400 to 499: 'request refused or not found'. If nothing failed return 'all tests passed'."""
+        pass
+  tests:
+  - name: first failure
+    code: |
+      assert diagnose_connection({}) == "all tests passed"
+      ok = {"link_up": True, "has_ip": True, "gateway_ping": True, "internet_ping": True, "dns_ok": True, "port": "open", "http_status": 200}
+      assert diagnose_connection(ok) == "all tests passed"
+      assert diagnose_connection({"has_ip": False, "dns_ok": False}) == "no IP address"
+      assert diagnose_connection({"link_up": False, "has_ip": False}) == "no link"
+      assert diagnose_connection({"dns_ok": False, "port": "refused"}) == "DNS failure"
+      assert diagnose_connection(dict(ok, gateway_ping=False)) == "cannot reach the router" and diagnose_connection(dict(ok, internet_ping=False)) == "no internet access"
+  - name: service and web layer
+    code: |
+      assert diagnose_connection({"port": "refused", "http_status": 500}) == "nothing listens on the port"
+      assert diagnose_connection({"port": "timeout", "http_status": 503}) == "blocked by a firewall or lost on the way"
+      assert diagnose_connection({"port": "open", "http_status": 503}) == "server error" and diagnose_connection({"http_status": 404}) == "request refused or not found"
+      assert diagnose_connection({"http_status": 399}) == "all tests passed" and diagnose_connection({"http_status": 500}) == "server error"
+      assert diagnose_connection({"link_up": True, "internet_ping": False, "dns_ok": None}) == "no internet access" and diagnose_connection({"dns_ok": None, "port": None}) == "all tests passed"
+  hints:
+  - List the tests in order as (key, 'what counts as failed', text) and walk through them.
+  - Skip a key that is missing or None.
+  solution: |
+    def diagnose_connection(facts):
+        """Put the detective method of the unit into one function. `facts` is a dict with some of these keys (a missing key means 'not tested yet'): 'link_up' (bool: the cable or Wi-Fi works), 'has_ip' (bool), 'gateway_ping' (bool: the router answers), 'internet_ping' (bool: an address on the internet answers), 'dns_ok' (bool: names can be looked up), 'port' ('open', 'refused' or 'timeout': what happened when connecting to the service) and 'http_status' (int). Go through the tests in this order and return the text for the FIRST one that has failed (a test that is missing is skipped): link_up False: 'no link'; has_ip False: 'no IP address'; gateway_ping False: 'cannot reach the router'; internet_ping False: 'no internet access'; dns_ok False: 'DNS failure'; port 'refused': 'nothing listens on the port'; port 'timeout': 'blocked by a firewall or lost on the way'; http_status of 500 or more: 'server error'; http_status of 400 to 499: 'request refused or not found'. If nothing failed return 'all tests passed'."""
+        checks = [("link_up", lambda v: v is False, "no link"), ("has_ip", lambda v: v is False, "no IP address"),
+                  ("gateway_ping", lambda v: v is False, "cannot reach the router"), ("internet_ping", lambda v: v is False, "no internet access"),
+                  ("dns_ok", lambda v: v is False, "DNS failure"), ("port", lambda v: v == "refused", "nothing listens on the port"),
+                  ("port", lambda v: v == "timeout", "blocked by a firewall or lost on the way"),
+                  ("http_status", lambda v: v >= 500, "server error"), ("http_status", lambda v: 400 <= v < 500, "request refused or not found")]
+        for key, failed, text in checks:
+            if key in facts and facts[key] is not None and failed(facts[key]):
+                return text
+        return "all tests passed"
+  explanation: 'The order is the whole idea: a DNS failure is only interesting if the internet itself works, and a 404 is only interesting if the connection works. Every real runbook follows this shape.'
+commonMistakes:
+- title: A broad ALLOW above a specific DENY
+  explanation: The first matching rule wins.
+- title: Opening a port 'just to test' and forgetting it
+  explanation: Open ports are attacked within minutes.
+- title: Forgetting that the host bits of a CIDR are ignored
+  explanation: 192.168.1.77/24 is the network 192.168.1.0/24.
+- title: Expecting to reach a device behind NAT
+  explanation: The table has no entry for unsolicited packets.
+- title: Fixing several things at once
+  explanation: You cannot tell which change helped.
+summary:
+- CIDR /n fixes the first n bits; a /24 holds 256 addresses.
+- 'Firewalls: default deny, first match wins.'
+- NAT shares one public address and drops unsolicited packets.
+- A scan is one source touching many ports quickly.
+- Troubleshoot from the bottom up and fix the first failure.
+next: u34-project
+quiz:
+- type: mcq
+  question: How many addresses are in a /24 network?
+  options:
+  - '256'
+  - '24'
+  - '1024'
+  - '65536'
+  answer: 0
+  explanation: 32 minus 24 leaves 8 bits.
+- type: mcq
+  question: What does a firewall do when no rule matches?
+  options:
+  - It should deny the packet
+  - It allows the packet
+  - It restarts
+  - It logs out
+  answer: 0
+  explanation: Default deny.
+- type: mcq
+  question: Why is the order of firewall rules important?
+  options:
+  - The first matching rule wins
+  - The last rule wins
+  - All rules are added up
+  - The order is random
+  answer: 0
+  explanation: A broad rule above a narrow one hides it.
+- type: mcq
+  question: What does NAT do with an unsolicited packet from outside?
+  options:
+  - Drops it, there is no table entry
+  - Forwards it to the first device
+  - Answers it
+  - Stores it
+  answer: 0
+  explanation: No device asked for it.
+- type: mcq
+  question: Which address range is private?
+  options:
+  - 192.168.0.0/16
+  - 8.8.8.0/24
+  - 93.184.216.0/24
+  - 1.1.1.0/24
+  answer: 0
+  explanation: Also 10.0.0.0/8 and 172.16.0.0/12.
+- type: mcq
+  question: Where do you start when you troubleshoot a network?
+  options:
+  - 'At the bottom: link and address'
+  - With the website
+  - With the password
+  - With the keyboard
+  answer: 0
+  explanation: Fix the first failure.
+- type: code
+  question: Write `host_count(length)` returning how many addresses a network with the CIDR length (0 to 32) contains.
+  starter: |
+    def host_count(length):
+        pass
+  tests:
+  - name: count
+    code: |
+      assert host_count(24) == 256 and host_count(32) == 1 and host_count(16) == 65536 and host_count(0) == 4294967296 and host_count(30) == 4
+  solution: |
+    def host_count(length):
+        return 2 ** (32 - length)

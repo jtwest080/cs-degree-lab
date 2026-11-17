@@ -1,0 +1,1111 @@
+id: u34-dns
+title: DNS and Email in Depth
+minutes: 110
+objective: Understand the internet's phone book and what depends on it. You will read a zone file, follow aliases to an address, find the mail servers of a domain, see how TTL caching works and check a zone for mistakes.
+outcomes:
+- Explain how a name becomes an address, step by step
+- Read a zone file and its record types
+- Follow CNAME aliases and know the DNS status words
+- Explain MX records and how email finds its server
+- Choose a sensible TTL
+sections:
+- heading: From a name to an address
+  body: |-
+    People remember names, computers need numbers, so the **Domain Name System (DNS)** translates. It is a worldwide, distributed database, organized as a tree: the **root** (written as a dot at the end, `example.com.`), the **top-level domains** (`.com`, `.org`, `.de`), then each owner's **domain** (`example.com`) with its **subdomains** (`www.example.com`). Nobody holds the whole database. Each domain owner runs (or rents) **authoritative servers** with the truth about their zone, and everybody else asks.
+
+    When your computer needs `www.example.com` it asks a **recursive resolver** (your provider's, or a public one such as 1.1.1.1). If the answer is not cached, the resolver walks the tree: it asks a **root server** (who handles `.com`?), then the `.com` servers (who handles `example.com`?), then the authoritative server of `example.com`, which gives the answer. Every answer carries a **TTL**, the number of seconds it may be remembered, and every step is **cached**, which is why most lookups take one millisecond instead of one hundred.
+
+    The most common **record types**: **A** (name to IPv4 address), **AAAA** (name to IPv6), **CNAME** (this name is an alias of another name), **MX** (the mail servers, with a priority), **NS** (the authoritative servers), **TXT** (free text, used for proofs of ownership and anti-spam rules) and **PTR** (an address back to a name, the *reverse* lookup). The answer words: `NOERROR` (fine), `NXDOMAIN` (the name does not exist), `NODATA` (the name exists but not with that record type) and `SERVFAIL` (the server failed).
+- heading: Zones, mail and mistakes
+  body: |-
+    The owner edits a **zone file** (often through a web page of the provider) with one record per line: *name, ttl, class (always IN), type, value*. A name that ends with a dot is complete, other names get the **origin** (`example.com.`) added, and `@` is the origin itself. A **CNAME** must stand **alone**: a name that is an alias cannot also have an MX or TXT record, because the alias would take over everything.
+
+    **Email** is found through DNS. To deliver to `ada@example.com`, the sending server asks for the **MX** records of `example.com`, tries the one with the **lowest number** first and falls back to higher ones if it does not answer. The mail server's name must have an **A** record (not a CNAME). Because anyone can write any sender name in an email, domains publish **SPF** (a TXT record: which servers may send mail for us), **DKIM** (a public key; each mail is signed with the matching secret key) and **DMARC** (what receivers should do with mail that fails the checks). Without them your mail lands in the spam folder, and criminals can pretend to be you (**phishing**).
+
+    **Operations.** *Propagation* is not magic: after a change, old answers stay in caches until their TTL runs out, so lower the TTL a day before a planned move. DNS is also a favourite attack target: **cache poisoning** (feeding a resolver a false answer; defended by random ports and **DNSSEC**, which signs the records), **DDoS** against name servers (defended by many servers around the world) and **domain hijacking** (stealing the account at the registrar; use strong passwords, two-factor login and a registrar lock). DNS is a good reminder that the internet depends on a few small, old, text-based systems that work extremely well.
+examples:
+- title: Names to addresses
+  intro: Read a zone file and follow two aliases to the real address.
+  code: |
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+    def resolve(records, name, rtype):
+        """A **resolver** answers 'what is the rtype record of this name?' from the records (a list as returned by parse_zone). Names are compared in lower case without a trailing dot. If the name has records of the wanted type, those are the answer (their values in order of the list). If it has none but has a CNAME (an alias) and the wanted type is not CNAME, follow the alias: look for the same type at the target name, and so on. Return {'status', 'chain' (the names visited, the asked name first), 'answers' (the list of values), 'ttl' (the SMALLEST ttl of the records that were used: the final answers and all CNAMEs followed; None without an answer)}. The status is 'NOERROR' with answers; 'NODATA' if the final name exists (has any record) but has none of the wanted type; 'NXDOMAIN' if the final name has no record at all (this includes an alias to a name that does not exist); 'LOOP' if an alias leads back to a name already in the chain (that name is not added again); 'TOO LONG' if more than 8 aliases would have to be followed."""
+        cur = name.lower().rstrip(".")
+        chain, ttls, follows = [cur], [], 0
+        while True:
+            here = [r for r in records if r["name"] == cur]
+            if not here:
+                return {"status": "NXDOMAIN", "chain": chain, "answers": [], "ttl": None}
+            direct = [r for r in here if r["type"] == rtype]
+            if direct:
+                return {"status": "NOERROR", "chain": chain, "answers": [r["value"] for r in direct], "ttl": min([r["ttl"] for r in direct] + ttls)}
+            alias = next((r for r in here if r["type"] == "CNAME"), None)
+            if alias is None or rtype == "CNAME":
+                return {"status": "NODATA", "chain": chain, "answers": [], "ttl": None}
+            if follows >= 8:
+                return {"status": "TOO LONG", "chain": chain, "answers": [], "ttl": None}
+            follows += 1
+            ttls.append(alias["ttl"])
+            cur = alias["value"]
+            if cur in chain:
+                return {"status": "LOOP", "chain": chain, "answers": [], "ttl": None}
+            chain.append(cur)
+    ZONE = "$ORIGIN example.com.\n$TTL 3600\n@        IN MX 10 mail\n@        IN MX 20 backup.example.net.\nwww  300 IN CNAME @   ; the same site\nmail     IN A 192.0.2.25\n         IN TXT \"v=spf1 -all\"\n@   86400 A 192.0.2.1\nShop IN CNAME www\nblog IN CNAME nowhere\n"
+
+    records = parse_zone(ZONE)
+    print(len(records), "records")
+    answer = resolve(records, "shop.example.com", "A")
+    print(answer["status"], answer["answers"], answer["ttl"])
+    print(" -> ".join(answer["chain"]))
+    print(resolve(records, "blog.example.com", "A")["status"])
+  output: |
+    8 records
+    NOERROR ['192.0.2.1'] 300
+    shop.example.com -> www.example.com -> example.com
+    NXDOMAIN
+  lines:
+  - line: 96
+    note: Eight records in the zone.
+  - line: 98
+    note: The answer uses the smallest TTL on the way, 300 seconds from the www alias.
+  - line: 99
+    note: shop is an alias of www, which is an alias of the domain itself.
+  - line: 100
+    note: The alias points to a name that does not exist.
+- title: Mail, TTL and checks
+  intro: Find the mail servers, simulate a cache and look for mistakes in the zone.
+  code: |
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+    def mail_servers(records, domain):
+        """To send an email to ada@example.com a program asks for the MX records of example.com: each gives a priority (the LOWEST number is tried first) and the name of a mail server. Return the list of tuples (priority, host, addresses) for the domain, sorted by priority and then by host name, where addresses is the list of the values of the A records of the host (an empty list if there are none; do not follow aliases). The value of an MX record is the text 'PRIORITY HOST'. If the domain has no MX record but has an A record, mail goes to the domain itself: return [(0, domain, its addresses)]. Otherwise return []. Names are compared in lower case without trailing dot."""
+        domain = domain.lower().rstrip(".")
+        mx = []
+        for r in records:
+            if r["name"] == domain and r["type"] == "MX":
+                prio, host = r["value"].split(" ", 1)
+                mx.append((int(prio), host))
+        if not mx:
+            addrs = [r["value"] for r in records if r["name"] == domain and r["type"] == "A"]
+            return [(0, domain, addrs)] if addrs else []
+        return [(p, h, [r["value"] for r in records if r["name"] == h and r["type"] == "A"]) for p, h in sorted(mx)]
+
+
+    def simulate_cache(requests, ttls):
+        """Every resolver keeps answers for the time that the record's TTL allows. `requests` is a list of (time, name) pairs in time order (times in seconds) and `ttls` a dict {name: ttl in seconds}. The cache starts empty. A request is a HIT if the name was stored and the time is BEFORE its expiry (the time of the request that stored it plus the ttl); otherwise it is a MISS, the resolver asks the real server and stores the name with the new expiry (a name that is missing from ttls has the ttl 0, so it is never a hit). Return {'hits': number, 'misses': number, 'asked': the list of the (time, name) pairs that were misses}."""
+        expiry, hits, asked = {}, 0, []
+        for t, name in requests:
+            if name in expiry and t < expiry[name]:
+                hits += 1
+            else:
+                asked.append((t, name))
+                expiry[name] = t + ttls.get(name, 0)
+        return {"hits": hits, "misses": len(asked), "asked": asked}
+
+
+    def validate_zone(records):
+        """Typical mistakes in a zone can break a website or lose mail. Check a list of records (from parse_zone) and return the list of problem texts in this order: first, for every name (sorted) that has a CNAME record AND any record of another type, 'CNAME and other data at NAME' (an alias must stand alone); then, for every MX record in the order of the list, if its host is the name of a CNAME record, 'MX target HOST is a CNAME'; otherwise, if the host has no A and no AAAA record in the list, 'MX target HOST has no address' (the MX value is 'PRIORITY HOST')."""
+        problems = []
+        names = sorted({r["name"] for r in records})
+        for n in names:
+            types = {r["type"] for r in records if r["name"] == n}
+            if "CNAME" in types and len(types - {"CNAME"}) > 0:
+                problems.append("CNAME and other data at " + n)
+        cnames = {r["name"] for r in records if r["type"] == "CNAME"}
+        for r in records:
+            if r["type"] != "MX":
+                continue
+            host = r["value"].split(" ", 1)[1]
+            if host in cnames:
+                problems.append("MX target " + host + " is a CNAME")
+            elif not any(x["name"] == host and x["type"] in ("A", "AAAA") for x in records):
+                problems.append("MX target " + host + " has no address")
+        return problems
+    ZONE = "$ORIGIN example.com.\n$TTL 3600\n@        IN MX 10 mail\n@        IN MX 20 backup.example.net.\nwww  300 IN CNAME @   ; the same site\nmail     IN A 192.0.2.25\n         IN TXT \"v=spf1 -all\"\n@   86400 A 192.0.2.1\nShop IN CNAME www\nblog IN CNAME nowhere\n"
+
+    records = parse_zone(ZONE)
+    for priority, host, addresses in mail_servers(records, "example.com"):
+        print(priority, host, addresses)
+    print(validate_zone(records))
+    result = simulate_cache([(0, "a"), (10, "a"), (60, "a")], {"a": 60})
+    print(result["hits"], result["misses"])
+  output: |
+    10 mail.example.com ['192.0.2.25']
+    20 backup.example.net []
+    ['MX target backup.example.net has no address']
+    1 2
+  lines:
+  - line: 118
+    note: The lowest priority comes first; the backup has no address in this zone.
+  - line: 120
+    note: The zone check finds that the backup mail server has no address.
+  - line: 122
+    note: Only the request at 10 seconds is served from the cache.
+playground:
+  prompt: 'Reverse an IPv4 address the way PTR records write it: 93.184.216.34 becomes 34.216.184.93.in-addr.arpa.'
+  code: |
+    ip = '93.184.216.34'
+    parts = ip.split('.')
+    print('.'.join(reversed(parts)) + '.in-addr.arpa')
+exercises:
+- id: zone
+  title: Reading a zone file
+  difficulty: 5
+  prompt: |-
+    The internet's phone book is made of **zone files**, plain text that the owner of a domain edits. Write `parse_zone(text)`. The records of a domain are kept in a **zone file**, for example:
+
+    ```
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+    ```
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line.
+  starter: |-
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        pass
+  tests:
+  - name: records
+    code: |
+      ZONE = "$ORIGIN example.com.\n$TTL 3600\n@        IN MX 10 mail\n@        IN MX 20 backup.example.net.\nwww  300 IN CNAME @   ; the same site\nmail     IN A 192.0.2.25\n         IN TXT \"v=spf1 -all\"\n@   86400 A 192.0.2.1\nShop IN CNAME www\nblog IN CNAME nowhere\n"
+
+      r = parse_zone(ZONE)
+      assert r == [{"name": "example.com", "ttl": 3600, "type": "MX", "value": "10 mail.example.com"}, {"name": "example.com", "ttl": 3600, "type": "MX", "value": "20 backup.example.net"}, {"name": "www.example.com", "ttl": 300, "type": "CNAME", "value": "example.com"}, {"name": "mail.example.com", "ttl": 3600, "type": "A", "value": "192.0.2.25"}, {"name": "mail.example.com", "ttl": 3600, "type": "TXT", "value": "v=spf1 -all"}, {"name": "example.com", "ttl": 86400, "type": "A", "value": "192.0.2.1"}, {"name": "shop.example.com", "ttl": 3600, "type": "CNAME", "value": "www.example.com"}, {"name": "blog.example.com", "ttl": 3600, "type": "CNAME", "value": "nowhere.example.com"}]
+      assert parse_zone("") == [] and parse_zone("; only a comment\n\n") == []
+  - name: shapes and errors
+    code: |
+      z = parse_zone("a IN A 1.2.3.4\n 60 IN AAAA ::1\n")
+      assert z == [{"name": "a", "ttl": 3600, "type": "A", "value": "1.2.3.4"}, {"name": "a", "ttl": 60, "type": "AAAA", "value": "::1"}]
+      r = parse_zone("$TTL 60\n$ORIGIN Ex.org\nA.B. IN NS ns1\nx IN 120 a 9.9.9.9\n")
+      assert r == [{"name": "a.b", "ttl": 60, "type": "NS", "value": "ns1.ex.org"}, {"name": "x.ex.org", "ttl": 120, "type": "A", "value": "9.9.9.9"}]
+      for text in ("$TTL x", "@ IN FOO 1", "  IN A 1.2.3.4", "a IN A", "a IN MX x y", "$ORIGIN", "a IN CNAME b c", "a IN MX 10", "a IN A 1.1.1.1 2.2.2.2"):
+          try:
+              parse_zone(text)
+              raise AssertionError("accepted " + text)
+          except ValueError as e:
+              assert str(e) == "line 1: bad record", (text, str(e))
+      try:
+          parse_zone("a A 1.1.1.1\n\n$TTL\n")
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert str(e) == "line 3: bad record"
+  hints:
+  - Split each line into words and look at what the first word is.
+  - 'Write a small helper that completes a name: ''@'', a name with a dot at the end, or a relative name.'
+  solution: |
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+  explanation: A zone has an SOA record (serial number and timers) and NS records that say who the authoritative servers are. Forgetting to increase the serial number is a classic reason for 'my change does not show up'.
+- id: resolve
+  title: Following the aliases
+  difficulty: 5
+  prompt: 'When your browser asks for `shop.example.com`, the answer may be an alias of an alias of a real address. Write `resolve(records, name, rtype)`. A **resolver** answers ''what is the rtype record of this name?'' from the records (a list as returned by parse_zone). Names are compared in lower case without a trailing dot. If the name has records of the wanted type, those are the answer (their values in order of the list). If it has none but has a CNAME (an alias) and the wanted type is not CNAME, follow the alias: look for the same type at the target name, and so on. Return {''status'', ''chain'' (the names visited, the asked name first), ''answers'' (the list of values), ''ttl'' (the SMALLEST ttl of the records that were used: the final answers and all CNAMEs followed; None without an answer)}. The status is ''NOERROR'' with answers; ''NODATA'' if the final name exists (has any record) but has none of the wanted type; ''NXDOMAIN'' if the final name has no record at all (this includes an alias to a name that does not exist); ''LOOP'' if an alias leads back to a name already in the chain (that name is not added again); ''TOO LONG'' if more than 8 aliases would have to be followed.'
+  starter: |-
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+
+
+    def resolve(records, name, rtype):
+        """A **resolver** answers 'what is the rtype record of this name?' from the records (a list as returned by parse_zone). Names are compared in lower case without a trailing dot. If the name has records of the wanted type, those are the answer (their values in order of the list). If it has none but has a CNAME (an alias) and the wanted type is not CNAME, follow the alias: look for the same type at the target name, and so on. Return {'status', 'chain' (the names visited, the asked name first), 'answers' (the list of values), 'ttl' (the SMALLEST ttl of the records that were used: the final answers and all CNAMEs followed; None without an answer)}. The status is 'NOERROR' with answers; 'NODATA' if the final name exists (has any record) but has none of the wanted type; 'NXDOMAIN' if the final name has no record at all (this includes an alias to a name that does not exist); 'LOOP' if an alias leads back to a name already in the chain (that name is not added again); 'TOO LONG' if more than 8 aliases would have to be followed."""
+        pass
+  tests:
+  - name: answers and aliases
+    code: |
+      ZONE = "$ORIGIN example.com.\n$TTL 3600\n@        IN MX 10 mail\n@        IN MX 20 backup.example.net.\nwww  300 IN CNAME @   ; the same site\nmail     IN A 192.0.2.25\n         IN TXT \"v=spf1 -all\"\n@   86400 A 192.0.2.1\nShop IN CNAME www\nblog IN CNAME nowhere\n"
+
+      r = parse_zone(ZONE)
+      assert resolve(r, "www.example.com", "A") == {"status": "NOERROR", "chain": ["www.example.com", "example.com"], "answers": ["192.0.2.1"], "ttl": 300}
+      assert resolve(r, "shop.example.com.", "A") == {"status": "NOERROR", "chain": ["shop.example.com", "www.example.com", "example.com"], "answers": ["192.0.2.1"], "ttl": 300}
+      assert resolve(r, "WWW.example.com", "CNAME") == {"status": "NOERROR", "chain": ["www.example.com"], "answers": ["example.com"], "ttl": 300}
+      assert resolve(r, "example.com", "MX")["answers"] == ["10 mail.example.com", "20 backup.example.net"]
+  - name: failures
+    code: |
+      ZONE = "$ORIGIN example.com.\n$TTL 3600\n@        IN MX 10 mail\n@        IN MX 20 backup.example.net.\nwww  300 IN CNAME @   ; the same site\nmail     IN A 192.0.2.25\n         IN TXT \"v=spf1 -all\"\n@   86400 A 192.0.2.1\nShop IN CNAME www\nblog IN CNAME nowhere\n"
+
+      r = parse_zone(ZONE)
+      assert resolve(r, "blog.example.com", "A") == {"status": "NXDOMAIN", "chain": ["blog.example.com", "nowhere.example.com"], "answers": [], "ttl": None}
+      assert resolve(r, "nope.example.com", "A")["status"] == "NXDOMAIN" and resolve(r, "mail.example.com", "MX")["status"] == "NODATA" and resolve(r, "example.com", "TXT")["status"] == "NODATA"
+      loop = parse_zone("$ORIGIN x.org.\na CNAME b\nb CNAME a\n")
+      assert resolve(loop, "a.x.org", "A") == {"status": "LOOP", "chain": ["a.x.org", "b.x.org"], "answers": [], "ttl": None}
+      chain = parse_zone("".join("c%d CNAME c%d\n" % (i, i + 1) for i in range(12)) + "c12 A 1.1.1.1\n")
+      assert resolve(chain, "c0", "A")["status"] == "TOO LONG" and resolve(chain, "c4", "A")["status"] == "NOERROR" and resolve(chain, "c4", "A")["chain"][-1] == "c12"
+  hints:
+  - 'Loop: look at the records of the current name, answer if the type matches, otherwise follow a CNAME.'
+  - Collect the TTLs of the CNAMEs followed and use min() at the end.
+  solution: |
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+
+
+    def resolve(records, name, rtype):
+        """A **resolver** answers 'what is the rtype record of this name?' from the records (a list as returned by parse_zone). Names are compared in lower case without a trailing dot. If the name has records of the wanted type, those are the answer (their values in order of the list). If it has none but has a CNAME (an alias) and the wanted type is not CNAME, follow the alias: look for the same type at the target name, and so on. Return {'status', 'chain' (the names visited, the asked name first), 'answers' (the list of values), 'ttl' (the SMALLEST ttl of the records that were used: the final answers and all CNAMEs followed; None without an answer)}. The status is 'NOERROR' with answers; 'NODATA' if the final name exists (has any record) but has none of the wanted type; 'NXDOMAIN' if the final name has no record at all (this includes an alias to a name that does not exist); 'LOOP' if an alias leads back to a name already in the chain (that name is not added again); 'TOO LONG' if more than 8 aliases would have to be followed."""
+        cur = name.lower().rstrip(".")
+        chain, ttls, follows = [cur], [], 0
+        while True:
+            here = [r for r in records if r["name"] == cur]
+            if not here:
+                return {"status": "NXDOMAIN", "chain": chain, "answers": [], "ttl": None}
+            direct = [r for r in here if r["type"] == rtype]
+            if direct:
+                return {"status": "NOERROR", "chain": chain, "answers": [r["value"] for r in direct], "ttl": min([r["ttl"] for r in direct] + ttls)}
+            alias = next((r for r in here if r["type"] == "CNAME"), None)
+            if alias is None or rtype == "CNAME":
+                return {"status": "NODATA", "chain": chain, "answers": [], "ttl": None}
+            if follows >= 8:
+                return {"status": "TOO LONG", "chain": chain, "answers": [], "ttl": None}
+            follows += 1
+            ttls.append(alias["ttl"])
+            cur = alias["value"]
+            if cur in chain:
+                return {"status": "LOOP", "chain": chain, "answers": [], "ttl": None}
+            chain.append(cur)
+  explanation: Real resolvers do this walk across many servers (root, top-level domain, the domain's own server) and cache every step, which is why the second visit is much faster.
+- id: mx
+  title: Where does the mail go?
+  difficulty: 3
+  prompt: 'Email depends entirely on DNS: the MX records say which servers accept the mail of a domain. Write `mail_servers(records, domain)`. To send an email to ada@example.com a program asks for the MX records of example.com: each gives a priority (the LOWEST number is tried first) and the name of a mail server. Return the list of tuples (priority, host, addresses) for the domain, sorted by priority and then by host name, where addresses is the list of the values of the A records of the host (an empty list if there are none; do not follow aliases). The value of an MX record is the text ''PRIORITY HOST''. If the domain has no MX record but has an A record, mail goes to the domain itself: return [(0, domain, its addresses)]. Otherwise return []. Names are compared in lower case without trailing dot.'
+  starter: |-
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+
+
+    def mail_servers(records, domain):
+        """To send an email to ada@example.com a program asks for the MX records of example.com: each gives a priority (the LOWEST number is tried first) and the name of a mail server. Return the list of tuples (priority, host, addresses) for the domain, sorted by priority and then by host name, where addresses is the list of the values of the A records of the host (an empty list if there are none; do not follow aliases). The value of an MX record is the text 'PRIORITY HOST'. If the domain has no MX record but has an A record, mail goes to the domain itself: return [(0, domain, its addresses)]. Otherwise return []. Names are compared in lower case without trailing dot."""
+        pass
+  tests:
+  - name: priorities
+    code: |
+      ZONE = "$ORIGIN example.com.\n$TTL 3600\n@        IN MX 10 mail\n@        IN MX 20 backup.example.net.\nwww  300 IN CNAME @   ; the same site\nmail     IN A 192.0.2.25\n         IN TXT \"v=spf1 -all\"\n@   86400 A 192.0.2.1\nShop IN CNAME www\nblog IN CNAME nowhere\n"
+
+      r = parse_zone(ZONE)
+      assert mail_servers(r, "example.com") == [(10, "mail.example.com", ["192.0.2.25"]), (20, "backup.example.net", [])]
+      assert mail_servers(r, "Example.COM.") == mail_servers(r, "example.com") and mail_servers(r, "other.org") == []
+      assert mail_servers(r, "mail.example.com") == [(0, "mail.example.com", ["192.0.2.25"])]
+  - name: order
+    code: |
+      recs = [{"name": "x.org", "ttl": 1, "type": "MX", "value": "20 b.x.org"}, {"name": "x.org", "ttl": 1, "type": "MX", "value": "10 z.x.org"}, {"name": "x.org", "ttl": 1, "type": "MX", "value": "10 a.x.org"}, {"name": "a.x.org", "ttl": 1, "type": "A", "value": "1.1.1.1"}, {"name": "a.x.org", "ttl": 1, "type": "A", "value": "1.1.1.2"}, {"name": "a.x.org", "ttl": 1, "type": "AAAA", "value": "::1"}]
+      assert mail_servers(recs, "x.org") == [(10, "a.x.org", ["1.1.1.1", "1.1.1.2"]), (10, "z.x.org", []), (20, "b.x.org", [])]
+      assert mail_servers([{"name": "web.org", "ttl": 1, "type": "TXT", "value": "hi"}], "web.org") == []
+      assert mail_servers([{"name": "web.org", "ttl": 1, "type": "A", "value": "2.2.2.2"}], "web.org") == [(0, "web.org", ["2.2.2.2"])]
+  hints:
+  - Split the MX value at the first blank.
+  - sorted() on tuples orders by priority first, then by host name.
+  solution: |
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+
+
+    def mail_servers(records, domain):
+        """To send an email to ada@example.com a program asks for the MX records of example.com: each gives a priority (the LOWEST number is tried first) and the name of a mail server. Return the list of tuples (priority, host, addresses) for the domain, sorted by priority and then by host name, where addresses is the list of the values of the A records of the host (an empty list if there are none; do not follow aliases). The value of an MX record is the text 'PRIORITY HOST'. If the domain has no MX record but has an A record, mail goes to the domain itself: return [(0, domain, its addresses)]. Otherwise return []. Names are compared in lower case without trailing dot."""
+        domain = domain.lower().rstrip(".")
+        mx = []
+        for r in records:
+            if r["name"] == domain and r["type"] == "MX":
+                prio, host = r["value"].split(" ", 1)
+                mx.append((int(prio), host))
+        if not mx:
+            addrs = [r["value"] for r in records if r["name"] == domain and r["type"] == "A"]
+            return [(0, domain, addrs)] if addrs else []
+        return [(p, h, [r["value"] for r in records if r["name"] == h and r["type"] == "A"]) for p, h in sorted(mx)]
+  explanation: 'Anti-spam records live in DNS too: SPF (which servers may send for the domain), DKIM (a public key to check signatures) and DMARC (what to do with mail that fails). They are TXT records.'
+- id: ttl
+  title: Time to live in action
+  difficulty: 4
+  prompt: 'The TTL is a trade-off between speed and flexibility. Write `simulate_cache(requests, ttls)`. Every resolver keeps answers for the time that the record''s TTL allows. `requests` is a list of (time, name) pairs in time order (times in seconds) and `ttls` a dict {name: ttl in seconds}. The cache starts empty. A request is a HIT if the name was stored and the time is BEFORE its expiry (the time of the request that stored it plus the ttl); otherwise it is a MISS, the resolver asks the real server and stores the name with the new expiry (a name that is missing from ttls has the ttl 0, so it is never a hit). Return {''hits'': number, ''misses'': number, ''asked'': the list of the (time, name) pairs that were misses}.'
+  starter: |-
+    def simulate_cache(requests, ttls):
+        """Every resolver keeps answers for the time that the record's TTL allows. `requests` is a list of (time, name) pairs in time order (times in seconds) and `ttls` a dict {name: ttl in seconds}. The cache starts empty. A request is a HIT if the name was stored and the time is BEFORE its expiry (the time of the request that stored it plus the ttl); otherwise it is a MISS, the resolver asks the real server and stores the name with the new expiry (a name that is missing from ttls has the ttl 0, so it is never a hit). Return {'hits': number, 'misses': number, 'asked': the list of the (time, name) pairs that were misses}."""
+        pass
+  tests:
+  - name: hits and misses
+    code: |
+      r = simulate_cache([(0, "a"), (10, "a"), (60, "a"), (61, "b"), (100, "b")], {"a": 60, "b": 30})
+      assert r == {"hits": 1, "misses": 4, "asked": [(0, "a"), (60, "a"), (61, "b"), (100, "b")]}
+      assert simulate_cache([], {"a": 1}) == {"hits": 0, "misses": 0, "asked": []}
+  - name: edges
+    code: |
+      assert simulate_cache([(0, "a"), (1, "a"), (2, "a")], {"a": 0}) == {"hits": 0, "misses": 3, "asked": [(0, "a"), (1, "a"), (2, "a")]}
+      assert simulate_cache([(0, "x"), (5, "x")], {}) == {"hits": 0, "misses": 2, "asked": [(0, "x"), (5, "x")]}
+      r = simulate_cache([(t, "n") for t in range(0, 100, 10)], {"n": 25})
+      assert r["hits"] == 6 and r["misses"] == 4 and [t for t, _ in r["asked"]] == [0, 30, 60, 90]
+      r = simulate_cache([(0, "a"), (0, "b"), (1, "a"), (1, "b")], {"a": 5, "b": 1})
+      assert r["hits"] == 1 and r["asked"] == [(0, "a"), (0, "b"), (1, "b")]
+  hints:
+  - Store the time until which each name is valid in a dict.
+  - A request at exactly the expiry time is already a miss.
+  solution: |
+    def simulate_cache(requests, ttls):
+        """Every resolver keeps answers for the time that the record's TTL allows. `requests` is a list of (time, name) pairs in time order (times in seconds) and `ttls` a dict {name: ttl in seconds}. The cache starts empty. A request is a HIT if the name was stored and the time is BEFORE its expiry (the time of the request that stored it plus the ttl); otherwise it is a MISS, the resolver asks the real server and stores the name with the new expiry (a name that is missing from ttls has the ttl 0, so it is never a hit). Return {'hits': number, 'misses': number, 'asked': the list of the (time, name) pairs that were misses}."""
+        expiry, hits, asked = {}, 0, []
+        for t, name in requests:
+            if name in expiry and t < expiry[name]:
+                hits += 1
+            else:
+                asked.append((t, name))
+                expiry[name] = t + ttls.get(name, 0)
+        return {"hits": hits, "misses": len(asked), "asked": asked}
+  explanation: Before moving a website to a new server, lower the TTL a day ahead (for example to 300 seconds), so that the old address disappears from caches quickly when you switch. Raise it again afterwards.
+- id: zonecheck
+  title: Checking a zone for mistakes
+  difficulty: 4
+  prompt: 'A small mistake in a zone can take a website or all email offline, so tools check the zone before it is published. Write `validate_zone(records)`. Typical mistakes in a zone can break a website or lose mail. Check a list of records (from parse_zone) and return the list of problem texts in this order: first, for every name (sorted) that has a CNAME record AND any record of another type, ''CNAME and other data at NAME'' (an alias must stand alone); then, for every MX record in the order of the list, if its host is the name of a CNAME record, ''MX target HOST is a CNAME''; otherwise, if the host has no A and no AAAA record in the list, ''MX target HOST has no address'' (the MX value is ''PRIORITY HOST'').'
+  starter: |-
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+
+
+    def validate_zone(records):
+        """Typical mistakes in a zone can break a website or lose mail. Check a list of records (from parse_zone) and return the list of problem texts in this order: first, for every name (sorted) that has a CNAME record AND any record of another type, 'CNAME and other data at NAME' (an alias must stand alone); then, for every MX record in the order of the list, if its host is the name of a CNAME record, 'MX target HOST is a CNAME'; otherwise, if the host has no A and no AAAA record in the list, 'MX target HOST has no address' (the MX value is 'PRIORITY HOST')."""
+        pass
+  tests:
+  - name: problems
+    code: |
+      ZONE = "$ORIGIN example.com.\n$TTL 3600\n@        IN MX 10 mail\n@        IN MX 20 backup.example.net.\nwww  300 IN CNAME @   ; the same site\nmail     IN A 192.0.2.25\n         IN TXT \"v=spf1 -all\"\n@   86400 A 192.0.2.1\nShop IN CNAME www\nblog IN CNAME nowhere\n"
+
+      r = parse_zone(ZONE)
+      assert validate_zone(r) == ["MX target backup.example.net has no address"]
+      more = r + [{"name": "mail.example.com", "ttl": 1, "type": "MX", "value": "5 www.example.com"}, {"name": "www.example.com", "ttl": 1, "type": "A", "value": "5.5.5.5"}]
+      assert validate_zone(more) == ["CNAME and other data at www.example.com", "MX target backup.example.net has no address", "MX target www.example.com is a CNAME"]
+  - name: clean and small
+    code: |
+      assert validate_zone([]) == []
+      ok = [{"name": "x.org", "ttl": 1, "type": "MX", "value": "10 m.x.org"}, {"name": "m.x.org", "ttl": 1, "type": "AAAA", "value": "::1"}, {"name": "w.x.org", "ttl": 1, "type": "CNAME", "value": "x.org"}]
+      assert validate_zone(ok) == []
+      bad = ok + [{"name": "a.x.org", "ttl": 1, "type": "CNAME", "value": "x.org"}, {"name": "a.x.org", "ttl": 1, "type": "TXT", "value": "t"}, {"name": "w.x.org", "ttl": 1, "type": "NS", "value": "ns.x.org"}]
+      assert validate_zone(bad) == ["CNAME and other data at a.x.org", "CNAME and other data at w.x.org"]
+  hints:
+  - Group the types per name with a set.
+  - Check MX records in the order of the list.
+  solution: |
+    def parse_zone(text):
+        """The records of a domain are kept in a **zone file**, for example:
+
+    $ORIGIN example.com.
+    $TTL 3600
+    @        IN MX 10 mail
+    www  300 IN CNAME @
+    mail     IN A 192.0.2.25
+             IN TXT "v=spf1 -all"
+
+    Parse it. A ';' starts a comment that runs to the end of the line; blank lines are ignored. '$ORIGIN name' sets the origin (its trailing dot is removed, it is turned to lower case; before any $ORIGIN the origin is empty) and '$TTL seconds' the default TTL (3600 until set). Any other line is a record: [name] [ttl] [IN] TYPE value..., where the name is missing if the line starts with a blank (it then repeats the previous record's name; the first record needs one), the ttl is a whole number and IN may stand before or after it, and TYPE is one of A, AAAA, CNAME, MX, NS or TXT (any case). Names are completed: '@' means the origin; a name that ends with a dot is complete (the dot is removed); any other name gets '.' + origin added (if the origin is empty it stays as it is); all names are turned to lower case. The value of CNAME and NS is a name completed in the same way; the value of MX is a priority (a whole number) and a name that is completed, joined by one blank, e.g. '10 mail.example.com'; the value of TXT has surrounding double quotes removed; for A and AAAA the value is the word as it is. Return the list of dicts {'name', 'ttl', 'type', 'value'}. ValueError('line N: bad record') (N counts all lines from 1) for a record with an unknown type, a missing or invalid value, a missing name, or a bad $ORIGIN or $TTL line."""
+        origin, default_ttl, last, records = "", 3600, None, []
+
+        def full(name):
+            if name == "@":
+                return origin
+            if name.endswith("."):
+                return name[:-1].lower()
+            return (name + "." + origin).lower() if origin else name.lower()
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.split(";", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            words = line.split()
+            bad = ValueError("line %d: bad record" % n)
+            if words[0] == "$ORIGIN":
+                if len(words) != 2:
+                    raise bad
+                origin = words[1].rstrip(".").lower()
+                continue
+            if words[0] == "$TTL":
+                if len(words) != 2 or not words[1].isdigit():
+                    raise bad
+                default_ttl = int(words[1])
+                continue
+            if line[0] in " \t":
+                if last is None:
+                    raise bad
+                name, rest = last, words
+            else:
+                name, rest = full(words[0]), words[1:]
+            ttl = default_ttl
+            while rest and (rest[0].isdigit() or rest[0].upper() == "IN"):
+                if rest[0].isdigit():
+                    ttl = int(rest[0])
+                rest = rest[1:]
+            if not rest or rest[0].upper() not in ("A", "AAAA", "CNAME", "MX", "NS", "TXT") or len(rest) < 2:
+                raise bad
+            rtype, args = rest[0].upper(), rest[1:]
+            if rtype in ("CNAME", "NS"):
+                if len(args) != 1:
+                    raise bad
+                value = full(args[0])
+            elif rtype == "MX":
+                if len(args) != 2 or not args[0].isdigit():
+                    raise bad
+                value = args[0] + " " + full(args[1])
+            elif rtype == "TXT":
+                value = " ".join(args)
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1]
+            else:
+                if len(args) != 1:
+                    raise bad
+                value = args[0]
+            records.append({"name": name, "ttl": ttl, "type": rtype, "value": value})
+            last = name
+        return records
+
+
+
+
+    def validate_zone(records):
+        """Typical mistakes in a zone can break a website or lose mail. Check a list of records (from parse_zone) and return the list of problem texts in this order: first, for every name (sorted) that has a CNAME record AND any record of another type, 'CNAME and other data at NAME' (an alias must stand alone); then, for every MX record in the order of the list, if its host is the name of a CNAME record, 'MX target HOST is a CNAME'; otherwise, if the host has no A and no AAAA record in the list, 'MX target HOST has no address' (the MX value is 'PRIORITY HOST')."""
+        problems = []
+        names = sorted({r["name"] for r in records})
+        for n in names:
+            types = {r["type"] for r in records if r["name"] == n}
+            if "CNAME" in types and len(types - {"CNAME"}) > 0:
+                problems.append("CNAME and other data at " + n)
+        cnames = {r["name"] for r in records if r["type"] == "CNAME"}
+        for r in records:
+            if r["type"] != "MX":
+                continue
+            host = r["value"].split(" ", 1)[1]
+            if host in cnames:
+                problems.append("MX target " + host + " is a CNAME")
+            elif not any(x["name"] == host and x["type"] in ("A", "AAAA") for x in records):
+                problems.append("MX target " + host + " has no address")
+        return problems
+  explanation: A CNAME at the very top of a domain (the apex) is not allowed because the apex needs NS and SOA records. Many providers offer a special 'ALIAS' or 'ANAME' record as a workaround.
+commonMistakes:
+- title: Giving a CNAME other records
+  explanation: The alias hides them.
+- title: Pointing MX at a CNAME
+  explanation: Mail servers need a direct address.
+- title: Changing DNS and expecting an instant effect
+  explanation: Caches keep old answers until the TTL ends.
+- title: Forgetting the trailing dot in a zone file
+  explanation: The origin is added a second time.
+- title: Publishing no SPF, DKIM or DMARC
+  explanation: Your mail goes to spam and can be forged.
+summary:
+- DNS is a distributed tree; resolvers walk it and cache every answer.
+- 'Record types: A, AAAA, CNAME, MX, NS, TXT, PTR.'
+- A CNAME is an alias and must stand alone.
+- 'MX priorities: the lowest number is tried first.'
+- The TTL trades speed against flexibility.
+next: u34-firewall
+quiz:
+- type: mcq
+  question: What does an A record hold?
+  options:
+  - An IPv4 address
+  - A mail server
+  - An alias
+  - A password
+  answer: 0
+  explanation: AAAA is for IPv6.
+- type: mcq
+  question: What does a CNAME record do?
+  options:
+  - Makes a name an alias of another name
+  - Names a mail server
+  - Signs a zone
+  - Counts visitors
+  answer: 0
+  explanation: The target holds the real records.
+- type: mcq
+  question: Which MX record is tried first?
+  options:
+  - The lowest priority number
+  - The highest number
+  - The newest
+  - The longest
+  answer: 0
+  explanation: 10 comes before 20.
+- type: mcq
+  question: What does NXDOMAIN mean?
+  options:
+  - The name does not exist
+  - The server is down
+  - A wrong password
+  - A cached answer
+  answer: 0
+  explanation: NODATA means the name exists without that type.
+- type: mcq
+  question: Why lower the TTL before moving a website?
+  options:
+  - Old answers disappear from caches quickly
+  - The page loads faster
+  - It is cheaper
+  - It encrypts DNS
+  answer: 0
+  explanation: A big TTL keeps the old address alive.
+- type: mcq
+  question: What is SPF for?
+  options:
+  - Saying which servers may send mail for a domain
+  - Speeding up pages
+  - Compressing mail
+  - Storing contacts
+  answer: 0
+  explanation: A TXT record.
+- type: code
+  question: Write `reverse_name(ip)` that turns an IPv4 address such as '93.184.216.34' into its PTR name '34.216.184.93.in-addr.arpa'.
+  starter: |
+    def reverse_name(ip):
+        pass
+  tests:
+  - name: ptr
+    code: |
+      assert reverse_name("93.184.216.34") == "34.216.184.93.in-addr.arpa" and reverse_name("1.2.3.4") == "4.3.2.1.in-addr.arpa" and reverse_name("127.0.0.1") == "1.0.0.127.in-addr.arpa"
+  solution: |
+    def reverse_name(ip):
+        return ".".join(reversed(ip.split("."))) + ".in-addr.arpa"

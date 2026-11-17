@@ -39,8 +39,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 31 | Security Basics (Version 2, practice unit) | ✅ Complete (Phase 32) | 6 | 30 | Mini Security Toolkit (registration and login, token and role checks, safe pages and queries, project scanning, site audit, log alerts, risk summary) |
 | 32 | AI-Assisted Coding (Version 2, practice unit) | ✅ Complete (Phase 33) | 6 | 30 | Mini AI Pair Toolkit (safe requests with redaction, review-then-test judge that never runs risky code, fix loop session, guarded project agent, report) |
 | 33 | Operating Systems in Practice (Version 2, practice unit) | ✅ Complete (Phase 36) | 6 | 30 | Mini System Doctor (CPU, memory, disk and security checks combined into one health report that survives broken input) |
+| 34 | Networking in Practice (Version 2, practice unit) | ✅ Complete (Phase 37) | 6 | 30 | Mini Network Doctor (link, web, DNS, firewall and scan checks combined into one report that survives broken input) |
 
-Totals: 260 lessons, 1253 practice exercises, 260 lesson quizzes (1560 multiple-choice questions + 260 coding questions), 33 unit projects, 2390 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 266 lessons, 1283 practice exercises, 266 lesson quizzes (1596 multiple-choice questions + 266 coding questions), 34 unit projects, 2436 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -721,6 +722,21 @@ Can assume: prompts and context limits, reviewing and verifying AI code, the ask
 
 Can assume: reading process, memory, disk and log output, systemd services, containers and layers, latency percentiles and bottleneck hunting. Next: Unit 34 Networking in Practice.
 
+## Unit 34: Networking in Practice (Version 2, practice unit) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 34.1 Network Detective Tools | `u34-tools` | ping, traceroute, dig and curl timing output, bottom-up checks |
+| 34.2 Packets and TCP in Detail | `u34-packets` | internet checksum, IPv4 and TCP headers from hex bytes, segment reassembly, connection states |
+| 34.3 HTTP, Cookies and Caching | `u34-http` | query strings and percent escapes, request and response parsing, cookie audit, Cache-Control, redirects |
+| 34.4 Proxies and Load Balancing | `u34-proxy` | reverse proxy configuration, longest-prefix routing, smooth weighted round robin, consistent hashing, health checks |
+| 34.5 DNS and Email in Depth | `u34-dns` | zone files, CNAME chains and status words, MX records, TTL caching, zone validation |
+| 34.6 Firewalls, NAT and Troubleshooting | `u34-firewall` | CIDR membership, firewall rules and order, NAT table, port scans, diagnosis order |
+
+**Project: Mini Network Doctor.** Learners write `check_link`, `check_web`, `check_dns`, `check_firewall`, `check_scans`, `diagnose_network` and `format_report` (all lesson parsers are given). Everything works on plain text, so it needs no real network.
+
+Can assume: reading network tool output, IP/TCP/HTTP structure, cookies and caching, proxies and load balancing, DNS and mail records, firewalls and NAT. Next: ask the coordinator what to add after the approved list.
+
 ## Plan for remaining units (to refine before each phase)
 
 Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction (electives) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
@@ -768,3 +784,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 34 (2026-11-16):** Placement checks (new `#/placement` page, `content/placement.yaml`, `src/components/Placement.jsx`): four 8-question checks (Python basics, Python data structures, HTML and CSS, JavaScript). Scoring 80% or more marks the covered lessons as mastered (`placed: true`, no gating lock-out), enrolls their questions in the Review deck, and a miss lists the lessons to study. Dashboard shows a hint and the heading now counts units dynamically.
 - **Phase 35 (2026-11-16):** Daily review upgrade (`src/components/Review.jsx`, `src/lib/srs.js`): forecast of due cards (now, within a day, this week), reviewed today, streak, session size 10/20/50, bar chart of the Leitner boxes, a missed card is asked again at the end of the session (second try does not change the schedule), and the session summary lists missed cards with answers, explanations and a link to the lesson.
 - **Phase 36 (2026-11-17):** Complete Unit 33 Operating Systems in Practice (6 lessons, 30 exercises, 6 quizzes, Mini System Doctor project, 54 new glossary terms). No framework changes; all Python on plain text.
+- **Phase 37 (2026-11-17):** Complete Unit 34 Networking in Practice (6 lessons, 30 exercises, 6 quizzes, Mini Network Doctor project, 46 new glossary terms). No framework changes; all Python on plain text. This finishes the approved additions list.

@@ -1,0 +1,505 @@
+id: u34-tools
+title: Network Detective Tools
+minutes: 110
+objective: Learn to find out what is wrong when 'the internet is broken'. You will read the output of ping, traceroute, dig and curl timings and turn it into a diagnosis.
+outcomes:
+- Use ping to test reachability, loss and delay
+- Read a traceroute and find where a path fails
+- Read DNS answers from dig and know the status codes
+- Split a web request into DNS, connect, TLS, wait and download
+- Follow a simple order of checks from the bottom up
+sections:
+- heading: Checking from the bottom up
+  body: |-
+    When a page does not load, the cause can be at any of many levels, so detectives work from the **bottom up** and stop at the first thing that is broken:
+
+    1. **Is my own computer connected?** (Wi-Fi on, an IP address assigned: `ip addr` or `ipconfig`.)
+    2. **Can I reach my router?** (`ping 192.168.1.1`, the **default gateway**.)
+    3. **Can I reach the internet by number?** (`ping 1.1.1.1`.) If yes, your connection is fine.
+    4. **Does name lookup work?** (`dig example.com` or `nslookup`.) If step 3 works and this fails, the problem is **DNS**.
+    5. **Can I connect to the port?** (`curl -v https://example.com`, `nc -vz host 443`.)
+    6. **Does the application answer correctly?** (the HTTP status code, the content.)
+
+    **ping** sends an ICMP *echo request* and waits for the *echo reply*. It shows the **round-trip time** (RTT) in milliseconds and the **packet loss** in percent. A few percent of loss already makes calls and games stutter. Many servers and firewalls drop ping on purpose, so silence is only a *hint*.
+
+    **traceroute** (`tracert` on Windows) sends probes with a small **TTL** (time to live: the number of hops a packet may make) 1, 2, 3, and so on. Each router that decreases the TTL to zero sends back a message, so you see every router on the path. Stars (`*`) mean no reply; many routers simply do not answer.
+- heading: Names and web requests
+  body: |-
+    **dig** (or `nslookup`, `host`) asks a **DNS** server for records. The status tells most of the story: `NOERROR` (fine), `NXDOMAIN` (the name does not exist, often a typo), `SERVFAIL` (the server could not find out, often a broken domain setup) and `REFUSED` (it does not talk to you). A record has a name, a **TTL** (how many seconds it may be remembered), a type (`A` for an IPv4 address, `AAAA` for IPv6, `CNAME` for an alias, `MX` for mail, `TXT` for free text) and a value. The **Query time** shows how fast the server answered; a slow DNS makes everything feel slow, because every new name needs a lookup first.
+
+    **curl** is a command line browser. `curl -v` shows the whole conversation, `curl -I` only the headers, and `curl -w` can print timings. A web request has phases: **DNS lookup**, **TCP connect** (the three-way handshake), **TLS handshake** (for https: agree on keys and check the certificate), **waiting** for the server (also called *time to first byte*, TTFB, it includes the server program's work) and the **download**. Knowing which phase is slow tells you whom to call: the DNS provider, the network, or the developers of the server.
+
+    **Good habits:** change one thing at a time, write down what you tried, test from a second place (your phone on mobile data) to find out if the problem is yours or theirs, and keep the output of the commands when you ask somebody for help.
+examples:
+- title: ping and traceroute
+  intro: Parse real-looking output and find the first sign of trouble.
+  code: |
+    def parse_ping(text):
+        """The command `ping host` sends small test messages and prints one line per reply, such as '64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms', and at the end a statistics line such as '4 packets transmitted, 3 received, 25% packet loss, time 3004ms' (the words 'packets received' may also be written 'received' only). Parse the text. Return a dict {'sent', 'received' (both ints from the statistics line), 'loss' (the percentage of lost messages computed from sent and received, rounded to 1 decimal, 0.0 if nothing was sent), 'times' (the list of all numbers in 'time=... ms' in order, as floats), 'min', 'avg', 'max' (of the times, rounded to 1 decimal, or None if there are no times)}. ValueError('no statistics') if the statistics line is missing."""
+        import re
+        m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", text)
+        if not m:
+            raise ValueError("no statistics")
+        sent, received = int(m.group(1)), int(m.group(2))
+        times = [float(t) for t in re.findall(r"time=([0-9.]+) ?ms", text)]
+        loss = round((sent - received) / sent * 100, 1) if sent else 0.0
+        return {"sent": sent, "received": received, "loss": loss, "times": times,
+                "min": round(min(times), 1) if times else None, "avg": round(sum(times) / len(times), 1) if times else None, "max": round(max(times), 1) if times else None}
+
+
+    def parse_traceroute(text):
+        """The command `traceroute host` shows the routers on the way, one line per hop (a hop is one router), for example '1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms' or '4  10.0.0.2  5.1 ms * 5.3 ms' (a star means that one probe got no reply) or '5  * * *'. Lines that do not start with a number (such as the header 'traceroute to ...') are ignored. Return a list of dicts {'hop' (int), 'host' (the first word that is not a star and not a time, or None if there is none), 'rtts' (the list of times in ms as floats, in order) and 'lost' (the number of stars)}. A time is a number that is followed by the word ms."""
+        hops = []
+        for line in text.split("\n"):
+            parts = line.split()
+            if not parts or not parts[0].isdigit():
+                continue
+            host, rtts, lost = None, [], 0
+            rest = parts[1:]
+            for i, tok in enumerate(rest):
+                if tok == "*":
+                    lost += 1
+                elif tok == "ms":
+                    continue
+                elif i + 1 < len(rest) and rest[i + 1] == "ms":
+                    rtts.append(float(tok))
+                elif host is None:
+                    host = tok
+            hops.append({"hop": int(parts[0]), "host": host, "rtts": rtts, "lost": lost})
+        return hops
+
+
+    def trace_report(hops, jump_ms):
+        """Read a traceroute for the first sign of trouble. `hops` comes from parse_traceroute. The typical time of a hop is the MEDIAN of its rtts (for an even count the mean of the two middle ones); a hop without any time has none. Return a list of text lines: first, if a hop's typical time is at least `jump_ms` MORE than the typical time of the nearest earlier hop that has one (the first hop needs an earlier hop to compare with), 'latency jumps at hop N (+X ms)' for the FIRST such hop, where X is the difference rounded to 1 decimal; then, if the list ends with one or more hops that have no rtts at all, 'no reply from hop N onward' where N is the first hop of that final run. An empty list gives ['no hops']. A healthy path gives []."""
+        if not hops:
+            return ["no hops"]
+
+        def median(values):
+            v = sorted(values)
+            mid = len(v) // 2
+            return v[mid] if len(v) % 2 else (v[mid - 1] + v[mid]) / 2
+        lines, prev = [], None
+        for h in hops:
+            if not h["rtts"]:
+                continue
+            typical = median(h["rtts"])
+            if prev is not None and typical - prev >= jump_ms:
+                lines.append("latency jumps at hop " + str(h["hop"]) + " (+" + str(round(typical - prev, 1)) + " ms)")
+                break
+            prev = typical
+        end = len(hops)
+        while end > 0 and not hops[end - 1]["rtts"]:
+            end -= 1
+        if end < len(hops):
+            lines.append("no reply from hop " + str(hops[end]["hop"]) + " onward")
+        return lines
+    PING = "PING example.com (93.184.216.34) 56(84) bytes of data.\n64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n\n--- example.com ping statistics ---\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\nrtt min/avg/max/mdev = 11.8/23.1/45.0/15.5 ms\n"
+    TR = "traceroute to example.com (93.184.216.34), 30 hops max\n 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1 (isp)  8.0 ms  8.5 ms  9.0 ms\n 3  * * *\n 4  core.isp.net  120.5 ms * 118.0 ms\n 5  * * *\n 6  * * *\n"
+
+    ping = parse_ping(PING)
+    print(ping["sent"], ping["received"], ping["loss"], "% lost")
+    print(ping["min"], ping["avg"], ping["max"])
+    hops = parse_traceroute(TR)
+    print(len(hops), "hops")
+    for line in trace_report(hops, 50):
+        print(line)
+  output: |
+    4 3 25.0 % lost
+    11.8 23.1 45.0
+    6 hops
+    latency jumps at hop 4 (+110.8 ms)
+    no reply from hop 5 onward
+  lines:
+  - line: 64
+    note: 4 sent, 3 received, 25 percent lost.
+  - line: 65
+    note: The slowest reply is much slower than the fastest.
+  - line: 67
+    note: Six hops.
+  - line: 68
+    note: The delay jumps at hop 4, and nothing answers after hop 4.
+- title: dig and curl timings
+  intro: Read a DNS answer and split a request into phases.
+  code: |
+    def parse_dig(text):
+        """The command `dig name` asks a DNS server (the internet's phone book) for the records of a name. Its output has a header line such as ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 4711', an optional line ';; Query time: 23 msec' and a section that starts with the line ';; ANSWER SECTION:' and ends at the next blank line, with one record per line: name, ttl, class, type and the value (the rest of the line), separated by blanks, for example 'www.example.com. 300 IN CNAME example.com.'. Return {'status' (the word after 'status: '), 'query_ms' (the int before 'msec', or None if there is no such line), 'answers' (a list of dicts {'name', 'ttl' (int), 'type', 'value'}; a trailing dot is removed from name and value; without an answer section the list is empty)}. ValueError('no status') if there is no status."""
+        import re
+        m = re.search(r"status: ([A-Z]+)", text)
+        if not m:
+            raise ValueError("no status")
+        q = re.search(r"Query time: (\d+) msec", text)
+        answers, inside = [], False
+        for line in text.split("\n"):
+            if line.startswith(";; ANSWER SECTION:"):
+                inside = True
+                continue
+            if inside:
+                if not line.strip():
+                    break
+                f = line.split(None, 4)
+                if len(f) < 5:
+                    continue
+                answers.append({"name": f[0].rstrip("."), "ttl": int(f[1]), "type": f[3], "value": f[4].strip().rstrip(".")})
+        return {"status": m.group(1), "query_ms": int(q.group(1)) if q else None, "answers": answers}
+
+
+    def timing_report(t):
+        """A web request has phases: looking up the name (DNS), opening the connection (TCP), the encryption handshake (TLS, only for https), waiting for the server to start answering, and downloading. The tool `curl -w` prints CUMULATIVE times in seconds since the start: namelookup, connect, appconnect (0 for plain http), starttransfer and total. Given them as a dict with these five keys, return {'dns', 'tcp', 'tls', 'wait', 'transfer', 'slowest'} where the first five are the DURATION of each phase in milliseconds rounded to a whole number (dns = namelookup; tcp = connect - namelookup; tls = appconnect - connect, or 0 if appconnect is 0; wait = starttransfer - the later one of connect and appconnect; transfer = total - starttransfer) and 'slowest' is the name of the longest phase (the first in the order dns, tcp, tls, wait, transfer if there is a tie). Compute with the unrounded values, then round."""
+        ac = t["appconnect"]
+        d = {"dns": t["namelookup"], "tcp": t["connect"] - t["namelookup"], "tls": (ac - t["connect"]) if ac else 0.0,
+             "wait": t["starttransfer"] - max(t["connect"], ac), "transfer": t["total"] - t["starttransfer"]}
+        out = {k: int(round(v * 1000)) for k, v in d.items()}
+        order = ["dns", "tcp", "tls", "wait", "transfer"]
+        out["slowest"] = max(order, key=lambda k: (d[k], -order.index(k)))
+        return out
+
+    text = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; ANSWER SECTION:\nexample.com. 300 IN A 93.184.216.34\n\n;; Query time: 23 msec\n"
+    result = parse_dig(text)
+    print(result["status"], result["query_ms"], "ms")
+    print(result["answers"][0]["type"], result["answers"][0]["value"])
+    t = {"namelookup": 0.020, "connect": 0.045, "appconnect": 0.120, "starttransfer": 0.400, "total": 0.450}
+    report = timing_report(t)
+    print(report)
+  output: |
+    NOERROR 23 ms
+    A 93.184.216.34
+    {'dns': 20, 'tcp': 25, 'tls': 75, 'wait': 280, 'transfer': 50, 'slowest': 'wait'}
+  lines:
+  - line: 35
+    note: NOERROR, answered in 23 ms.
+  - line: 36
+    note: An A record with the IP address.
+  - line: 39
+    note: 'The server needs 280 ms before it starts to answer: that is the slow phase.'
+playground:
+  prompt: Find the average of some ping times.
+  code: |
+    times = [11.8, 12.4, 45.0]
+    print(round(sum(times) / len(times), 1))
+exercises:
+- id: ping
+  title: Is the other computer there?
+  difficulty: 3
+  prompt: 'The first tool of every network detective is `ping`: it sends a tiny message to another computer and measures how long the answer takes. Write `parse_ping(text)`. The command `ping host` sends small test messages and prints one line per reply, such as ''64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms'', and at the end a statistics line such as ''4 packets transmitted, 3 received, 25% packet loss, time 3004ms'' (the words ''packets received'' may also be written ''received'' only). Parse the text. Return a dict {''sent'', ''received'' (both ints from the statistics line), ''loss'' (the percentage of lost messages computed from sent and received, rounded to 1 decimal, 0.0 if nothing was sent), ''times'' (the list of all numbers in ''time=... ms'' in order, as floats), ''min'', ''avg'', ''max'' (of the times, rounded to 1 decimal, or None if there are no times)}. ValueError(''no statistics'') if the statistics line is missing.'
+  starter: |-
+    def parse_ping(text):
+        """The command `ping host` sends small test messages and prints one line per reply, such as '64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms', and at the end a statistics line such as '4 packets transmitted, 3 received, 25% packet loss, time 3004ms' (the words 'packets received' may also be written 'received' only). Parse the text. Return a dict {'sent', 'received' (both ints from the statistics line), 'loss' (the percentage of lost messages computed from sent and received, rounded to 1 decimal, 0.0 if nothing was sent), 'times' (the list of all numbers in 'time=... ms' in order, as floats), 'min', 'avg', 'max' (of the times, rounded to 1 decimal, or None if there are no times)}. ValueError('no statistics') if the statistics line is missing."""
+        pass
+  tests:
+  - name: a normal run
+    code: |
+      PING = "PING example.com (93.184.216.34) 56(84) bytes of data.\n64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=12.4 ms\n64 bytes from 93.184.216.34: icmp_seq=4 ttl=56 time=45.0 ms\n\n--- example.com ping statistics ---\n4 packets transmitted, 3 received, 25% packet loss, time 3004ms\nrtt min/avg/max/mdev = 11.8/23.1/45.0/15.5 ms\n"
+
+      r = parse_ping(PING)
+      assert r == {"sent": 4, "received": 3, "loss": 25.0, "times": [11.8, 12.4, 45.0], "min": 11.8, "avg": 23.1, "max": 45.0}
+  - name: silence and errors
+    code: |
+      r = parse_ping("--- x ping statistics ---\n4 packets transmitted, 0 received, 100% packet loss, time 3070ms\n")
+      assert r == {"sent": 4, "received": 0, "loss": 100.0, "times": [], "min": None, "avg": None, "max": None}
+      assert parse_ping("0 packets transmitted, 0 received")["loss"] == 0.0
+      r = parse_ping("64 bytes from a: time=1 ms\n64 bytes from a: time=2.5 ms\n3 packets transmitted, 2 packets received, 33% packet loss\n")
+      assert r["loss"] == 33.3 and r["times"] == [1.0, 2.5] and r["avg"] == 1.8 and r["received"] == 2
+      for text in ("", "no numbers"):
+          try:
+              parse_ping(text)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "no statistics"
+  hints:
+  - re.search with groups finds the numbers of the statistics line.
+  - re.findall collects every time= value.
+  solution: |
+    def parse_ping(text):
+        """The command `ping host` sends small test messages and prints one line per reply, such as '64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=11.8 ms', and at the end a statistics line such as '4 packets transmitted, 3 received, 25% packet loss, time 3004ms' (the words 'packets received' may also be written 'received' only). Parse the text. Return a dict {'sent', 'received' (both ints from the statistics line), 'loss' (the percentage of lost messages computed from sent and received, rounded to 1 decimal, 0.0 if nothing was sent), 'times' (the list of all numbers in 'time=... ms' in order, as floats), 'min', 'avg', 'max' (of the times, rounded to 1 decimal, or None if there are no times)}. ValueError('no statistics') if the statistics line is missing."""
+        import re
+        m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", text)
+        if not m:
+            raise ValueError("no statistics")
+        sent, received = int(m.group(1)), int(m.group(2))
+        times = [float(t) for t in re.findall(r"time=([0-9.]+) ?ms", text)]
+        loss = round((sent - received) / sent * 100, 1) if sent else 0.0
+        return {"sent": sent, "received": received, "loss": loss, "times": times,
+                "min": round(min(times), 1) if times else None, "avg": round(sum(times) / len(times), 1) if times else None, "max": round(max(times), 1) if times else None}
+  explanation: Some servers ignore ping on purpose, so no reply does not always mean 'down'. Use it as a hint, not as proof.
+- id: traceroute
+  title: The road to the server
+  difficulty: 4
+  prompt: 'Data does not travel directly: it hops from router to router. `traceroute` shows the hops by sending messages that die one step further each time. Write `parse_traceroute(text)`. The command `traceroute host` shows the routers on the way, one line per hop (a hop is one router), for example ''1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms'' or ''4  10.0.0.2  5.1 ms * 5.3 ms'' (a star means that one probe got no reply) or ''5  * * *''. Lines that do not start with a number (such as the header ''traceroute to ...'') are ignored. Return a list of dicts {''hop'' (int), ''host'' (the first word that is not a star and not a time, or None if there is none), ''rtts'' (the list of times in ms as floats, in order) and ''lost'' (the number of stars)}. A time is a number that is followed by the word ms.'
+  starter: |-
+    def parse_traceroute(text):
+        """The command `traceroute host` shows the routers on the way, one line per hop (a hop is one router), for example '1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms' or '4  10.0.0.2  5.1 ms * 5.3 ms' (a star means that one probe got no reply) or '5  * * *'. Lines that do not start with a number (such as the header 'traceroute to ...') are ignored. Return a list of dicts {'hop' (int), 'host' (the first word that is not a star and not a time, or None if there is none), 'rtts' (the list of times in ms as floats, in order) and 'lost' (the number of stars)}. A time is a number that is followed by the word ms."""
+        pass
+  tests:
+  - name: hops
+    code: |
+      TR = "traceroute to example.com (93.184.216.34), 30 hops max\n 1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms\n 2  10.0.0.1 (isp)  8.0 ms  8.5 ms  9.0 ms\n 3  * * *\n 4  core.isp.net  120.5 ms * 118.0 ms\n 5  * * *\n 6  * * *\n"
+
+      r = parse_traceroute(TR)
+      assert r == [{"hop": 1, "host": "192.168.1.1", "rtts": [1.2, 1.1, 1.0], "lost": 0}, {"hop": 2, "host": "10.0.0.1", "rtts": [8.0, 8.5, 9.0], "lost": 0}, {"hop": 3, "host": None, "rtts": [], "lost": 3}, {"hop": 4, "host": "core.isp.net", "rtts": [120.5, 118.0], "lost": 1}, {"hop": 5, "host": None, "rtts": [], "lost": 3}, {"hop": 6, "host": None, "rtts": [], "lost": 3}]
+  - name: odd lines
+    code: |
+      assert parse_traceroute("") == [] and parse_traceroute("traceroute to x\nnot a hop\n") == []
+      r = parse_traceroute("10  * r1.example.net  5 ms  6.5 ms\n")
+      assert r == [{"hop": 10, "host": "r1.example.net", "rtts": [5.0, 6.5], "lost": 1}]
+      assert parse_traceroute("2  a  1 ms  b  2 ms  3 ms\n") == [{"hop": 2, "host": "a", "rtts": [1.0, 2.0, 3.0], "lost": 0}]
+  hints:
+  - A word is a time if the NEXT word is 'ms'.
+  - The host is the first word that is neither a star, nor a time, nor 'ms'.
+  solution: |
+    def parse_traceroute(text):
+        """The command `traceroute host` shows the routers on the way, one line per hop (a hop is one router), for example '1  192.168.1.1  1.2 ms  1.1 ms  1.0 ms' or '4  10.0.0.2  5.1 ms * 5.3 ms' (a star means that one probe got no reply) or '5  * * *'. Lines that do not start with a number (such as the header 'traceroute to ...') are ignored. Return a list of dicts {'hop' (int), 'host' (the first word that is not a star and not a time, or None if there is none), 'rtts' (the list of times in ms as floats, in order) and 'lost' (the number of stars)}. A time is a number that is followed by the word ms."""
+        hops = []
+        for line in text.split("\n"):
+            parts = line.split()
+            if not parts or not parts[0].isdigit():
+                continue
+            host, rtts, lost = None, [], 0
+            rest = parts[1:]
+            for i, tok in enumerate(rest):
+                if tok == "*":
+                    lost += 1
+                elif tok == "ms":
+                    continue
+                elif i + 1 < len(rest) and rest[i + 1] == "ms":
+                    rtts.append(float(tok))
+                elif host is None:
+                    host = tok
+            hops.append({"hop": int(parts[0]), "host": host, "rtts": rtts, "lost": lost})
+        return hops
+  explanation: Many routers do not answer these probes at all, which shows as stars. A star in the middle with normal hops after it is harmless; stars up to the end of the list are the real problem.
+- id: tracereport
+  title: Where does it go wrong?
+  difficulty: 4
+  prompt: 'The list of hops comes from your `parse_traceroute`. Write `trace_report(hops, jump_ms)`. Read a traceroute for the first sign of trouble. `hops` comes from parse_traceroute. The typical time of a hop is the MEDIAN of its rtts (for an even count the mean of the two middle ones); a hop without any time has none. Return a list of text lines: first, if a hop''s typical time is at least `jump_ms` MORE than the typical time of the nearest earlier hop that has one (the first hop needs an earlier hop to compare with), ''latency jumps at hop N (+X ms)'' for the FIRST such hop, where X is the difference rounded to 1 decimal; then, if the list ends with one or more hops that have no rtts at all, ''no reply from hop N onward'' where N is the first hop of that final run. An empty list gives [''no hops'']. A healthy path gives [].'
+  starter: |-
+    def trace_report(hops, jump_ms):
+        """Read a traceroute for the first sign of trouble. `hops` comes from parse_traceroute. The typical time of a hop is the MEDIAN of its rtts (for an even count the mean of the two middle ones); a hop without any time has none. Return a list of text lines: first, if a hop's typical time is at least `jump_ms` MORE than the typical time of the nearest earlier hop that has one (the first hop needs an earlier hop to compare with), 'latency jumps at hop N (+X ms)' for the FIRST such hop, where X is the difference rounded to 1 decimal; then, if the list ends with one or more hops that have no rtts at all, 'no reply from hop N onward' where N is the first hop of that final run. An empty list gives ['no hops']. A healthy path gives []."""
+        pass
+  tests:
+  - name: jump and silence
+    code: |
+      HOPS = [{"hop": 1, "host": "192.168.1.1", "rtts": [1.2, 1.1, 1.0], "lost": 0}, {"hop": 2, "host": "10.0.0.1", "rtts": [8.0, 8.5, 9.0], "lost": 0}, {"hop": 3, "host": None, "rtts": [], "lost": 3}, {"hop": 4, "host": "core.isp.net", "rtts": [120.5, 118.0], "lost": 1}, {"hop": 5, "host": None, "rtts": [], "lost": 3}, {"hop": 6, "host": None, "rtts": [], "lost": 3}]
+
+      assert trace_report(HOPS, 50) == ["latency jumps at hop 4 (+110.8 ms)", "no reply from hop 5 onward"]
+      assert trace_report(HOPS[:2], 50) == [] and trace_report([], 5) == ["no hops"]
+      assert trace_report(HOPS[:4], 200) == [] and trace_report(HOPS, 200) == ["no reply from hop 5 onward"]
+  - name: small cases
+    code: |
+      h = lambda n, r: {"hop": n, "host": None if not r else "x", "rtts": r, "lost": 0}
+      assert trace_report([h(1, [10.0]), h(2, [10.0, 70.0]), h(3, [100.0])], 30) == ["latency jumps at hop 2 (+30.0 ms)"]
+      assert trace_report([h(1, [5.0]), h(2, [])], 10) == ["no reply from hop 2 onward"]
+      assert trace_report([h(1, []), h(2, [])], 10) == ["no reply from hop 1 onward"]
+      assert trace_report([h(1, [5.0]), h(2, []), h(3, [9.0]), h(4, [])], 10) == ["no reply from hop 4 onward"]
+      assert trace_report([h(1, [5.0]), h(2, []), h(3, [95.0])], 80) == ["latency jumps at hop 3 (+90.0 ms)"]
+  hints:
+  - The median of a list sorts it and takes the middle value.
+  - Remember the typical time of the last hop that had one.
+  solution: |
+    def trace_report(hops, jump_ms):
+        """Read a traceroute for the first sign of trouble. `hops` comes from parse_traceroute. The typical time of a hop is the MEDIAN of its rtts (for an even count the mean of the two middle ones); a hop without any time has none. Return a list of text lines: first, if a hop's typical time is at least `jump_ms` MORE than the typical time of the nearest earlier hop that has one (the first hop needs an earlier hop to compare with), 'latency jumps at hop N (+X ms)' for the FIRST such hop, where X is the difference rounded to 1 decimal; then, if the list ends with one or more hops that have no rtts at all, 'no reply from hop N onward' where N is the first hop of that final run. An empty list gives ['no hops']. A healthy path gives []."""
+        if not hops:
+            return ["no hops"]
+
+        def median(values):
+            v = sorted(values)
+            mid = len(v) // 2
+            return v[mid] if len(v) % 2 else (v[mid - 1] + v[mid]) / 2
+        lines, prev = [], None
+        for h in hops:
+            if not h["rtts"]:
+                continue
+            typical = median(h["rtts"])
+            if prev is not None and typical - prev >= jump_ms:
+                lines.append("latency jumps at hop " + str(h["hop"]) + " (+" + str(round(typical - prev, 1)) + " ms)")
+                break
+            prev = typical
+        end = len(hops)
+        while end > 0 and not hops[end - 1]["rtts"]:
+            end -= 1
+        if end < len(hops):
+            lines.append("no reply from hop " + str(hops[end]["hop"]) + " onward")
+        return lines
+  explanation: A real jump in latency often marks a long distance, such as an ocean cable, and is normal. What matters is a jump that does not match where the server is.
+- id: dig
+  title: Asking the phone book
+  difficulty: 4
+  prompt: 'Before anything can be sent to `www.example.com`, the computer must turn the name into a number, and `dig` shows what the name servers answered. Write `parse_dig(text)`. The command `dig name` asks a DNS server (the internet''s phone book) for the records of a name. Its output has a header line such as '';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 4711'', an optional line '';; Query time: 23 msec'' and a section that starts with the line '';; ANSWER SECTION:'' and ends at the next blank line, with one record per line: name, ttl, class, type and the value (the rest of the line), separated by blanks, for example ''www.example.com. 300 IN CNAME example.com.''. Return {''status'' (the word after ''status: ''), ''query_ms'' (the int before ''msec'', or None if there is no such line), ''answers'' (a list of dicts {''name'', ''ttl'' (int), ''type'', ''value''}; a trailing dot is removed from name and value; without an answer section the list is empty)}. ValueError(''no status'') if there is no status.'
+  starter: |-
+    def parse_dig(text):
+        """The command `dig name` asks a DNS server (the internet's phone book) for the records of a name. Its output has a header line such as ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 4711', an optional line ';; Query time: 23 msec' and a section that starts with the line ';; ANSWER SECTION:' and ends at the next blank line, with one record per line: name, ttl, class, type and the value (the rest of the line), separated by blanks, for example 'www.example.com. 300 IN CNAME example.com.'. Return {'status' (the word after 'status: '), 'query_ms' (the int before 'msec', or None if there is no such line), 'answers' (a list of dicts {'name', 'ttl' (int), 'type', 'value'}; a trailing dot is removed from name and value; without an answer section the list is empty)}. ValueError('no status') if there is no status."""
+        pass
+  tests:
+  - name: answers
+    code: |
+      text = """; <<>> DiG 9.18 <<>> www.example.com
+      ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 4711
+      ;; flags: qr rd ra; QUERY: 1, ANSWER: 2
+
+      ;; QUESTION SECTION:
+      ;www.example.com.   IN  A
+
+      ;; ANSWER SECTION:
+      www.example.com.  300 IN CNAME example.com.
+      example.com.   86400 IN A 93.184.216.34
+
+      ;; Query time: 23 msec
+      """
+      assert parse_dig(text) == {"status": "NOERROR", "query_ms": 23, "answers": [{"name": "www.example.com", "ttl": 300, "type": "CNAME", "value": "example.com"}, {"name": "example.com", "ttl": 86400, "type": "A", "value": "93.184.216.34"}]}
+  - name: failures
+    code: |
+      assert parse_dig(";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n") == {"status": "NXDOMAIN", "query_ms": None, "answers": []}
+      r = parse_dig("status: NOERROR\n;; ANSWER SECTION:\nx.org. 60 IN MX 10 mail.x.org.\n\nignored. 1 IN A 1.1.1.1\n")
+      assert r["answers"] == [{"name": "x.org", "ttl": 60, "type": "MX", "value": "10 mail.x.org"}]
+      for text in ("", ";; ANSWER SECTION:\na. 1 IN A 1.1.1.1\n"):
+          try:
+              parse_dig(text)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "no status"
+  hints:
+  - split(None, 4) keeps the value (which may contain blanks) together.
+  - Stop reading at the first blank line after the section starts.
+  solution: |
+    def parse_dig(text):
+        """The command `dig name` asks a DNS server (the internet's phone book) for the records of a name. Its output has a header line such as ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 4711', an optional line ';; Query time: 23 msec' and a section that starts with the line ';; ANSWER SECTION:' and ends at the next blank line, with one record per line: name, ttl, class, type and the value (the rest of the line), separated by blanks, for example 'www.example.com. 300 IN CNAME example.com.'. Return {'status' (the word after 'status: '), 'query_ms' (the int before 'msec', or None if there is no such line), 'answers' (a list of dicts {'name', 'ttl' (int), 'type', 'value'}; a trailing dot is removed from name and value; without an answer section the list is empty)}. ValueError('no status') if there is no status."""
+        import re
+        m = re.search(r"status: ([A-Z]+)", text)
+        if not m:
+            raise ValueError("no status")
+        q = re.search(r"Query time: (\d+) msec", text)
+        answers, inside = [], False
+        for line in text.split("\n"):
+            if line.startswith(";; ANSWER SECTION:"):
+                inside = True
+                continue
+            if inside:
+                if not line.strip():
+                    break
+                f = line.split(None, 4)
+                if len(f) < 5:
+                    continue
+                answers.append({"name": f[0].rstrip("."), "ttl": int(f[1]), "type": f[3], "value": f[4].strip().rstrip(".")})
+        return {"status": m.group(1), "query_ms": int(q.group(1)) if q else None, "answers": answers}
+  explanation: NXDOMAIN means the name does not exist, SERVFAIL means the name server itself failed, and NOERROR with an empty answer means the name exists but has no record of that type.
+- id: timing
+  title: Where does the time go?
+  difficulty: 4
+  prompt: 'A page that feels slow can be slow for very different reasons, and the cure depends on which one. Write `timing_report(t)`. A web request has phases: looking up the name (DNS), opening the connection (TCP), the encryption handshake (TLS, only for https), waiting for the server to start answering, and downloading. The tool `curl -w` prints CUMULATIVE times in seconds since the start: namelookup, connect, appconnect (0 for plain http), starttransfer and total. Given them as a dict with these five keys, return {''dns'', ''tcp'', ''tls'', ''wait'', ''transfer'', ''slowest''} where the first five are the DURATION of each phase in milliseconds rounded to a whole number (dns = namelookup; tcp = connect - namelookup; tls = appconnect - connect, or 0 if appconnect is 0; wait = starttransfer - the later one of connect and appconnect; transfer = total - starttransfer) and ''slowest'' is the name of the longest phase (the first in the order dns, tcp, tls, wait, transfer if there is a tie). Compute with the unrounded values, then round.'
+  starter: |-
+    def timing_report(t):
+        """A web request has phases: looking up the name (DNS), opening the connection (TCP), the encryption handshake (TLS, only for https), waiting for the server to start answering, and downloading. The tool `curl -w` prints CUMULATIVE times in seconds since the start: namelookup, connect, appconnect (0 for plain http), starttransfer and total. Given them as a dict with these five keys, return {'dns', 'tcp', 'tls', 'wait', 'transfer', 'slowest'} where the first five are the DURATION of each phase in milliseconds rounded to a whole number (dns = namelookup; tcp = connect - namelookup; tls = appconnect - connect, or 0 if appconnect is 0; wait = starttransfer - the later one of connect and appconnect; transfer = total - starttransfer) and 'slowest' is the name of the longest phase (the first in the order dns, tcp, tls, wait, transfer if there is a tie). Compute with the unrounded values, then round."""
+        pass
+  tests:
+  - name: https
+    code: |
+      t = {"namelookup": 0.020, "connect": 0.045, "appconnect": 0.120, "starttransfer": 0.400, "total": 0.450}
+      assert timing_report(t) == {"dns": 20, "tcp": 25, "tls": 75, "wait": 280, "transfer": 50, "slowest": "wait"}
+  - name: http and ties
+    code: |
+      t = {"namelookup": 0.005, "connect": 0.015, "appconnect": 0, "starttransfer": 0.115, "total": 0.116}
+      assert timing_report(t) == {"dns": 5, "tcp": 10, "tls": 0, "wait": 100, "transfer": 1, "slowest": "wait"}
+      t = {"namelookup": 0.9, "connect": 0.91, "appconnect": 0.92, "starttransfer": 0.93, "total": 0.94}
+      assert timing_report(t)["slowest"] == "dns" and timing_report(t)["tls"] == 10
+      t = {"namelookup": 0.001, "connect": 0.002, "appconnect": 0, "starttransfer": 0.003, "total": 2.003}
+      assert timing_report(t)["slowest"] == "transfer" and timing_report(t)["transfer"] == 2000
+  hints:
+  - Each phase is the difference between two cumulative times.
+  - max() with a key function picks the longest phase.
+  solution: |
+    def timing_report(t):
+        """A web request has phases: looking up the name (DNS), opening the connection (TCP), the encryption handshake (TLS, only for https), waiting for the server to start answering, and downloading. The tool `curl -w` prints CUMULATIVE times in seconds since the start: namelookup, connect, appconnect (0 for plain http), starttransfer and total. Given them as a dict with these five keys, return {'dns', 'tcp', 'tls', 'wait', 'transfer', 'slowest'} where the first five are the DURATION of each phase in milliseconds rounded to a whole number (dns = namelookup; tcp = connect - namelookup; tls = appconnect - connect, or 0 if appconnect is 0; wait = starttransfer - the later one of connect and appconnect; transfer = total - starttransfer) and 'slowest' is the name of the longest phase (the first in the order dns, tcp, tls, wait, transfer if there is a tie). Compute with the unrounded values, then round."""
+        ac = t["appconnect"]
+        d = {"dns": t["namelookup"], "tcp": t["connect"] - t["namelookup"], "tls": (ac - t["connect"]) if ac else 0.0,
+             "wait": t["starttransfer"] - max(t["connect"], ac), "transfer": t["total"] - t["starttransfer"]}
+        out = {k: int(round(v * 1000)) for k, v in d.items()}
+        order = ["dns", "tcp", "tls", "wait", "transfer"]
+        out["slowest"] = max(order, key=lambda k: (d[k], -order.index(k)))
+        return out
+  explanation: A big 'dns' means a slow name server (try another), a big 'tcp' or 'tls' means distance or packet loss, a big 'wait' means a slow server program, a big 'transfer' means a big page or a slow link.
+commonMistakes:
+- title: Believing that no ping reply means the server is down
+  explanation: Many servers ignore ping.
+- title: Blaming the network when the name lookup is slow
+  explanation: Check DNS separately.
+- title: Changing three things at once
+  explanation: You do not learn which one helped.
+- title: Testing only from your own computer
+  explanation: Test from another network to compare.
+- title: Reading stars in traceroute as a failure
+  explanation: Only stars up to the end matter.
+summary:
+- 'Check from the bottom up: computer, router, internet, DNS, port, application.'
+- ping measures reachability, delay and loss.
+- traceroute lists the routers on the path.
+- dig shows DNS records and a status such as NXDOMAIN.
+- A request splits into DNS, TCP, TLS, wait and download.
+next: u34-packets
+quiz:
+- type: mcq
+  question: What does ping measure?
+  options:
+  - Round-trip time and packet loss
+  - The size of a file
+  - The number of users
+  - The price of a connection
+  answer: 0
+  explanation: It sends echo requests.
+- type: mcq
+  question: What does a star in traceroute mean?
+  options:
+  - One probe got no reply
+  - The server is down
+  - A fast hop
+  - A secure hop
+  answer: 0
+  explanation: Many routers do not answer.
+- type: mcq
+  question: What does NXDOMAIN mean?
+  options:
+  - The name does not exist
+  - The server is down
+  - The page is slow
+  - The password is wrong
+  answer: 0
+  explanation: Non-existent domain.
+- type: mcq
+  question: What is TTL in a DNS record?
+  options:
+  - How long the answer may be remembered
+  - The speed
+  - The size
+  - The owner
+  answer: 0
+  explanation: Time to live in seconds.
+- type: mcq
+  question: ping 1.1.1.1 works but websites do not load by name. What is the likely problem?
+  options:
+  - DNS
+  - The router cable
+  - The monitor
+  - The keyboard
+  answer: 0
+  explanation: Numbers work, names do not.
+- type: mcq
+  question: What is TTFB?
+  options:
+  - Time to first byte, the wait for the server
+  - Total time for browsing
+  - The first bit of a packet
+  - A kind of cable
+  answer: 0
+  explanation: It includes the server's work.
+- type: code
+  question: Write `loss_percent(sent, received)` that returns the percentage of lost messages, rounded to 1 decimal. If nothing was sent return 0.0.
+  starter: |
+    def loss_percent(sent, received):
+        pass
+  tests:
+  - name: loss
+    code: |
+      assert loss_percent(4, 3) == 25.0 and loss_percent(3, 2) == 33.3 and loss_percent(0, 0) == 0.0 and loss_percent(5, 5) == 0.0 and loss_percent(10, 0) == 100.0
+  solution: |
+    def loss_percent(sent, received):
+        if sent == 0:
+            return 0.0
+        return round((sent - received) / sent * 100, 1)
