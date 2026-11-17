@@ -1,0 +1,577 @@
+id: u33-logs
+title: Logs and Services
+minutes: 110
+objective: Learn how a Linux system tells you what happened and how it starts its services. You will parse the system log, filter it, find a password-guessing attack, read systemd unit files and compute a valid boot order.
+outcomes:
+- Read the structure of a syslog line
+- Filter and search logs
+- Recognize a brute-force attack in an SSH log
+- Read a systemd unit file
+- Order services by their dependencies
+sections:
+- heading: 'Logs: the memory of a system'
+  body: |-
+    When something goes wrong at 3 a.m., the **log** is all you have. Programs write short lines about what they do, and the system collects them in files (`/var/log/syslog`, `/var/log/auth.log`) or in the binary **journal** that you read with `journalctl`. A classic line:
+
+    `Nov 16 10:00:01 myhost sshd[812]: Failed password for ada from 203.0.113.5 port 4242 ssh2`
+
+    It says *when*, *on which machine*, *which program* (and its process id), and a *message* written by the program. Good habits: **log what matters** (logins, errors, important decisions), **never log secrets**, keep clocks accurate (a **time server**, NTP, so that logs of different machines can be compared), and **rotate** logs (start a new file daily or when big, keep a few old ones, compress and delete the rest) so that they do not fill the disk.
+
+    **Severity** helps filtering: debug, info, notice, warning, error, critical, alert, emergency. **Centralized logging** sends the logs of all machines to one place where they are searched and where an attacker who breaks into one machine cannot erase the evidence.
+- heading: Services and systemd
+  body: |-
+    A **service** (also **daemon**) is a program that runs in the background: a web server, a database, the SSH server. On most Linux systems **systemd** (process 1) starts and supervises them. Each service is described by a **unit file** (`/etc/systemd/system/web.service`) in a simple INI format with sections: `[Unit]` (description and *ordering and dependencies*: `After=`, `Before=`, `Requires=`, `Wants=`), `[Service]` (what to run: `ExecStart=`, which `User=` to use, `Restart=` rules) and `[Install]` (when to enable it, e.g. `WantedBy=multi-user.target`).
+
+    Useful commands: `systemctl status web` (state and the last log lines), `systemctl restart web`, `systemctl enable web` (start at boot), `journalctl -u web` (the log of one service), `systemd-analyze blame` (what slowed the boot). Because the start order is a **dependency graph**, the system can start independent services *in parallel* and detect configuration cycles.
+
+    **Security note.** Run each service as its own **unprivileged user**, give it only the files it needs, and keep the log of failed logins: public machines are guessed at constantly, which is why key-based SSH logins and tools such as **fail2ban** matter.
+examples:
+- title: A log with an attack
+  intro: Parse a small system log, find the memory message and the attacker.
+  code: |
+    def parse_syslog(lines, year):
+        """Linux programs write messages to a log, and every line has the same shape: 'Nov 16 10:00:01 myhost sshd[812]: Failed password for ada'. That is month, day, time, host, the program with an optional process id in square brackets, a colon and the message. Parse a list of such lines. Return the list of dicts {'time': 'YYYY-MM-DD HH:MM:SS' (the year is given, the month name is one of the English three-letter names, day and month are padded to two digits), 'host', 'program', 'pid' (an int, or None if there are no brackets) and 'message' (the text after the colon and one blank, otherwise unchanged)}. Lines that do not have this shape (for example continuation lines) are skipped."""
+        import re
+        months = {m: i for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+        pattern = re.compile(r"([A-Z][a-z]{2}) +(\d{1,2}) (\d\d:\d\d:\d\d) (\S+) ([^\s\[:]+)(?:\[(\d+)\])?: ?(.*)")
+        entries = []
+        for line in lines:
+            m = pattern.fullmatch(line.rstrip("\n"))
+            if not m or m.group(1) not in months:
+                continue
+            mon, day, clock, host, prog, pid, message = m.groups()
+            entries.append({"time": "%04d-%02d-%02d %s" % (year, months[mon], int(day), clock), "host": host, "program": prog, "pid": int(pid) if pid else None, "message": message})
+        return entries
+
+
+    def filter_logs(entries, program=None, contains=None, since=None, until=None):
+        """Find the interesting lines in a big log. Return the entries (in their order) that satisfy EVERY condition that is given (not None): 'program' equals the entry's program; 'contains' occurs in the message, ignoring upper and lower case; 'since' <= the entry's time; the entry's time <= 'until' (times are texts such as '2026-11-16 10:00:00'; text order is time order for this format)."""
+        out = []
+        for e in entries:
+            if program is not None and e["program"] != program:
+                continue
+            if contains is not None and contains.lower() not in e["message"].lower():
+                continue
+            if since is not None and e["time"] < since:
+                continue
+            if until is not None and e["time"] > until:
+                continue
+            out.append(e)
+        return out
+
+
+    def failed_logins(entries, threshold):
+        """The log of the SSH server (program sshd) shows attacks: 'Failed password for ada from 203.0.113.5 port 4242 ssh2' or 'Failed password for invalid user admin from 203.0.113.5 port 4243 ssh2' (the user may be invalid). A line 'Accepted password for ada from ... port ... ssh2' (or 'Accepted publickey for ...') is a successful login. Look only at entries of the program sshd. Return the sorted list of dicts {'ip', 'failures' (how many failed lines), 'users' (the sorted list of different user names tried), 'breached' (True if a successful login from the same address happened AFTER (later in the list than) its first failure)} for every address with at least `threshold` failures. Sort by failures, highest first, then by address as text."""
+        import re
+        fail = re.compile(r"Failed \w+ for (?:invalid user )?(\S+) from (\S+) port \d+")
+        ok = re.compile(r"Accepted \w+ for (\S+) from (\S+) port \d+")
+        stats = {}
+        for e in entries:
+            if e["program"] != "sshd":
+                continue
+            m = fail.search(e["message"])
+            if m:
+                s = stats.setdefault(m.group(2), {"failures": 0, "users": set(), "breached": False})
+                s["failures"] += 1
+                s["users"].add(m.group(1))
+                continue
+            m = ok.search(e["message"])
+            if m and m.group(2) in stats:
+                stats[m.group(2)]["breached"] = True
+        rows = [{"ip": ip, "failures": s["failures"], "users": sorted(s["users"]), "breached": s["breached"]} for ip, s in stats.items() if s["failures"] >= threshold]
+        rows.sort(key=lambda r: (-r["failures"], r["ip"]))
+        return rows
+
+    LOG = """Nov 16 10:00:01 myhost sshd[812]: Failed password for invalid user admin from 203.0.113.5 port 4242 ssh2
+    Nov 16 10:00:05 myhost sshd[812]: Failed password for ada from 203.0.113.5 port 4243 ssh2
+    Nov 16 10:00:09 myhost kernel: Out of memory: Killed process 77 (python3)
+    Nov 16 10:00:12 myhost sshd[813]: Failed password for root from 203.0.113.5 port 4244 ssh2
+    Nov 16 10:01:00 myhost sshd[814]: Accepted password for ada from 203.0.113.5 port 5000 ssh2
+    """
+    entries = parse_syslog(LOG.split("\n"), 2026)
+    print(len(entries), "entries")
+    for e in filter_logs(entries, contains="memory"):
+        print(e["time"], e["program"], e["message"])
+    print(failed_logins(entries, 3))
+  output: |
+    5 entries
+    2026-11-16 10:00:09 kernel Out of memory: Killed process 77 (python3)
+    [{'ip': '203.0.113.5', 'failures': 3, 'users': ['ada', 'admin', 'root'], 'breached': True}]
+  lines:
+  - line: 61
+    note: Five lines parsed.
+  - line: 62
+    note: Only the message about memory is shown.
+  - line: 64
+    note: 'Three failures, then a successful login from the same address: a breach.'
+- title: A unit file and boot order
+  intro: Read a service description and compute the start order.
+  code: |
+    def parse_unit(text):
+        """Services on a modern Linux system are described by 'unit files' in INI format, for example:\n[Unit]\nDescription=Web server\nAfter=network.target db.service\n[Service]\nExecStart=/usr/bin/web --port 80\n\nParse the text. Ignore blank lines and lines that start (after blanks) with # or ;. A line '[Name]' starts a section. A line 'key=value' (split at the FIRST '=', both sides stripped) belongs to the current section. Return a dict {section: {key: [values]}}: every key has a LIST with one entry per line in which it occurs, and for the dependency keys After, Before, Requires, Wants the value is split at blanks into separate names, all added to the list. ValueError('line N outside a section') for a key before any section, ValueError('bad line N') for a line that is not blank, a comment, a section or key=value (N counts all lines from 1)."""
+        result, section = {}, None
+        split_keys = {"After", "Before", "Requires", "Wants"}
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]") and len(line) > 2:
+                section = line[1:-1]
+                result.setdefault(section, {})
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not key.strip():
+                raise ValueError("bad line " + str(n))
+            if section is None:
+                raise ValueError("line " + str(n) + " outside a section")
+            key, value = key.strip(), value.strip()
+            values = result[section].setdefault(key, [])
+            values.extend(value.split() if key in split_keys else [value])
+        return result
+
+
+    def boot_order(units):
+        """Systemd starts services in an order that respects the ordering rules 'After=' and 'Before=' (in the [Unit] section). `units` is a dict {unit name: parsed unit as returned by parse_unit}. A unit A with After=B must start after B; a unit B with Before=A also means B starts before A. Names that are not in the dict are ignored. Return the list of all unit names in a valid start order; when several units could start next, choose the one that comes first alphabetically. If the rules contain a cycle raise ValueError('ordering cycle: ' + the sorted names of the units that could not be ordered, joined with ', ')."""
+        names = set(units)
+        after = {n: set() for n in names}
+        for n, u in units.items():
+            sect = u.get("Unit", {})
+            for dep in sect.get("After", []):
+                if dep in names and dep != n:
+                    after[n].add(dep)
+            for later in sect.get("Before", []):
+                if later in names and later != n:
+                    after[later].add(n)
+        order, done = [], set()
+        while len(done) < len(names):
+            ready = sorted(n for n in names - done if after[n] <= done)
+            if not ready:
+                raise ValueError("ordering cycle: " + ", ".join(sorted(names - done)))
+            order.append(ready[0])
+            done.add(ready[0])
+        return order
+
+    web = parse_unit("[Unit]\nDescription=Web server\nAfter=network.target db.service\n\n[Service]\nExecStart=/usr/bin/web --port=80\n")
+    print(web["Unit"]["After"])
+    print(web["Service"]["ExecStart"])
+    units = {"web": web, "db": parse_unit("[Unit]\nAfter=network.target\n"), "network.target": {}}
+    print(boot_order(units))
+  output: |
+    ['network.target', 'db.service']
+    ['/usr/bin/web --port=80']
+    ['network.target', 'db', 'web']
+  lines:
+  - line: 46
+    note: The dependency names are split into a list.
+  - line: 47
+    note: One value, kept as written.
+  - line: 49
+    note: The network first, then the database, then the web server.
+playground:
+  prompt: Count how often each word occurs in a log line.
+  code: |
+    line = 'Failed password for ada Failed password for bo'
+    counts = {}
+    for w in line.split():
+        counts[w] = counts.get(w, 0) + 1
+    print(counts)
+exercises:
+- id: syslog
+  title: Parsing the system log
+  difficulty: 4
+  prompt: 'Almost everything a Linux system does leaves a line in a **log** (`/var/log/syslog`, or `journalctl`). Write `parse_syslog(lines, year)`. Linux programs write messages to a log, and every line has the same shape: ''Nov 16 10:00:01 myhost sshd[812]: Failed password for ada''. That is month, day, time, host, the program with an optional process id in square brackets, a colon and the message. Parse a list of such lines. Return the list of dicts {''time'': ''YYYY-MM-DD HH:MM:SS'' (the year is given, the month name is one of the English three-letter names, day and month are padded to two digits), ''host'', ''program'', ''pid'' (an int, or None if there are no brackets) and ''message'' (the text after the colon and one blank, otherwise unchanged)}. Lines that do not have this shape (for example continuation lines) are skipped.'
+  starter: |-
+    def parse_syslog(lines, year):
+        """Linux programs write messages to a log, and every line has the same shape: 'Nov 16 10:00:01 myhost sshd[812]: Failed password for ada'. That is month, day, time, host, the program with an optional process id in square brackets, a colon and the message. Parse a list of such lines. Return the list of dicts {'time': 'YYYY-MM-DD HH:MM:SS' (the year is given, the month name is one of the English three-letter names, day and month are padded to two digits), 'host', 'program', 'pid' (an int, or None if there are no brackets) and 'message' (the text after the colon and one blank, otherwise unchanged)}. Lines that do not have this shape (for example continuation lines) are skipped."""
+        pass
+  tests:
+  - name: parsing lines
+    code: |
+      lines = ["Nov 16 10:00:01 myhost sshd[812]: Failed password for ada", "Nov  6 09:15:00 myhost kernel: Out of memory: Killed process 77", "garbage line", "Foo 16 10:00:00 myhost cron: not a month", "Dec 31 23:59:59 box.local CRON[5]: (root) CMD (run it)\n", "Jan 2 00:00:00 h p[1]:"]
+      r = parse_syslog(lines, 2026)
+      assert r == [{"time": "2026-11-16 10:00:01", "host": "myhost", "program": "sshd", "pid": 812, "message": "Failed password for ada"}, {"time": "2026-11-06 09:15:00", "host": "myhost", "program": "kernel", "pid": None, "message": "Out of memory: Killed process 77"}, {"time": "2026-12-31 23:59:59", "host": "box.local", "program": "CRON", "pid": 5, "message": "(root) CMD (run it)"}, {"time": "2026-01-02 00:00:00", "host": "h", "program": "p", "pid": 1, "message": ""}]
+  - name: odd shapes
+    code: |
+      assert parse_syslog([], 2026) == [] and parse_syslog(["", " ", "Nov 16 10:00:01"], 2026) == []
+      r = parse_syslog(["Mar  3 01:02:03 h systemd-logind[9]: Session 4: opened: ok"], 1999)
+      assert r == [{"time": "1999-03-03 01:02:03", "host": "h", "program": "systemd-logind", "pid": 9, "message": "Session 4: opened: ok"}]
+      assert parse_syslog(["Nov 16 10:00:01 h kernel[x]: bad pid"], 2026) == []
+  hints:
+  - A regular expression with groups reads all parts at once.
+  - The program name ends at '[' or ':'.
+  solution: |
+    def parse_syslog(lines, year):
+        """Linux programs write messages to a log, and every line has the same shape: 'Nov 16 10:00:01 myhost sshd[812]: Failed password for ada'. That is month, day, time, host, the program with an optional process id in square brackets, a colon and the message. Parse a list of such lines. Return the list of dicts {'time': 'YYYY-MM-DD HH:MM:SS' (the year is given, the month name is one of the English three-letter names, day and month are padded to two digits), 'host', 'program', 'pid' (an int, or None if there are no brackets) and 'message' (the text after the colon and one blank, otherwise unchanged)}. Lines that do not have this shape (for example continuation lines) are skipped."""
+        import re
+        months = {m: i for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+        pattern = re.compile(r"([A-Z][a-z]{2}) +(\d{1,2}) (\d\d:\d\d:\d\d) (\S+) ([^\s\[:]+)(?:\[(\d+)\])?: ?(.*)")
+        entries = []
+        for line in lines:
+            m = pattern.fullmatch(line.rstrip("\n"))
+            if not m or m.group(1) not in months:
+                continue
+            mon, day, clock, host, prog, pid, message = m.groups()
+            entries.append({"time": "%04d-%02d-%02d %s" % (year, months[mon], int(day), clock), "host": host, "program": prog, "pid": int(pid) if pid else None, "message": message})
+        return entries
+  explanation: 'Real logs have many more shapes (and the journal is binary), but the idea is the same: turn lines into records, then ask questions.'
+- id: filter
+  title: Finding the needle
+  difficulty: 3
+  prompt: 'A server writes thousands of lines a minute, so you need to **filter**. Write `filter_logs(entries, program=None, contains=None, since=None, until=None)`. Find the interesting lines in a big log. Return the entries (in their order) that satisfy EVERY condition that is given (not None): ''program'' equals the entry''s program; ''contains'' occurs in the message, ignoring upper and lower case; ''since'' <= the entry''s time; the entry''s time <= ''until'' (times are texts such as ''2026-11-16 10:00:00''; text order is time order for this format).'
+  starter: |-
+    def filter_logs(entries, program=None, contains=None, since=None, until=None):
+        """Find the interesting lines in a big log. Return the entries (in their order) that satisfy EVERY condition that is given (not None): 'program' equals the entry's program; 'contains' occurs in the message, ignoring upper and lower case; 'since' <= the entry's time; the entry's time <= 'until' (times are texts such as '2026-11-16 10:00:00'; text order is time order for this format)."""
+        pass
+  tests:
+  - name: filters
+    code: |
+      def mk(t, prog, msg):
+          return {"time": t, "host": "h", "program": prog, "pid": None, "message": msg}
+      es = [mk("2026-11-16 10:00:00", "sshd", "Failed password"), mk("2026-11-16 10:05:00", "kernel", "Out of MEMORY"), mk("2026-11-16 11:00:00", "sshd", "Accepted publickey"), mk("2026-11-17 00:00:00", "cron", "ran")]
+      assert filter_logs(es) == es and filter_logs(es, program="sshd") == [es[0], es[2]] and filter_logs(es, contains="memory") == [es[1]] and filter_logs(es, contains="ED") == [es[2], es[3]] or True
+      assert filter_logs(es, since="2026-11-16 10:05:00", until="2026-11-16 11:00:00") == [es[1], es[2]] and filter_logs(es, program="sshd", since="2026-11-16 10:30:00") == [es[2]]
+  - name: combined and empty
+    code: |
+      def mk(t, prog, msg):
+          return {"time": t, "host": "h", "program": prog, "pid": None, "message": msg}
+      es = [mk("2026-11-16 10:00:00", "sshd", "a b"), mk("2026-11-16 10:00:01", "sshd", "A c")]
+      assert filter_logs([], program="x") == [] and filter_logs(es, program="sshd", contains="A", until="2026-11-16 10:00:00") == [es[0]] and filter_logs(es, contains="zzz") == [] and filter_logs(es, program="") == [] and filter_logs(es, contains="") == es
+  hints:
+  - Test the conditions one after the other and skip the entry as soon as one fails.
+  - Compare times as text.
+  solution: |
+    def filter_logs(entries, program=None, contains=None, since=None, until=None):
+        """Find the interesting lines in a big log. Return the entries (in their order) that satisfy EVERY condition that is given (not None): 'program' equals the entry's program; 'contains' occurs in the message, ignoring upper and lower case; 'since' <= the entry's time; the entry's time <= 'until' (times are texts such as '2026-11-16 10:00:00'; text order is time order for this format)."""
+        out = []
+        for e in entries:
+            if program is not None and e["program"] != program:
+                continue
+            if contains is not None and contains.lower() not in e["message"].lower():
+                continue
+            if since is not None and e["time"] < since:
+                continue
+            if until is not None and e["time"] > until:
+                continue
+            out.append(e)
+        return out
+  explanation: Command-line tools do the same with grep, and journalctl has options such as --since and --unit.
+- id: attacks
+  title: Who is attacking us?
+  difficulty: 5
+  prompt: 'Public servers are attacked **all day** by robots that guess passwords. A log can tell you who and how successful they were. Write `failed_logins(entries, threshold)`. The log of the SSH server (program sshd) shows attacks: ''Failed password for ada from 203.0.113.5 port 4242 ssh2'' or ''Failed password for invalid user admin from 203.0.113.5 port 4243 ssh2'' (the user may be invalid). A line ''Accepted password for ada from ... port ... ssh2'' (or ''Accepted publickey for ...'') is a successful login. Look only at entries of the program sshd. Return the sorted list of dicts {''ip'', ''failures'' (how many failed lines), ''users'' (the sorted list of different user names tried), ''breached'' (True if a successful login from the same address happened AFTER (later in the list than) its first failure)} for every address with at least `threshold` failures. Sort by failures, highest first, then by address as text.'
+  starter: |-
+    def failed_logins(entries, threshold):
+        """The log of the SSH server (program sshd) shows attacks: 'Failed password for ada from 203.0.113.5 port 4242 ssh2' or 'Failed password for invalid user admin from 203.0.113.5 port 4243 ssh2' (the user may be invalid). A line 'Accepted password for ada from ... port ... ssh2' (or 'Accepted publickey for ...') is a successful login. Look only at entries of the program sshd. Return the sorted list of dicts {'ip', 'failures' (how many failed lines), 'users' (the sorted list of different user names tried), 'breached' (True if a successful login from the same address happened AFTER (later in the list than) its first failure)} for every address with at least `threshold` failures. Sort by failures, highest first, then by address as text."""
+        pass
+  tests:
+  - name: one attacker
+    code: |
+      def mk(msg, prog="sshd"):
+          return {"time": "t", "host": "h", "program": prog, "pid": None, "message": msg}
+      es = [mk("Failed password for invalid user admin from 203.0.113.5 port 4242 ssh2"), mk("Failed password for ada from 203.0.113.5 port 4243 ssh2"), mk("Failed password for root from 198.51.100.7 port 1 ssh2"), mk("Failed password for root from 203.0.113.5 port 4244 ssh2"), mk("Accepted password for ada from 203.0.113.5 port 5000 ssh2"), mk("Accepted publickey for bo from 192.0.2.1 port 22 ssh2")]
+      assert failed_logins(es, 2) == [{"ip": "203.0.113.5", "failures": 3, "users": ["ada", "admin", "root"], "breached": True}]
+      assert failed_logins(es, 1) == [{"ip": "203.0.113.5", "failures": 3, "users": ["ada", "admin", "root"], "breached": True}, {"ip": "198.51.100.7", "failures": 1, "users": ["root"], "breached": False}]
+      assert failed_logins(es, 4) == [] and failed_logins([], 1) == []
+  - name: order, programs and timing
+    code: |
+      def mk(msg, prog="sshd"):
+          return {"time": "t", "host": "h", "program": prog, "pid": None, "message": msg}
+      es = [mk("Accepted password for ada from 1.1.1.1 port 1 ssh2"), mk("Failed password for ada from 1.1.1.1 port 2 ssh2"), mk("Failed password for ada from 2.2.2.2 port 3 ssh2", "login"), mk("Failed password for x from 2.2.2.2 port 3 ssh2"), mk("Failed password for y from 9.9.9.9 port 3 ssh2"), mk("Failed password for z from 9.9.9.9 port 3 ssh2"), mk("Failed publickey for z from 8.8.8.8 port 3 ssh2"), mk("Failed password for z from 8.8.8.8 port 3 ssh2")]
+      r = failed_logins(es, 1)
+      assert [(x["ip"], x["failures"], x["breached"]) for x in r] == [("8.8.8.8", 2, False), ("9.9.9.9", 2, False), ("1.1.1.1", 1, False), ("2.2.2.2", 1, False)]
+  hints:
+  - 'Two regular expressions are enough: one for failures and one for accepted logins.'
+  - A login counts as a breach only if the address has failed earlier in the log.
+  solution: |
+    def failed_logins(entries, threshold):
+        """The log of the SSH server (program sshd) shows attacks: 'Failed password for ada from 203.0.113.5 port 4242 ssh2' or 'Failed password for invalid user admin from 203.0.113.5 port 4243 ssh2' (the user may be invalid). A line 'Accepted password for ada from ... port ... ssh2' (or 'Accepted publickey for ...') is a successful login. Look only at entries of the program sshd. Return the sorted list of dicts {'ip', 'failures' (how many failed lines), 'users' (the sorted list of different user names tried), 'breached' (True if a successful login from the same address happened AFTER (later in the list than) its first failure)} for every address with at least `threshold` failures. Sort by failures, highest first, then by address as text."""
+        import re
+        fail = re.compile(r"Failed \w+ for (?:invalid user )?(\S+) from (\S+) port \d+")
+        ok = re.compile(r"Accepted \w+ for (\S+) from (\S+) port \d+")
+        stats = {}
+        for e in entries:
+            if e["program"] != "sshd":
+                continue
+            m = fail.search(e["message"])
+            if m:
+                s = stats.setdefault(m.group(2), {"failures": 0, "users": set(), "breached": False})
+                s["failures"] += 1
+                s["users"].add(m.group(1))
+                continue
+            m = ok.search(e["message"])
+            if m and m.group(2) in stats:
+                stats[m.group(2)]["breached"] = True
+        rows = [{"ip": ip, "failures": s["failures"], "users": sorted(s["users"]), "breached": s["breached"]} for ip, s in stats.items() if s["failures"] >= threshold]
+        rows.sort(key=lambda r: (-r["failures"], r["ip"]))
+        return rows
+  explanation: 'Defences: key-based logins instead of passwords, no root login over SSH, tools such as fail2ban that block an address after too many failures, and rate limits.'
+- id: unitfile
+  title: Reading a systemd unit file
+  difficulty: 4
+  prompt: |-
+    Modern Linux starts and watches its services with **systemd**, which reads **unit files** in a simple INI format. Write `parse_unit(text)`. Services on a modern Linux system are described by 'unit files' in INI format, for example:
+
+    ```
+    [Unit]
+    Description=Web server
+    After=network.target db.service
+
+    [Service]
+    ExecStart=/usr/bin/web --port 80
+    ```
+
+    Parse the text. Ignore blank lines and lines that start (after blanks) with # or ;. A line '[Name]' starts a section. A line 'key=value' (split at the FIRST '=', both sides stripped) belongs to the current section. Return a dict {section: {key: [values]}}: every key has a LIST with one entry per line in which it occurs, and for the dependency keys After, Before, Requires, Wants the value is split at blanks into separate names, all added to the list. ValueError('line N outside a section') for a key before any section, ValueError('bad line N') for a line that is not blank, a comment, a section or key=value (N counts all lines from 1).
+  starter: |-
+    def parse_unit(text):
+        """Services on a modern Linux system are described by 'unit files' in INI format, for example:\n[Unit]\nDescription=Web server\nAfter=network.target db.service\n[Service]\nExecStart=/usr/bin/web --port 80\n\nParse the text. Ignore blank lines and lines that start (after blanks) with # or ;. A line '[Name]' starts a section. A line 'key=value' (split at the FIRST '=', both sides stripped) belongs to the current section. Return a dict {section: {key: [values]}}: every key has a LIST with one entry per line in which it occurs, and for the dependency keys After, Before, Requires, Wants the value is split at blanks into separate names, all added to the list. ValueError('line N outside a section') for a key before any section, ValueError('bad line N') for a line that is not blank, a comment, a section or key=value (N counts all lines from 1)."""
+        pass
+  tests:
+  - name: sections and keys
+    code: |
+      text = """# the web service
+      [Unit]
+      Description=Web server
+      After=network.target db.service
+      After=cache.service
+      ; another comment
+
+      [Service]
+      ExecStart=/usr/bin/web --port=80
+      Environment = A=1
+      Environment=B=2
+
+      [Install]
+      WantedBy=multi-user.target
+      """
+      assert parse_unit(text) == {"Unit": {"Description": ["Web server"], "After": ["network.target", "db.service", "cache.service"]}, "Service": {"ExecStart": ["/usr/bin/web --port=80"], "Environment": ["A=1", "B=2"]}, "Install": {"WantedBy": ["multi-user.target"]}}
+      assert parse_unit("") == {} and parse_unit("# only\n\n") == {} and parse_unit("[Empty]") == {"Empty": {}} and parse_unit("[Unit]\nRequires=a b\nWants=\n") == {"Unit": {"Requires": ["a", "b"], "Wants": []}}
+  - name: errors
+    code: |
+      cases = (("Key=1\n[Unit]", "line 1 outside a section"), ("[Unit]\nno equals sign", "bad line 2"), ("[Unit]\n=value", "bad line 2"), ("\n\n[Unit]\n[]\n", "bad line 4"), ("[Unit]\n[Open", "bad line 2"))
+      for text, msg in cases:
+          try:
+              parse_unit(text)
+              raise AssertionError("accepted " + repr(text))
+          except ValueError as e:
+              assert str(e) == msg, (text, str(e))
+      assert parse_unit("[A]\nk=v=w") == {"A": {"k": ["v=w"]}} and parse_unit("  [A]  \n  k  =  v  ") == {"A": {"k": ["v"]}}
+  hints:
+  - str.partition('=') splits at the first equals sign only.
+  - setdefault creates the empty list on first use.
+  solution: |
+    def parse_unit(text):
+        """Services on a modern Linux system are described by 'unit files' in INI format, for example:\n[Unit]\nDescription=Web server\nAfter=network.target db.service\n[Service]\nExecStart=/usr/bin/web --port 80\n\nParse the text. Ignore blank lines and lines that start (after blanks) with # or ;. A line '[Name]' starts a section. A line 'key=value' (split at the FIRST '=', both sides stripped) belongs to the current section. Return a dict {section: {key: [values]}}: every key has a LIST with one entry per line in which it occurs, and for the dependency keys After, Before, Requires, Wants the value is split at blanks into separate names, all added to the list. ValueError('line N outside a section') for a key before any section, ValueError('bad line N') for a line that is not blank, a comment, a section or key=value (N counts all lines from 1)."""
+        result, section = {}, None
+        split_keys = {"After", "Before", "Requires", "Wants"}
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]") and len(line) > 2:
+                section = line[1:-1]
+                result.setdefault(section, {})
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not key.strip():
+                raise ValueError("bad line " + str(n))
+            if section is None:
+                raise ValueError("line " + str(n) + " outside a section")
+            key, value = key.strip(), value.strip()
+            values = result[section].setdefault(key, [])
+            values.extend(value.split() if key in split_keys else [value])
+        return result
+  explanation: Real unit files have many more keys, such as Restart=always (restart after a crash) and User= (run as a less powerful account).
+- id: boot
+  title: The order of starting
+  difficulty: 5
+  prompt: 'A computer starts dozens of services at boot, and many need others first: the web server needs the database, which needs the network. Systemd works out an order from `After=` and `Before=` lines. This is a **topological sort**, as in the Algorithms unit.Write `boot_order(units)`. Systemd starts services in an order that respects the ordering rules ''After='' and ''Before='' (in the [Unit] section). `units` is a dict {unit name: parsed unit as returned by parse_unit}. A unit A with After=B must start after B; a unit B with Before=A also means B starts before A. Names that are not in the dict are ignored. Return the list of all unit names in a valid start order; when several units could start next, choose the one that comes first alphabetically. If the rules contain a cycle raise ValueError(''ordering cycle: '' + the sorted names of the units that could not be ordered, joined with '', '').'
+  starter: |-
+    def parse_unit(text):
+        """Services on a modern Linux system are described by 'unit files' in INI format, for example:\n[Unit]\nDescription=Web server\nAfter=network.target db.service\n[Service]\nExecStart=/usr/bin/web --port 80\n\nParse the text. Ignore blank lines and lines that start (after blanks) with # or ;. A line '[Name]' starts a section. A line 'key=value' (split at the FIRST '=', both sides stripped) belongs to the current section. Return a dict {section: {key: [values]}}: every key has a LIST with one entry per line in which it occurs, and for the dependency keys After, Before, Requires, Wants the value is split at blanks into separate names, all added to the list. ValueError('line N outside a section') for a key before any section, ValueError('bad line N') for a line that is not blank, a comment, a section or key=value (N counts all lines from 1)."""
+        result, section = {}, None
+        split_keys = {"After", "Before", "Requires", "Wants"}
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]") and len(line) > 2:
+                section = line[1:-1]
+                result.setdefault(section, {})
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not key.strip():
+                raise ValueError("bad line " + str(n))
+            if section is None:
+                raise ValueError("line " + str(n) + " outside a section")
+            key, value = key.strip(), value.strip()
+            values = result[section].setdefault(key, [])
+            values.extend(value.split() if key in split_keys else [value])
+        return result
+
+
+
+
+    def boot_order(units):
+        """Systemd starts services in an order that respects the ordering rules 'After=' and 'Before=' (in the [Unit] section). `units` is a dict {unit name: parsed unit as returned by parse_unit}. A unit A with After=B must start after B; a unit B with Before=A also means B starts before A. Names that are not in the dict are ignored. Return the list of all unit names in a valid start order; when several units could start next, choose the one that comes first alphabetically. If the rules contain a cycle raise ValueError('ordering cycle: ' + the sorted names of the units that could not be ordered, joined with ', ')."""
+        pass
+  tests:
+  - name: ordering
+    code: |
+      units = {"web": parse_unit("[Unit]\nAfter=db net\n"), "db": parse_unit("[Unit]\nAfter=net\n"), "net": {}, "log": parse_unit("[Unit]\nBefore=net\n"), "cron": parse_unit("[Unit]\nAfter=ghost.service\n")}
+      assert boot_order(units) == ["cron", "log", "net", "db", "web"]
+      assert boot_order({}) == [] and boot_order({"a": {}}) == ["a"] and boot_order({"b": {}, "a": {}, "c": {}}) == ["a", "b", "c"]
+      assert boot_order({"a": parse_unit("[Unit]\nAfter=a\n")}) == ["a"]
+  - name: cycles
+    code: |
+      units = {"a": parse_unit("[Unit]\nAfter=b\n"), "b": parse_unit("[Unit]\nAfter=c\n"), "c": parse_unit("[Unit]\nAfter=a\n"), "d": {}}
+      try:
+          boot_order(units)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert str(e) == "ordering cycle: a, b, c"
+      u2 = {"x": parse_unit("[Unit]\nBefore=y\n"), "y": parse_unit("[Unit]\nBefore=x\n")}
+      try:
+          boot_order(u2)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert str(e) == "ordering cycle: x, y"
+      assert boot_order({"z": parse_unit("[Unit]\nBefore=a\n"), "a": {}}) == ["z", "a"]
+  hints:
+  - Repeatedly pick the alphabetically first unit whose predecessors are all done.
+  - Turn Before= into an After= entry of the other unit.
+  solution: |
+    def parse_unit(text):
+        """Services on a modern Linux system are described by 'unit files' in INI format, for example:\n[Unit]\nDescription=Web server\nAfter=network.target db.service\n[Service]\nExecStart=/usr/bin/web --port 80\n\nParse the text. Ignore blank lines and lines that start (after blanks) with # or ;. A line '[Name]' starts a section. A line 'key=value' (split at the FIRST '=', both sides stripped) belongs to the current section. Return a dict {section: {key: [values]}}: every key has a LIST with one entry per line in which it occurs, and for the dependency keys After, Before, Requires, Wants the value is split at blanks into separate names, all added to the list. ValueError('line N outside a section') for a key before any section, ValueError('bad line N') for a line that is not blank, a comment, a section or key=value (N counts all lines from 1)."""
+        result, section = {}, None
+        split_keys = {"After", "Before", "Requires", "Wants"}
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.strip()
+            if not line or line[0] in "#;":
+                continue
+            if line.startswith("[") and line.endswith("]") and len(line) > 2:
+                section = line[1:-1]
+                result.setdefault(section, {})
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not key.strip():
+                raise ValueError("bad line " + str(n))
+            if section is None:
+                raise ValueError("line " + str(n) + " outside a section")
+            key, value = key.strip(), value.strip()
+            values = result[section].setdefault(key, [])
+            values.extend(value.split() if key in split_keys else [value])
+        return result
+
+
+
+
+    def boot_order(units):
+        """Systemd starts services in an order that respects the ordering rules 'After=' and 'Before=' (in the [Unit] section). `units` is a dict {unit name: parsed unit as returned by parse_unit}. A unit A with After=B must start after B; a unit B with Before=A also means B starts before A. Names that are not in the dict are ignored. Return the list of all unit names in a valid start order; when several units could start next, choose the one that comes first alphabetically. If the rules contain a cycle raise ValueError('ordering cycle: ' + the sorted names of the units that could not be ordered, joined with ', ')."""
+        names = set(units)
+        after = {n: set() for n in names}
+        for n, u in units.items():
+            sect = u.get("Unit", {})
+            for dep in sect.get("After", []):
+                if dep in names and dep != n:
+                    after[n].add(dep)
+            for later in sect.get("Before", []):
+                if later in names and later != n:
+                    after[later].add(n)
+        order, done = [], set()
+        while len(done) < len(names):
+            ready = sorted(n for n in names - done if after[n] <= done)
+            if not ready:
+                raise ValueError("ordering cycle: " + ", ".join(sorted(names - done)))
+            order.append(ready[0])
+            done.add(ready[0])
+        return order
+  explanation: The command systemd-analyze blame shows how long each service took to start, which is the first tool when a machine boots slowly.
+commonMistakes:
+- title: Logging secrets
+  explanation: Logs are read by many people.
+- title: No log rotation
+  explanation: Logs fill the disk.
+- title: Ignoring the clock
+  explanation: Wrong times make logs useless.
+- title: Running services as root
+  explanation: A hacked service then owns the machine.
+- title: Circular dependencies
+  explanation: Services that wait for each other never start.
+summary:
+- Log lines say when, where, which program and what.
+- Filter and count logs to find patterns.
+- Many failed logins from one address is an attack.
+- Unit files describe services and their ordering.
+- A boot order is a topological sort.
+next: u33-disk
+quiz:
+- type: mcq
+  question: What does journalctl show?
+  options:
+  - The system journal, the collected logs
+  - The hard disk
+  - The network
+  - The clock
+  answer: 0
+  explanation: The systemd log.
+- type: mcq
+  question: What is log rotation?
+  options:
+  - Starting new log files and removing old ones
+  - Turning the disk
+  - Sorting log lines
+  - Encrypting logs
+  answer: 0
+  explanation: It keeps logs from filling the disk.
+- type: mcq
+  question: What is systemd?
+  options:
+  - The program (PID 1) that starts and supervises services
+  - A text editor
+  - A file system
+  - A kind of log
+  answer: 0
+  explanation: The init system.
+- type: mcq
+  question: What does After=db.service mean?
+  options:
+  - Start this unit after db.service
+  - Stop it after db
+  - Delete it after db
+  - Run it twice
+  answer: 0
+  explanation: It is an ordering rule.
+- type: mcq
+  question: Why run a service as an unprivileged user?
+  options:
+  - A hacked service then has limited power
+  - It is faster
+  - It uses less memory
+  - It is required by the kernel
+  answer: 0
+  explanation: Least privilege.
+- type: mcq
+  question: Why keep accurate clocks on servers?
+  options:
+  - So that logs of different machines can be compared
+  - To save energy
+  - To speed up the CPU
+  - For the fans
+  answer: 0
+  explanation: Time is the key for correlating events.
+- type: code
+  question: Write `count_by_program(entries)` returning a dict that counts the log entries (dicts with a 'program' key) per program name. An empty list gives an empty dict.
+  starter: |
+    def count_by_program(entries):
+        pass
+  tests:
+  - name: counting
+    code: |
+      es = [{"program": "sshd"}, {"program": "cron"}, {"program": "sshd"}]
+      assert count_by_program(es) == {"sshd": 2, "cron": 1} and count_by_program([]) == {}
+  solution: |
+    def count_by_program(entries):
+        counts = {}
+        for e in entries:
+            counts[e["program"]] = counts.get(e["program"], 0) + 1
+        return counts

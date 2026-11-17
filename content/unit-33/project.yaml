@@ -1,0 +1,608 @@
+title: Mini System Doctor
+language: python
+brief: 'Build the first thing an administrator runs when a machine is in trouble: a health check. You
+  are given the parsers you wrote in this unit: the process table, the load average, memory, disks, `fstab`,
+  the system log and failed logins. Your job is to **combine** them into five checks and a report, with
+  one rule that real tools need: *one broken input must never stop the whole check*. Everything works
+  on plain text, so it runs anywhere and you can test it with logs you invent.'
+steps:
+- title: The processor
+  body: 'Write `check_processes`: report a busy load and every problem process.'
+- title: Memory
+  body: 'Write `check_memory`: report high memory use and swap.'
+- title: Storage
+  body: 'Write `check_disks`: report disks that are too full and mistakes in fstab.'
+- title: Security
+  body: 'Write `check_security`: report attackers and, worst of all, a breach.'
+- title: The doctor
+  body: Write `diagnose` (run only the checks whose data is present, survive bad input, decide the severity)
+    and `format_report`.
+checklist:
+- text: Finds overload, busy, zombie and stuck processes
+  test: cpu findings
+- text: Reports memory pressure and swap
+  test: memory findings
+- text: Reports full disks and fstab mistakes
+  test: disk findings
+- text: Finds attackers and breaches in the log
+  test: security findings
+- text: Combines all checks with the right severity
+  test: the whole machine
+- text: Survives broken input
+  test: broken input
+- text: Formats a readable report
+  test: the report
+starter: |-
+  def parse_ps(text):
+      """Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError('no header')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {'pid': int, 'ppid': int, 'state': the FIRST letter of STAT, 'cpu': float, 'mem': float, 'command': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError('bad line N') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1."""
+      lines = text.split("\n")
+      rows, seen_header = [], False
+      for n, line in enumerate(lines, 1):
+          if not line.strip():
+              continue
+          if not seen_header:
+              if not line.split()[0] == "PID":
+                  raise ValueError("no header")
+              seen_header = True
+              continue
+          parts = line.split(None, 5)
+          try:
+              if len(parts) < 6:
+                  raise ValueError
+              rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "state": parts[2][0], "cpu": float(parts[3]), "mem": float(parts[4]), "command": parts[5].strip()})
+          except ValueError:
+              raise ValueError("bad line " + str(n))
+      if not seen_header:
+          raise ValueError("no header")
+      return rows
+
+
+  def find_problems(procs):
+      """The first things an administrator looks for. For every process, in order of pid (and, for one process, in the order below), report: 'pid N: zombie COMMAND (parent PPID)' when the state is Z (a zombie has finished, but its parent has not collected its exit status); 'pid N: stuck in disk wait COMMAND' when the state is D (uninterruptible sleep, usually waiting for a disk or network file system); and 'pid N: busy COMMAND at X%' when cpu is at least 90.0 (X written with one decimal, e.g. 97.5). Return the list of text lines."""
+      problems = []
+      for p in sorted(procs, key=lambda p: p["pid"]):
+          n = str(p["pid"])
+          if p["state"] == "Z":
+              problems.append("pid " + n + ": zombie " + p["command"] + " (parent " + str(p["ppid"]) + ")")
+          if p["state"] == "D":
+              problems.append("pid " + n + ": stuck in disk wait " + p["command"])
+          if p["cpu"] >= 90.0:
+              problems.append("pid " + n + ": busy " + p["command"] + " at " + format(p["cpu"], ".1f") + "%")
+      return problems
+
+
+  def load_report(uptime_text, cores):
+      """The three LOAD AVERAGES are the average number of processes that wanted to run (or were waiting for the disk) over the last 1, 5 and 15 minutes. Take them from the text of the uptime command: the three numbers after 'load average:' separated by commas (a decimal comma is not allowed). ValueError('no load average') if the text has none. Return a dict: 'load' (the tuple of the three floats), 'per_core' (the first number divided by cores, rounded to 2 decimals), 'status' ('idle' below 0.3, 'ok' below 0.7, 'busy' below 1.0, otherwise 'overloaded', using the unrounded per-core value) and 'trend' ('rising' if the 1-minute load is more than 25% above the 15-minute load, 'falling' if it is more than 25% below it, otherwise 'steady'; if the 15-minute load is 0, 'rising' when the 1-minute load is above 0, else 'steady')."""
+      import re
+      m = re.search(r"load average:\s*([0-9.]+),\s*([0-9.]+),\s*([0-9.]+)", uptime_text)
+      if not m:
+          raise ValueError("no load average")
+      a, b, c = (float(x) for x in m.groups())
+      per = a / cores
+      status = "idle" if per < 0.3 else "ok" if per < 0.7 else "busy" if per < 1.0 else "overloaded"
+      if c == 0:
+          trend = "rising" if a > 0 else "steady"
+      else:
+          trend = "rising" if a > c * 1.25 else "falling" if a < c * 0.75 else "steady"
+      return {"load": (a, b, c), "per_core": round(per, 2), "status": status, "trend": trend}
+
+
+  def parse_meminfo(text):
+      """Linux describes its memory in /proc/meminfo, lines such as 'MemTotal:       16384000 kB', 'Active(anon):  100 kB' or 'HugePages_Total:       0' (a count, without unit). Return a dict {name: number} where the name is the text before the colon (with any brackets) and the number the integer after it, in kilobytes for lines with kB (the numbers are not changed) and as it is for lines without a unit. Ignore lines without a colon, without a number or with another unit than kB (such as MB)."""
+      info = {}
+      for line in text.split("\n"):
+          name, sep, rest = line.partition(":")
+          parts = rest.split()
+          if not sep or not parts or not parts[0].isdigit() or len(parts) > 2 or (len(parts) == 2 and parts[1] != "kB"):
+              continue
+          info[name.strip()] = int(parts[0])
+      return info
+
+
+  def memory_summary(info):
+      """What an administrator wants to know from the numbers of parse_meminfo. ValueError('MemTotal missing') if there is no MemTotal. 'Free' memory is a misleading number, because Linux uses spare memory as a cache that it gives back when programs need it. The real number is MemAvailable; if it is missing estimate it as MemFree + Buffers + Cached (missing entries count as 0). Return a dict: 'total_mb', 'available_mb' and 'used_mb' (used = total - available), all in whole megabytes (kB divided by 1024, rounded down with //), 'used_percent' (used / total * 100, rounded to 1 decimal), 'swap_used_mb' (SwapTotal - SwapFree in MB; a missing swap counts as 0) and 'status': 'ok' if used_percent is below 70, 'high' below 90, otherwise 'critical'."""
+      if "MemTotal" not in info:
+          raise ValueError("MemTotal missing")
+      total = info["MemTotal"]
+      available = info["MemAvailable"] if "MemAvailable" in info else info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)
+      used = total - available
+      pct = round(used / total * 100, 1)
+      swap = info.get("SwapTotal", 0) - info.get("SwapFree", 0)
+      status = "ok" if pct < 70 else "high" if pct < 90 else "critical"
+      return {"total_mb": total // 1024, "available_mb": available // 1024, "used_mb": used // 1024, "used_percent": pct, "swap_used_mb": swap // 1024, "status": status}
+
+
+  def parse_syslog(lines, year):
+      """Linux programs write messages to a log, and every line has the same shape: 'Nov 16 10:00:01 myhost sshd[812]: Failed password for ada'. That is month, day, time, host, the program with an optional process id in square brackets, a colon and the message. Parse a list of such lines. Return the list of dicts {'time': 'YYYY-MM-DD HH:MM:SS' (the year is given, the month name is one of the English three-letter names, day and month are padded to two digits), 'host', 'program', 'pid' (an int, or None if there are no brackets) and 'message' (the text after the colon and one blank, otherwise unchanged)}. Lines that do not have this shape (for example continuation lines) are skipped."""
+      import re
+      months = {m: i for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+      pattern = re.compile(r"([A-Z][a-z]{2}) +(\d{1,2}) (\d\d:\d\d:\d\d) (\S+) ([^\s\[:]+)(?:\[(\d+)\])?: ?(.*)")
+      entries = []
+      for line in lines:
+          m = pattern.fullmatch(line.rstrip("\n"))
+          if not m or m.group(1) not in months:
+              continue
+          mon, day, clock, host, prog, pid, message = m.groups()
+          entries.append({"time": "%04d-%02d-%02d %s" % (year, months[mon], int(day), clock), "host": host, "program": prog, "pid": int(pid) if pid else None, "message": message})
+      return entries
+
+
+  def failed_logins(entries, threshold):
+      """The log of the SSH server (program sshd) shows attacks: 'Failed password for ada from 203.0.113.5 port 4242 ssh2' or 'Failed password for invalid user admin from 203.0.113.5 port 4243 ssh2' (the user may be invalid). A line 'Accepted password for ada from ... port ... ssh2' (or 'Accepted publickey for ...') is a successful login. Look only at entries of the program sshd. Return the sorted list of dicts {'ip', 'failures' (how many failed lines), 'users' (the sorted list of different user names tried), 'breached' (True if a successful login from the same address happened AFTER (later in the list than) its first failure)} for every address with at least `threshold` failures. Sort by failures, highest first, then by address as text."""
+      import re
+      fail = re.compile(r"Failed \w+ for (?:invalid user )?(\S+) from (\S+) port \d+")
+      ok = re.compile(r"Accepted \w+ for (\S+) from (\S+) port \d+")
+      stats = {}
+      for e in entries:
+          if e["program"] != "sshd":
+              continue
+          m = fail.search(e["message"])
+          if m:
+              s = stats.setdefault(m.group(2), {"failures": 0, "users": set(), "breached": False})
+              s["failures"] += 1
+              s["users"].add(m.group(1))
+              continue
+          m = ok.search(e["message"])
+          if m and m.group(2) in stats:
+              stats[m.group(2)]["breached"] = True
+      rows = [{"ip": ip, "failures": s["failures"], "users": sorted(s["users"]), "breached": s["breached"]} for ip, s in stats.items() if s["failures"] >= threshold]
+      rows.sort(key=lambda r: (-r["failures"], r["ip"]))
+      return rows
+
+
+  def parse_df(text):
+      """The command 'df -k' shows how full each disk is. Its output has a header line that starts with 'Filesystem' and then one line per disk with six columns separated by blanks: device, size, used, available (all in kilobytes), the use percentage with a % sign, and the mount point (the folder where the disk appears; it is the rest of the line and may contain blanks). Parse the text. Return a list of dicts {'device', 'size', 'used', 'avail' (all three converted to BYTES, 1 kilobyte = 1024 bytes), 'percent' (an int without the % sign) and 'mount'}. Skip blank lines and the header. ValueError('bad line N') for a line with fewer than six columns or with numbers that are not whole numbers (N counts all lines of the text from 1, including the header and blank ones)."""
+      rows = []
+      for n, line in enumerate(text.split("\n"), 1):
+          if not line.strip() or line.startswith("Filesystem"):
+              continue
+          parts = line.split(None, 5)
+          try:
+              if len(parts) < 6 or not parts[4].endswith("%"):
+                  raise ValueError
+              device, size, used, avail, pct, mount = parts
+              rows.append({"device": device, "size": int(size) * 1024, "used": int(used) * 1024, "avail": int(avail) * 1024, "percent": int(pct[:-1]), "mount": mount.strip()})
+          except ValueError:
+              raise ValueError("bad line %d" % n)
+      return rows
+
+
+  def parse_fstab(text):
+      """The file /etc/fstab tells Linux which disks to mount where at boot. Every line has 4 to 6 fields separated by blanks: device, mount point, file system type, options (a comma separated list), dump (a number, default 0) and pass (the order of the check at boot, a number, default 0). Ignore blank lines and lines that start (after blanks) with #. Return a list of dicts {'device', 'mount', 'type', 'options' (a list), 'dump' (int), 'pass' (int)}. ValueError('bad line N') for a line with fewer than 4 or more than 6 fields or with dump or pass that is not a whole number (N counts all lines from 1)."""
+      entries = []
+      for n, raw in enumerate(text.split("\n"), 1):
+          line = raw.strip()
+          if not line or line.startswith("#"):
+              continue
+          f = line.split()
+          if not 4 <= len(f) <= 6:
+              raise ValueError("bad line %d" % n)
+          try:
+              dump = int(f[4]) if len(f) > 4 else 0
+              pas = int(f[5]) if len(f) > 5 else 0
+          except ValueError:
+              raise ValueError("bad line %d" % n)
+          entries.append({"device": f[0], "mount": f[1], "type": f[2], "options": f[3].split(","), "dump": dump, "pass": pas})
+      return entries
+
+
+  def fstab_problems(entries):
+      """A mistake in /etc/fstab can stop a machine from booting, so check it. Given the list of entries from parse_fstab, return a list of problem messages (texts), in this order: 'no root filesystem' if no entry has the mount point '/'; 'root should have pass 1' if the '/' entry has a pass number other than 1; then, for every mount point that is used by more than one entry, 'duplicate mount point X' (sorted by mount point, once each). Entries whose type is 'swap' are ignored completely (they have no real mount point). No problems gives an empty list."""
+      entries = [e for e in entries if e["type"] != "swap"]
+      problems = []
+      roots = [e for e in entries if e["mount"] == "/"]
+      if not roots:
+          problems.append("no root filesystem")
+      elif roots[0]["pass"] != 1:
+          problems.append("root should have pass 1")
+      count = {}
+      for e in entries:
+          count[e["mount"]] = count.get(e["mount"], 0) + 1
+      for mount in sorted(count):
+          if count[mount] > 1:
+              problems.append("duplicate mount point " + mount)
+      return problems
+
+
+  def check_processes(ps_text, uptime_text, cores):
+      """Look at the CPU side of a machine. Use load_report(uptime_text, cores) and find_problems(parse_ps(ps_text)). Return a list of findings (texts): first, if the load status is 'busy' or 'overloaded', the text 'load is STATUS (P per core, TREND)' with the status, the per_core number as it is and the trend (for example 'load is overloaded (1.62 per core, rising)'); then every line of find_problems unchanged. A healthy machine gives an empty list."""
+      pass
+
+
+  def check_memory(meminfo_text):
+      """Look at the memory. Use memory_summary(parse_meminfo(meminfo_text)). Return a list of findings: if the status is not 'ok', the text 'memory STATUS: P% used (U of T MB)' with the status, used_percent, used_mb and total_mb (for example 'memory critical: 93.9% used (15024 of 16000 MB)'); then, if swap_used_mb is above 0, 'swap in use: S MB'."""
+      pass
+
+
+  def check_disks(df_text, fstab_text, threshold):
+      """Look at the storage. For every disk of parse_df(df_text) whose percent is at least `threshold`, in the order of the highest percent first and then by mount point, add 'disk MOUNT is P% full'. Then, unless fstab_text is None (no fstab to check), add 'fstab: PROBLEM' for every problem found by fstab_problems(parse_fstab(fstab_text))."""
+      pass
+
+
+  def check_security(log_lines, year, threshold):
+      """Look at the login attempts. Use failed_logins(parse_syslog(log_lines, year), threshold). For every address add 'attack from IP: N failures (users: A, B)' with the user names joined by ', '. If the address also logged in successfully (breached), add right after it 'BREACH: IP logged in after failed attempts'."""
+      pass
+
+
+  def diagnose(snapshot):
+      """Check a whole machine. `snapshot` is a dict that may contain: 'ps', 'uptime' and 'cores' (default 1) for check_processes; 'meminfo' for check_memory; 'df', 'fstab' (default None, which means: no fstab check) and 'disk_threshold' (default 85) for check_disks; 'syslog' (a list of lines), 'year' (default 2026) and 'fail_threshold' (default 3) for check_security. The areas are 'cpu' (needs 'ps' and 'uptime'), 'memory', 'disk' (needs 'df') and 'security' (needs 'syslog'), always checked in that order; an area whose required keys are missing is not checked. If a check raises ValueError the area's only finding is 'could not check (MESSAGE)'. Return {'severity', 'checked' (the list of area names checked), 'findings' (texts 'AREA: finding')}. The severity is 'critical' if any finding contains 'critical', 'overloaded' or 'BREACH', otherwise 'warning' if there is any finding, otherwise 'ok'."""
+      pass
+
+
+  def format_report(result):
+      """Turn the result of diagnose into the lines of a report: 'Health: SEVERITY' (the severity in capitals), then 'Checked: A, B' (the areas joined by ', ', or 'Checked: nothing' if there are none), then either 'No problems found.' or one line '- FINDING' for every finding."""
+      pass
+tests:
+- name: cpu findings
+  code: |
+    PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n310 200 R 97.5 2.0 python3 miner.py\n455 1 Z 0.0 0.0 worker <defunct>\n512 1 D 0.1 0.2 backup\n"
+    UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 6.50, 4.00, 2.00"
+    CALM_PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n"
+    CALM_UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 0.20, 0.30, 0.25"
+    MEM = "MemTotal: 16384000 kB\nMemFree: 500000 kB\nMemAvailable: 1000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n"
+    FINE_MEM = "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+    DF = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 1000 950 50 95% /\n/dev/sdb1 1000 500 500 50% /data\n/dev/sdc1 1000 870 130 87% /boot\n"
+    FS = "UUID=1 / ext4 defaults 0 2\n/dev/sdb /data ext4 defaults\n/dev/sdc /data ext4 defaults\n"
+    GOOD_FS = "UUID=1 / ext4 defaults 0 1\n/dev/sdb /data ext4 defaults 0 2\n"
+    LOG = ["Nov 16 10:00:01 h sshd[1]: Failed password for invalid user admin from 203.0.113.5 port 1 ssh2", "Nov 16 10:00:02 h sshd[1]: Failed password for root from 203.0.113.5 port 2 ssh2", "Nov 16 10:00:03 h sshd[1]: Failed password for ada from 203.0.113.5 port 3 ssh2", "Nov 16 10:01:00 h sshd[2]: Accepted password for ada from 203.0.113.5 port 4 ssh2", "Nov 16 10:02:00 h sshd[3]: Failed password for bo from 198.51.100.7 port 1 ssh2"]
+
+    assert check_processes(PS, UP, 4) == ["load is overloaded (1.62 per core, rising)", "pid 310: busy python3 miner.py at 97.5%", "pid 455: zombie worker <defunct> (parent 1)", "pid 512: stuck in disk wait backup"]
+    assert check_processes(CALM_PS, CALM_UP, 4) == []
+    assert check_processes(CALM_PS, " up 1 day, load average: 0.80, 0.80, 0.80", 1) == ["load is busy (0.8 per core, steady)"]
+    try:
+        check_processes(PS, "no numbers here", 4)
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert str(e) == "no load average"
+- name: memory findings
+  code: |
+    PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n310 200 R 97.5 2.0 python3 miner.py\n455 1 Z 0.0 0.0 worker <defunct>\n512 1 D 0.1 0.2 backup\n"
+    UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 6.50, 4.00, 2.00"
+    CALM_PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n"
+    CALM_UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 0.20, 0.30, 0.25"
+    MEM = "MemTotal: 16384000 kB\nMemFree: 500000 kB\nMemAvailable: 1000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n"
+    FINE_MEM = "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+    DF = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 1000 950 50 95% /\n/dev/sdb1 1000 500 500 50% /data\n/dev/sdc1 1000 870 130 87% /boot\n"
+    FS = "UUID=1 / ext4 defaults 0 2\n/dev/sdb /data ext4 defaults\n/dev/sdc /data ext4 defaults\n"
+    GOOD_FS = "UUID=1 / ext4 defaults 0 1\n/dev/sdb /data ext4 defaults 0 2\n"
+    LOG = ["Nov 16 10:00:01 h sshd[1]: Failed password for invalid user admin from 203.0.113.5 port 1 ssh2", "Nov 16 10:00:02 h sshd[1]: Failed password for root from 203.0.113.5 port 2 ssh2", "Nov 16 10:00:03 h sshd[1]: Failed password for ada from 203.0.113.5 port 3 ssh2", "Nov 16 10:01:00 h sshd[2]: Accepted password for ada from 203.0.113.5 port 4 ssh2", "Nov 16 10:02:00 h sshd[3]: Failed password for bo from 198.51.100.7 port 1 ssh2"]
+
+    assert check_memory(MEM) == ["memory critical: 93.9% used (15023 of 16000 MB)", "swap in use: 1024 MB"]
+    assert check_memory(FINE_MEM) == []
+    assert check_memory("MemTotal: 1000 kB\nMemAvailable: 200 kB\n") == ["memory high: 80.0% used (0 of 0 MB)"]
+    try:
+        check_memory("nothing")
+        raise AssertionError("accepted")
+    except ValueError as e:
+        assert str(e) == "MemTotal missing"
+- name: disk findings
+  code: |
+    PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n310 200 R 97.5 2.0 python3 miner.py\n455 1 Z 0.0 0.0 worker <defunct>\n512 1 D 0.1 0.2 backup\n"
+    UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 6.50, 4.00, 2.00"
+    CALM_PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n"
+    CALM_UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 0.20, 0.30, 0.25"
+    MEM = "MemTotal: 16384000 kB\nMemFree: 500000 kB\nMemAvailable: 1000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n"
+    FINE_MEM = "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+    DF = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 1000 950 50 95% /\n/dev/sdb1 1000 500 500 50% /data\n/dev/sdc1 1000 870 130 87% /boot\n"
+    FS = "UUID=1 / ext4 defaults 0 2\n/dev/sdb /data ext4 defaults\n/dev/sdc /data ext4 defaults\n"
+    GOOD_FS = "UUID=1 / ext4 defaults 0 1\n/dev/sdb /data ext4 defaults 0 2\n"
+    LOG = ["Nov 16 10:00:01 h sshd[1]: Failed password for invalid user admin from 203.0.113.5 port 1 ssh2", "Nov 16 10:00:02 h sshd[1]: Failed password for root from 203.0.113.5 port 2 ssh2", "Nov 16 10:00:03 h sshd[1]: Failed password for ada from 203.0.113.5 port 3 ssh2", "Nov 16 10:01:00 h sshd[2]: Accepted password for ada from 203.0.113.5 port 4 ssh2", "Nov 16 10:02:00 h sshd[3]: Failed password for bo from 198.51.100.7 port 1 ssh2"]
+
+    assert check_disks(DF, FS, 85) == ["disk / is 95% full", "disk /boot is 87% full", "fstab: root should have pass 1", "fstab: duplicate mount point /data"]
+    assert check_disks(DF, GOOD_FS, 90) == ["disk / is 95% full"]
+    assert check_disks(DF, GOOD_FS, 99) == []
+    assert check_disks("Filesystem x\n/dev/a 10 5 5 50% /\n/dev/b 10 5 5 50% /b\n", "", 50) == ["disk / is 50% full", "disk /b is 50% full", "fstab: no root filesystem"]
+- name: security findings
+  code: |
+    PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n310 200 R 97.5 2.0 python3 miner.py\n455 1 Z 0.0 0.0 worker <defunct>\n512 1 D 0.1 0.2 backup\n"
+    UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 6.50, 4.00, 2.00"
+    CALM_PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n"
+    CALM_UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 0.20, 0.30, 0.25"
+    MEM = "MemTotal: 16384000 kB\nMemFree: 500000 kB\nMemAvailable: 1000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n"
+    FINE_MEM = "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+    DF = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 1000 950 50 95% /\n/dev/sdb1 1000 500 500 50% /data\n/dev/sdc1 1000 870 130 87% /boot\n"
+    FS = "UUID=1 / ext4 defaults 0 2\n/dev/sdb /data ext4 defaults\n/dev/sdc /data ext4 defaults\n"
+    GOOD_FS = "UUID=1 / ext4 defaults 0 1\n/dev/sdb /data ext4 defaults 0 2\n"
+    LOG = ["Nov 16 10:00:01 h sshd[1]: Failed password for invalid user admin from 203.0.113.5 port 1 ssh2", "Nov 16 10:00:02 h sshd[1]: Failed password for root from 203.0.113.5 port 2 ssh2", "Nov 16 10:00:03 h sshd[1]: Failed password for ada from 203.0.113.5 port 3 ssh2", "Nov 16 10:01:00 h sshd[2]: Accepted password for ada from 203.0.113.5 port 4 ssh2", "Nov 16 10:02:00 h sshd[3]: Failed password for bo from 198.51.100.7 port 1 ssh2"]
+
+    assert check_security(LOG, 2026, 3) == ["attack from 203.0.113.5: 3 failures (users: ada, admin, root)", "BREACH: 203.0.113.5 logged in after failed attempts"]
+    assert check_security(LOG, 2026, 1) == ["attack from 203.0.113.5: 3 failures (users: ada, admin, root)", "BREACH: 203.0.113.5 logged in after failed attempts", "attack from 198.51.100.7: 1 failures (users: bo)"]
+    assert check_security(LOG, 2026, 4) == [] and check_security([], 2026, 1) == []
+- name: the whole machine
+  code: |
+    PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n310 200 R 97.5 2.0 python3 miner.py\n455 1 Z 0.0 0.0 worker <defunct>\n512 1 D 0.1 0.2 backup\n"
+    UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 6.50, 4.00, 2.00"
+    CALM_PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n"
+    CALM_UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 0.20, 0.30, 0.25"
+    MEM = "MemTotal: 16384000 kB\nMemFree: 500000 kB\nMemAvailable: 1000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n"
+    FINE_MEM = "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+    DF = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 1000 950 50 95% /\n/dev/sdb1 1000 500 500 50% /data\n/dev/sdc1 1000 870 130 87% /boot\n"
+    FS = "UUID=1 / ext4 defaults 0 2\n/dev/sdb /data ext4 defaults\n/dev/sdc /data ext4 defaults\n"
+    GOOD_FS = "UUID=1 / ext4 defaults 0 1\n/dev/sdb /data ext4 defaults 0 2\n"
+    LOG = ["Nov 16 10:00:01 h sshd[1]: Failed password for invalid user admin from 203.0.113.5 port 1 ssh2", "Nov 16 10:00:02 h sshd[1]: Failed password for root from 203.0.113.5 port 2 ssh2", "Nov 16 10:00:03 h sshd[1]: Failed password for ada from 203.0.113.5 port 3 ssh2", "Nov 16 10:01:00 h sshd[2]: Accepted password for ada from 203.0.113.5 port 4 ssh2", "Nov 16 10:02:00 h sshd[3]: Failed password for bo from 198.51.100.7 port 1 ssh2"]
+
+    snap = {"ps": PS, "uptime": UP, "cores": 4, "meminfo": MEM, "df": DF, "fstab": FS, "syslog": LOG}
+    r = diagnose(snap)
+    assert r["severity"] == "critical" and r["checked"] == ["cpu", "memory", "disk", "security"]
+    assert r["findings"] == ["cpu: load is overloaded (1.62 per core, rising)", "cpu: pid 310: busy python3 miner.py at 97.5%", "cpu: pid 455: zombie worker <defunct> (parent 1)", "cpu: pid 512: stuck in disk wait backup", "memory: memory critical: 93.9% used (15023 of 16000 MB)", "memory: swap in use: 1024 MB", "disk: disk / is 95% full", "disk: disk /boot is 87% full", "disk: fstab: root should have pass 1", "disk: fstab: duplicate mount point /data", "security: attack from 203.0.113.5: 3 failures (users: ada, admin, root)", "security: BREACH: 203.0.113.5 logged in after failed attempts"]
+    calm = {"ps": CALM_PS, "uptime": CALM_UP, "cores": 4, "meminfo": FINE_MEM, "df": DF.replace("95%", "10%").replace("87%", "20%"), "syslog": []}
+    assert diagnose(calm) == {"severity": "ok", "checked": ["cpu", "memory", "disk", "security"], "findings": []}
+    assert diagnose({}) == {"severity": "ok", "checked": [], "findings": []}
+    assert diagnose({"ps": PS}) == {"severity": "ok", "checked": [], "findings": []}
+    w = diagnose({"df": DF, "disk_threshold": 90, "fstab": GOOD_FS})
+    assert w == {"severity": "warning", "checked": ["disk"], "findings": ["disk: disk / is 95% full"]}
+- name: broken input
+  code: |
+    PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n310 200 R 97.5 2.0 python3 miner.py\n455 1 Z 0.0 0.0 worker <defunct>\n512 1 D 0.1 0.2 backup\n"
+    UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 6.50, 4.00, 2.00"
+    CALM_PS = "PID PPID STAT %CPU %MEM COMMAND\n1 0 Ss 0.0 0.1 systemd\n200 1 Ss 0.5 0.3 sshd\n"
+    CALM_UP = " 10:00:00 up 3 days,  2:14,  2 users,  load average: 0.20, 0.30, 0.25"
+    MEM = "MemTotal: 16384000 kB\nMemFree: 500000 kB\nMemAvailable: 1000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n"
+    FINE_MEM = "MemTotal: 16384000 kB\nMemAvailable: 12000000 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+    DF = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/sda1 1000 950 50 95% /\n/dev/sdb1 1000 500 500 50% /data\n/dev/sdc1 1000 870 130 87% /boot\n"
+    FS = "UUID=1 / ext4 defaults 0 2\n/dev/sdb /data ext4 defaults\n/dev/sdc /data ext4 defaults\n"
+    GOOD_FS = "UUID=1 / ext4 defaults 0 1\n/dev/sdb /data ext4 defaults 0 2\n"
+    LOG = ["Nov 16 10:00:01 h sshd[1]: Failed password for invalid user admin from 203.0.113.5 port 1 ssh2", "Nov 16 10:00:02 h sshd[1]: Failed password for root from 203.0.113.5 port 2 ssh2", "Nov 16 10:00:03 h sshd[1]: Failed password for ada from 203.0.113.5 port 3 ssh2", "Nov 16 10:01:00 h sshd[2]: Accepted password for ada from 203.0.113.5 port 4 ssh2", "Nov 16 10:02:00 h sshd[3]: Failed password for bo from 198.51.100.7 port 1 ssh2"]
+
+    r = diagnose({"uptime": "x", "ps": PS, "meminfo": "nothing", "df": "a b\n", "syslog": ["garbage"]})
+    assert r == {"severity": "warning", "checked": ["cpu", "memory", "disk", "security"], "findings": ["cpu: could not check (no load average)", "memory: could not check (MemTotal missing)", "disk: could not check (bad line 1)"]}
+    r = diagnose({"meminfo": FINE_MEM, "syslog": LOG, "fail_threshold": 2, "year": 2025})
+    assert r["checked"] == ["memory", "security"] and r["severity"] == "critical" and r["findings"][0].startswith("security: attack from 203.0.113.5")
+- name: the report
+  code: |
+    assert format_report({"severity": "ok", "checked": ["cpu", "disk"], "findings": []}) == ["Health: OK", "Checked: cpu, disk", "No problems found."]
+    assert format_report({"severity": "warning", "checked": ["disk"], "findings": ["disk: disk / is 95% full"]}) == ["Health: WARNING", "Checked: disk", "- disk: disk / is 95% full"]
+    assert format_report({"severity": "ok", "checked": [], "findings": []}) == ["Health: OK", "Checked: nothing", "No problems found."]
+    assert format_report({"severity": "critical", "checked": ["memory", "security"], "findings": ["a", "b"]}) == ["Health: CRITICAL", "Checked: memory, security", "- a", "- b"]
+solution: |
+  def parse_ps(text):
+      """Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError('no header')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {'pid': int, 'ppid': int, 'state': the FIRST letter of STAT, 'cpu': float, 'mem': float, 'command': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError('bad line N') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1."""
+      lines = text.split("\n")
+      rows, seen_header = [], False
+      for n, line in enumerate(lines, 1):
+          if not line.strip():
+              continue
+          if not seen_header:
+              if not line.split()[0] == "PID":
+                  raise ValueError("no header")
+              seen_header = True
+              continue
+          parts = line.split(None, 5)
+          try:
+              if len(parts) < 6:
+                  raise ValueError
+              rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "state": parts[2][0], "cpu": float(parts[3]), "mem": float(parts[4]), "command": parts[5].strip()})
+          except ValueError:
+              raise ValueError("bad line " + str(n))
+      if not seen_header:
+          raise ValueError("no header")
+      return rows
+
+
+  def find_problems(procs):
+      """The first things an administrator looks for. For every process, in order of pid (and, for one process, in the order below), report: 'pid N: zombie COMMAND (parent PPID)' when the state is Z (a zombie has finished, but its parent has not collected its exit status); 'pid N: stuck in disk wait COMMAND' when the state is D (uninterruptible sleep, usually waiting for a disk or network file system); and 'pid N: busy COMMAND at X%' when cpu is at least 90.0 (X written with one decimal, e.g. 97.5). Return the list of text lines."""
+      problems = []
+      for p in sorted(procs, key=lambda p: p["pid"]):
+          n = str(p["pid"])
+          if p["state"] == "Z":
+              problems.append("pid " + n + ": zombie " + p["command"] + " (parent " + str(p["ppid"]) + ")")
+          if p["state"] == "D":
+              problems.append("pid " + n + ": stuck in disk wait " + p["command"])
+          if p["cpu"] >= 90.0:
+              problems.append("pid " + n + ": busy " + p["command"] + " at " + format(p["cpu"], ".1f") + "%")
+      return problems
+
+
+  def load_report(uptime_text, cores):
+      """The three LOAD AVERAGES are the average number of processes that wanted to run (or were waiting for the disk) over the last 1, 5 and 15 minutes. Take them from the text of the uptime command: the three numbers after 'load average:' separated by commas (a decimal comma is not allowed). ValueError('no load average') if the text has none. Return a dict: 'load' (the tuple of the three floats), 'per_core' (the first number divided by cores, rounded to 2 decimals), 'status' ('idle' below 0.3, 'ok' below 0.7, 'busy' below 1.0, otherwise 'overloaded', using the unrounded per-core value) and 'trend' ('rising' if the 1-minute load is more than 25% above the 15-minute load, 'falling' if it is more than 25% below it, otherwise 'steady'; if the 15-minute load is 0, 'rising' when the 1-minute load is above 0, else 'steady')."""
+      import re
+      m = re.search(r"load average:\s*([0-9.]+),\s*([0-9.]+),\s*([0-9.]+)", uptime_text)
+      if not m:
+          raise ValueError("no load average")
+      a, b, c = (float(x) for x in m.groups())
+      per = a / cores
+      status = "idle" if per < 0.3 else "ok" if per < 0.7 else "busy" if per < 1.0 else "overloaded"
+      if c == 0:
+          trend = "rising" if a > 0 else "steady"
+      else:
+          trend = "rising" if a > c * 1.25 else "falling" if a < c * 0.75 else "steady"
+      return {"load": (a, b, c), "per_core": round(per, 2), "status": status, "trend": trend}
+
+
+  def parse_meminfo(text):
+      """Linux describes its memory in /proc/meminfo, lines such as 'MemTotal:       16384000 kB', 'Active(anon):  100 kB' or 'HugePages_Total:       0' (a count, without unit). Return a dict {name: number} where the name is the text before the colon (with any brackets) and the number the integer after it, in kilobytes for lines with kB (the numbers are not changed) and as it is for lines without a unit. Ignore lines without a colon, without a number or with another unit than kB (such as MB)."""
+      info = {}
+      for line in text.split("\n"):
+          name, sep, rest = line.partition(":")
+          parts = rest.split()
+          if not sep or not parts or not parts[0].isdigit() or len(parts) > 2 or (len(parts) == 2 and parts[1] != "kB"):
+              continue
+          info[name.strip()] = int(parts[0])
+      return info
+
+
+  def memory_summary(info):
+      """What an administrator wants to know from the numbers of parse_meminfo. ValueError('MemTotal missing') if there is no MemTotal. 'Free' memory is a misleading number, because Linux uses spare memory as a cache that it gives back when programs need it. The real number is MemAvailable; if it is missing estimate it as MemFree + Buffers + Cached (missing entries count as 0). Return a dict: 'total_mb', 'available_mb' and 'used_mb' (used = total - available), all in whole megabytes (kB divided by 1024, rounded down with //), 'used_percent' (used / total * 100, rounded to 1 decimal), 'swap_used_mb' (SwapTotal - SwapFree in MB; a missing swap counts as 0) and 'status': 'ok' if used_percent is below 70, 'high' below 90, otherwise 'critical'."""
+      if "MemTotal" not in info:
+          raise ValueError("MemTotal missing")
+      total = info["MemTotal"]
+      available = info["MemAvailable"] if "MemAvailable" in info else info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)
+      used = total - available
+      pct = round(used / total * 100, 1)
+      swap = info.get("SwapTotal", 0) - info.get("SwapFree", 0)
+      status = "ok" if pct < 70 else "high" if pct < 90 else "critical"
+      return {"total_mb": total // 1024, "available_mb": available // 1024, "used_mb": used // 1024, "used_percent": pct, "swap_used_mb": swap // 1024, "status": status}
+
+
+  def parse_syslog(lines, year):
+      """Linux programs write messages to a log, and every line has the same shape: 'Nov 16 10:00:01 myhost sshd[812]: Failed password for ada'. That is month, day, time, host, the program with an optional process id in square brackets, a colon and the message. Parse a list of such lines. Return the list of dicts {'time': 'YYYY-MM-DD HH:MM:SS' (the year is given, the month name is one of the English three-letter names, day and month are padded to two digits), 'host', 'program', 'pid' (an int, or None if there are no brackets) and 'message' (the text after the colon and one blank, otherwise unchanged)}. Lines that do not have this shape (for example continuation lines) are skipped."""
+      import re
+      months = {m: i for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+      pattern = re.compile(r"([A-Z][a-z]{2}) +(\d{1,2}) (\d\d:\d\d:\d\d) (\S+) ([^\s\[:]+)(?:\[(\d+)\])?: ?(.*)")
+      entries = []
+      for line in lines:
+          m = pattern.fullmatch(line.rstrip("\n"))
+          if not m or m.group(1) not in months:
+              continue
+          mon, day, clock, host, prog, pid, message = m.groups()
+          entries.append({"time": "%04d-%02d-%02d %s" % (year, months[mon], int(day), clock), "host": host, "program": prog, "pid": int(pid) if pid else None, "message": message})
+      return entries
+
+
+  def failed_logins(entries, threshold):
+      """The log of the SSH server (program sshd) shows attacks: 'Failed password for ada from 203.0.113.5 port 4242 ssh2' or 'Failed password for invalid user admin from 203.0.113.5 port 4243 ssh2' (the user may be invalid). A line 'Accepted password for ada from ... port ... ssh2' (or 'Accepted publickey for ...') is a successful login. Look only at entries of the program sshd. Return the sorted list of dicts {'ip', 'failures' (how many failed lines), 'users' (the sorted list of different user names tried), 'breached' (True if a successful login from the same address happened AFTER (later in the list than) its first failure)} for every address with at least `threshold` failures. Sort by failures, highest first, then by address as text."""
+      import re
+      fail = re.compile(r"Failed \w+ for (?:invalid user )?(\S+) from (\S+) port \d+")
+      ok = re.compile(r"Accepted \w+ for (\S+) from (\S+) port \d+")
+      stats = {}
+      for e in entries:
+          if e["program"] != "sshd":
+              continue
+          m = fail.search(e["message"])
+          if m:
+              s = stats.setdefault(m.group(2), {"failures": 0, "users": set(), "breached": False})
+              s["failures"] += 1
+              s["users"].add(m.group(1))
+              continue
+          m = ok.search(e["message"])
+          if m and m.group(2) in stats:
+              stats[m.group(2)]["breached"] = True
+      rows = [{"ip": ip, "failures": s["failures"], "users": sorted(s["users"]), "breached": s["breached"]} for ip, s in stats.items() if s["failures"] >= threshold]
+      rows.sort(key=lambda r: (-r["failures"], r["ip"]))
+      return rows
+
+
+  def parse_df(text):
+      """The command 'df -k' shows how full each disk is. Its output has a header line that starts with 'Filesystem' and then one line per disk with six columns separated by blanks: device, size, used, available (all in kilobytes), the use percentage with a % sign, and the mount point (the folder where the disk appears; it is the rest of the line and may contain blanks). Parse the text. Return a list of dicts {'device', 'size', 'used', 'avail' (all three converted to BYTES, 1 kilobyte = 1024 bytes), 'percent' (an int without the % sign) and 'mount'}. Skip blank lines and the header. ValueError('bad line N') for a line with fewer than six columns or with numbers that are not whole numbers (N counts all lines of the text from 1, including the header and blank ones)."""
+      rows = []
+      for n, line in enumerate(text.split("\n"), 1):
+          if not line.strip() or line.startswith("Filesystem"):
+              continue
+          parts = line.split(None, 5)
+          try:
+              if len(parts) < 6 or not parts[4].endswith("%"):
+                  raise ValueError
+              device, size, used, avail, pct, mount = parts
+              rows.append({"device": device, "size": int(size) * 1024, "used": int(used) * 1024, "avail": int(avail) * 1024, "percent": int(pct[:-1]), "mount": mount.strip()})
+          except ValueError:
+              raise ValueError("bad line %d" % n)
+      return rows
+
+
+  def parse_fstab(text):
+      """The file /etc/fstab tells Linux which disks to mount where at boot. Every line has 4 to 6 fields separated by blanks: device, mount point, file system type, options (a comma separated list), dump (a number, default 0) and pass (the order of the check at boot, a number, default 0). Ignore blank lines and lines that start (after blanks) with #. Return a list of dicts {'device', 'mount', 'type', 'options' (a list), 'dump' (int), 'pass' (int)}. ValueError('bad line N') for a line with fewer than 4 or more than 6 fields or with dump or pass that is not a whole number (N counts all lines from 1)."""
+      entries = []
+      for n, raw in enumerate(text.split("\n"), 1):
+          line = raw.strip()
+          if not line or line.startswith("#"):
+              continue
+          f = line.split()
+          if not 4 <= len(f) <= 6:
+              raise ValueError("bad line %d" % n)
+          try:
+              dump = int(f[4]) if len(f) > 4 else 0
+              pas = int(f[5]) if len(f) > 5 else 0
+          except ValueError:
+              raise ValueError("bad line %d" % n)
+          entries.append({"device": f[0], "mount": f[1], "type": f[2], "options": f[3].split(","), "dump": dump, "pass": pas})
+      return entries
+
+
+  def fstab_problems(entries):
+      """A mistake in /etc/fstab can stop a machine from booting, so check it. Given the list of entries from parse_fstab, return a list of problem messages (texts), in this order: 'no root filesystem' if no entry has the mount point '/'; 'root should have pass 1' if the '/' entry has a pass number other than 1; then, for every mount point that is used by more than one entry, 'duplicate mount point X' (sorted by mount point, once each). Entries whose type is 'swap' are ignored completely (they have no real mount point). No problems gives an empty list."""
+      entries = [e for e in entries if e["type"] != "swap"]
+      problems = []
+      roots = [e for e in entries if e["mount"] == "/"]
+      if not roots:
+          problems.append("no root filesystem")
+      elif roots[0]["pass"] != 1:
+          problems.append("root should have pass 1")
+      count = {}
+      for e in entries:
+          count[e["mount"]] = count.get(e["mount"], 0) + 1
+      for mount in sorted(count):
+          if count[mount] > 1:
+              problems.append("duplicate mount point " + mount)
+      return problems
+
+
+  def check_processes(ps_text, uptime_text, cores):
+      """Look at the CPU side of a machine. Use load_report(uptime_text, cores) and find_problems(parse_ps(ps_text)). Return a list of findings (texts): first, if the load status is 'busy' or 'overloaded', the text 'load is STATUS (P per core, TREND)' with the status, the per_core number as it is and the trend (for example 'load is overloaded (1.62 per core, rising)'); then every line of find_problems unchanged. A healthy machine gives an empty list."""
+      findings = []
+      report = load_report(uptime_text, cores)
+      if report["status"] in ("busy", "overloaded"):
+          findings.append("load is " + report["status"] + " (" + str(report["per_core"]) + " per core, " + report["trend"] + ")")
+      findings.extend(find_problems(parse_ps(ps_text)))
+      return findings
+
+
+  def check_memory(meminfo_text):
+      """Look at the memory. Use memory_summary(parse_meminfo(meminfo_text)). Return a list of findings: if the status is not 'ok', the text 'memory STATUS: P% used (U of T MB)' with the status, used_percent, used_mb and total_mb (for example 'memory critical: 93.9% used (15024 of 16000 MB)'); then, if swap_used_mb is above 0, 'swap in use: S MB'."""
+      s = memory_summary(parse_meminfo(meminfo_text))
+      findings = []
+      if s["status"] != "ok":
+          findings.append("memory " + s["status"] + ": " + str(s["used_percent"]) + "% used (" + str(s["used_mb"]) + " of " + str(s["total_mb"]) + " MB)")
+      if s["swap_used_mb"] > 0:
+          findings.append("swap in use: " + str(s["swap_used_mb"]) + " MB")
+      return findings
+
+
+  def check_disks(df_text, fstab_text, threshold):
+      """Look at the storage. For every disk of parse_df(df_text) whose percent is at least `threshold`, in the order of the highest percent first and then by mount point, add 'disk MOUNT is P% full'. Then, unless fstab_text is None (no fstab to check), add 'fstab: PROBLEM' for every problem found by fstab_problems(parse_fstab(fstab_text))."""
+      findings = []
+      full = [d for d in parse_df(df_text) if d["percent"] >= threshold]
+      for d in sorted(full, key=lambda d: (-d["percent"], d["mount"])):
+          findings.append("disk " + d["mount"] + " is " + str(d["percent"]) + "% full")
+      if fstab_text is not None:
+          for problem in fstab_problems(parse_fstab(fstab_text)):
+              findings.append("fstab: " + problem)
+      return findings
+
+
+  def check_security(log_lines, year, threshold):
+      """Look at the login attempts. Use failed_logins(parse_syslog(log_lines, year), threshold). For every address add 'attack from IP: N failures (users: A, B)' with the user names joined by ', '. If the address also logged in successfully (breached), add right after it 'BREACH: IP logged in after failed attempts'."""
+      findings = []
+      for row in failed_logins(parse_syslog(log_lines, year), threshold):
+          findings.append("attack from " + row["ip"] + ": " + str(row["failures"]) + " failures (users: " + ", ".join(row["users"]) + ")")
+          if row["breached"]:
+              findings.append("BREACH: " + row["ip"] + " logged in after failed attempts")
+      return findings
+
+
+  def diagnose(snapshot):
+      """Check a whole machine. `snapshot` is a dict that may contain: 'ps', 'uptime' and 'cores' (default 1) for check_processes; 'meminfo' for check_memory; 'df', 'fstab' (default None, which means: no fstab check) and 'disk_threshold' (default 85) for check_disks; 'syslog' (a list of lines), 'year' (default 2026) and 'fail_threshold' (default 3) for check_security. The areas are 'cpu' (needs 'ps' and 'uptime'), 'memory', 'disk' (needs 'df') and 'security' (needs 'syslog'), always checked in that order; an area whose required keys are missing is not checked. If a check raises ValueError the area's only finding is 'could not check (MESSAGE)'. Return {'severity', 'checked' (the list of area names checked), 'findings' (texts 'AREA: finding')}. The severity is 'critical' if any finding contains 'critical', 'overloaded' or 'BREACH', otherwise 'warning' if there is any finding, otherwise 'ok'."""
+      checks = [
+          ("cpu", ("ps", "uptime"), lambda s: check_processes(s["ps"], s["uptime"], s.get("cores", 1))),
+          ("memory", ("meminfo",), lambda s: check_memory(s["meminfo"])),
+          ("disk", ("df",), lambda s: check_disks(s["df"], s.get("fstab"), s.get("disk_threshold", 85))),
+          ("security", ("syslog",), lambda s: check_security(s["syslog"], s.get("year", 2026), s.get("fail_threshold", 3))),
+      ]
+      checked, findings = [], []
+      for area, needs, run_check in checks:
+          if not all(k in snapshot for k in needs):
+              continue
+          checked.append(area)
+          try:
+              found = run_check(snapshot)
+          except ValueError as e:
+              found = ["could not check (" + str(e) + ")"]
+          findings.extend(area + ": " + f for f in found)
+      if any("critical" in f or "overloaded" in f or "BREACH" in f for f in findings):
+          severity = "critical"
+      else:
+          severity = "warning" if findings else "ok"
+      return {"severity": severity, "checked": checked, "findings": findings}
+
+
+  def format_report(result):
+      """Turn the result of diagnose into the lines of a report: 'Health: SEVERITY' (the severity in capitals), then 'Checked: A, B' (the areas joined by ', ', or 'Checked: nothing' if there are none), then either 'No problems found.' or one line '- FINDING' for every finding."""
+      lines = ["Health: " + result["severity"].upper(), "Checked: " + (", ".join(result["checked"]) if result["checked"] else "nothing")]
+      if result["findings"]:
+          lines.extend("- " + f for f in result["findings"])
+      else:
+          lines.append("No problems found.")
+      return lines
+stretch: Read the real files of your own computer (`/proc/meminfo`, `/proc/loadavg`, the output of `df`
+  from `subprocess.run`) and run the doctor on them, add a check for the `/proc/stat` counters, add an
+  `--email` style summary line for the severity, store a history of results and warn when memory grows
+  hour after hour (see `detect_leak`), or write a systemd unit file that runs the doctor every five minutes.

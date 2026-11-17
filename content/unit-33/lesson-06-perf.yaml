@@ -1,0 +1,411 @@
+id: u33-perf
+title: Measuring Performance
+minutes: 110
+objective: Learn to find out why a system is slow without guessing. You will calculate percentiles, apply Little's law, read a profiler's call stacks, run the USE checklist and use Amdahl's law to decide whether an optimization is worth it.
+outcomes:
+- Explain why percentiles are better than averages
+- Apply Little's law to size a service
+- Read a profile and find where the time goes
+- Use the USE method to find the bottleneck
+- Calculate the limit of an optimization with Amdahl's law
+sections:
+- heading: Measure, do not guess
+  body: |-
+    **Premature optimization is the root of all evil**, said Donald Knuth: programmers are notoriously bad at guessing where the time goes. The cure is a loop: *measure* what is slow, *change one thing*, *measure again*. Start with a number that matters to users, such as the **latency** (how long one request takes) and the **throughput** (how many requests per second the system completes).
+
+    Never trust the **average** alone. If 99 requests take 100 ms and one takes 10 seconds, the average is 199 ms but one user in a hundred waits for 10 seconds. So use **percentiles**: p50 (the median, the typical request), p95 and p99 (the slow tail). A user who makes many requests meets the tail often, and in a system that calls many services for each page the tail of the parts becomes the *typical* case of the whole.
+
+    **Little's law:** the average number of things in a system equals the arrival rate times the time each stays (`L = λ × W`). A shop with 2 customers per minute who stay 5 minutes holds 10 people. A service with 100 requests per second and 0.2 seconds each has 20 requests in flight, so it needs more than 20 workers. Near full load, **queues** grow explosively, which is why teams aim for 50 to 70 percent utilization at peak.
+- heading: Finding the bottleneck
+  body: |-
+    Every system has a **bottleneck**, the part that limits the whole; making anything else faster changes nothing. The **USE method** finds it: for every resource (CPU, memory, disk, network) check **U**tilization (how busy), **S**aturation (work waiting in a queue, for example the load average above the number of cores, a swap in use, a long disk queue) and **E**rrors (dropped packets, disk errors). The first resource with a problem is your suspect.
+
+    Then look inside the program with a **profiler**, which samples the call stack many times a second. A **flame graph** stacks the samples: the width of a box is the share of the samples in which that function was on the stack, and the *top edge* shows who is doing the work. Tools: `perf`, `py-spy`, the browser developer tools, `strace` (system calls) and `tcpdump` (network). Distinguish **self time** (work in the function itself) from **total time** (including everything it calls). Also consider *waiting*: a program that is slow with a low CPU use usually waits for a disk, a network or a lock.
+
+    **Amdahl's law** limits what you win: if a part takes 60 percent of the time and becomes 10 times faster, the program is only 2.2 times faster, because 40 percent did not change. So work on the biggest part first, and stop when the next step no longer pays.
+
+    **Caching** (keep the answer of an expensive operation), **batching** (do many things in one trip), **indexes** in databases, **parallelism** and better **algorithms** are the tools, in roughly that order of value; a better algorithm beats faster hardware.
+examples:
+- title: Latency and capacity
+  intro: A service with one very slow request, and how many workers it needs.
+  code: |
+    def percentile(values, p):
+        """Averages hide the slow requests that annoy users, so engineers look at **percentiles**. The p-th percentile (0 <= p <= 100) of a list of numbers is found with the **nearest rank** method: sort the numbers, compute the rank = ceil(p / 100 * n) (a whole number counted from 1; if it would be 0 use 1) and take the number at that rank. So the 50th percentile of 10 numbers is the 5th smallest, and the 100th is the largest. An empty list or p outside 0..100 is a ValueError('bad percentile'). Do the arithmetic with integers where you can (-(-a // b) rounds up) so that the result is exact."""
+        n = len(values)
+        if n == 0 or not 0 <= p <= 100:
+            raise ValueError("bad percentile")
+        ordered = sorted(values)
+        from fractions import Fraction
+        q = Fraction(p) / 100 * n
+        rank = -(-q.numerator // q.denominator)
+        return ordered[max(rank, 1) - 1]
+
+
+    def latency_report(samples):
+        """Summarize the response times (in milliseconds) of a service. Return a dict {'count', 'mean' (rounded to 2 decimals), 'p50', 'p95', 'p99', 'max'} where the percentiles use the nearest rank method (the 50th percentile is the ceil(0.5 * n)-th smallest value, and so on). An empty list gives {'count': 0}."""
+        if not samples:
+            return {"count": 0}
+        ordered = sorted(samples)
+        n = len(ordered)
+
+        def pct(p):
+            rank = max(-(-p * n // 100), 1)
+            return ordered[rank - 1]
+        return {"count": n, "mean": round(sum(ordered) / n, 2), "p50": pct(50), "p95": pct(95), "p99": pct(99), "max": ordered[-1]}
+
+
+    def capacity_plan(per_second, seconds_each, workers):
+        """**Little's law** says: the average number of requests in the system equals the arrival rate times the time each one stays. A service receives `per_second` requests per second, each takes `seconds_each` seconds of work, and `workers` of them can run at the same time. Return {'in_flight': per_second * seconds_each rounded to 2 decimals, 'utilization': in_flight / workers rounded to 3 decimals, 'status': 'ok' if the utilization is below 0.7, 'busy' if it is from 0.7 up to (not including) 1, 'overloaded' from 1 up}. The status uses the UNROUNDED values. workers < 1 is a ValueError('need workers')."""
+        if workers < 1:
+            raise ValueError("need workers")
+        in_flight = per_second * seconds_each
+        util = in_flight / workers
+        status = "ok" if util < 0.7 else "busy" if util < 1 else "overloaded"
+        return {"in_flight": round(in_flight, 2), "utilization": round(util, 3), "status": status}
+
+    samples = [12, 15, 11, 14, 13, 16, 12, 15, 11, 900]
+    print(latency_report(samples))
+    print(capacity_plan(80, 0.25, 16))
+    print(capacity_plan(80, 0.25, 32))
+  output: |
+    {'count': 10, 'mean': 101.9, 'p50': 13, 'p95': 900, 'p99': 900, 'max': 900}
+    {'in_flight': 20.0, 'utilization': 1.25, 'status': 'overloaded'}
+    {'in_flight': 20.0, 'utilization': 0.625, 'status': 'ok'}
+  lines:
+  - line: 36
+    note: The mean is 101.9 but p95 shows the 900 ms outlier.
+  - line: 37
+    note: '20 requests in flight on 16 workers: overloaded.'
+  - line: 38
+    note: The same load on 32 workers is a comfortable 0.625.
+- title: Profile, USE and Amdahl
+  intro: Find the hot function and the limit of an optimization.
+  code: |
+    def profile(stacks):
+        """A **profiler** looks at a running program many times per second and writes down the **call stack** (the chain of functions that are running, from main down to the function that is working right now), for example 'main;parse;read'. Given such samples as a list of texts, return a list of dicts {'function', 'self', 'total'} for every function that occurs. 'self' counts the samples in which it is the LAST function of the stack (it was doing the work itself), 'total' counts the samples in which it occurs anywhere in the stack (counted ONCE per sample even if it occurs twice, as in recursion). Sort by self, highest first, then by total (highest first), then by name. Empty texts are ignored."""
+        own, total = {}, {}
+        for stack in stacks:
+            frames = [f for f in stack.split(";") if f]
+            if not frames:
+                continue
+            own[frames[-1]] = own.get(frames[-1], 0) + 1
+            for f in set(frames):
+                total[f] = total.get(f, 0) + 1
+        rows = [{"function": f, "self": own.get(f, 0), "total": t} for f, t in total.items()]
+        rows.sort(key=lambda r: (-r["self"], -r["total"], r["function"]))
+        return rows
+
+
+    def use_method(metrics):
+        """Brendan Gregg's **USE method** checks every resource (CPU, memory, disk, network) for three things: Utilization (how busy, in percent), Saturation (how much work is waiting in a queue) and Errors. Given a dict {resource: {'utilization': percent, 'saturation': queue length, 'errors': count}}, return the list of findings as texts: for each resource, in alphabetical order of the resource names, first 'NAME errors' if the errors are above 0, then 'NAME saturated' if the saturation is above 0, then 'NAME busy' if the utilization is 90 or more. A healthy resource gives nothing. Missing keys count as 0."""
+        findings = []
+        for name in sorted(metrics):
+            m = metrics[name]
+            if m.get("errors", 0) > 0:
+                findings.append(name + " errors")
+            if m.get("saturation", 0) > 0:
+                findings.append(name + " saturated")
+            if m.get("utilization", 0) >= 90:
+                findings.append(name + " busy")
+        return findings
+
+
+    def amdahl(fraction, factor):
+        """**Amdahl's law** says how much a whole program speeds up when only a part of it gets faster. If a part that takes the `fraction` (0 to 1) of the time becomes `factor` times faster, the speedup of the whole program is 1 / ((1 - fraction) + fraction / factor). Return it rounded to 3 decimals. A fraction outside 0..1 is a ValueError('bad fraction'), a factor that is not above 0 a ValueError('bad factor') (check the fraction first)."""
+        if not 0 <= fraction <= 1:
+            raise ValueError("bad fraction")
+        if factor <= 0:
+            raise ValueError("bad factor")
+        return round(1 / ((1 - fraction) + fraction / factor), 3)
+
+    stacks = ["main;handle;parse_json", "main;handle;parse_json", "main;handle;parse_json", "main;handle;query_db", "main;log"]
+    for row in profile(stacks)[:3]:
+        print(row["function"], row["self"], row["total"])
+    print(use_method({"cpu": {"utilization": 97, "saturation": 4}, "disk": {"utilization": 20}}))
+    print(amdahl(0.6, 10))
+  output: |
+    parse_json 3 3
+    log 1 1
+    query_db 1 1
+    ['cpu saturated', 'cpu busy']
+    2.174
+  lines:
+  - line: 39
+    note: 'parse_json is the hot function: three of five samples.'
+  - line: 41
+    note: The CPU is busy and saturated; the disk is fine.
+  - line: 42
+    note: Ten times faster on 60 percent of the time gives only 2.174 times.
+playground:
+  prompt: Compute the average and the largest of some response times.
+  code: |
+    times = [12, 15, 11, 900]
+    print(sum(times) / len(times), max(times))
+exercises:
+- id: percentile
+  title: The slowest 1 in 100
+  difficulty: 4
+  prompt: 'Imagine a web page whose average response time is 100 ms. Sounds fine, but if 1 request in 100 takes 5 seconds, a user who clicks ten times meets a slow one nearly every time. Write `percentile(values, p)`. Averages hide the slow requests that annoy users, so engineers look at **percentiles**. The p-th percentile (0 <= p <= 100) of a list of numbers is found with the **nearest rank** method: sort the numbers, compute the rank = ceil(p / 100 * n) (a whole number counted from 1; if it would be 0 use 1) and take the number at that rank. So the 50th percentile of 10 numbers is the 5th smallest, and the 100th is the largest. An empty list or p outside 0..100 is a ValueError(''bad percentile''). Do the arithmetic with integers where you can (-(-a // b) rounds up) so that the result is exact.'
+  starter: |-
+    def percentile(values, p):
+        """Averages hide the slow requests that annoy users, so engineers look at **percentiles**. The p-th percentile (0 <= p <= 100) of a list of numbers is found with the **nearest rank** method: sort the numbers, compute the rank = ceil(p / 100 * n) (a whole number counted from 1; if it would be 0 use 1) and take the number at that rank. So the 50th percentile of 10 numbers is the 5th smallest, and the 100th is the largest. An empty list or p outside 0..100 is a ValueError('bad percentile'). Do the arithmetic with integers where you can (-(-a // b) rounds up) so that the result is exact."""
+        pass
+  tests:
+  - name: ranks
+    code: |
+      assert percentile([15, 20, 35, 40, 50], 30) == 20 and percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 50) == 5 and percentile([3], 0) == 3 and percentile([5, 1], 100) == 5
+      assert percentile([9, 1, 5, 3, 7], 0) == 1 and percentile([9, 1, 5, 3, 7], 40) == 3 and percentile([9, 1, 5, 3, 7], 41) == 5 and percentile(list(range(1, 101)), 99) == 99
+  - name: errors
+    code: |
+      for args in (([], 50), ([1, 2], -1), ([1, 2], 101)):
+          try:
+              percentile(*args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "bad percentile"
+      assert percentile([4, 8], 100) == 8 and percentile([2, 2, 2], 50) == 2
+  hints:
+  - Sort first. The rank is ceil(p * n / 100), counted from 1.
+  - The rank of p = 0 would be 0; use 1 in that case.
+  solution: |
+    def percentile(values, p):
+        """Averages hide the slow requests that annoy users, so engineers look at **percentiles**. The p-th percentile (0 <= p <= 100) of a list of numbers is found with the **nearest rank** method: sort the numbers, compute the rank = ceil(p / 100 * n) (a whole number counted from 1; if it would be 0 use 1) and take the number at that rank. So the 50th percentile of 10 numbers is the 5th smallest, and the 100th is the largest. An empty list or p outside 0..100 is a ValueError('bad percentile'). Do the arithmetic with integers where you can (-(-a // b) rounds up) so that the result is exact."""
+        n = len(values)
+        if n == 0 or not 0 <= p <= 100:
+            raise ValueError("bad percentile")
+        ordered = sorted(values)
+        from fractions import Fraction
+        q = Fraction(p) / 100 * n
+        rank = -(-q.numerator // q.denominator)
+        return ordered[max(rank, 1) - 1]
+  explanation: In practice people watch p50 (the typical user), p95 and p99 (the slow tail) of a service and set goals such as 'p99 under 300 ms'.
+- id: little
+  title: How many workers do we need?
+  difficulty: 3
+  prompt: 'How many servers or threads does a service need? Write `capacity_plan(per_second, seconds_each, workers)`. **Little''s law** says: the average number of requests in the system equals the arrival rate times the time each one stays. A service receives `per_second` requests per second, each takes `seconds_each` seconds of work, and `workers` of them can run at the same time. Return {''in_flight'': per_second * seconds_each rounded to 2 decimals, ''utilization'': in_flight / workers rounded to 3 decimals, ''status'': ''ok'' if the utilization is below 0.7, ''busy'' if it is from 0.7 up to (not including) 1, ''overloaded'' from 1 up}. The status uses the UNROUNDED values. workers < 1 is a ValueError(''need workers'').'
+  starter: |-
+    def capacity_plan(per_second, seconds_each, workers):
+        """**Little's law** says: the average number of requests in the system equals the arrival rate times the time each one stays. A service receives `per_second` requests per second, each takes `seconds_each` seconds of work, and `workers` of them can run at the same time. Return {'in_flight': per_second * seconds_each rounded to 2 decimals, 'utilization': in_flight / workers rounded to 3 decimals, 'status': 'ok' if the utilization is below 0.7, 'busy' if it is from 0.7 up to (not including) 1, 'overloaded' from 1 up}. The status uses the UNROUNDED values. workers < 1 is a ValueError('need workers')."""
+        pass
+  tests:
+  - name: plans
+    code: |
+      assert capacity_plan(50, 0.2, 20) == {"in_flight": 10.0, "utilization": 0.5, "status": "ok"}
+      assert capacity_plan(7, 1, 10) == {"in_flight": 7, "utilization": 0.7, "status": "busy"}
+      assert capacity_plan(100, 0.1, 10) == {"in_flight": 10.0, "utilization": 1.0, "status": "overloaded"}
+      assert capacity_plan(3, 0.5, 1) == {"in_flight": 1.5, "utilization": 1.5, "status": "overloaded"}
+  - name: edges
+    code: |
+      assert capacity_plan(0, 1, 2) == {"in_flight": 0, "utilization": 0.0, "status": "ok"}
+      assert capacity_plan(6.9, 1, 10)["status"] == "ok" and capacity_plan(9.99, 1, 10)["status"] == "busy"
+      assert capacity_plan(10, 0.333, 3) == {"in_flight": 3.33, "utilization": 1.11, "status": "overloaded"}
+      try:
+          capacity_plan(1, 1, 0)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert str(e) == "need workers"
+  hints:
+  - in_flight = per_second * seconds_each.
+  - Compare the unrounded utilization with 0.7 and 1.
+  solution: |
+    def capacity_plan(per_second, seconds_each, workers):
+        """**Little's law** says: the average number of requests in the system equals the arrival rate times the time each one stays. A service receives `per_second` requests per second, each takes `seconds_each` seconds of work, and `workers` of them can run at the same time. Return {'in_flight': per_second * seconds_each rounded to 2 decimals, 'utilization': in_flight / workers rounded to 3 decimals, 'status': 'ok' if the utilization is below 0.7, 'busy' if it is from 0.7 up to (not including) 1, 'overloaded' from 1 up}. The status uses the UNROUNDED values. workers < 1 is a ValueError('need workers')."""
+        if workers < 1:
+            raise ValueError("need workers")
+        in_flight = per_second * seconds_each
+        util = in_flight / workers
+        status = "ok" if util < 0.7 else "busy" if util < 1 else "overloaded"
+        return {"in_flight": round(in_flight, 2), "utilization": round(util, 3), "status": status}
+  explanation: 'Queues explode near full load: at 90 percent utilization the waiting time is already about ten times the work time, which is why ''busy'' starts at 70 percent here.'
+- id: profile
+  title: Reading a profiler
+  difficulty: 5
+  prompt: 'When a program is slow, do not guess: **measure**. A profiler samples the running program. A **flame graph** draws the result, but under the picture is a simple count. Write `profile(stacks)`. A **profiler** looks at a running program many times per second and writes down the **call stack** (the chain of functions that are running, from main down to the function that is working right now), for example ''main;parse;read''. Given such samples as a list of texts, return a list of dicts {''function'', ''self'', ''total''} for every function that occurs. ''self'' counts the samples in which it is the LAST function of the stack (it was doing the work itself), ''total'' counts the samples in which it occurs anywhere in the stack (counted ONCE per sample even if it occurs twice, as in recursion). Sort by self, highest first, then by total (highest first), then by name. Empty texts are ignored.'
+  starter: |-
+    def profile(stacks):
+        """A **profiler** looks at a running program many times per second and writes down the **call stack** (the chain of functions that are running, from main down to the function that is working right now), for example 'main;parse;read'. Given such samples as a list of texts, return a list of dicts {'function', 'self', 'total'} for every function that occurs. 'self' counts the samples in which it is the LAST function of the stack (it was doing the work itself), 'total' counts the samples in which it occurs anywhere in the stack (counted ONCE per sample even if it occurs twice, as in recursion). Sort by self, highest first, then by total (highest first), then by name. Empty texts are ignored."""
+        pass
+  tests:
+  - name: counting
+    code: |
+      stacks = ["main;parse;read", "main;parse;read", "main;work", "main;f;f", "", "main"]
+      assert profile(stacks) == [{"function": "read", "self": 2, "total": 2}, {"function": "main", "self": 1, "total": 5}, {"function": "f", "self": 1, "total": 1}, {"function": "work", "self": 1, "total": 1}, {"function": "parse", "self": 0, "total": 2}]
+      assert profile([]) == [] and profile(["", ";"]) == []
+  - name: recursion
+    code: |
+      r = profile(["a;b;b;b", "a;b", "a;c"])
+      assert r == [{"function": "b", "self": 2, "total": 2}, {"function": "c", "self": 1, "total": 1}, {"function": "a", "self": 0, "total": 3}]
+      assert profile(["x"]) == [{"function": "x", "self": 1, "total": 1}]
+  hints:
+  - Split each stack at ';' and look at the last frame for self time.
+  - A set of the frames gives each function once per sample.
+  solution: |
+    def profile(stacks):
+        """A **profiler** looks at a running program many times per second and writes down the **call stack** (the chain of functions that are running, from main down to the function that is working right now), for example 'main;parse;read'. Given such samples as a list of texts, return a list of dicts {'function', 'self', 'total'} for every function that occurs. 'self' counts the samples in which it is the LAST function of the stack (it was doing the work itself), 'total' counts the samples in which it occurs anywhere in the stack (counted ONCE per sample even if it occurs twice, as in recursion). Sort by self, highest first, then by total (highest first), then by name. Empty texts are ignored."""
+        own, total = {}, {}
+        for stack in stacks:
+            frames = [f for f in stack.split(";") if f]
+            if not frames:
+                continue
+            own[frames[-1]] = own.get(frames[-1], 0) + 1
+            for f in set(frames):
+                total[f] = total.get(f, 0) + 1
+        rows = [{"function": f, "self": own.get(f, 0), "total": t} for f, t in total.items()]
+        rows.sort(key=lambda r: (-r["self"], -r["total"], r["function"]))
+        return rows
+  explanation: A function with high total but low self time is only a caller; look for high self time to find where the work really happens (the wide plateau at the top of a flame graph).
+- id: use
+  title: The USE method
+  difficulty: 3
+  prompt: 'A slow machine has hundreds of numbers to look at. A checklist saves you from drowning in them. Write `use_method(metrics)`. Brendan Gregg''s **USE method** checks every resource (CPU, memory, disk, network) for three things: Utilization (how busy, in percent), Saturation (how much work is waiting in a queue) and Errors. Given a dict {resource: {''utilization'': percent, ''saturation'': queue length, ''errors'': count}}, return the list of findings as texts: for each resource, in alphabetical order of the resource names, first ''NAME errors'' if the errors are above 0, then ''NAME saturated'' if the saturation is above 0, then ''NAME busy'' if the utilization is 90 or more. A healthy resource gives nothing. Missing keys count as 0.'
+  starter: |-
+    def use_method(metrics):
+        """Brendan Gregg's **USE method** checks every resource (CPU, memory, disk, network) for three things: Utilization (how busy, in percent), Saturation (how much work is waiting in a queue) and Errors. Given a dict {resource: {'utilization': percent, 'saturation': queue length, 'errors': count}}, return the list of findings as texts: for each resource, in alphabetical order of the resource names, first 'NAME errors' if the errors are above 0, then 'NAME saturated' if the saturation is above 0, then 'NAME busy' if the utilization is 90 or more. A healthy resource gives nothing. Missing keys count as 0."""
+        pass
+  tests:
+  - name: findings
+    code: |
+      m = {"disk": {"errors": 2, "saturation": 1, "utilization": 95}, "cpu": {"utilization": 90}, "mem": {}, "net": {"utilization": 89.9, "saturation": 0, "errors": 0}}
+      assert use_method(m) == ["cpu busy", "disk errors", "disk saturated", "disk busy"]
+      assert use_method({}) == [] and use_method({"cpu": {"utilization": 10}}) == []
+  - name: order
+    code: |
+      m = {"b": {"saturation": 3}, "a": {"errors": 1}, "c": {"utilization": 100, "errors": 1}}
+      assert use_method(m) == ["a errors", "b saturated", "c errors", "c busy"]
+  hints:
+  - Loop over the sorted resource names and check the three rules in order.
+  - dict.get(key, 0) handles missing keys.
+  solution: |
+    def use_method(metrics):
+        """Brendan Gregg's **USE method** checks every resource (CPU, memory, disk, network) for three things: Utilization (how busy, in percent), Saturation (how much work is waiting in a queue) and Errors. Given a dict {resource: {'utilization': percent, 'saturation': queue length, 'errors': count}}, return the list of findings as texts: for each resource, in alphabetical order of the resource names, first 'NAME errors' if the errors are above 0, then 'NAME saturated' if the saturation is above 0, then 'NAME busy' if the utilization is 90 or more. A healthy resource gives nothing. Missing keys count as 0."""
+        findings = []
+        for name in sorted(metrics):
+            m = metrics[name]
+            if m.get("errors", 0) > 0:
+                findings.append(name + " errors")
+            if m.get("saturation", 0) > 0:
+                findings.append(name + " saturated")
+            if m.get("utilization", 0) >= 90:
+                findings.append(name + " busy")
+        return findings
+  explanation: 'The method is best used as a first pass: it tells you which resource to investigate before you open any detailed tool.'
+- id: amdahl
+  title: Where speed-ups stop
+  difficulty: 3
+  prompt: Before you spend a week making one part faster, calculate what it can bring. Write `amdahl(fraction, factor)`. **Amdahl's law** says how much a whole program speeds up when only a part of it gets faster. If a part that takes the `fraction` (0 to 1) of the time becomes `factor` times faster, the speedup of the whole program is 1 / ((1 - fraction) + fraction / factor). Return it rounded to 3 decimals. A fraction outside 0..1 is a ValueError('bad fraction'), a factor that is not above 0 a ValueError('bad factor') (check the fraction first).
+  starter: |-
+    def amdahl(fraction, factor):
+        """**Amdahl's law** says how much a whole program speeds up when only a part of it gets faster. If a part that takes the `fraction` (0 to 1) of the time becomes `factor` times faster, the speedup of the whole program is 1 / ((1 - fraction) + fraction / factor). Return it rounded to 3 decimals. A fraction outside 0..1 is a ValueError('bad fraction'), a factor that is not above 0 a ValueError('bad factor') (check the fraction first)."""
+        pass
+  tests:
+  - name: speedups
+    code: |
+      assert amdahl(0.5, 2) == 1.333 and amdahl(0.9, 1000) == 9.911 and amdahl(0, 5) == 1.0 and amdahl(1, 4) == 4.0 and amdahl(0.75, 3) == 2.0
+  - name: errors
+    code: |
+      for args, msg in (((1.5, 2), "bad fraction"), ((-0.1, 2), "bad fraction"), ((0.5, 0), "bad factor"), ((0.5, -2), "bad factor"), ((2, 0), "bad fraction")):
+          try:
+              amdahl(*args)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == msg, (args, str(e))
+      assert amdahl(0.5, 1) == 1.0 and amdahl(0.5, 0.5) == 0.667
+  hints:
+  - Check the arguments first, then use the formula.
+  - round(x, 3) rounds to three decimals.
+  solution: |
+    def amdahl(fraction, factor):
+        """**Amdahl's law** says how much a whole program speeds up when only a part of it gets faster. If a part that takes the `fraction` (0 to 1) of the time becomes `factor` times faster, the speedup of the whole program is 1 / ((1 - fraction) + fraction / factor). Return it rounded to 3 decimals. A fraction outside 0..1 is a ValueError('bad fraction'), a factor that is not above 0 a ValueError('bad factor') (check the fraction first)."""
+        if not 0 <= fraction <= 1:
+            raise ValueError("bad fraction")
+        if factor <= 0:
+            raise ValueError("bad factor")
+        return round(1 / ((1 - fraction) + fraction / factor), 3)
+  explanation: 'The same law is the limit of parallel programs: if 10 percent of a job cannot be shared among cores, even a million cores give at most a 10 times speedup.'
+commonMistakes:
+- title: Looking only at the average
+  explanation: It hides the slow tail.
+- title: Optimizing without measuring
+  explanation: The slow part is rarely where you guess.
+- title: Changing many things at once
+  explanation: You cannot tell which change helped.
+- title: Running a service at 100 percent load
+  explanation: Queues and waiting times explode.
+- title: Measuring on a laptop with other programs running
+  explanation: The numbers are noise.
+summary:
+- Measure first, change one thing, measure again.
+- Use percentiles for latency, not just the average.
+- 'Little''s law: in flight = rate times time.'
+- The USE method checks utilization, saturation and errors.
+- Amdahl's law limits the gain of one optimization.
+next: u33-project
+quiz:
+- type: mcq
+  question: What is p99 latency?
+  options:
+  - The time that 99 percent of the requests are faster than
+  - The average
+  - The fastest request
+  - The 99th request
+  answer: 0
+  explanation: The slow tail.
+- type: mcq
+  question: Why is the average misleading?
+  options:
+  - A few slow requests hide in it
+  - It is always wrong
+  - It is hard to compute
+  - It is too high
+  answer: 0
+  explanation: The tail is what annoys users.
+- type: mcq
+  question: What does USE stand for?
+  options:
+  - Utilization, Saturation, Errors
+  - Users, Servers, Events
+  - Uptime, Speed, Energy
+  - Units, Sizes, Entries
+  answer: 0
+  explanation: A checklist per resource.
+- type: mcq
+  question: What does a profiler record?
+  options:
+  - The call stack of the program at many moments
+  - The keys typed
+  - The disk content
+  - The temperature
+  answer: 0
+  explanation: It samples the stack.
+- type: mcq
+  question: 100 requests per second, each 0.5 seconds. How many are in flight on average?
+  options:
+  - '50'
+  - '5'
+  - '200'
+  - '0.5'
+  answer: 0
+  explanation: 100 times 0.5 (Little's law).
+- type: mcq
+  question: A part takes 10 percent of the time and becomes infinitely fast. What is the best speedup?
+  options:
+  - About 1.11 times
+  - 10 times
+  - Infinite
+  - 2 times
+  answer: 0
+  explanation: 1 / 0.9.
+- type: code
+  question: Write `average(values)` that returns the mean of a list of numbers, rounded to 2 decimals. An empty list gives 0.
+  starter: |
+    def average(values):
+        pass
+  tests:
+  - name: mean
+    code: |
+      assert average([1, 2]) == 1.5 and average([]) == 0 and average([1, 1, 2]) == 1.33 and average([5]) == 5
+  solution: |
+    def average(values):
+        if not values:
+            return 0
+        return round(sum(values) / len(values), 2)

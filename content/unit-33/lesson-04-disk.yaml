@@ -1,0 +1,410 @@
+id: u33-disk
+title: Disks, Files and Quotas
+minutes: 110
+objective: Learn how a Linux machine keeps track of its storage. You will read df output, find the folders that fill a disk, read and check /etc/fstab, calculate how blocks waste space and apply quotas.
+outcomes:
+- Read the output of df and du
+- Explain mount points and /etc/fstab
+- Explain blocks and inodes and why tiny files waste space
+- Apply soft and hard quotas
+- Find out what fills a disk
+sections:
+- heading: Mounts and the one big tree
+  body: |-
+    On Windows every disk has a letter (C:, D:). Linux and macOS have **one tree** that starts at `/` (root). Another disk (or a USB stick, a network share or a virtual file system) is attached to a folder of the tree: that is called **mounting**, and the folder is its **mount point**. The disk you open at `/home` may be an entirely different drive from the one at `/`, and you cannot tell by looking at paths.
+
+    The commands: `mount` (list the mounts), `df -h` (**d**isk **f**ree, in **h**uman readable sizes), `lsblk` (list **bl**ock devices). A **file system** (ext4, XFS, APFS, NTFS) is the structure on the disk that records files; **formatting** creates it. The file `/etc/fstab` lists what to mount at boot: device (better the `UUID=`, a number that never changes, because `/dev/sdb` can change when you plug in another disk), mount point, type, options, a **dump** flag and a **pass** number (the order of the check after a crash; the root should be 1).
+
+    Mount options matter: `noexec` forbids running programs from the disk, `ro` is read-only, `noatime` stops updating "last read" times to save writes. Virtual file systems such as `/proc` and `tmpfs` (kept in memory) are mounted too.
+- heading: Blocks, inodes and a full disk
+  body: |-
+    A disk hands out space in **blocks** (typically 4096 bytes), so a file of 1 byte uses a whole block. The **inode** is a small record per file (owner, permissions, size, times and where its blocks are; the *name* is stored in the folder). A file system has a fixed number of inodes, chosen when it is made, so a disk can be **full without bytes being used**: millions of tiny files (mail queues, caches) use up all inodes. `df -i` shows that.
+
+    When a disk is full, follow the path: `df -h` (which disk?) then `du -sh /* ` or `du -h --max-depth=1 /var` (which folder?) and go deeper until you find the culprit, often **logs** that were never rotated, a **core dump**, old **backups** or a **deleted file that a program still holds open** (the space comes back only when the program closes it or restarts; `lsof | grep deleted` finds it).
+
+    Sharing a disk fairly needs **quotas**: a **soft limit** (a warning and a grace period) and a **hard limit** (writes are refused), per user, group or project. Also remember **backups** (the 3-2-1 rule: three copies, on two kinds of media, one off site) and that **RAID** (several disks used as one) protects against a broken disk but *not* against deleting a file.
+examples:
+- title: What fills the disk?
+  intro: Parse df output and total the folders.
+  code: |
+    def parse_df(text):
+        """The command 'df -k' shows how full each disk is. Its output has a header line that starts with 'Filesystem' and then one line per disk with six columns separated by blanks: device, size, used, available (all in kilobytes), the use percentage with a % sign, and the mount point (the folder where the disk appears; it is the rest of the line and may contain blanks). Parse the text. Return a list of dicts {'device', 'size', 'used', 'avail' (all three converted to BYTES, 1 kilobyte = 1024 bytes), 'percent' (an int without the % sign) and 'mount'}. Skip blank lines and the header. ValueError('bad line N') for a line with fewer than six columns or with numbers that are not whole numbers (N counts all lines of the text from 1, including the header and blank ones)."""
+        rows = []
+        for n, line in enumerate(text.split("\n"), 1):
+            if not line.strip() or line.startswith("Filesystem"):
+                continue
+            parts = line.split(None, 5)
+            try:
+                if len(parts) < 6 or not parts[4].endswith("%"):
+                    raise ValueError
+                device, size, used, avail, pct, mount = parts
+                rows.append({"device": device, "size": int(size) * 1024, "used": int(used) * 1024, "avail": int(avail) * 1024, "percent": int(pct[:-1]), "mount": mount.strip()})
+            except ValueError:
+                raise ValueError("bad line %d" % n)
+        return rows
+
+
+    def dir_sizes(files, depth):
+        """To find out what fills a disk you add up the sizes of the files in each folder (the command 'du' does this). 'files' is a list of (path, size) pairs such as ('/var/log/syslog', 5000). Return a list of (folder, total size) pairs, one for each folder at the given depth, where depth 1 means folders such as '/var', depth 2 means '/var/log' and so on. A file belongs to the folder made of the first `depth` parts of its path; a file that is not deep enough (for example '/boot/vmlinuz' at depth 2) belongs to its own folder ('/boot'), and a file directly in the root ('/swapfile') belongs to '/'. Depth 0 puts everything into '/'. Sort the result by size, the biggest first, then by folder name."""
+        totals = {}
+        for path, size in files:
+            parts = [p for p in path.split("/") if p]
+            folders = parts[:-1]
+            key = "/" + "/".join(folders[:depth])
+            totals[key] = totals.get(key, 0) + size
+        return sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    text = """Filesystem 1K-blocks Used Available Use% Mounted on
+    /dev/sda1 100000 91000 9000 91% /
+    tmpfs 8000 100 7900 2% /run
+    """
+    for row in parse_df(text):
+        print(row["mount"], row["percent"], "% full,", row["avail"] // 1024, "KB free")
+    files = [("/var/log/syslog", 52000), ("/var/log/auth.log", 4000), ("/var/lib/db/data", 31000), ("/home/ada/video.mp4", 8000)]
+    for folder, size in dir_sizes(files, 2):
+        print(folder, size)
+  output: |
+    / 91 % full, 9000 KB free
+    /run 2 % full, 7900 KB free
+    /var/log 56000
+    /var/lib 31000
+    /home/ada 8000
+  lines:
+  - line: 32
+    note: Each disk is shown with its mount point, how full it is and the free space.
+  - line: 35
+    note: 'The biggest folder is at the top: the logs.'
+- title: Blocks and quotas
+  intro: See the waste of small files and the state of two users.
+  code: |
+    def block_usage(sizes, block_size):
+        """A file system hands out space in whole **blocks** (for example 4096 bytes), so a file of 1 byte still uses a whole block, and every file also needs an **inode** (a small record with its owner, size and where its blocks are). Given the list of file sizes in bytes and the block size, return a dict {'files' (how many), 'bytes' (the sum of the sizes), 'disk' (the space really used: every file takes ceil(size / block_size) blocks; an empty file takes none), 'waste' (disk minus bytes) and 'inodes' (one per file)}."""
+        disk = 0
+        for s in sizes:
+            disk += -(-s // block_size) * block_size
+        total = sum(sizes)
+        return {"files": len(sizes), "bytes": total, "disk": disk, "waste": disk - total, "inodes": len(sizes)}
+
+
+    def quota_report(usage, quotas):
+        """On a shared server every user gets a **quota**, a limit on the disk space. A quota has a soft limit (above it you get a warning and a grace period) and a hard limit (when you reach it, writing is refused). 'usage' is a dict {user: bytes used}; 'quotas' is a dict {user: (soft, hard)}. Return a list of dicts {'user', 'used', 'status'} for every user that appears in either dict, sorted by user name. A user without usage has used 0. The status is 'unlimited' for a user without a quota, otherwise 'blocked' if used >= hard, else 'over soft' if used > soft, else 'ok'."""
+        rows = []
+        for user in sorted(set(usage) | set(quotas)):
+            used = usage.get(user, 0)
+            if user not in quotas:
+                status = "unlimited"
+            else:
+                soft, hard = quotas[user]
+                status = "blocked" if used >= hard else "over soft" if used > soft else "ok"
+            rows.append({"user": user, "used": used, "status": status})
+        return rows
+
+    print(block_usage([1, 4096, 4097], 4096))
+    usage = {"ada": 70, "bo": 20}
+    quotas = {"ada": (50, 100), "bo": (50, 100)}
+    for row in quota_report(usage, quotas):
+        print(row["user"], row["status"])
+  output: |
+    {'files': 3, 'bytes': 8194, 'disk': 16384, 'waste': 8190, 'inodes': 3}
+    ada over soft
+    bo ok
+  lines:
+  - line: 23
+    note: 'Three files with 8194 bytes in total take 16384 bytes on the disk: half is wasted.'
+  - line: 26
+    note: Ada is over her soft limit and Bo is fine.
+playground:
+  prompt: Convert a size in bytes into a readable text.
+  code: |
+    size = 3_500_000
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024 or unit == 'GB':
+            print(round(size, 1), unit)
+            break
+        size /= 1024
+exercises:
+- id: df
+  title: How full are the disks?
+  difficulty: 3
+  prompt: 'A full disk is one of the most common reasons for a server to fail: databases cannot write, logs cannot be saved, even logging in can break. The command `df` (disk free) shows the state. Write `parse_df(text)`. The command ''df -k'' shows how full each disk is. Its output has a header line that starts with ''Filesystem'' and then one line per disk with six columns separated by blanks: device, size, used, available (all in kilobytes), the use percentage with a % sign, and the mount point (the folder where the disk appears; it is the rest of the line and may contain blanks). Parse the text. Return a list of dicts {''device'', ''size'', ''used'', ''avail'' (all three converted to BYTES, 1 kilobyte = 1024 bytes), ''percent'' (an int without the % sign) and ''mount''}. Skip blank lines and the header. ValueError(''bad line N'') for a line with fewer than six columns or with numbers that are not whole numbers (N counts all lines of the text from 1, including the header and blank ones).'
+  starter: |-
+    def parse_df(text):
+        """The command 'df -k' shows how full each disk is. Its output has a header line that starts with 'Filesystem' and then one line per disk with six columns separated by blanks: device, size, used, available (all in kilobytes), the use percentage with a % sign, and the mount point (the folder where the disk appears; it is the rest of the line and may contain blanks). Parse the text. Return a list of dicts {'device', 'size', 'used', 'avail' (all three converted to BYTES, 1 kilobyte = 1024 bytes), 'percent' (an int without the % sign) and 'mount'}. Skip blank lines and the header. ValueError('bad line N') for a line with fewer than six columns or with numbers that are not whole numbers (N counts all lines of the text from 1, including the header and blank ones)."""
+        pass
+  tests:
+  - name: parsing
+    code: |
+      text = """Filesystem 1K-blocks Used Available Use% Mounted on
+      /dev/sda1 1000 900 100 90% /
+
+      tmpfs 10 1 9 10% /run/my dir
+      """
+      r = parse_df(text)
+      assert r == [{"device": "/dev/sda1", "size": 1024000, "used": 921600, "avail": 102400, "percent": 90, "mount": "/"}, {"device": "tmpfs", "size": 10240, "used": 1024, "avail": 9216, "percent": 10, "mount": "/run/my dir"}]
+      assert parse_df("") == [] and parse_df("Filesystem 1K-blocks Used Available Use% Mounted on\n") == []
+  - name: errors
+    code: |
+      for text, msg in (("a 1 2 3 4%\n", "bad line 1"), ("Filesystem x\n/dev/a 1 2 3 4 /\n", "bad line 2"), ("/dev/a 1 x 3 4% /\n", "bad line 1"), ("\n\n/dev/a 1.5 2 3 4% /\n", "bad line 3")):
+          try:
+              parse_df(text)
+              raise AssertionError("accepted " + repr(text))
+          except ValueError as e:
+              assert str(e) == msg, (text, str(e))
+  hints:
+  - split(None, 5) splits at blanks, at most five times.
+  - Wrap the conversion in try/except ValueError and raise your own message.
+  solution: |
+    def parse_df(text):
+        """The command 'df -k' shows how full each disk is. Its output has a header line that starts with 'Filesystem' and then one line per disk with six columns separated by blanks: device, size, used, available (all in kilobytes), the use percentage with a % sign, and the mount point (the folder where the disk appears; it is the rest of the line and may contain blanks). Parse the text. Return a list of dicts {'device', 'size', 'used', 'avail' (all three converted to BYTES, 1 kilobyte = 1024 bytes), 'percent' (an int without the % sign) and 'mount'}. Skip blank lines and the header. ValueError('bad line N') for a line with fewer than six columns or with numbers that are not whole numbers (N counts all lines of the text from 1, including the header and blank ones)."""
+        rows = []
+        for n, line in enumerate(text.split("\n"), 1):
+            if not line.strip() or line.startswith("Filesystem"):
+                continue
+            parts = line.split(None, 5)
+            try:
+                if len(parts) < 6 or not parts[4].endswith("%"):
+                    raise ValueError
+                device, size, used, avail, pct, mount = parts
+                rows.append({"device": device, "size": int(size) * 1024, "used": int(used) * 1024, "avail": int(avail) * 1024, "percent": int(pct[:-1]), "mount": mount.strip()})
+            except ValueError:
+                raise ValueError("bad line %d" % n)
+        return rows
+  explanation: A disk can also be full of inodes while it still has free bytes (see block_usage below), and df -i shows that.
+- id: du
+  title: What is eating the disk?
+  difficulty: 4
+  prompt: When `df` says a disk is full, the next question is *where*. The command `du` (disk usage) adds up the sizes folder by folder. Write `dir_sizes(files, depth)`. To find out what fills a disk you add up the sizes of the files in each folder (the command 'du' does this). 'files' is a list of (path, size) pairs such as ('/var/log/syslog', 5000). Return a list of (folder, total size) pairs, one for each folder at the given depth, where depth 1 means folders such as '/var', depth 2 means '/var/log' and so on. A file belongs to the folder made of the first `depth` parts of its path; a file that is not deep enough (for example '/boot/vmlinuz' at depth 2) belongs to its own folder ('/boot'), and a file directly in the root ('/swapfile') belongs to '/'. Depth 0 puts everything into '/'. Sort the result by size, the biggest first, then by folder name.
+  starter: |-
+    def dir_sizes(files, depth):
+        """To find out what fills a disk you add up the sizes of the files in each folder (the command 'du' does this). 'files' is a list of (path, size) pairs such as ('/var/log/syslog', 5000). Return a list of (folder, total size) pairs, one for each folder at the given depth, where depth 1 means folders such as '/var', depth 2 means '/var/log' and so on. A file belongs to the folder made of the first `depth` parts of its path; a file that is not deep enough (for example '/boot/vmlinuz' at depth 2) belongs to its own folder ('/boot'), and a file directly in the root ('/swapfile') belongs to '/'. Depth 0 puts everything into '/'. Sort the result by size, the biggest first, then by folder name."""
+        pass
+  tests:
+  - name: depths
+    code: |
+      files = [("/var/log/syslog", 5000), ("/var/log/auth.log", 1000), ("/var/lib/db/data", 9000), ("/boot/vmlinuz", 700), ("/swapfile", 4000)]
+      assert dir_sizes(files, 1) == [("/var", 15000), ("/swapfile".rsplit("/", 1)[0] or "/", 4000), ("/boot", 700)]
+      assert dir_sizes(files, 2) == [("/var/lib", 9000), ("/var/log", 6000), ("/", 4000), ("/boot", 700)]
+      assert dir_sizes(files, 3) == [("/var/lib/db", 9000), ("/var/log", 6000), ("/", 4000), ("/boot", 700)]
+      assert dir_sizes(files, 0) == [("/", 19700)]
+  - name: ties and empty
+    code: |
+      assert dir_sizes([], 2) == []
+      assert dir_sizes([("/b/x", 1), ("/a/y", 1), ("/c/z", 0)], 1) == [("/a", 1), ("/b", 1), ("/c", 0)]
+      assert dir_sizes([("/a/b/c/d", 5), ("/a/b/e", 5), ("/a/f", 1)], 2) == [("/a/b", 10), ("/a", 1)]
+  hints:
+  - Split the path at '/' and drop the empty parts; the last part is the file name.
+  - Join the first `depth` folders with '/' and add a '/' in front.
+  solution: |
+    def dir_sizes(files, depth):
+        """To find out what fills a disk you add up the sizes of the files in each folder (the command 'du' does this). 'files' is a list of (path, size) pairs such as ('/var/log/syslog', 5000). Return a list of (folder, total size) pairs, one for each folder at the given depth, where depth 1 means folders such as '/var', depth 2 means '/var/log' and so on. A file belongs to the folder made of the first `depth` parts of its path; a file that is not deep enough (for example '/boot/vmlinuz' at depth 2) belongs to its own folder ('/boot'), and a file directly in the root ('/swapfile') belongs to '/'. Depth 0 puts everything into '/'. Sort the result by size, the biggest first, then by folder name."""
+        totals = {}
+        for path, size in files:
+            parts = [p for p in path.split("/") if p]
+            folders = parts[:-1]
+            key = "/" + "/".join(folders[:depth])
+            totals[key] = totals.get(key, 0) + size
+        return sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+  explanation: A graphical version of the same idea is a treemap (like the Disk Usage Analyzer app), where each folder is a rectangle sized by its content.
+- id: fstab
+  title: The boot map
+  difficulty: 4
+  prompt: 'A computer must know which disk goes where. The file `/etc/fstab` (file system table) is that map, read at every boot. A typo here can make a machine refuse to start, so it deserves careful reading. Write `parse_fstab(text)`. The file /etc/fstab tells Linux which disks to mount where at boot. Every line has 4 to 6 fields separated by blanks: device, mount point, file system type, options (a comma separated list), dump (a number, default 0) and pass (the order of the check at boot, a number, default 0). Ignore blank lines and lines that start (after blanks) with #. Return a list of dicts {''device'', ''mount'', ''type'', ''options'' (a list), ''dump'' (int), ''pass'' (int)}. ValueError(''bad line N'') for a line with fewer than 4 or more than 6 fields or with dump or pass that is not a whole number (N counts all lines from 1).'
+  starter: |-
+    def parse_fstab(text):
+        """The file /etc/fstab tells Linux which disks to mount where at boot. Every line has 4 to 6 fields separated by blanks: device, mount point, file system type, options (a comma separated list), dump (a number, default 0) and pass (the order of the check at boot, a number, default 0). Ignore blank lines and lines that start (after blanks) with #. Return a list of dicts {'device', 'mount', 'type', 'options' (a list), 'dump' (int), 'pass' (int)}. ValueError('bad line N') for a line with fewer than 4 or more than 6 fields or with dump or pass that is not a whole number (N counts all lines from 1)."""
+        pass
+  tests:
+  - name: entries
+    code: |
+      text = """# static file system information
+      UUID=1111 / ext4 defaults,noatime 0 1
+
+        /dev/sdb1 /data ext4 defaults
+      /dev/sda2 none swap sw 0 0
+      """
+      assert parse_fstab(text) == [{"device": "UUID=1111", "mount": "/", "type": "ext4", "options": ["defaults", "noatime"], "dump": 0, "pass": 1}, {"device": "/dev/sdb1", "mount": "/data", "type": "ext4", "options": ["defaults"], "dump": 0, "pass": 0}, {"device": "/dev/sda2", "mount": "none", "type": "swap", "options": ["sw"], "dump": 0, "pass": 0}]
+      assert parse_fstab("") == [] and parse_fstab("# a\n\n") == []
+  - name: errors
+    code: |
+      for text, msg in (("/dev/a /\n", "bad line 1"), ("# c\n/dev/a / ext4 defaults 0 1 7\n", "bad line 2"), ("\n/dev/a / ext4 defaults x 1\n", "bad line 2"), ("/dev/a / ext4 defaults 0 y\n", "bad line 1")):
+          try:
+              parse_fstab(text)
+              raise AssertionError("accepted " + repr(text))
+          except ValueError as e:
+              assert str(e) == msg, (text, str(e))
+  hints:
+  - split() without arguments splits at any amount of blanks.
+  - Use len(fields) to decide whether dump and pass are present.
+  solution: |
+    def parse_fstab(text):
+        """The file /etc/fstab tells Linux which disks to mount where at boot. Every line has 4 to 6 fields separated by blanks: device, mount point, file system type, options (a comma separated list), dump (a number, default 0) and pass (the order of the check at boot, a number, default 0). Ignore blank lines and lines that start (after blanks) with #. Return a list of dicts {'device', 'mount', 'type', 'options' (a list), 'dump' (int), 'pass' (int)}. ValueError('bad line N') for a line with fewer than 4 or more than 6 fields or with dump or pass that is not a whole number (N counts all lines from 1)."""
+        entries = []
+        for n, raw in enumerate(text.split("\n"), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            f = line.split()
+            if not 4 <= len(f) <= 6:
+                raise ValueError("bad line %d" % n)
+            try:
+                dump = int(f[4]) if len(f) > 4 else 0
+                pas = int(f[5]) if len(f) > 5 else 0
+            except ValueError:
+                raise ValueError("bad line %d" % n)
+            entries.append({"device": f[0], "mount": f[1], "type": f[2], "options": f[3].split(","), "dump": dump, "pass": pas})
+        return entries
+  explanation: Modern systems also use /etc/fstab entries with UUID=... instead of /dev/sda1, because device names can change when disks are added, while the UUID (a long unique number) stays.
+- id: blocks
+  title: Why 1 byte can take 4096
+  difficulty: 3
+  prompt: 'Here is a surprise: a file of 1 byte takes up 4096 bytes on the disk, and a folder with a million tiny files wastes gigabytes. Write `block_usage(sizes, block_size)`. A file system hands out space in whole **blocks** (for example 4096 bytes), so a file of 1 byte still uses a whole block, and every file also needs an **inode** (a small record with its owner, size and where its blocks are). Given the list of file sizes in bytes and the block size, return a dict {''files'' (how many), ''bytes'' (the sum of the sizes), ''disk'' (the space really used: every file takes ceil(size / block_size) blocks; an empty file takes none), ''waste'' (disk minus bytes) and ''inodes'' (one per file)}.'
+  starter: |-
+    def block_usage(sizes, block_size):
+        """A file system hands out space in whole **blocks** (for example 4096 bytes), so a file of 1 byte still uses a whole block, and every file also needs an **inode** (a small record with its owner, size and where its blocks are). Given the list of file sizes in bytes and the block size, return a dict {'files' (how many), 'bytes' (the sum of the sizes), 'disk' (the space really used: every file takes ceil(size / block_size) blocks; an empty file takes none), 'waste' (disk minus bytes) and 'inodes' (one per file)}."""
+        pass
+  tests:
+  - name: rounding up
+    code: |
+      assert block_usage([1, 4096, 4097, 0], 4096) == {"files": 4, "bytes": 8194, "disk": 16384, "waste": 8190, "inodes": 4}
+      assert block_usage([], 4096) == {"files": 0, "bytes": 0, "disk": 0, "waste": 0, "inodes": 0}
+      assert block_usage([100] * 10, 512) == {"files": 10, "bytes": 1000, "disk": 5120, "waste": 4120, "inodes": 10}
+  - name: exact fits
+    code: |
+      assert block_usage([512, 1024], 512) == {"files": 2, "bytes": 1536, "disk": 1536, "waste": 0, "inodes": 2}
+      assert block_usage([1], 1) == {"files": 1, "bytes": 1, "disk": 1, "waste": 0, "inodes": 1}
+      assert block_usage([5000], 4096)["disk"] == 8192
+  hints:
+  - Round up with -(-size // block_size) or with math.ceil.
+  - An empty file needs no blocks.
+  solution: |
+    def block_usage(sizes, block_size):
+        """A file system hands out space in whole **blocks** (for example 4096 bytes), so a file of 1 byte still uses a whole block, and every file also needs an **inode** (a small record with its owner, size and where its blocks are). Given the list of file sizes in bytes and the block size, return a dict {'files' (how many), 'bytes' (the sum of the sizes), 'disk' (the space really used: every file takes ceil(size / block_size) blocks; an empty file takes none), 'waste' (disk minus bytes) and 'inodes' (one per file)}."""
+        disk = 0
+        for s in sizes:
+            disk += -(-s // block_size) * block_size
+        total = sum(sizes)
+        return {"files": len(sizes), "bytes": total, "disk": disk, "waste": disk - total, "inodes": len(sizes)}
+  explanation: Small files are the reason some systems pack tiny files together, and why databases keep many records in one big file.
+- id: quota
+  title: Quotas on a shared server
+  difficulty: 3
+  prompt: 'Without limits, one student can fill the disk of a university server with videos. Write `quota_report(usage, quotas)`. On a shared server every user gets a **quota**, a limit on the disk space. A quota has a soft limit (above it you get a warning and a grace period) and a hard limit (when you reach it, writing is refused). ''usage'' is a dict {user: bytes used}; ''quotas'' is a dict {user: (soft, hard)}. Return a list of dicts {''user'', ''used'', ''status''} for every user that appears in either dict, sorted by user name. A user without usage has used 0. The status is ''unlimited'' for a user without a quota, otherwise ''blocked'' if used >= hard, else ''over soft'' if used > soft, else ''ok''.'
+  starter: |-
+    def quota_report(usage, quotas):
+        """On a shared server every user gets a **quota**, a limit on the disk space. A quota has a soft limit (above it you get a warning and a grace period) and a hard limit (when you reach it, writing is refused). 'usage' is a dict {user: bytes used}; 'quotas' is a dict {user: (soft, hard)}. Return a list of dicts {'user', 'used', 'status'} for every user that appears in either dict, sorted by user name. A user without usage has used 0. The status is 'unlimited' for a user without a quota, otherwise 'blocked' if used >= hard, else 'over soft' if used > soft, else 'ok'."""
+        pass
+  tests:
+  - name: statuses
+    code: |
+      usage = {"ada": 50, "bo": 100, "cy": 10, "di": 90}
+      quotas = {"ada": (40, 90), "cy": (10, 20), "di": (60, 90), "ed": (5, 6)}
+      assert quota_report(usage, quotas) == [{"user": "ada", "used": 50, "status": "over soft"}, {"user": "bo", "used": 100, "status": "unlimited"}, {"user": "cy", "used": 10, "status": "ok"}, {"user": "di", "used": 90, "status": "blocked"}, {"user": "ed", "used": 0, "status": "ok"}]
+  - name: empty
+    code: |
+      assert quota_report({}, {}) == []
+      assert quota_report({"x": 0}, {"x": (0, 0)}) == [{"user": "x", "used": 0, "status": "blocked"}]
+      assert quota_report({"z": 1, "a": 2}, {}) == [{"user": "a", "used": 2, "status": "unlimited"}, {"user": "z", "used": 1, "status": "unlimited"}]
+  hints:
+  - Build the union of both key sets and sort it.
+  - Check blocked first, then over soft.
+  solution: |
+    def quota_report(usage, quotas):
+        """On a shared server every user gets a **quota**, a limit on the disk space. A quota has a soft limit (above it you get a warning and a grace period) and a hard limit (when you reach it, writing is refused). 'usage' is a dict {user: bytes used}; 'quotas' is a dict {user: (soft, hard)}. Return a list of dicts {'user', 'used', 'status'} for every user that appears in either dict, sorted by user name. A user without usage has used 0. The status is 'unlimited' for a user without a quota, otherwise 'blocked' if used >= hard, else 'over soft' if used > soft, else 'ok'."""
+        rows = []
+        for user in sorted(set(usage) | set(quotas)):
+            used = usage.get(user, 0)
+            if user not in quotas:
+                status = "unlimited"
+            else:
+                soft, hard = quotas[user]
+                status = "blocked" if used >= hard else "over soft" if used > soft else "ok"
+            rows.append({"user": user, "used": used, "status": status})
+        return rows
+  explanation: Quotas apply to bytes and often also to the number of files (inodes), as shown in the lesson.
+commonMistakes:
+- title: Editing /etc/fstab without a check
+  explanation: A typo can stop the boot.
+- title: Using /dev/sdb names in fstab
+  explanation: Device names can change; use the UUID.
+- title: Deleting a log that is still open
+  explanation: The space is not freed until the program closes it.
+- title: Forgetting inodes
+  explanation: A disk can be full with free bytes.
+- title: Thinking RAID is a backup
+  explanation: It copies mistakes too.
+summary:
+- There is one file tree and disks are mounted onto folders.
+- df shows which disk is full and du shows which folder.
+- fstab is the mount map for boot and should use UUIDs.
+- Blocks waste space for small files and inodes can run out.
+- Quotas limit users with a soft and a hard limit.
+next: u33-containers
+quiz:
+- type: mcq
+  question: What does mounting a disk mean?
+  options:
+  - Attaching it to a folder of the file tree
+  - Formatting it
+  - Copying it
+  - Deleting its files
+  answer: 0
+  explanation: The folder is the mount point.
+- type: mcq
+  question: What does df show?
+  options:
+  - How full the disks are
+  - The size of one folder
+  - The running programs
+  - The network speed
+  answer: 0
+  explanation: disk free.
+- type: mcq
+  question: Why can a disk be full with bytes free?
+  options:
+  - It ran out of inodes
+  - The clock is wrong
+  - The CPU is busy
+  - RAM is full
+  answer: 0
+  explanation: Every file needs an inode.
+- type: mcq
+  question: Why use UUID= in /etc/fstab?
+  options:
+  - Device names like /dev/sdb can change
+  - It is faster
+  - It saves space
+  - It is secure by itself
+  answer: 0
+  explanation: The UUID stays the same.
+- type: mcq
+  question: What happens at a hard quota limit?
+  options:
+  - Writing is refused
+  - A warning appears
+  - The disk is formatted
+  - Nothing
+  answer: 0
+  explanation: Soft limits warn; hard limits block.
+- type: mcq
+  question: Does RAID replace backups?
+  options:
+  - No, it also copies deletions and mistakes
+  - 'Yes'
+  - Only on SSDs
+  - Only on servers
+  answer: 0
+  explanation: Backups are separate.
+- type: code
+  question: Write `percent_used(used, size)` that returns the percentage of a disk that is used, rounded to a whole number (use round). If size is 0 return 0.
+  starter: |
+    def percent_used(used, size):
+        pass
+  tests:
+  - name: percent
+    code: |
+      assert percent_used(50, 200) == 25 and percent_used(1, 3) == 33 and percent_used(5, 0) == 0 and percent_used(0, 10) == 0 and percent_used(10, 10) == 100
+  solution: |
+    def percent_used(used, size):
+        if size == 0:
+            return 0
+        return round(used * 100 / size)

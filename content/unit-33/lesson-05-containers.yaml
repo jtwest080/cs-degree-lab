@@ -1,0 +1,544 @@
+id: u33-containers
+title: Containers and Images
+minutes: 110
+objective: Understand what a container really is. You will apply cgroup limits, read a Dockerfile, work out which layers a build can reuse, merge layers like an overlay file system and see why deleting a file does not shrink an image.
+outcomes:
+- Explain that a container is a limited process
+- Explain namespaces and cgroups
+- Read a Dockerfile
+- Order a Dockerfile for good caching
+- Explain image layers and the overlay file system
+sections:
+- heading: A container is a boxed process
+  body: |-
+    A **virtual machine** pretends to be a whole computer, with its own kernel, and starts in a minute. A **container** is much lighter: an ordinary Linux process that the kernel puts into a box, so it starts in a fraction of a second. The box has two parts. **Namespaces** limit what the process can *see*: its own process list (it believes it is process 1), its own network, its own hostnames and its own view of the file system (`chroot` and mounts). **Cgroups** (control groups) limit how much it can *use*: memory, CPU time, number of processes, disk speed. A memory limit is enforced by the OOM killer (the process dies) and a CPU limit by **throttling** (the process is paused for part of every 100 ms).
+
+    All containers on a machine **share one kernel**. That is why they are small and fast, and also why they are less isolated than virtual machines: a kernel bug can let one escape. Never run a container as root unless you must (`USER` in the Dockerfile), and treat `--privileged` (all limits off) as dangerous.
+
+    Docker made containers easy, but the pieces are standard: images (the OCI format), runtimes (runc, containerd), registries (a server of images, such as Docker Hub) and orchestrators such as **Kubernetes**, which decides *where* many containers run and restarts them.
+- heading: Images, layers and Dockerfiles
+  body: |-
+    An **image** is the read-only package from which containers start: files and some settings (the command to run, environment variables, open ports). It is built from a recipe, the **Dockerfile**: `FROM python:3.12-slim` (a base image to start with), `COPY` (add files), `RUN` (run a command while building), `ENV`, `WORKDIR`, `EXPOSE`, `USER` and `CMD` (what to run on start). Each of `FROM`, `RUN`, `COPY` and `ADD` creates a **layer**: a stack of changed files. An **overlay file system** merges all layers into one view, and each running container adds a thin writable layer on top (deleted when the container is, so keep data in **volumes**).
+
+    Layers are the reason images are quick to build and to share. Docker caches each layer: if an instruction and everything before it is unchanged, it is reused, but **after the first change everything is rebuilt**. So put things that rarely change (installing the dependencies) first and things that change often (your own source code) last. The flip side: layers are never edited, only added, so deleting a file in a later `RUN` hides it but the old layer still holds it. Clean up in the same instruction that made the mess: `RUN apt-get install ... && rm -rf /var/lib/apt/lists/*`.
+
+    **Security.** Images contain software with bugs, so use small trusted base images, pin versions, rebuild regularly, scan for known vulnerabilities and **never put secrets in an image** (anyone who can read the image can read its layers).
+examples:
+- title: Limits of a container
+  intro: Convert a limit and apply it to the usage of a container.
+  code: |
+    def parse_size(text):
+        """Container limits are written like '512m' or '2g'. Convert such a text into a number of bytes. Accepted: a whole number, optionally followed by ONE letter k, m, g or t (upper or lower case) for 1024, 1024**2, 1024**3, 1024**4 bytes; no letter means bytes; surrounding blanks are ignored. Anything else (an empty text, a decimal point, a minus sign, two letters, a letter without a number) is a ValueError('bad size ' + the original text)."""
+        s = text.strip()
+        units = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+        mult = 1
+        if s and s[-1].lower() in units:
+            mult = units[s[-1].lower()]
+            s = s[:-1]
+        if not s.isdigit():
+            raise ValueError("bad size " + text)
+        return int(s) * mult
+
+
+    def container_status(limits, usage):
+        """A **container** is an ordinary process that Linux limits with **cgroups** (control groups). Given the limits of a container, a dict that may contain 'memory' (a text such as '512m'), 'cpus' (a number of CPU cores, for example 1.5) and 'pids' (the highest number of processes), and a dict with the current usage ('memory' in bytes, 'cpus' = how many cores it wants, 'pids' = how many processes; a missing key means 0), return a dict with four entries. 'memory': 'unlimited' without a memory limit, 'oom-killed' if the usage is MORE than the limit (the kernel kills the process), else 'ok'. 'cpu_granted': the cores it really gets, the smaller one of wish and limit (the whole wish without a limit). 'throttled': True if the wish is MORE than the cpu limit (the kernel pauses the container to enforce the limit), else False. 'pids': 'unlimited' without a limit, 'fork refused' if the usage is more than the limit, else 'ok'."""
+        result = {}
+        mem = usage.get("memory", 0)
+        if "memory" not in limits:
+            result["memory"] = "unlimited"
+        else:
+            result["memory"] = "oom-killed" if mem > parse_size(limits["memory"]) else "ok"
+        want = usage.get("cpus", 0)
+        if "cpus" in limits:
+            result["cpu_granted"] = min(want, limits["cpus"])
+            result["throttled"] = want > limits["cpus"]
+        else:
+            result["cpu_granted"] = want
+            result["throttled"] = False
+        n = usage.get("pids", 0)
+        if "pids" not in limits:
+            result["pids"] = "unlimited"
+        else:
+            result["pids"] = "fork refused" if n > limits["pids"] else "ok"
+        return result
+
+    limits = {"memory": "256m", "cpus": 1, "pids": 50}
+    usage = {"memory": 300 * 1024 * 1024, "cpus": 2, "pids": 12}
+    print(parse_size("256m"))
+    for key, value in container_status(limits, usage).items():
+        print(key, value)
+  output: |
+    268435456
+    memory oom-killed
+    cpu_granted 1
+    throttled True
+    pids ok
+  lines:
+  - line: 38
+    note: 256 times 1024 times 1024.
+  - line: 39
+    note: The container uses too much memory and is killed; it is throttled to one core and its process count is fine.
+- title: Layers and the build cache
+  intro: Parse a recipe, see what is reused and why a deleted file still costs space.
+  code: |
+    def parse_dockerfile(text):
+        """A **Dockerfile** is the recipe of a container image: one instruction per line, the first word is the instruction (FROM, RUN, COPY, ...) and the rest its arguments. Parse the text. Ignore blank lines and lines that start (after blanks) with #. A line that ends with a backslash continues on the next line: remove the backslash, join the lines with ONE blank and strip. The instruction word may be written in any case but is returned in upper case. Return a list of dicts {'op', 'args'} (args stripped; '' if none). The known instructions are FROM, RUN, COPY, ADD, CMD, ENTRYPOINT, ENV, EXPOSE, WORKDIR, USER, ARG, LABEL and VOLUME; anything else is a ValueError('unknown instruction ' + the word in upper case). The first instruction must be FROM; only ARG may come before it. Otherwise (or if there is no instruction at all) raise ValueError('first instruction must be FROM')."""
+        known = {"FROM", "RUN", "COPY", "ADD", "CMD", "ENTRYPOINT", "ENV", "EXPOSE", "WORKDIR", "USER", "ARG", "LABEL", "VOLUME"}
+        logical, current = [], None
+        for raw in text.split("\n"):
+            line = raw.strip()
+            if current is None and (not line or line.startswith("#")):
+                continue
+            if current is not None and line.startswith("#"):
+                continue
+            cont = line.endswith("\\")
+            piece = line[:-1].strip() if cont else line
+            current = piece if current is None else (current + " " + piece).strip()
+            if not cont:
+                logical.append(current)
+                current = None
+        if current is not None:
+            logical.append(current)
+        result = []
+        for line in logical:
+            if not line:
+                continue
+            word, _, args = line.partition(" ")
+            op = word.upper()
+            if op not in known:
+                raise ValueError("unknown instruction " + op)
+            result.append({"op": op, "args": args.strip()})
+        for item in result:
+            if item["op"] == "FROM":
+                break
+            if item["op"] != "ARG":
+                raise ValueError("first instruction must be FROM")
+        else:
+            raise ValueError("first instruction must be FROM")
+        return result
+
+
+    def build_cache(old, new):
+        """Docker builds an image **layer** by layer and keeps each one in a **cache**. When you build again, every instruction that is the same as before (and all before it are the same too) is taken from the cache; from the first changed instruction on, everything is rebuilt. Only the instructions FROM, RUN, COPY and ADD create layers (the others only change settings). Given the old and the new instruction list (as returned by parse_dockerfile), find the longest common start, the instructions that are equal in op and args at the same positions. Return {'cached': the number of layer-creating instructions in that common start, 'rebuilt': the number of layer-creating instructions of the NEW list after it}."""
+        layer_ops = {"FROM", "RUN", "COPY", "ADD"}
+        p = 0
+        while p < len(old) and p < len(new) and old[p] == new[p]:
+            p += 1
+        cached = sum(1 for i in new[:p] if i["op"] in layer_ops)
+        rebuilt = sum(1 for i in new[p:] if i["op"] in layer_ops)
+        return {"cached": cached, "rebuilt": rebuilt}
+
+
+    def overlay(layers):
+        """An image is a stack of read-only layers, and a container sees them merged by an **overlay file system**. Every layer is a dict {path: content}; a content of None means 'this file is deleted in this layer' (Docker's whiteout). The layers are given from the bottom (oldest) to the top (newest). Return the dict that a container sees: for each path the content of the NEWEST layer that mentions it; paths whose newest entry is None do not appear."""
+        merged = {}
+        for layer in layers:
+            for path, content in layer.items():
+                if content is None:
+                    merged.pop(path, None)
+                else:
+                    merged[path] = content
+        return merged
+
+
+    def wasted_bytes(layers):
+        """Deleting a file in a later layer does NOT make the image smaller, because the old layer still holds it. The size of an image is the total length of all contents (len of the text) in ALL layers (None counts as 0). The visible size is the total length of the contents in the merged view of overlay(layers). Return how many bytes are hidden: the image size minus the visible size."""
+        image = sum(len(c) for layer in layers for c in layer.values() if c is not None)
+        visible = sum(len(c) for c in overlay(layers).values())
+        return image - visible
+
+    first = parse_dockerfile("FROM python:3.12\nCOPY requirements.txt /app/\nRUN pip install -r /app/requirements.txt\nCOPY . /app\nCMD python /app/main.py")
+    second = parse_dockerfile("FROM python:3.12\nCOPY requirements.txt /app/\nRUN pip install -r /app/requirements.txt\nCOPY . /app\nCMD python /app/main.py")
+    print(build_cache(first, second))
+    changed = parse_dockerfile("FROM python:3.12\nCOPY . /app\nRUN pip install -r /app/requirements.txt\nCMD python /app/main.py")
+    print(build_cache(first, changed))
+    layers = [{"/tmp/download.tar": "x" * 100, "/bin/tool": "t" * 10}, {"/tmp/download.tar": None}]
+    print(sorted(overlay(layers)), wasted_bytes(layers))
+  output: |
+    {'cached': 4, 'rebuilt': 0}
+    {'cached': 1, 'rebuilt': 2}
+    ['/bin/tool'] 100
+  lines:
+  - line: 69
+    note: Nothing changed, so every layer is reused.
+  - line: 71
+    note: Copying the source first makes the install step rebuild.
+  - line: 73
+    note: The file is gone from the container but 100 bytes remain in the image.
+playground:
+  prompt: Find out how many layers an image with this list of instructions would have.
+  code: |
+    ops = ['FROM', 'RUN', 'ENV', 'COPY', 'CMD']
+    print(len([o for o in ops if o in ('FROM', 'RUN', 'COPY', 'ADD')]))
+exercises:
+- id: cgroup
+  title: Limits that the kernel enforces
+  difficulty: 4
+  prompt: 'A container is not a small computer; it is a normal process that Linux puts in a box with **namespaces** (what it can see) and **cgroups** (how much it can use). Write `container_status(limits, usage)`. A **container** is an ordinary process that Linux limits with **cgroups** (control groups). Given the limits of a container, a dict that may contain ''memory'' (a text such as ''512m''), ''cpus'' (a number of CPU cores, for example 1.5) and ''pids'' (the highest number of processes), and a dict with the current usage (''memory'' in bytes, ''cpus'' = how many cores it wants, ''pids'' = how many processes; a missing key means 0), return a dict with four entries. ''memory'': ''unlimited'' without a memory limit, ''oom-killed'' if the usage is MORE than the limit (the kernel kills the process), else ''ok''. ''cpu_granted'': the cores it really gets, the smaller one of wish and limit (the whole wish without a limit). ''throttled'': True if the wish is MORE than the cpu limit (the kernel pauses the container to enforce the limit), else False. ''pids'': ''unlimited'' without a limit, ''fork refused'' if the usage is more than the limit, else ''ok''.'
+  starter: |-
+    def parse_size(text):
+        """Container limits are written like '512m' or '2g'. Convert such a text into a number of bytes. Accepted: a whole number, optionally followed by ONE letter k, m, g or t (upper or lower case) for 1024, 1024**2, 1024**3, 1024**4 bytes; no letter means bytes; surrounding blanks are ignored. Anything else (an empty text, a decimal point, a minus sign, two letters, a letter without a number) is a ValueError('bad size ' + the original text)."""
+        s = text.strip()
+        units = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+        mult = 1
+        if s and s[-1].lower() in units:
+            mult = units[s[-1].lower()]
+            s = s[:-1]
+        if not s.isdigit():
+            raise ValueError("bad size " + text)
+        return int(s) * mult
+
+
+
+
+    def container_status(limits, usage):
+        """A **container** is an ordinary process that Linux limits with **cgroups** (control groups). Given the limits of a container, a dict that may contain 'memory' (a text such as '512m'), 'cpus' (a number of CPU cores, for example 1.5) and 'pids' (the highest number of processes), and a dict with the current usage ('memory' in bytes, 'cpus' = how many cores it wants, 'pids' = how many processes; a missing key means 0), return a dict with four entries. 'memory': 'unlimited' without a memory limit, 'oom-killed' if the usage is MORE than the limit (the kernel kills the process), else 'ok'. 'cpu_granted': the cores it really gets, the smaller one of wish and limit (the whole wish without a limit). 'throttled': True if the wish is MORE than the cpu limit (the kernel pauses the container to enforce the limit), else False. 'pids': 'unlimited' without a limit, 'fork refused' if the usage is more than the limit, else 'ok'."""
+        pass
+  tests:
+  - name: states
+    code: |
+      lim = {"memory": "512m", "cpus": 1.5, "pids": 10}
+      assert container_status(lim, {"memory": 100 * 1024 ** 2, "cpus": 1, "pids": 3}) == {"memory": "ok", "cpu_granted": 1, "throttled": False, "pids": "ok"}
+      assert container_status(lim, {"memory": 512 * 1024 ** 2 + 1, "cpus": 3, "pids": 11}) == {"memory": "oom-killed", "cpu_granted": 1.5, "throttled": True, "pids": "fork refused"}
+      assert container_status(lim, {"memory": 512 * 1024 ** 2, "cpus": 1.5, "pids": 10}) == {"memory": "ok", "cpu_granted": 1.5, "throttled": False, "pids": "ok"}
+  - name: no limits
+    code: |
+      assert container_status({}, {}) == {"memory": "unlimited", "cpu_granted": 0, "throttled": False, "pids": "unlimited"}
+      assert container_status({}, {"memory": 10 ** 12, "cpus": 8, "pids": 5000}) == {"memory": "unlimited", "cpu_granted": 8, "throttled": False, "pids": "unlimited"}
+      assert container_status({"cpus": 2}, {"cpus": 0.5}) == {"memory": "unlimited", "cpu_granted": 0.5, "throttled": False, "pids": "unlimited"}
+      assert container_status({"memory": "1k"}, {"memory": 1025})["memory"] == "oom-killed"
+  hints:
+  - Convert the memory limit with the given parse_size.
+  - Use dict.get(key, 0) for missing usage.
+  solution: |
+    def parse_size(text):
+        """Container limits are written like '512m' or '2g'. Convert such a text into a number of bytes. Accepted: a whole number, optionally followed by ONE letter k, m, g or t (upper or lower case) for 1024, 1024**2, 1024**3, 1024**4 bytes; no letter means bytes; surrounding blanks are ignored. Anything else (an empty text, a decimal point, a minus sign, two letters, a letter without a number) is a ValueError('bad size ' + the original text)."""
+        s = text.strip()
+        units = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4}
+        mult = 1
+        if s and s[-1].lower() in units:
+            mult = units[s[-1].lower()]
+            s = s[:-1]
+        if not s.isdigit():
+            raise ValueError("bad size " + text)
+        return int(s) * mult
+
+
+
+
+    def container_status(limits, usage):
+        """A **container** is an ordinary process that Linux limits with **cgroups** (control groups). Given the limits of a container, a dict that may contain 'memory' (a text such as '512m'), 'cpus' (a number of CPU cores, for example 1.5) and 'pids' (the highest number of processes), and a dict with the current usage ('memory' in bytes, 'cpus' = how many cores it wants, 'pids' = how many processes; a missing key means 0), return a dict with four entries. 'memory': 'unlimited' without a memory limit, 'oom-killed' if the usage is MORE than the limit (the kernel kills the process), else 'ok'. 'cpu_granted': the cores it really gets, the smaller one of wish and limit (the whole wish without a limit). 'throttled': True if the wish is MORE than the cpu limit (the kernel pauses the container to enforce the limit), else False. 'pids': 'unlimited' without a limit, 'fork refused' if the usage is more than the limit, else 'ok'."""
+        result = {}
+        mem = usage.get("memory", 0)
+        if "memory" not in limits:
+            result["memory"] = "unlimited"
+        else:
+            result["memory"] = "oom-killed" if mem > parse_size(limits["memory"]) else "ok"
+        want = usage.get("cpus", 0)
+        if "cpus" in limits:
+            result["cpu_granted"] = min(want, limits["cpus"])
+            result["throttled"] = want > limits["cpus"]
+        else:
+            result["cpu_granted"] = want
+            result["throttled"] = False
+        n = usage.get("pids", 0)
+        if "pids" not in limits:
+            result["pids"] = "unlimited"
+        else:
+            result["pids"] = "fork refused" if n > limits["pids"] else "ok"
+        return result
+  explanation: 'With a memory limit, Linux does not slow the process down: it kills it (the OOM killer), which you saw in the memory lesson. A CPU limit only slows it down (throttling).'
+- id: dockerfile
+  title: Reading a recipe
+  difficulty: 4
+  prompt: 'An **image** is a package with everything a program needs, made from a recipe: the `Dockerfile`. Write `parse_dockerfile(text)`. A **Dockerfile** is the recipe of a container image: one instruction per line, the first word is the instruction (FROM, RUN, COPY, ...) and the rest its arguments. Parse the text. Ignore blank lines and lines that start (after blanks) with #. A line that ends with a backslash continues on the next line: remove the backslash, join the lines with ONE blank and strip. The instruction word may be written in any case but is returned in upper case. Return a list of dicts {''op'', ''args''} (args stripped; '''' if none). The known instructions are FROM, RUN, COPY, ADD, CMD, ENTRYPOINT, ENV, EXPOSE, WORKDIR, USER, ARG, LABEL and VOLUME; anything else is a ValueError(''unknown instruction '' + the word in upper case). The first instruction must be FROM; only ARG may come before it. Otherwise (or if there is no instruction at all) raise ValueError(''first instruction must be FROM'').'
+  starter: |-
+    def parse_dockerfile(text):
+        """A **Dockerfile** is the recipe of a container image: one instruction per line, the first word is the instruction (FROM, RUN, COPY, ...) and the rest its arguments. Parse the text. Ignore blank lines and lines that start (after blanks) with #. A line that ends with a backslash continues on the next line: remove the backslash, join the lines with ONE blank and strip. The instruction word may be written in any case but is returned in upper case. Return a list of dicts {'op', 'args'} (args stripped; '' if none). The known instructions are FROM, RUN, COPY, ADD, CMD, ENTRYPOINT, ENV, EXPOSE, WORKDIR, USER, ARG, LABEL and VOLUME; anything else is a ValueError('unknown instruction ' + the word in upper case). The first instruction must be FROM; only ARG may come before it. Otherwise (or if there is no instruction at all) raise ValueError('first instruction must be FROM')."""
+        pass
+  tests:
+  - name: parsing
+    code: |
+      text = """# my service
+      ARG VERSION=3.12
+
+      from python:3.12-slim
+      RUN apt-get update \\
+          && apt-get install -y git \\
+          # no cache
+          && rm -rf /var/lib/apt/lists/*
+      COPY . /app
+        WORKDIR /app
+      CMD python app.py
+      """
+      assert parse_dockerfile(text) == [{"op": "ARG", "args": "VERSION=3.12"}, {"op": "FROM", "args": "python:3.12-slim"}, {"op": "RUN", "args": "apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*"}, {"op": "COPY", "args": ". /app"}, {"op": "WORKDIR", "args": "/app"}, {"op": "CMD", "args": "python app.py"}]
+      assert parse_dockerfile("FROM scratch") == [{"op": "FROM", "args": "scratch"}] and parse_dockerfile("FROM a\nEXPOSE") == [{"op": "FROM", "args": "a"}, {"op": "EXPOSE", "args": ""}]
+  - name: errors
+    code: |
+      for text, msg in (("", "first instruction must be FROM"), ("# only a comment\n", "first instruction must be FROM"), ("RUN echo hi\nFROM a", "first instruction must be FROM"), ("ARG a=1\n", "first instruction must be FROM"), ("FROM a\nFOO bar", "unknown instruction FOO"), ("FROM a\nrun x\nmaintain me", "unknown instruction MAINTAIN")):
+          try:
+              parse_dockerfile(text)
+              raise AssertionError("accepted " + repr(text))
+          except ValueError as e:
+              assert str(e) == msg, (text, str(e))
+  hints:
+  - First join the continuation lines into logical lines, then split each at the first blank.
+  - str.partition(' ') gives (word, blank, rest).
+  solution: |
+    def parse_dockerfile(text):
+        """A **Dockerfile** is the recipe of a container image: one instruction per line, the first word is the instruction (FROM, RUN, COPY, ...) and the rest its arguments. Parse the text. Ignore blank lines and lines that start (after blanks) with #. A line that ends with a backslash continues on the next line: remove the backslash, join the lines with ONE blank and strip. The instruction word may be written in any case but is returned in upper case. Return a list of dicts {'op', 'args'} (args stripped; '' if none). The known instructions are FROM, RUN, COPY, ADD, CMD, ENTRYPOINT, ENV, EXPOSE, WORKDIR, USER, ARG, LABEL and VOLUME; anything else is a ValueError('unknown instruction ' + the word in upper case). The first instruction must be FROM; only ARG may come before it. Otherwise (or if there is no instruction at all) raise ValueError('first instruction must be FROM')."""
+        known = {"FROM", "RUN", "COPY", "ADD", "CMD", "ENTRYPOINT", "ENV", "EXPOSE", "WORKDIR", "USER", "ARG", "LABEL", "VOLUME"}
+        logical, current = [], None
+        for raw in text.split("\n"):
+            line = raw.strip()
+            if current is None and (not line or line.startswith("#")):
+                continue
+            if current is not None and line.startswith("#"):
+                continue
+            cont = line.endswith("\\")
+            piece = line[:-1].strip() if cont else line
+            current = piece if current is None else (current + " " + piece).strip()
+            if not cont:
+                logical.append(current)
+                current = None
+        if current is not None:
+            logical.append(current)
+        result = []
+        for line in logical:
+            if not line:
+                continue
+            word, _, args = line.partition(" ")
+            op = word.upper()
+            if op not in known:
+                raise ValueError("unknown instruction " + op)
+            result.append({"op": op, "args": args.strip()})
+        for item in result:
+            if item["op"] == "FROM":
+                break
+            if item["op"] != "ARG":
+                raise ValueError("first instruction must be FROM")
+        else:
+            raise ValueError("first instruction must be FROM")
+        return result
+  explanation: Good Dockerfiles use a small base image, a non-root USER and (for build tools) multi-stage builds with several FROM lines; the extra FROM lines are what this exercise's simple rule allows.
+- id: cache
+  title: Why order matters in a Dockerfile
+  difficulty: 5
+  prompt: 'Building an image can take minutes, so Docker remembers layers. Write `build_cache(old, new)`. Docker builds an image **layer** by layer and keeps each one in a **cache**. When you build again, every instruction that is the same as before (and all before it are the same too) is taken from the cache; from the first changed instruction on, everything is rebuilt. Only the instructions FROM, RUN, COPY and ADD create layers (the others only change settings). Given the old and the new instruction list (as returned by parse_dockerfile), find the longest common start, the instructions that are equal in op and args at the same positions. Return {''cached'': the number of layer-creating instructions in that common start, ''rebuilt'': the number of layer-creating instructions of the NEW list after it}.'
+  starter: |-
+    def build_cache(old, new):
+        """Docker builds an image **layer** by layer and keeps each one in a **cache**. When you build again, every instruction that is the same as before (and all before it are the same too) is taken from the cache; from the first changed instruction on, everything is rebuilt. Only the instructions FROM, RUN, COPY and ADD create layers (the others only change settings). Given the old and the new instruction list (as returned by parse_dockerfile), find the longest common start, the instructions that are equal in op and args at the same positions. Return {'cached': the number of layer-creating instructions in that common start, 'rebuilt': the number of layer-creating instructions of the NEW list after it}."""
+        pass
+  tests:
+  - name: reuse
+    code: |
+      def ins(*pairs):
+          return [{"op": o, "args": a} for o, a in pairs]
+      old = ins(("FROM", "a"), ("RUN", "x"), ("COPY", ". /app"), ("ENV", "A=1"), ("RUN", "y"))
+      same = ins(("FROM", "a"), ("RUN", "x"), ("COPY", ". /app"), ("ENV", "A=1"), ("RUN", "y"))
+      env = ins(("FROM", "a"), ("RUN", "x"), ("COPY", ". /app"), ("ENV", "A=2"), ("RUN", "y"))
+      assert build_cache(old, same) == {"cached": 4, "rebuilt": 0}
+      assert build_cache(old, env) == {"cached": 3, "rebuilt": 1}
+      assert build_cache(old, ins(("FROM", "b"), ("RUN", "x"))) == {"cached": 0, "rebuilt": 2}
+  - name: edge cases
+    code: |
+      def ins(*pairs):
+          return [{"op": o, "args": a} for o, a in pairs]
+      a = ins(("FROM", "a"), ("RUN", "x"))
+      assert build_cache([], a) == {"cached": 0, "rebuilt": 2} and build_cache(a, []) == {"cached": 0, "rebuilt": 0} and build_cache([], []) == {"cached": 0, "rebuilt": 0}
+      b = ins(("FROM", "a"), ("ENV", "k=v"), ("RUN", "x"), ("CMD", "go"))
+      assert build_cache(a, b) == {"cached": 1, "rebuilt": 1}
+      assert build_cache(b, a) == {"cached": 1, "rebuilt": 1}
+  hints:
+  - Count how many items are equal from the start (a while loop).
+  - Only FROM, RUN, COPY and ADD count as layers.
+  solution: |
+    def build_cache(old, new):
+        """Docker builds an image **layer** by layer and keeps each one in a **cache**. When you build again, every instruction that is the same as before (and all before it are the same too) is taken from the cache; from the first changed instruction on, everything is rebuilt. Only the instructions FROM, RUN, COPY and ADD create layers (the others only change settings). Given the old and the new instruction list (as returned by parse_dockerfile), find the longest common start, the instructions that are equal in op and args at the same positions. Return {'cached': the number of layer-creating instructions in that common start, 'rebuilt': the number of layer-creating instructions of the NEW list after it}."""
+        layer_ops = {"FROM", "RUN", "COPY", "ADD"}
+        p = 0
+        while p < len(old) and p < len(new) and old[p] == new[p]:
+            p += 1
+        cached = sum(1 for i in new[:p] if i["op"] in layer_ops)
+        rebuilt = sum(1 for i in new[p:] if i["op"] in layer_ops)
+        return {"cached": cached, "rebuilt": rebuilt}
+  explanation: 'A good habit: copy the dependency list and install it first, and copy your source code last, because the code changes all the time and the dependencies rarely do.'
+- id: overlay
+  title: The merged view
+  difficulty: 4
+  prompt: 'Containers share layers: ten containers from one image use the same files on disk and only their own changes are stored in a small writable top layer. Write `overlay(layers)`. An image is a stack of read-only layers, and a container sees them merged by an **overlay file system**. Every layer is a dict {path: content}; a content of None means ''this file is deleted in this layer'' (Docker''s whiteout). The layers are given from the bottom (oldest) to the top (newest). Return the dict that a container sees: for each path the content of the NEWEST layer that mentions it; paths whose newest entry is None do not appear.'
+  starter: |-
+    def overlay(layers):
+        """An image is a stack of read-only layers, and a container sees them merged by an **overlay file system**. Every layer is a dict {path: content}; a content of None means 'this file is deleted in this layer' (Docker's whiteout). The layers are given from the bottom (oldest) to the top (newest). Return the dict that a container sees: for each path the content of the NEWEST layer that mentions it; paths whose newest entry is None do not appear."""
+        pass
+  tests:
+  - name: merging
+    code: |
+      layers = [{"/a": "x", "/b": "yy"}, {"/a": None, "/c": "z"}, {"/b": "qqq", "/a": "back"}]
+      assert overlay(layers) == {"/a": "back", "/b": "qqq", "/c": "z"}
+      assert overlay(layers[:2]) == {"/b": "yy", "/c": "z"} and overlay(layers[:1]) == {"/a": "x", "/b": "yy"}
+      assert overlay([]) == {} and overlay([{}, {}]) == {}
+  - name: deletion
+    code: |
+      assert overlay([{"/x": "1"}, {"/x": None}]) == {}
+      assert overlay([{"/x": None}]) == {}
+      l = [{"/x": "1"}]
+      assert overlay(l) == {"/x": "1"} and l == [{"/x": "1"}]
+  hints:
+  - Go through the layers from the bottom and update a dict.
+  - dict.pop(key, None) deletes a key that may not exist.
+  solution: |
+    def overlay(layers):
+        """An image is a stack of read-only layers, and a container sees them merged by an **overlay file system**. Every layer is a dict {path: content}; a content of None means 'this file is deleted in this layer' (Docker's whiteout). The layers are given from the bottom (oldest) to the top (newest). Return the dict that a container sees: for each path the content of the NEWEST layer that mentions it; paths whose newest entry is None do not appear."""
+        merged = {}
+        for layer in layers:
+            for path, content in layer.items():
+                if content is None:
+                    merged.pop(path, None)
+                else:
+                    merged[path] = content
+        return merged
+  explanation: A container that deletes a file from its base image only hides it (a whiteout entry), exactly like the None in this exercise.
+- id: waste
+  title: Deleting does not shrink the image
+  difficulty: 3
+  prompt: 'This is why people clean up in the *same* `RUN` instruction that created the mess. Write `wasted_bytes(layers)`. Deleting a file in a later layer does NOT make the image smaller, because the old layer still holds it. The size of an image is the total length of all contents (len of the text) in ALL layers (None counts as 0). The visible size is the total length of the contents in the merged view of overlay(layers). Return how many bytes are hidden: the image size minus the visible size.'
+  starter: |-
+    def overlay(layers):
+        """An image is a stack of read-only layers, and a container sees them merged by an **overlay file system**. Every layer is a dict {path: content}; a content of None means 'this file is deleted in this layer' (Docker's whiteout). The layers are given from the bottom (oldest) to the top (newest). Return the dict that a container sees: for each path the content of the NEWEST layer that mentions it; paths whose newest entry is None do not appear."""
+        merged = {}
+        for layer in layers:
+            for path, content in layer.items():
+                if content is None:
+                    merged.pop(path, None)
+                else:
+                    merged[path] = content
+        return merged
+
+
+
+
+    def wasted_bytes(layers):
+        """Deleting a file in a later layer does NOT make the image smaller, because the old layer still holds it. The size of an image is the total length of all contents (len of the text) in ALL layers (None counts as 0). The visible size is the total length of the contents in the merged view of overlay(layers). Return how many bytes are hidden: the image size minus the visible size."""
+        pass
+  tests:
+  - name: waste
+    code: |
+      layers = [{"/a": "xxxx", "/b": "yy"}, {"/a": None, "/c": "z"}, {"/b": "qqq"}]
+      assert wasted_bytes(layers) == 6
+      assert wasted_bytes(layers[:1]) == 0 and wasted_bytes([]) == 0
+      assert wasted_bytes([{"/big": "x" * 1000}, {"/big": None}]) == 1000
+  - name: overrides
+    code: |
+      assert wasted_bytes([{"/a": "12345"}, {"/a": "12"}]) == 5
+      assert wasted_bytes([{"/a": "1"}, {"/a": "12"}, {"/a": "123"}]) == 3
+      assert wasted_bytes([{"/a": "1", "/b": "22"}, {"/c": "333"}]) == 0
+  hints:
+  - Sum the lengths of everything in all layers, then subtract the visible total.
+  - The given overlay function does the merging.
+  solution: |
+    def overlay(layers):
+        """An image is a stack of read-only layers, and a container sees them merged by an **overlay file system**. Every layer is a dict {path: content}; a content of None means 'this file is deleted in this layer' (Docker's whiteout). The layers are given from the bottom (oldest) to the top (newest). Return the dict that a container sees: for each path the content of the NEWEST layer that mentions it; paths whose newest entry is None do not appear."""
+        merged = {}
+        for layer in layers:
+            for path, content in layer.items():
+                if content is None:
+                    merged.pop(path, None)
+                else:
+                    merged[path] = content
+        return merged
+
+
+
+
+    def wasted_bytes(layers):
+        """Deleting a file in a later layer does NOT make the image smaller, because the old layer still holds it. The size of an image is the total length of all contents (len of the text) in ALL layers (None counts as 0). The visible size is the total length of the contents in the merged view of overlay(layers). Return how many bytes are hidden: the image size minus the visible size."""
+        image = sum(len(c) for layer in layers for c in layer.values() if c is not None)
+        visible = sum(len(c) for c in overlay(layers).values())
+        return image - visible
+  explanation: Real tools that show this are docker history and the 'dive' program.
+commonMistakes:
+- title: Believing a container is a virtual machine
+  explanation: It shares the kernel of the host.
+- title: Running as root in the container
+  explanation: A break-out then has full power.
+- title: Copying the source before installing dependencies
+  explanation: Every code change then reinstalls everything.
+- title: Putting secrets in the image
+  explanation: Layers can be read.
+- title: Keeping data in the container layer
+  explanation: It disappears with the container; use a volume.
+summary:
+- A container is a process limited by namespaces and cgroups.
+- Containers share the kernel of the host.
+- An image is a stack of layers made from a Dockerfile.
+- Order instructions so that the cache is reused.
+- Deleting a file in a later layer does not shrink the image.
+next: u33-perf
+quiz:
+- type: mcq
+  question: What do cgroups limit?
+  options:
+  - How much a process can use
+  - What a process can see
+  - Which user runs it
+  - The file names
+  answer: 0
+  explanation: Namespaces limit what it sees.
+- type: mcq
+  question: What do namespaces limit?
+  options:
+  - What a process can see
+  - The memory
+  - The CPU
+  - The price
+  answer: 0
+  explanation: Process list, network, mounts.
+- type: mcq
+  question: What happens when a container exceeds its memory limit?
+  options:
+  - It is killed by the kernel
+  - It is slowed down
+  - It gets more memory
+  - Nothing
+  answer: 0
+  explanation: The OOM killer.
+- type: mcq
+  question: Why copy requirements before the source code in a Dockerfile?
+  options:
+  - The dependency layer stays cached
+  - It is shorter
+  - It is required
+  - It is safer
+  answer: 0
+  explanation: Rare changes first.
+- type: mcq
+  question: What is a volume used for?
+  options:
+  - Data that must outlive the container
+  - Sound
+  - Faster CPU
+  - Images
+  answer: 0
+  explanation: The container layer is thrown away.
+- type: mcq
+  question: Do containers share a kernel with the host?
+  options:
+  - 'Yes'
+  - No, each has its own
+  - Only on Windows
+  - Only with Kubernetes
+  answer: 0
+  explanation: That is the main difference to virtual machines.
+- type: code
+  question: Write `layer_count(ops)` returning how many of the instruction names in the list create a layer (FROM, RUN, COPY and ADD, in upper case).
+  starter: |
+    def layer_count(ops):
+        pass
+  tests:
+  - name: count
+    code: |
+      assert layer_count(["FROM", "RUN", "ENV", "COPY", "CMD", "ADD"]) == 4 and layer_count([]) == 0 and layer_count(["CMD", "ENV"]) == 0
+  solution: |
+    def layer_count(ops):
+        return len([o for o in ops if o in ("FROM", "RUN", "COPY", "ADD")])

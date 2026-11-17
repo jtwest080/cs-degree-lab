@@ -1,0 +1,423 @@
+id: u33-memory
+title: Memory in Practice
+minutes: 110
+objective: 'Learn to read what a real system says about its memory: /proc/meminfo, the map of a process, the choice of the OOM killer and the signature of a leak. You will explain why ''free'' memory is a misleading number.'
+outcomes:
+- Read /proc/meminfo and judge memory pressure
+- Explain what cache and available memory mean
+- Read the memory map of a process
+- Explain how the OOM killer chooses
+- Detect a memory leak from a trend
+sections:
+- heading: What memory numbers mean
+  body: |-
+    In the Operating Systems unit you built page tables and replacement policies. Here is how it looks on a real machine. The kernel reports memory in **/proc/meminfo** (and the `free` command shows a summary). The numbers an administrator uses:
+
+    - **MemTotal**: the installed RAM. **MemFree**: memory that is completely unused. This is almost always small, and that is **good**: unused RAM is wasted RAM.
+    - **Cached** and **Buffers**: the **page cache**, copies of file data kept in RAM so that the next read is instant. The kernel gives this memory back immediately when a program needs it.
+    - **MemAvailable**: the kernel's estimate of how much a new program could get without swapping. **This is the number to watch**, not MemFree.
+    - **SwapTotal / SwapFree**: **swap** is disk space used as extra, much slower memory. Some swap use is normal for rarely used pages. Constant swapping (**thrashing**) makes the machine crawl.
+    - **RSS** (resident set size) of a process: the part of its memory that is really in RAM. **VSZ** (virtual size) counts everything it has *reserved*, which is usually far more.
+
+    Every process has its own **virtual address space**. `/proc/PID/maps` shows its areas: the program code (read and execute), data (read and write), the **heap** (grows with malloc), the **stack** (grows with function calls), shared **libraries**, and anonymous areas. Areas that are both writable *and* executable are suspicious.
+- heading: When memory runs out
+  body: |-
+    If RAM and swap are both exhausted, the kernel's **OOM killer** (out-of-memory killer) picks a process and kills it, which shows up in the logs as "Out of memory: Killed process 1234 (name)". It prefers processes with a large RSS; an administrator can protect an important service with a low **oom_score_adj** (-1000 means never) or sacrifice a cache with a high one. **Containers** have their own memory limit (next lessons): exceeding it kills the container with status "OOMKilled".
+
+    A **memory leak** is memory that a program takes and never gives back. It looks like a line that climbs steadily in a graph of RSS over hours or days, usually until the OOM killer strikes. Spotting it means looking at the **trend**, not a single value. Tools to find *where* it leaks: a heap profiler (`valgrind`, `heaptrack`, Python's `tracemalloc`).
+
+    Remember: a program that has a large but *stable* RSS is not leaking. Look at the slope.
+examples:
+- title: Reading meminfo
+  intro: Only a small part of the memory is free, but a lot is available.
+  code: |
+    def parse_meminfo(text):
+        """Linux describes its memory in /proc/meminfo, lines such as 'MemTotal:       16384000 kB', 'Active(anon):  100 kB' or 'HugePages_Total:       0' (a count, without unit). Return a dict {name: number} where the name is the text before the colon (with any brackets) and the number the integer after it, in kilobytes for lines with kB (the numbers are not changed) and as it is for lines without a unit. Ignore lines without a colon, without a number or with another unit than kB (such as MB)."""
+        info = {}
+        for line in text.split("\n"):
+            name, sep, rest = line.partition(":")
+            parts = rest.split()
+            if not sep or not parts or not parts[0].isdigit() or len(parts) > 2 or (len(parts) == 2 and parts[1] != "kB"):
+                continue
+            info[name.strip()] = int(parts[0])
+        return info
+
+
+    def memory_summary(info):
+        """What an administrator wants to know from the numbers of parse_meminfo. ValueError('MemTotal missing') if there is no MemTotal. 'Free' memory is a misleading number, because Linux uses spare memory as a cache that it gives back when programs need it. The real number is MemAvailable; if it is missing estimate it as MemFree + Buffers + Cached (missing entries count as 0). Return a dict: 'total_mb', 'available_mb' and 'used_mb' (used = total - available), all in whole megabytes (kB divided by 1024, rounded down with //), 'used_percent' (used / total * 100, rounded to 1 decimal), 'swap_used_mb' (SwapTotal - SwapFree in MB; a missing swap counts as 0) and 'status': 'ok' if used_percent is below 70, 'high' below 90, otherwise 'critical'."""
+        if "MemTotal" not in info:
+            raise ValueError("MemTotal missing")
+        total = info["MemTotal"]
+        available = info["MemAvailable"] if "MemAvailable" in info else info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)
+        used = total - available
+        pct = round(used / total * 100, 1)
+        swap = info.get("SwapTotal", 0) - info.get("SwapFree", 0)
+        status = "ok" if pct < 70 else "high" if pct < 90 else "critical"
+        return {"total_mb": total // 1024, "available_mb": available // 1024, "used_mb": used // 1024, "used_percent": pct, "swap_used_mb": swap // 1024, "status": status}
+
+    text = """MemTotal:       16384000 kB
+    MemFree:         1024000 kB
+    MemAvailable:    9830400 kB
+    Buffers:          204800 kB
+    Cached:          6144000 kB
+    SwapTotal:       2097152 kB
+    SwapFree:        1048576 kB
+    """
+    info = parse_meminfo(text)
+    print(info["MemFree"] // 1024, "MB free,", info["MemAvailable"] // 1024, "MB available")
+    print(memory_summary(info))
+  output: |
+    1000 MB free, 9600 MB available
+    {'total_mb': 16000, 'available_mb': 9600, 'used_mb': 6400, 'used_percent': 40.0, 'swap_used_mb': 1024, 'status': 'ok'}
+  lines:
+  - line: 34
+    note: Almost nothing is free, yet a lot is available.
+  - line: 35
+    note: '40% used: the machine is healthy, and 1 GB of swap is in use.'
+- title: A map, the OOM killer and a leak
+  intro: Group a process map, see who the OOM killer would choose, and fit a leak trend.
+  code: "def parse_maps(text):\n    \"\"\"The file /proc/PID/maps lists the memory areas of a process, one per line: 'ADDRESS PERMS OFFSET DEV INODE PATHNAME', for example '55d0c0a00000-55d0c0a21000 r-xp 00000000 08:01 131 /usr/bin/python3'. The pathname may be missing (an anonymous area) or a name in brackets such as [heap] or [stack], and may contain blanks. Return a list of dicts {'start': int, 'end': int, 'size': end - start, 'perms': the 4 characters, 'path': the pathname ('' if missing)}. The addresses are hexadecimal. Skip blank lines; ValueError('bad maps line') for a line with fewer than 5 fields or an unreadable address.\"\"\"\n    regions = []\n    for line in text.split(\"\\n\"):\n        if not line.strip():\n            continue\n        parts = line.split(None, 5)\n        try:\n            if len(parts) < 5:\n                raise ValueError\n            start, end = (int(x, 16) for x in parts[0].split(\"-\"))\n        except ValueError:\n            raise ValueError(\"bad maps line\")\n        regions.append({\"start\": start, \"end\": end, \"size\": end - start, \"perms\": parts[1], \"path\": parts[5].strip() if len(parts) > 5 else \"\"})\n    return regions\n\n\ndef maps_summary(regions):\n    \"\"\"Group the memory areas by purpose. The category of an area: 'heap' if the path is [heap]; 'stack' if it is [stack]; 'library' if the path contains '.so'; 'anonymous' if the path is empty; 'program' for everything else (the program file itself and other special areas). Return a dict with 'bytes' (a dict {category: total size}, only categories that occur), 'total' (the sum of all sizes) and 'risky' (the sorted list of start addresses of areas whose permissions contain BOTH w and x: memory that can be written and executed is how many attacks work).\"\"\"\n    sizes = {}\n    for r in regions:\n        path = r[\"path\"]\n        cat = \"heap\" if path == \"[heap]\" else \"stack\" if path == \"[stack]\" else \"library\" if \".so\" in path else \"anonymous\" if not path else \"program\"\n        sizes[cat] = sizes.get(cat, 0) + r[\"size\"]\n    risky = sorted(r[\"start\"] for r in regions if \"w\" in r[\"perms\"] and \"x\" in r[\"perms\"])\n    return {\"bytes\": sizes, \"total\": sum(r[\"size\"] for r in regions), \"risky\": risky}\n\n\ndef oom_candidates(procs, total_kb, limit):\n    \"\"\"When memory runs out the kernel's OOM killer (out-of-memory killer) kills a process. It prefers the one that uses the most memory, adjusted by the setting oom_score_adj (-1000 to 1000) that an administrator can give to protect or sacrifice a process. Model: the score of a process is rss_kb * 1000 // total_kb + adj, kept within 0 to 1000; a process with adj = -1000 is never killed and is left out. `procs` is a list of dicts {'pid', 'name', 'rss_kb', 'adj'}. Return the first `limit` entries (limit < 1 gives an empty list) as tuples (pid, name, score), highest score first and, for equal scores, lower pid first.\"\"\"\n    scored = []\n    for p in procs:\n        if p[\"adj\"] == -1000:\n            continue\n        score = max(0, min(1000, p[\"rss_kb\"] * 1000 // total_kb + p[\"adj\"]))\n        scored.append((p[\"pid\"], p[\"name\"], score))\n    scored.sort(key=lambda t: (-t[2], t[0]))\n    return scored[:max(limit, 0)]\n\n\ndef detect_leak(samples, min_growth_per_hour):\n    \"\"\"A MEMORY LEAK is memory that a program keeps taking and never gives back; it shows as an RSS (resident memory) that grows over time. `samples` is a list of (seconds, rss_kb) readings in time order. ValueError('need at least 3 samples') for fewer than 3, and ValueError('samples need different times') if all times are equal. Compute the trend with the method of least squares: slope = sum((t - mean_t) * (r - mean_r)) / sum((t - mean_t) ** 2), in kB per second; multiply by 3600 for kB per hour. Also compute 'steady' = the fraction of consecutive steps in which the memory did NOT fall (rounded to 2 decimals). Return {'slope_per_hour': the slope rounded to 1 decimal, 'steady': ..., 'leak': True only if the slope is at least min_growth_per_hour AND steady is at least 0.8}.\"\"\"\n    if len(samples) < 3:\n        raise ValueError(\"need at least 3 samples\")\n    n = len(samples)\n    mt = sum(t for t, _ in samples) / n\n    mr = sum(r for _, r in samples) / n\n    den = sum((t - mt) ** 2 for t, _ in samples)\n    if den == 0:\n        raise ValueError(\"samples need different times\")\n    slope = sum((t - mt) * (r - mr) for t, r in samples) / den * 3600\n    steps = [samples[i + 1][1] >= samples[i][1] for i in range(n - 1)]\n    steady = round(sum(steps) / len(steps), 2)\n    return {\"slope_per_hour\": round(slope, 1), \"steady\": steady, \"leak\": slope >= min_growth_per_hour and steady >= 0.8}\n\nmaps = \"\"\"1000-3000 r-xp 00000000 08:01 131 /usr/bin/python3\n5000-9000 rw-p 00000000 00:00 0 [heap]\na000-b000 r-xp 00000000 08:01 200 /usr/lib/libc.so.6\nc000-d000 rwxp 00000000 00:00 0 \ne000-f000 rw-p 00000000 00:00 0 [stack]\n\"\"\"\nprint(maps_summary(parse_maps(maps)))\nprocs = [{\"pid\": 1, \"name\": \"db\", \"rss_kb\": 8192000, \"adj\": 0}, {\"pid\": 2, \"name\": \"cache\", \"rss_kb\": 4096000, \"adj\": 500}, {\"pid\": 3, \"name\": \"sshd\", \"rss_kb\": 9000000, \"adj\": -1000}]\nprint(oom_candidates(procs, 16384000, 2))\nprint(detect_leak([(0, 1000), (3600, 1100), (7200, 1210), (10800, 1300)], 50))\n"
+  output: |
+    {'bytes': {'program': 8192, 'heap': 16384, 'library': 4096, 'anonymous': 4096, 'stack': 4096}, 'total': 36864, 'risky': [49152]}
+    [(2, 'cache', 750), (1, 'db', 500)]
+    {'slope_per_hour': 101.0, 'steady': 1.0, 'leak': True}
+  lines:
+  - line: 62
+    note: The risky list names the area that is writable and executable.
+  - line: 64
+    note: The cache with a high adjustment is the first victim; sshd is protected.
+  - line: 65
+    note: 'About 100 kB more every hour, with no fall: a leak.'
+playground:
+  prompt: Convert kilobytes to megabytes.
+  code: |
+    kb = 9830400
+    print(kb // 1024, 'MB')
+exercises:
+- id: meminfo
+  title: Reading /proc/meminfo
+  difficulty: 3
+  prompt: 'Memory is the other resource, besides the CPU, that an administrator watches. Linux describes it in a pretend file called `/proc/meminfo`. Write `parse_meminfo(text)`. Linux describes its memory in /proc/meminfo, lines such as ''MemTotal:       16384000 kB'', ''Active(anon):  100 kB'' or ''HugePages_Total:       0'' (a count, without unit). Return a dict {name: number} where the name is the text before the colon (with any brackets) and the number the integer after it, in kilobytes for lines with kB (the numbers are not changed) and as it is for lines without a unit. Ignore lines without a colon, without a number or with another unit than kB (such as MB).'
+  starter: |-
+    def parse_meminfo(text):
+        """Linux describes its memory in /proc/meminfo, lines such as 'MemTotal:       16384000 kB', 'Active(anon):  100 kB' or 'HugePages_Total:       0' (a count, without unit). Return a dict {name: number} where the name is the text before the colon (with any brackets) and the number the integer after it, in kilobytes for lines with kB (the numbers are not changed) and as it is for lines without a unit. Ignore lines without a colon, without a number or with another unit than kB (such as MB)."""
+        pass
+  tests:
+  - name: parsing
+    code: |
+      text = """MemTotal:       16384000 kB
+      MemFree:         1024000 kB
+      Active(anon):     100000 kB
+      HugePages_Total:       0
+      Mixed: 5 MB
+      no colon here
+      Empty:
+      Text: abc kB
+      """
+      assert parse_meminfo(text) == {"MemTotal": 16384000, "MemFree": 1024000, "Active(anon)": 100000, "HugePages_Total": 0}
+      assert parse_meminfo("") == {} and parse_meminfo("A: 1 kB\nA: 2 kB") == {"A": 2}
+  - name: spaces and units
+    code: |
+      assert parse_meminfo("  Spaced :   42   kB  ") == {"Spaced": 42} and parse_meminfo("X: 1 kb") == {} and parse_meminfo("X: 1 kB extra") == {} and parse_meminfo("Y: -5 kB") == {} and parse_meminfo("Z: 7") == {"Z": 7}
+  hints:
+  - str.partition(':') splits at the first colon.
+  - isdigit() is False for negative numbers and empty text.
+  solution: |
+    def parse_meminfo(text):
+        """Linux describes its memory in /proc/meminfo, lines such as 'MemTotal:       16384000 kB', 'Active(anon):  100 kB' or 'HugePages_Total:       0' (a count, without unit). Return a dict {name: number} where the name is the text before the colon (with any brackets) and the number the integer after it, in kilobytes for lines with kB (the numbers are not changed) and as it is for lines without a unit. Ignore lines without a colon, without a number or with another unit than kB (such as MB)."""
+        info = {}
+        for line in text.split("\n"):
+            name, sep, rest = line.partition(":")
+            parts = rest.split()
+            if not sep or not parts or not parts[0].isdigit() or len(parts) > 2 or (len(parts) == 2 and parts[1] != "kB"):
+                continue
+            info[name.strip()] = int(parts[0])
+        return info
+  explanation: Because every line has the same shape, one small parser reads the whole file. The same trick works for /proc/cpuinfo, /proc/loadavg and many others.
+- id: summary
+  title: Free is not free
+  difficulty: 4
+  prompt: 'A beginner looks at the *free* memory and panics: it is almost zero! But Linux uses spare memory to **cache** files, because unused memory is wasted memory, and gives it back when programs ask. Write `memory_summary(info)`. What an administrator wants to know from the numbers of parse_meminfo. ValueError(''MemTotal missing'') if there is no MemTotal. ''Free'' memory is a misleading number, because Linux uses spare memory as a cache that it gives back when programs need it. The real number is MemAvailable; if it is missing estimate it as MemFree + Buffers + Cached (missing entries count as 0). Return a dict: ''total_mb'', ''available_mb'' and ''used_mb'' (used = total - available), all in whole megabytes (kB divided by 1024, rounded down with //), ''used_percent'' (used / total * 100, rounded to 1 decimal), ''swap_used_mb'' (SwapTotal - SwapFree in MB; a missing swap counts as 0) and ''status'': ''ok'' if used_percent is below 70, ''high'' below 90, otherwise ''critical''.'
+  starter: |-
+    def memory_summary(info):
+        """What an administrator wants to know from the numbers of parse_meminfo. ValueError('MemTotal missing') if there is no MemTotal. 'Free' memory is a misleading number, because Linux uses spare memory as a cache that it gives back when programs need it. The real number is MemAvailable; if it is missing estimate it as MemFree + Buffers + Cached (missing entries count as 0). Return a dict: 'total_mb', 'available_mb' and 'used_mb' (used = total - available), all in whole megabytes (kB divided by 1024, rounded down with //), 'used_percent' (used / total * 100, rounded to 1 decimal), 'swap_used_mb' (SwapTotal - SwapFree in MB; a missing swap counts as 0) and 'status': 'ok' if used_percent is below 70, 'high' below 90, otherwise 'critical'."""
+        pass
+  tests:
+  - name: a healthy machine
+    code: |
+      info = {"MemTotal": 16384000, "MemFree": 1024000, "MemAvailable": 9830400, "Buffers": 204800, "Cached": 6144000, "SwapTotal": 2097152, "SwapFree": 1048576}
+      assert memory_summary(info) == {"total_mb": 16000, "available_mb": 9600, "used_mb": 6400, "used_percent": 40.0, "swap_used_mb": 1024, "status": "ok"}
+  - name: estimates and limits
+    code: |
+      old = {"MemTotal": 10240, "MemFree": 1024, "Buffers": 1024, "Cached": 2048}
+      assert memory_summary(old) == {"total_mb": 10, "available_mb": 4, "used_mb": 6, "used_percent": 60.0, "swap_used_mb": 0, "status": "ok"}
+      def status(avail):
+          return memory_summary({"MemTotal": 1000, "MemAvailable": avail})["status"]
+      assert [status(310), status(300), status(101), status(100), status(0)] == ["ok", "high", "high", "critical", "critical"]
+      assert memory_summary({"MemTotal": 2048, "MemAvailable": 0, "SwapTotal": 4096, "SwapFree": 1024})["swap_used_mb"] == 3
+      for bad in ({}, {"MemFree": 5}):
+          try:
+              memory_summary(bad)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "MemTotal missing" in str(e)
+  hints:
+  - MemAvailable is the honest number; fall back to the estimate only when it is missing.
+  - Use the unrounded percentage for the status, or the rounded one? The rule says used_percent, the rounded value.
+  solution: |
+    def memory_summary(info):
+        """What an administrator wants to know from the numbers of parse_meminfo. ValueError('MemTotal missing') if there is no MemTotal. 'Free' memory is a misleading number, because Linux uses spare memory as a cache that it gives back when programs need it. The real number is MemAvailable; if it is missing estimate it as MemFree + Buffers + Cached (missing entries count as 0). Return a dict: 'total_mb', 'available_mb' and 'used_mb' (used = total - available), all in whole megabytes (kB divided by 1024, rounded down with //), 'used_percent' (used / total * 100, rounded to 1 decimal), 'swap_used_mb' (SwapTotal - SwapFree in MB; a missing swap counts as 0) and 'status': 'ok' if used_percent is below 70, 'high' below 90, otherwise 'critical'."""
+        if "MemTotal" not in info:
+            raise ValueError("MemTotal missing")
+        total = info["MemTotal"]
+        available = info["MemAvailable"] if "MemAvailable" in info else info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)
+        used = total - available
+        pct = round(used / total * 100, 1)
+        swap = info.get("SwapTotal", 0) - info.get("SwapFree", 0)
+        status = "ok" if pct < 70 else "high" if pct < 90 else "critical"
+        return {"total_mb": total // 1024, "available_mb": available // 1024, "used_mb": used // 1024, "used_percent": pct, "swap_used_mb": swap // 1024, "status": status}
+  explanation: 'A machine with a high ''used'' but plenty of ''available'' is fine. The warning sign is swapping: when the system has to write memory to disk, everything slows down.'
+- id: maps
+  title: The map of a process
+  difficulty: 5
+  prompt: 'Every process sees its own private address space, and Linux shows how it is laid out in `/proc/PID/maps`. Write `parse_maps(text)`. The file /proc/PID/maps lists the memory areas of a process, one per line: ''ADDRESS PERMS OFFSET DEV INODE PATHNAME'', for example ''55d0c0a00000-55d0c0a21000 r-xp 00000000 08:01 131 /usr/bin/python3''. The pathname may be missing (an anonymous area) or a name in brackets such as [heap] or [stack], and may contain blanks. Return a list of dicts {''start'': int, ''end'': int, ''size'': end - start, ''perms'': the 4 characters, ''path'': the pathname ('''' if missing)}. The addresses are hexadecimal. Skip blank lines; ValueError(''bad maps line'') for a line with fewer than 5 fields or an unreadable address. Also write `maps_summary(regions)`: Group the memory areas by purpose. The category of an area: ''heap'' if the path is [heap]; ''stack'' if it is [stack]; ''library'' if the path contains ''.so''; ''anonymous'' if the path is empty; ''program'' for everything else (the program file itself and other special areas). Return a dict with ''bytes'' (a dict {category: total size}, only categories that occur), ''total'' (the sum of all sizes) and ''risky'' (the sorted list of start addresses of areas whose permissions contain BOTH w and x: memory that can be written and executed is how many attacks work).'
+  starter: |-
+    def parse_maps(text):
+        """The file /proc/PID/maps lists the memory areas of a process, one per line: 'ADDRESS PERMS OFFSET DEV INODE PATHNAME', for example '55d0c0a00000-55d0c0a21000 r-xp 00000000 08:01 131 /usr/bin/python3'. The pathname may be missing (an anonymous area) or a name in brackets such as [heap] or [stack], and may contain blanks. Return a list of dicts {'start': int, 'end': int, 'size': end - start, 'perms': the 4 characters, 'path': the pathname ('' if missing)}. The addresses are hexadecimal. Skip blank lines; ValueError('bad maps line') for a line with fewer than 5 fields or an unreadable address."""
+        pass
+
+
+    def maps_summary(regions):
+        """Group the memory areas by purpose. The category of an area: 'heap' if the path is [heap]; 'stack' if it is [stack]; 'library' if the path contains '.so'; 'anonymous' if the path is empty; 'program' for everything else (the program file itself and other special areas). Return a dict with 'bytes' (a dict {category: total size}, only categories that occur), 'total' (the sum of all sizes) and 'risky' (the sorted list of start addresses of areas whose permissions contain BOTH w and x: memory that can be written and executed is how many attacks work)."""
+        pass
+  tests:
+  - name: reading regions
+    code: "text = \"\"\"1000-3000 r-xp 00000000 08:01 131 /usr/bin/python3\n3000-4000 rw-p 00002000 08:01 131 /usr/bin/python3\n\n5000-9000 rw-p 00000000 00:00 0 [heap]\nc000-d000 rwxp 00000000 00:00 0 \n7f00-7f80 r--p 00000000 08:01 9 /home/ada/my file.txt\n\"\"\"\nr = parse_maps(text)\nassert [(x[\"start\"], x[\"end\"], x[\"size\"], x[\"perms\"], x[\"path\"]) for x in r] == [(0x1000, 0x3000, 0x2000, \"r-xp\", \"/usr/bin/python3\"), (0x3000, 0x4000, 0x1000, \"rw-p\", \"/usr/bin/python3\"), (0x5000, 0x9000, 0x4000, \"rw-p\", \"[heap]\"), (0xc000, 0xd000, 0x1000, \"rwxp\", \"\"), (0x7f00, 0x7f80, 0x80, \"r--p\", \"/home/ada/my file.txt\")]\nassert parse_maps(\"\") == [] and parse_maps(\"\\n  \\n\") == []\n"
+  - name: bad lines
+    code: |
+      for bad in ("1000-2000 r-xp", "zzzz-2000 r-xp 0 08:01 5 x", "10002000 r-xp 0 08:01 5 x", "1000-2000-3000 r-xp 0 08:01 5", "only"):
+          try:
+              parse_maps(bad)
+              raise AssertionError("accepted " + bad)
+          except ValueError as e:
+              assert "bad maps line" in str(e)
+      assert parse_maps("a-b r--p 0 0:0 0")[0]["size"] == 1
+  - name: categories
+    code: "text = \"\"\"1000-3000 r-xp 00000000 08:01 131 /usr/bin/python3\n3000-4000 rw-p 00002000 08:01 131 /usr/bin/python3\n5000-9000 rw-p 00000000 00:00 0 [heap]\na000-b000 r-xp 00000000 08:01 200 /usr/lib/libc.so.6\nc000-d000 rwxp 00000000 00:00 0 \ne000-f000 rw-p 00000000 00:00 0 [stack]\n1f000-20000 r--s 00000000 00:00 0 [vdso]\n\"\"\"\nr = maps_summary(parse_maps(text))\nassert r == {\"bytes\": {\"program\": 16384, \"heap\": 16384, \"library\": 4096, \"anonymous\": 4096, \"stack\": 4096}, \"total\": 45056, \"risky\": [49152]}\n"
+  - name: details
+    code: |
+      def reg(start, size, perms, path):
+          return {"start": start, "end": start + size, "size": size, "perms": perms, "path": path}
+      r = maps_summary([reg(300, 10, "rwxp", "/lib/x.so.1"), reg(100, 5, "-wx-", ""), reg(200, 7, "r-xp", "/bin/a"), reg(50, 3, "rw-p", "/bin/a")])
+      assert r == {"bytes": {"library": 10, "anonymous": 5, "program": 10}, "total": 25, "risky": [100, 300]}
+      assert maps_summary([]) == {"bytes": {}, "total": 0, "risky": []} and maps_summary([reg(1, 4, "rw-p", "[heap]")]) == {"bytes": {"heap": 4}, "total": 4, "risky": []}
+  hints:
+  - str.split(None, 5) keeps a pathname with blanks together.
+  - int(text, 16) reads hexadecimal.
+  solution: |
+    def parse_maps(text):
+        """The file /proc/PID/maps lists the memory areas of a process, one per line: 'ADDRESS PERMS OFFSET DEV INODE PATHNAME', for example '55d0c0a00000-55d0c0a21000 r-xp 00000000 08:01 131 /usr/bin/python3'. The pathname may be missing (an anonymous area) or a name in brackets such as [heap] or [stack], and may contain blanks. Return a list of dicts {'start': int, 'end': int, 'size': end - start, 'perms': the 4 characters, 'path': the pathname ('' if missing)}. The addresses are hexadecimal. Skip blank lines; ValueError('bad maps line') for a line with fewer than 5 fields or an unreadable address."""
+        regions = []
+        for line in text.split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split(None, 5)
+            try:
+                if len(parts) < 5:
+                    raise ValueError
+                start, end = (int(x, 16) for x in parts[0].split("-"))
+            except ValueError:
+                raise ValueError("bad maps line")
+            regions.append({"start": start, "end": end, "size": end - start, "perms": parts[1], "path": parts[5].strip() if len(parts) > 5 else ""})
+        return regions
+
+
+    def maps_summary(regions):
+        """Group the memory areas by purpose. The category of an area: 'heap' if the path is [heap]; 'stack' if it is [stack]; 'library' if the path contains '.so'; 'anonymous' if the path is empty; 'program' for everything else (the program file itself and other special areas). Return a dict with 'bytes' (a dict {category: total size}, only categories that occur), 'total' (the sum of all sizes) and 'risky' (the sorted list of start addresses of areas whose permissions contain BOTH w and x: memory that can be written and executed is how many attacks work)."""
+        sizes = {}
+        for r in regions:
+            path = r["path"]
+            cat = "heap" if path == "[heap]" else "stack" if path == "[stack]" else "library" if ".so" in path else "anonymous" if not path else "program"
+            sizes[cat] = sizes.get(cat, 0) + r["size"]
+        risky = sorted(r["start"] for r in regions if "w" in r["perms"] and "x" in r["perms"])
+        return {"bytes": sizes, "total": sum(r["size"] for r in regions), "risky": risky}
+  explanation: 'Large anonymous areas are usually memory a program asked for with malloc or mmap. The [heap] and [stack] are special names: the heap grows with allocations, and the stack with function calls.'
+- id: oom
+  title: Who gets killed?
+  difficulty: 4
+  prompt: 'When memory really runs out, Linux must free some, and its last resort is to **kill a process**. Write `oom_candidates(procs, total_kb, limit)`. When memory runs out the kernel''s OOM killer (out-of-memory killer) kills a process. It prefers the one that uses the most memory, adjusted by the setting oom_score_adj (-1000 to 1000) that an administrator can give to protect or sacrifice a process. Model: the score of a process is rss_kb * 1000 // total_kb + adj, kept within 0 to 1000; a process with adj = -1000 is never killed and is left out. `procs` is a list of dicts {''pid'', ''name'', ''rss_kb'', ''adj''}. Return the first `limit` entries (limit < 1 gives an empty list) as tuples (pid, name, score), highest score first and, for equal scores, lower pid first.'
+  starter: |-
+    def oom_candidates(procs, total_kb, limit):
+        """When memory runs out the kernel's OOM killer (out-of-memory killer) kills a process. It prefers the one that uses the most memory, adjusted by the setting oom_score_adj (-1000 to 1000) that an administrator can give to protect or sacrifice a process. Model: the score of a process is rss_kb * 1000 // total_kb + adj, kept within 0 to 1000; a process with adj = -1000 is never killed and is left out. `procs` is a list of dicts {'pid', 'name', 'rss_kb', 'adj'}. Return the first `limit` entries (limit < 1 gives an empty list) as tuples (pid, name, score), highest score first and, for equal scores, lower pid first."""
+        pass
+  tests:
+  - name: ranking
+    code: |
+      procs = [{"pid": 1, "name": "db", "rss_kb": 8192000, "adj": 0}, {"pid": 2, "name": "cache", "rss_kb": 4096000, "adj": 500}, {"pid": 3, "name": "sshd", "rss_kb": 9000000, "adj": -1000}, {"pid": 4, "name": "idle", "rss_kb": 0, "adj": -500}, {"pid": 5, "name": "web", "rss_kb": 8192000, "adj": 0}]
+      assert oom_candidates(procs, 16384000, 3) == [(2, "cache", 750), (1, "db", 500), (5, "web", 500)]
+      assert oom_candidates(procs, 16384000, 10) == [(2, "cache", 750), (1, "db", 500), (5, "web", 500), (4, "idle", 0)]
+      assert oom_candidates(procs, 16384000, 0) == [] and oom_candidates(procs, 16384000, -2) == [] and oom_candidates([], 100, 5) == []
+  - name: clamping
+    code: |
+      big = [{"pid": 7, "name": "hog", "rss_kb": 900, "adj": 900}, {"pid": 8, "name": "tiny", "rss_kb": 1, "adj": -5}]
+      assert oom_candidates(big, 1000, 5) == [(7, "hog", 1000), (8, "tiny", 0)]
+      assert oom_candidates([{"pid": 1, "name": "x", "rss_kb": 999, "adj": 1000}], 1000, 1) == [(1, "x", 1000)]
+  hints:
+  - Integer division // keeps the score a whole number.
+  - min and max together keep a value inside a range.
+  solution: |
+    def oom_candidates(procs, total_kb, limit):
+        """When memory runs out the kernel's OOM killer (out-of-memory killer) kills a process. It prefers the one that uses the most memory, adjusted by the setting oom_score_adj (-1000 to 1000) that an administrator can give to protect or sacrifice a process. Model: the score of a process is rss_kb * 1000 // total_kb + adj, kept within 0 to 1000; a process with adj = -1000 is never killed and is left out. `procs` is a list of dicts {'pid', 'name', 'rss_kb', 'adj'}. Return the first `limit` entries (limit < 1 gives an empty list) as tuples (pid, name, score), highest score first and, for equal scores, lower pid first."""
+        scored = []
+        for p in procs:
+            if p["adj"] == -1000:
+                continue
+            score = max(0, min(1000, p["rss_kb"] * 1000 // total_kb + p["adj"]))
+            scored.append((p["pid"], p["name"], score))
+        scored.sort(key=lambda t: (-t[2], t[0]))
+        return scored[:max(limit, 0)]
+  explanation: This is why important services get a low oom_score_adj and why a container with a memory limit often dies with 'OOMKilled' instead of the whole machine going down.
+- id: leak
+  title: Detecting a leak
+  difficulty: 5
+  prompt: 'A **memory leak** is memory that a program keeps taking and never gives back: its resident memory (RSS) grows over time. You cannot see it in one reading, only in a **trend**. Write `detect_leak(samples, min_growth_per_hour)`. A MEMORY LEAK is memory that a program keeps taking and never gives back; it shows as an RSS (resident memory) that grows over time. `samples` is a list of (seconds, rss_kb) readings in time order. ValueError(''need at least 3 samples'') for fewer than 3, and ValueError(''samples need different times'') if all times are equal. Compute the trend with the method of least squares: slope = sum((t - mean_t) * (r - mean_r)) / sum((t - mean_t) ** 2), in kB per second; multiply by 3600 for kB per hour. Also compute ''steady'' = the fraction of consecutive steps in which the memory did NOT fall (rounded to 2 decimals). Return {''slope_per_hour'': the slope rounded to 1 decimal, ''steady'': ..., ''leak'': True only if the slope is at least min_growth_per_hour AND steady is at least 0.8}.'
+  starter: |-
+    def detect_leak(samples, min_growth_per_hour):
+        """A MEMORY LEAK is memory that a program keeps taking and never gives back; it shows as an RSS (resident memory) that grows over time. `samples` is a list of (seconds, rss_kb) readings in time order. ValueError('need at least 3 samples') for fewer than 3, and ValueError('samples need different times') if all times are equal. Compute the trend with the method of least squares: slope = sum((t - mean_t) * (r - mean_r)) / sum((t - mean_t) ** 2), in kB per second; multiply by 3600 for kB per hour. Also compute 'steady' = the fraction of consecutive steps in which the memory did NOT fall (rounded to 2 decimals). Return {'slope_per_hour': the slope rounded to 1 decimal, 'steady': ..., 'leak': True only if the slope is at least min_growth_per_hour AND steady is at least 0.8}."""
+        pass
+  tests:
+  - name: a leak and a healthy program
+    code: |
+      leak = [(0, 1000), (3600, 1100), (7200, 1210), (10800, 1300)]
+      assert detect_leak(leak, 50) == {"slope_per_hour": 101.0, "steady": 1.0, "leak": True}
+      assert detect_leak(leak, 200)["leak"] is False
+      saw = [(0, 1000), (600, 1400), (1200, 1000), (1800, 1400), (2400, 1000), (3000, 1400)]
+      r = detect_leak(saw, 1)
+      assert r["steady"] == 0.6 and r["leak"] is False
+      flat = [(0, 500), (60, 500), (120, 500)]
+      assert detect_leak(flat, 1) == {"slope_per_hour": 0.0, "steady": 1.0, "leak": False}
+  - name: errors and a noisy climb
+    code: |
+      for bad in ([], [(0, 1)], [(0, 1), (1, 2)]):
+          try:
+              detect_leak(bad, 1)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "need at least 3 samples" in str(e)
+      try:
+          detect_leak([(5, 1), (5, 2), (5, 3)], 1)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "samples need different times" in str(e)
+      noisy = [(0, 100), (10, 120), (20, 115), (30, 140), (40, 150), (50, 170), (60, 190), (70, 200), (80, 230), (90, 260), (100, 300)]
+      r = detect_leak(noisy, 1000)
+      assert r["steady"] == 0.9 and r["leak"] is True
+      assert detect_leak(noisy, 100000)["leak"] is False and detect_leak([(0, 300), (1, 200), (2, 100)], -10**9)["leak"] is False
+  hints:
+  - Write the least-squares sum with a list comprehension and keep t in seconds.
+  - A leak needs a clear slope AND a mostly rising series.
+  solution: |
+    def detect_leak(samples, min_growth_per_hour):
+        """A MEMORY LEAK is memory that a program keeps taking and never gives back; it shows as an RSS (resident memory) that grows over time. `samples` is a list of (seconds, rss_kb) readings in time order. ValueError('need at least 3 samples') for fewer than 3, and ValueError('samples need different times') if all times are equal. Compute the trend with the method of least squares: slope = sum((t - mean_t) * (r - mean_r)) / sum((t - mean_t) ** 2), in kB per second; multiply by 3600 for kB per hour. Also compute 'steady' = the fraction of consecutive steps in which the memory did NOT fall (rounded to 2 decimals). Return {'slope_per_hour': the slope rounded to 1 decimal, 'steady': ..., 'leak': True only if the slope is at least min_growth_per_hour AND steady is at least 0.8}."""
+        if len(samples) < 3:
+            raise ValueError("need at least 3 samples")
+        n = len(samples)
+        mt = sum(t for t, _ in samples) / n
+        mr = sum(r for _, r in samples) / n
+        den = sum((t - mt) ** 2 for t, _ in samples)
+        if den == 0:
+            raise ValueError("samples need different times")
+        slope = sum((t - mt) * (r - mr) for t, r in samples) / den * 3600
+        steps = [samples[i + 1][1] >= samples[i][1] for i in range(n - 1)]
+        steady = round(sum(steps) / len(steps), 2)
+        return {"slope_per_hour": round(slope, 1), "steady": steady, "leak": slope >= min_growth_per_hour and steady >= 0.8}
+  explanation: After a suspect program shows a steady climb, tools such as heap profilers (valgrind, tracemalloc in Python) tell you which line keeps the memory.
+commonMistakes:
+- title: Panicking about low free memory
+  explanation: Look at MemAvailable.
+- title: Judging a leak from one reading
+  explanation: A leak is a trend.
+- title: Confusing virtual and resident size
+  explanation: VSZ is what is reserved, RSS what is in RAM.
+- title: Ignoring swap activity
+  explanation: Constant swapping makes everything slow.
+- title: Killing processes at random
+  explanation: Find out which one grows, and why.
+summary:
+- MemAvailable, not MemFree, shows how much memory programs can still get.
+- Cache is memory used to speed up files and is given back at once.
+- A process map shows code, data, heap, stack and libraries.
+- The OOM killer prefers big processes, adjusted by oom_score_adj.
+- A leak is a steady climb over time.
+next: u33-logs
+quiz:
+- type: mcq
+  question: Which number shows how much memory new programs can get?
+  options:
+  - MemAvailable
+  - MemFree
+  - MemTotal
+  - SwapTotal
+  answer: 0
+  explanation: It includes cache that can be released.
+- type: mcq
+  question: What is the page cache?
+  options:
+  - File data kept in RAM to speed up reads
+  - A virus
+  - Swap space
+  - The CPU cache
+  answer: 0
+  explanation: Unused RAM works as a cache.
+- type: mcq
+  question: What does the OOM killer do?
+  options:
+  - Kills a process when memory has run out
+  - Cleans the disk
+  - Restarts the machine
+  - Compresses memory
+  answer: 0
+  explanation: A last resort.
+- type: mcq
+  question: What is a memory leak?
+  options:
+  - Memory taken and never given back
+  - A fast program
+  - Too much swap
+  - A full disk
+  answer: 0
+  explanation: RSS keeps growing.
+- type: mcq
+  question: Which memory areas are suspicious?
+  options:
+  - Those both writable and executable
+  - Those that are read-only
+  - The stack
+  - Shared libraries
+  answer: 0
+  explanation: Attackers like them.
+- type: mcq
+  question: What does constant swapping cause?
+  options:
+  - Everything becomes very slow
+  - Faster programs
+  - More cache
+  - A smaller kernel
+  answer: 0
+  explanation: Thrashing.
+- type: code
+  question: 'Write `kb_to_human(kb)` that turns a number of kilobytes into text: below 1024 give e.g. `''512 kB''`; below 1024*1024 the value in MB with one decimal, e.g. `''1.5 MB''`; otherwise the value in GB with one decimal, e.g. `''16.0 GB''` (divide by 1024 each time).'
+  starter: |
+    def kb_to_human(kb):
+        pass
+  tests:
+  - name: units
+    code: |
+      assert kb_to_human(512) == "512 kB" and kb_to_human(1536) == "1.5 MB" and kb_to_human(16 * 1024 * 1024) == "16.0 GB" and kb_to_human(0) == "0 kB" and kb_to_human(1023) == "1023 kB" and kb_to_human(1024) == "1.0 MB"
+  solution: |
+    def kb_to_human(kb):
+        if kb < 1024:
+            return str(kb) + " kB"
+        if kb < 1024 * 1024:
+            return format(kb / 1024, ".1f") + " MB"
+        return format(kb / (1024 * 1024), ".1f") + " GB"

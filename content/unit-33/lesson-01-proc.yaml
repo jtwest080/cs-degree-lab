@@ -1,0 +1,577 @@
+id: u33-proc
+title: Reading the Process Table
+minutes: 110
+objective: 'Learn how administrators see what a computer is doing: read the process table, draw the family tree, spot zombies and runaway programs, measure CPU use from kernel counters and read load averages. Everything is built by parsing the same text that real tools print.'
+outcomes:
+- Parse the output of ps
+- Draw a process tree and explain parents and children
+- Recognize zombies, uninterruptible sleep and runaway CPU use
+- Compute CPU percentages from counters
+- Read load averages
+sections:
+- heading: The operating system as seen by its tools
+  body: |-
+    In the Operating Systems unit you built models of schedulers and memory. This unit shows the **real thing**: what the kernel reports and what an administrator does with it. On Linux nearly everything is a **text interface**. The command `ps` prints the processes; the **/proc** folder is a pretend file system through which the kernel shows its state (`/proc/stat` for CPU counters, `/proc/meminfo` for memory, `/proc/1234/` for process 1234); `uptime` prints the load. Because it is all text, you can **parse** it in a few lines of Python and build your own tools. That is the skill of this unit.
+
+    A **process** is a running program with its own memory and an id, the **PID**. Every process (except the first one, `systemd` or `init`, PID 1) was started by a **parent**, its **PPID**. The result is a **tree**. The STAT column shows the **state**: `R` running or ready, `S` sleeping (waiting for something, the normal state), `D` uninterruptible sleep (waiting for the disk or a network file system; it cannot even be killed until the wait ends), `T` stopped, `Z` **zombie**, and extra letters such as `s` (session leader) or `+` (foreground).
+- heading: What trouble looks like
+  body: |-
+    - **A zombie** (`Z`) has already finished, but its parent has not yet *waited* for it (read its exit status), so the kernel keeps a tiny record. One zombie is harmless; thousands show a buggy parent. You cannot kill a zombie; you fix or restart its parent.
+    - **An orphan** is a process whose parent ended. The kernel hands it to PID 1.
+    - **Runaway CPU** shows as one process near 100% (per core). **Stuck in D** for a long time suggests a failing disk or network storage.
+    - **Load average.** The three numbers (1, 5 and 15 minutes) count processes that are running *or waiting to run* (on Linux also waiting for disk). Compare with the number of cores: a load of 4 on 4 cores is full; 12 on 4 cores means a long queue. Comparing the 1-minute and 15-minute numbers shows the **trend**.
+    - **CPU percentage** is not stored anywhere: the kernel only keeps **counters** of ticks spent in each mode since boot. Tools read the counters twice and divide the *difference*. This pattern, a counter that only grows and a rate computed from two readings, appears everywhere in monitoring.
+
+    Always remember the limits of a snapshot: a process at 98% for one second may be perfectly normal. Look at a few readings over time before you decide something is wrong.
+examples:
+- title: Reading a process table
+  intro: Parse a small ps listing, draw the family tree and list the problems.
+  code: |
+    def parse_ps(text):
+        """Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError('no header')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {'pid': int, 'ppid': int, 'state': the FIRST letter of STAT, 'cpu': float, 'mem': float, 'command': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError('bad line N') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1."""
+        lines = text.split("\n")
+        rows, seen_header = [], False
+        for n, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            if not seen_header:
+                if not line.split()[0] == "PID":
+                    raise ValueError("no header")
+                seen_header = True
+                continue
+            parts = line.split(None, 5)
+            try:
+                if len(parts) < 6:
+                    raise ValueError
+                rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "state": parts[2][0], "cpu": float(parts[3]), "mem": float(parts[4]), "command": parts[5].strip()})
+            except ValueError:
+                raise ValueError("bad line " + str(n))
+        if not seen_header:
+            raise ValueError("no header")
+        return rows
+
+
+    def process_tree(procs):
+        """Draw the family tree of processes (every process is started by a parent, PPID). `procs` is a list as returned by parse_ps. A ROOT is a process whose ppid is not the pid of any process in the list. Return the list of lines: for each process, in depth-first order, two blanks of indentation per level, then the pid, a blank and the command. Roots and the children of each process are listed in order of pid."""
+        pids = {p["pid"] for p in procs}
+        children = {}
+        for p in procs:
+            children.setdefault(p["ppid"], []).append(p)
+        lines = []
+
+        def walk(p, depth):
+            lines.append("  " * depth + str(p["pid"]) + " " + p["command"])
+            for child in sorted(children.get(p["pid"], []), key=lambda c: c["pid"]):
+                if child["pid"] != p["pid"]:
+                    walk(child, depth + 1)
+        for root in sorted((p for p in procs if p["ppid"] not in pids or p["ppid"] == p["pid"]), key=lambda p: p["pid"]):
+            walk(root, 0)
+        return lines
+
+
+    def find_problems(procs):
+        """The first things an administrator looks for. For every process, in order of pid (and, for one process, in the order below), report: 'pid N: zombie COMMAND (parent PPID)' when the state is Z (a zombie has finished, but its parent has not collected its exit status); 'pid N: stuck in disk wait COMMAND' when the state is D (uninterruptible sleep, usually waiting for a disk or network file system); and 'pid N: busy COMMAND at X%' when cpu is at least 90.0 (X written with one decimal, e.g. 97.5). Return the list of text lines."""
+        problems = []
+        for p in sorted(procs, key=lambda p: p["pid"]):
+            n = str(p["pid"])
+            if p["state"] == "Z":
+                problems.append("pid " + n + ": zombie " + p["command"] + " (parent " + str(p["ppid"]) + ")")
+            if p["state"] == "D":
+                problems.append("pid " + n + ": stuck in disk wait " + p["command"])
+            if p["cpu"] >= 90.0:
+                problems.append("pid " + n + ": busy " + p["command"] + " at " + format(p["cpu"], ".1f") + "%")
+        return problems
+
+    PS_TEXT = """  PID  PPID STAT %CPU %MEM COMMAND
+        1     0 Ss    0.0  0.1 systemd
+      200     1 Ss    0.2  0.5 sshd
+      311   200 S     0.1  0.2 bash
+      400     1 Z     0.0  0.0 old worker <defunct>
+      500     1 D     1.5  2.0 backup job
+      600   311 R+   97.5  4.0 python3 crunch.py
+    """
+    procs = parse_ps(PS_TEXT)
+    print(len(procs), procs[-1]["command"], procs[-1]["cpu"])
+    for line in process_tree(procs):
+        print(line)
+    for problem in find_problems(procs):
+        print(problem)
+  output: |
+    6 python3 crunch.py 97.5
+    1 systemd
+      200 sshd
+        311 bash
+          600 python3 crunch.py
+      400 old worker <defunct>
+      500 backup job
+    pid 400: zombie old worker <defunct> (parent 1)
+    pid 500: stuck in disk wait backup job
+    pid 600: busy python3 crunch.py at 97.5%
+  lines:
+  - line: 65
+    note: Six processes; the last one is the busy one.
+  - line: 66
+    note: The tree shows who started whom.
+  - line: 68
+    note: A zombie, a stuck process and a runaway.
+- title: CPU counters and load
+  intro: Two readings of the CPU counters, and what a load average of 9 on 4 cores means.
+  code: |
+    def cpu_percent(prev_text, curr_text):
+        """Linux keeps CPU time counters in /proc/stat: lines such as 'cpu  4705 150 1120 16250 520 0 30 0' (the total of all cores) and 'cpu0 ...' for each core. The eight numbers are ticks spent in user, nice, system, idle, iowait, irq, softirq and steal mode. Reading the counters twice shows how busy the CPU was in between. Both texts hold such lines (ignore every line that does not start with 'cpu'). Return a dict {name: percent busy} for every cpu name present in BOTH texts: busy = total ticks - idle - iowait, and percent = 100 * busy ticks gained / total ticks gained between the two readings, rounded to one decimal; 0.0 if no ticks passed. ValueError('counters went backwards') if the total decreased. A line with fewer than 8 numbers is ignored (old kernels)."""
+        def read(text):
+            out = {}
+            for line in text.split("\n"):
+                parts = line.split()
+                if parts and parts[0].startswith("cpu") and len(parts) >= 9:
+                    out[parts[0]] = [int(x) for x in parts[1:9]]
+            return out
+        before, after = read(prev_text), read(curr_text)
+        result = {}
+        for name in before:
+            if name not in after:
+                continue
+            a, b = before[name], after[name]
+            total = sum(b) - sum(a)
+            if total < 0:
+                raise ValueError("counters went backwards")
+            idle = (b[3] + b[4]) - (a[3] + a[4])
+            result[name] = round(100 * (total - idle) / total, 1) if total else 0.0
+        return result
+
+
+    def load_report(uptime_text, cores):
+        """The three LOAD AVERAGES are the average number of processes that wanted to run (or were waiting for the disk) over the last 1, 5 and 15 minutes. Take them from the text of the uptime command: the three numbers after 'load average:' separated by commas (a decimal comma is not allowed). ValueError('no load average') if the text has none. Return a dict: 'load' (the tuple of the three floats), 'per_core' (the first number divided by cores, rounded to 2 decimals), 'status' ('idle' below 0.3, 'ok' below 0.7, 'busy' below 1.0, otherwise 'overloaded', using the unrounded per-core value) and 'trend' ('rising' if the 1-minute load is more than 25% above the 15-minute load, 'falling' if it is more than 25% below it, otherwise 'steady'; if the 15-minute load is 0, 'rising' when the 1-minute load is above 0, else 'steady')."""
+        import re
+        m = re.search(r"load average:\s*([0-9.]+),\s*([0-9.]+),\s*([0-9.]+)", uptime_text)
+        if not m:
+            raise ValueError("no load average")
+        a, b, c = (float(x) for x in m.groups())
+        per = a / cores
+        status = "idle" if per < 0.3 else "ok" if per < 0.7 else "busy" if per < 1.0 else "overloaded"
+        if c == 0:
+            trend = "rising" if a > 0 else "steady"
+        else:
+            trend = "rising" if a > c * 1.25 else "falling" if a < c * 0.75 else "steady"
+        return {"load": (a, b, c), "per_core": round(per, 2), "status": status, "trend": trend}
+
+    first = "cpu  100 0 50 800 50 0 0 0\ncpu0 60 0 30 400 10 0 0 0\n"
+    second = "cpu  200 0 100 850 50 0 0 0\ncpu0 120 0 60 420 20 0 0 0\n"
+    print(cpu_percent(first, second))
+    report = load_report("10:00:01 up 3 days, 2 users, load average: 2.40, 1.20, 0.80", 4)
+    print(report)
+    print(load_report("10:00:01 up 3 days, 1 user, load average: 9.00, 8.50, 8.00", 4)["status"])
+  output: |
+    {'cpu': 75.0, 'cpu0': 75.0}
+    {'load': (2.4, 1.2, 0.8), 'per_core': 0.6, 'status': 'ok', 'trend': 'rising'}
+    overloaded
+  lines:
+  - line: 41
+    note: Between the two readings the CPU was busy three quarters of the time.
+  - line: 43
+    note: 2.4 on 4 cores is fine, but it is rising.
+  - line: 44
+    note: Over 2 per core is a long queue.
+playground:
+  prompt: Compute a percentage from two counter readings.
+  code: |
+    before, after = (100, 800), (200, 850)
+    busy = after[0] - before[0]
+    total = busy + (after[1] - before[1])
+    print(round(100 * busy / total, 1))
+exercises:
+- id: parse-ps
+  title: Reading ps output
+  difficulty: 4
+  prompt: 'The first tool of every system administrator is `ps`, which lists the **processes** (running programs) of a computer as a text table. Real systems are managed by reading and parsing text like this. Write `parse_ps(text)`. Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError(''no header'')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {''pid'': int, ''ppid'': int, ''state'': the FIRST letter of STAT, ''cpu'': float, ''mem'': float, ''command'': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError(''bad line N'') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1.'
+  starter: |-
+    def parse_ps(text):
+        """Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError('no header')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {'pid': int, 'ppid': int, 'state': the FIRST letter of STAT, 'cpu': float, 'mem': float, 'command': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError('bad line N') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1."""
+        pass
+  tests:
+  - name: parsing a table
+    code: |
+      text = """  PID  PPID STAT %CPU %MEM COMMAND
+          1     0 Ss    0.0  0.1 systemd
+        311   310 R+   97.5  4.0 python3 crunch.py
+        400     1 Z     0.0  0.0 old worker <defunct>
+      """
+      r = parse_ps(text)
+      assert r == [{"pid": 1, "ppid": 0, "state": "S", "cpu": 0.0, "mem": 0.1, "command": "systemd"}, {"pid": 311, "ppid": 310, "state": "R", "cpu": 97.5, "mem": 4.0, "command": "python3 crunch.py"}, {"pid": 400, "ppid": 1, "state": "Z", "cpu": 0.0, "mem": 0.0, "command": "old worker <defunct>"}]
+      assert parse_ps("PID PPID STAT %CPU %MEM COMMAND\n") == [] and parse_ps("\n\n PID x\n\n1 0 S 0 0 a\n")[0]["command"] == "a"
+  - name: errors
+    code: |
+      for text in ("", "   \n", "1 0 S 0.0 0.1 init", "USER PID\n1 0 S 0 0 a"):
+          try:
+              parse_ps(text)
+              raise AssertionError("accepted " + repr(text))
+          except ValueError as e:
+              assert "no header" in str(e)
+      head = "PID PPID STAT %CPU %MEM COMMAND\n"
+      for body, n in (("1 0 S 0.0 0.1\n", 2), ("\n\nx 0 S 0.0 0.1 a\n", 4), ("1 0 S 0.0 0.1 a\n2 0 S abc 0.1 b\n", 3), ("1 0 S 0.0 0.1 a\n\n\n3 0\n", 5)):
+          try:
+              parse_ps(head + body)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert str(e) == "bad line " + str(n), str(e)
+  hints:
+  - str.split(None, 5) splits at blanks but leaves the rest of the line in the last part.
+  - Count line numbers with enumerate(lines, 1) before skipping blank lines.
+  solution: |
+    def parse_ps(text):
+        """Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError('no header')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {'pid': int, 'ppid': int, 'state': the FIRST letter of STAT, 'cpu': float, 'mem': float, 'command': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError('bad line N') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1."""
+        lines = text.split("\n")
+        rows, seen_header = [], False
+        for n, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            if not seen_header:
+                if not line.split()[0] == "PID":
+                    raise ValueError("no header")
+                seen_header = True
+                continue
+            parts = line.split(None, 5)
+            try:
+                if len(parts) < 6:
+                    raise ValueError
+                rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "state": parts[2][0], "cpu": float(parts[3]), "mem": float(parts[4]), "command": parts[5].strip()})
+            except ValueError:
+                raise ValueError("bad line " + str(n))
+        if not seen_header:
+            raise ValueError("no header")
+        return rows
+  explanation: Real programs read this text with the `ps` command, or directly from the files in /proc, a pretend folder through which Linux shows what the kernel knows.
+- id: tree
+  title: The process family tree
+  difficulty: 4
+  prompt: 'Every process is started by a **parent** (its PPID), so processes form a tree, like the output of `pstree`. Write `process_tree(procs)`. Draw the family tree of processes (every process is started by a parent, PPID). `procs` is a list as returned by parse_ps. A ROOT is a process whose ppid is not the pid of any process in the list. Return the list of lines: for each process, in depth-first order, two blanks of indentation per level, then the pid, a blank and the command. Roots and the children of each process are listed in order of pid.'
+  starter: |-
+    def parse_ps(text):
+        """Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError('no header')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {'pid': int, 'ppid': int, 'state': the FIRST letter of STAT, 'cpu': float, 'mem': float, 'command': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError('bad line N') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1."""
+        lines = text.split("\n")
+        rows, seen_header = [], False
+        for n, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            if not seen_header:
+                if not line.split()[0] == "PID":
+                    raise ValueError("no header")
+                seen_header = True
+                continue
+            parts = line.split(None, 5)
+            try:
+                if len(parts) < 6:
+                    raise ValueError
+                rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "state": parts[2][0], "cpu": float(parts[3]), "mem": float(parts[4]), "command": parts[5].strip()})
+            except ValueError:
+                raise ValueError("bad line " + str(n))
+        if not seen_header:
+            raise ValueError("no header")
+        return rows
+
+
+
+
+    def process_tree(procs):
+        """Draw the family tree of processes (every process is started by a parent, PPID). `procs` is a list as returned by parse_ps. A ROOT is a process whose ppid is not the pid of any process in the list. Return the list of lines: for each process, in depth-first order, two blanks of indentation per level, then the pid, a blank and the command. Roots and the children of each process are listed in order of pid."""
+        pass
+  tests:
+  - name: a tree
+    code: |
+      ps = """PID PPID STAT %CPU %MEM COMMAND
+      1 0 Ss 0.0 0.1 systemd
+      200 1 Ss 0.2 0.5 sshd
+      310 200 Ss 0.0 0.3 sshd: ada [priv]
+      311 310 S 0.1 0.2 bash
+      400 1 Z 0.0 0.0 worker
+      500 1 D 1.5 2.0 backup job
+      600 311 R+ 97.5 4.0 python3 crunch.py
+      700 999 S 0.0 0.1 orphan
+      """
+      assert process_tree(parse_ps(ps)) == ["1 systemd", "  200 sshd", "    310 sshd: ada [priv]", "      311 bash", "        600 python3 crunch.py", "  400 worker", "  500 backup job", "700 orphan"]
+  - name: order and odd shapes
+    code: |
+      def mk(pid, ppid, cmd):
+          return {"pid": pid, "ppid": ppid, "state": "S", "cpu": 0.0, "mem": 0.0, "command": cmd}
+      assert process_tree([]) == [] and process_tree([mk(5, 0, "a")]) == ["5 a"]
+      procs = [mk(30, 10, "c"), mk(10, 0, "a"), mk(20, 10, "b"), mk(5, 7, "root2"), mk(40, 30, "d")]
+      assert process_tree(procs) == ["5 root2", "10 a", "  20 b", "  30 c", "    40 d"]
+      assert process_tree([mk(2, 2, "self")]) == ["2 self"] and process_tree([mk(1, 1, "init"), mk(2, 1, "x")]) == ["1 init", "  2 x"]
+  hints:
+  - Group the processes by ppid first, then walk from the roots with a small recursive function.
+  - A root is a process whose parent is not in the list.
+  solution: |
+    def parse_ps(text):
+        """Read the output of `ps -eo pid,ppid,stat,pcpu,pmem,comm`, a table of the processes of a computer. The first non-blank line must start with the word PID (the header; otherwise ValueError('no header')). Every other non-blank line has six columns separated by blanks: PID, PPID, STAT, %CPU, %MEM and then the command (the REST of the line, which may contain blanks). Return a list of dicts {'pid': int, 'ppid': int, 'state': the FIRST letter of STAT, 'cpu': float, 'mem': float, 'command': text}. A line that has fewer than 6 columns or whose numbers cannot be read raises ValueError('bad line N') where N is the position of the line in the text counting ALL lines including blank ones, starting at 1."""
+        lines = text.split("\n")
+        rows, seen_header = [], False
+        for n, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            if not seen_header:
+                if not line.split()[0] == "PID":
+                    raise ValueError("no header")
+                seen_header = True
+                continue
+            parts = line.split(None, 5)
+            try:
+                if len(parts) < 6:
+                    raise ValueError
+                rows.append({"pid": int(parts[0]), "ppid": int(parts[1]), "state": parts[2][0], "cpu": float(parts[3]), "mem": float(parts[4]), "command": parts[5].strip()})
+            except ValueError:
+                raise ValueError("bad line " + str(n))
+        if not seen_header:
+            raise ValueError("no header")
+        return rows
+
+
+
+
+    def process_tree(procs):
+        """Draw the family tree of processes (every process is started by a parent, PPID). `procs` is a list as returned by parse_ps. A ROOT is a process whose ppid is not the pid of any process in the list. Return the list of lines: for each process, in depth-first order, two blanks of indentation per level, then the pid, a blank and the command. Roots and the children of each process are listed in order of pid."""
+        pids = {p["pid"] for p in procs}
+        children = {}
+        for p in procs:
+            children.setdefault(p["ppid"], []).append(p)
+        lines = []
+
+        def walk(p, depth):
+            lines.append("  " * depth + str(p["pid"]) + " " + p["command"])
+            for child in sorted(children.get(p["pid"], []), key=lambda c: c["pid"]):
+                if child["pid"] != p["pid"]:
+                    walk(child, depth + 1)
+        for root in sorted((p for p in procs if p["ppid"] not in pids or p["ppid"] == p["pid"]), key=lambda p: p["pid"]):
+            walk(root, 0)
+        return lines
+  explanation: This is how `pstree` and the process view of every monitoring tool are drawn. The tree is also how `kill`ing a parent can affect its children.
+- id: problems
+  title: Spotting trouble
+  difficulty: 4
+  prompt: 'After parsing, an administrator scans for processes in trouble. Write `find_problems(procs)`. The first things an administrator looks for. For every process, in order of pid (and, for one process, in the order below), report: ''pid N: zombie COMMAND (parent PPID)'' when the state is Z (a zombie has finished, but its parent has not collected its exit status); ''pid N: stuck in disk wait COMMAND'' when the state is D (uninterruptible sleep, usually waiting for a disk or network file system); and ''pid N: busy COMMAND at X%'' when cpu is at least 90.0 (X written with one decimal, e.g. 97.5). Return the list of text lines.'
+  starter: |-
+    def find_problems(procs):
+        """The first things an administrator looks for. For every process, in order of pid (and, for one process, in the order below), report: 'pid N: zombie COMMAND (parent PPID)' when the state is Z (a zombie has finished, but its parent has not collected its exit status); 'pid N: stuck in disk wait COMMAND' when the state is D (uninterruptible sleep, usually waiting for a disk or network file system); and 'pid N: busy COMMAND at X%' when cpu is at least 90.0 (X written with one decimal, e.g. 97.5). Return the list of text lines."""
+        pass
+  tests:
+  - name: three kinds
+    code: |
+      def mk(pid, ppid, state, cpu, cmd):
+          return {"pid": pid, "ppid": ppid, "state": state, "cpu": cpu, "mem": 0.0, "command": cmd}
+      procs = [mk(600, 311, "R", 97.5, "python3 crunch.py"), mk(400, 1, "Z", 0.0, "old worker <defunct>"), mk(500, 1, "D", 1.5, "backup job"), mk(1, 0, "S", 0.0, "systemd")]
+      assert find_problems(procs) == ["pid 400: zombie old worker <defunct> (parent 1)", "pid 500: stuck in disk wait backup job", "pid 600: busy python3 crunch.py at 97.5%"]
+      assert find_problems([]) == [] and find_problems([mk(1, 0, "S", 89.9, "ok")]) == []
+  - name: boundaries
+    code: |
+      def mk(pid, state, cpu):
+          return {"pid": pid, "ppid": 1, "state": state, "cpu": cpu, "mem": 0.0, "command": "p"}
+      assert find_problems([mk(2, "S", 90.0)]) == ["pid 2: busy p at 90.0%"] and find_problems([mk(2, "S", 100.0)]) == ["pid 2: busy p at 100.0%"]
+      assert find_problems([mk(9, "Z", 95.26), mk(3, "R", 99.0)]) == ["pid 3: busy p at 99.0%", "pid 9: zombie p (parent 1)", "pid 9: busy p at 95.3%"]
+      assert find_problems([mk(1, "T", 0.0), mk(2, "I", 0.0), mk(3, "R", 0.0)]) == []
+  hints:
+  - Sort by pid and then append the messages for one process in the order given.
+  - format(x, '.1f') gives one decimal.
+  solution: |
+    def find_problems(procs):
+        """The first things an administrator looks for. For every process, in order of pid (and, for one process, in the order below), report: 'pid N: zombie COMMAND (parent PPID)' when the state is Z (a zombie has finished, but its parent has not collected its exit status); 'pid N: stuck in disk wait COMMAND' when the state is D (uninterruptible sleep, usually waiting for a disk or network file system); and 'pid N: busy COMMAND at X%' when cpu is at least 90.0 (X written with one decimal, e.g. 97.5). Return the list of text lines."""
+        problems = []
+        for p in sorted(procs, key=lambda p: p["pid"]):
+            n = str(p["pid"])
+            if p["state"] == "Z":
+                problems.append("pid " + n + ": zombie " + p["command"] + " (parent " + str(p["ppid"]) + ")")
+            if p["state"] == "D":
+                problems.append("pid " + n + ": stuck in disk wait " + p["command"])
+            if p["cpu"] >= 90.0:
+                problems.append("pid " + n + ": busy " + p["command"] + " at " + format(p["cpu"], ".1f") + "%")
+        return problems
+  explanation: A zombie is harmless on its own (it uses almost nothing) but many of them mean that a parent program forgets to collect its children. D state that lasts is a sign of a broken disk or network share.
+- id: cpu
+  title: How busy is the CPU?
+  difficulty: 5
+  prompt: 'Tools such as `top` do not ask the CPU how busy it is: they read **counters** from the kernel twice and subtract. Write `cpu_percent(prev_text, curr_text)`. Linux keeps CPU time counters in /proc/stat: lines such as ''cpu  4705 150 1120 16250 520 0 30 0'' (the total of all cores) and ''cpu0 ...'' for each core. The eight numbers are ticks spent in user, nice, system, idle, iowait, irq, softirq and steal mode. Reading the counters twice shows how busy the CPU was in between. Both texts hold such lines (ignore every line that does not start with ''cpu''). Return a dict {name: percent busy} for every cpu name present in BOTH texts: busy = total ticks - idle - iowait, and percent = 100 * busy ticks gained / total ticks gained between the two readings, rounded to one decimal; 0.0 if no ticks passed. ValueError(''counters went backwards'') if the total decreased. A line with fewer than 8 numbers is ignored (old kernels).'
+  starter: |-
+    def cpu_percent(prev_text, curr_text):
+        """Linux keeps CPU time counters in /proc/stat: lines such as 'cpu  4705 150 1120 16250 520 0 30 0' (the total of all cores) and 'cpu0 ...' for each core. The eight numbers are ticks spent in user, nice, system, idle, iowait, irq, softirq and steal mode. Reading the counters twice shows how busy the CPU was in between. Both texts hold such lines (ignore every line that does not start with 'cpu'). Return a dict {name: percent busy} for every cpu name present in BOTH texts: busy = total ticks - idle - iowait, and percent = 100 * busy ticks gained / total ticks gained between the two readings, rounded to one decimal; 0.0 if no ticks passed. ValueError('counters went backwards') if the total decreased. A line with fewer than 8 numbers is ignored (old kernels)."""
+        pass
+  tests:
+  - name: two readings
+    code: |
+      a = "cpu  100 0 50 800 50 0 0 0\ncpu0 60 0 30 400 10 0 0 0\ncpu1 40 0 20 400 40 0 0 0\nintr 123 4\n"
+      b = "cpu  200 0 100 850 50 0 0 0\ncpu0 120 0 60 420 20 0 0 0\ncpu1 80 0 40 430 30 0 0 0\nintr 456 7\n"
+      assert cpu_percent(a, b) == {"cpu": 75.0, "cpu0": 75.0, "cpu1": 75.0}
+      assert cpu_percent(a, a) == {"cpu": 0.0, "cpu0": 0.0, "cpu1": 0.0}
+  - name: errors and odd input
+    code: |
+      a = "cpu  100 0 50 800 50 0 0 0\n"
+      b = "cpu  100 0 50 790 50 0 0 0\n"
+      try:
+          cpu_percent(a, b)
+          raise AssertionError("accepted")
+      except ValueError as e:
+          assert "counters went backwards" in str(e)
+      assert cpu_percent("cpu  1 1 1 1 1 1 1 1\ncpu9 1 1 1 1 1 1 1 1\n", "cpu  3 1 1 1 1 1 1 1\n") == {"cpu": 100.0}
+      assert cpu_percent("cpu  1 2 3\n", "cpu  5 5 5\n") == {} and cpu_percent("", "") == {}
+      assert cpu_percent("cpu 0 0 0 10 0 0 0 0\n", "cpu 5 0 0 15 0 0 0 0\n") == {"cpu": 50.0} and cpu_percent("cpu 0 0 0 0 10 0 0 0", "cpu 0 0 0 0 20 0 0 0") == {"cpu": 0.0}
+  hints:
+  - Parse each line that starts with cpu into a list of eight integers.
+  - busy = total - idle - iowait, all counted as gains between the two readings.
+  solution: |
+    def cpu_percent(prev_text, curr_text):
+        """Linux keeps CPU time counters in /proc/stat: lines such as 'cpu  4705 150 1120 16250 520 0 30 0' (the total of all cores) and 'cpu0 ...' for each core. The eight numbers are ticks spent in user, nice, system, idle, iowait, irq, softirq and steal mode. Reading the counters twice shows how busy the CPU was in between. Both texts hold such lines (ignore every line that does not start with 'cpu'). Return a dict {name: percent busy} for every cpu name present in BOTH texts: busy = total ticks - idle - iowait, and percent = 100 * busy ticks gained / total ticks gained between the two readings, rounded to one decimal; 0.0 if no ticks passed. ValueError('counters went backwards') if the total decreased. A line with fewer than 8 numbers is ignored (old kernels)."""
+        def read(text):
+            out = {}
+            for line in text.split("\n"):
+                parts = line.split()
+                if parts and parts[0].startswith("cpu") and len(parts) >= 9:
+                    out[parts[0]] = [int(x) for x in parts[1:9]]
+            return out
+        before, after = read(prev_text), read(curr_text)
+        result = {}
+        for name in before:
+            if name not in after:
+                continue
+            a, b = before[name], after[name]
+            total = sum(b) - sum(a)
+            if total < 0:
+                raise ValueError("counters went backwards")
+            idle = (b[3] + b[4]) - (a[3] + a[4])
+            result[name] = round(100 * (total - idle) / total, 1) if total else 0.0
+        return result
+  explanation: 'The same two-readings idea is behind most monitoring: network traffic, disk operations and request counts are all counters that only ever grow, and rates come from differences.'
+- id: load
+  title: Load average
+  difficulty: 4
+  prompt: 'The three **load averages** at the end of the `uptime` text are the first number to look at when a server feels slow. Write `load_report(uptime_text, cores)`. The three LOAD AVERAGES are the average number of processes that wanted to run (or were waiting for the disk) over the last 1, 5 and 15 minutes. Take them from the text of the uptime command: the three numbers after ''load average:'' separated by commas (a decimal comma is not allowed). ValueError(''no load average'') if the text has none. Return a dict: ''load'' (the tuple of the three floats), ''per_core'' (the first number divided by cores, rounded to 2 decimals), ''status'' (''idle'' below 0.3, ''ok'' below 0.7, ''busy'' below 1.0, otherwise ''overloaded'', using the unrounded per-core value) and ''trend'' (''rising'' if the 1-minute load is more than 25% above the 15-minute load, ''falling'' if it is more than 25% below it, otherwise ''steady''; if the 15-minute load is 0, ''rising'' when the 1-minute load is above 0, else ''steady'').'
+  starter: |-
+    def load_report(uptime_text, cores):
+        """The three LOAD AVERAGES are the average number of processes that wanted to run (or were waiting for the disk) over the last 1, 5 and 15 minutes. Take them from the text of the uptime command: the three numbers after 'load average:' separated by commas (a decimal comma is not allowed). ValueError('no load average') if the text has none. Return a dict: 'load' (the tuple of the three floats), 'per_core' (the first number divided by cores, rounded to 2 decimals), 'status' ('idle' below 0.3, 'ok' below 0.7, 'busy' below 1.0, otherwise 'overloaded', using the unrounded per-core value) and 'trend' ('rising' if the 1-minute load is more than 25% above the 15-minute load, 'falling' if it is more than 25% below it, otherwise 'steady'; if the 15-minute load is 0, 'rising' when the 1-minute load is above 0, else 'steady')."""
+        pass
+  tests:
+  - name: reading uptime
+    code: |
+      up = "10:00:01 up 3 days,  2 users,  load average: 2.40, 1.20, 0.80"
+      assert load_report(up, 4) == {"load": (2.4, 1.2, 0.8), "per_core": 0.6, "status": "ok", "trend": "rising"}
+      assert load_report("up 1 day, load average: 0.00, 0.01, 0.05", 2) == {"load": (0.0, 0.01, 0.05), "per_core": 0.0, "status": "idle", "trend": "falling"}
+      assert load_report("load average: 8.00, 8.00, 8.00", 4)["status"] == "overloaded" and load_report("load average: 3.99, 4.0, 4.0", 4)["status"] == "busy"
+  - name: boundaries
+    code: |
+      def st(load, cores):
+          return load_report("load average: %s, 1.00, 1.00" % load, cores)["status"]
+      assert [st("0.29", 1), st("0.30", 1), st("0.69", 1), st("0.70", 1), st("0.99", 1), st("1.00", 1)] == ["idle", "ok", "ok", "busy", "busy", "overloaded"]
+      def tr(a, c):
+          return load_report("load average: %s, 1.00, %s" % (a, c), 1)["trend"]
+      assert [tr("1.25", "1.00"), tr("1.26", "1.00"), tr("0.75", "1.00"), tr("0.74", "1.00"), tr("0.50", "0.00"), tr("0.00", "0.00")] == ["steady", "rising", "steady", "falling", "rising", "steady"]
+      for bad in ("", "no numbers here", "load average: 1, 2"):
+          try:
+              load_report(bad, 1)
+              raise AssertionError("accepted")
+          except ValueError as e:
+              assert "no load average" in str(e)
+      assert load_report("load average: 1.5, 1.0, 1.0", 3)["per_core"] == 0.5
+  hints:
+  - A regular expression can capture the three numbers after load average:.
+  - Decide the status from the unrounded per-core value.
+  solution: |
+    def load_report(uptime_text, cores):
+        """The three LOAD AVERAGES are the average number of processes that wanted to run (or were waiting for the disk) over the last 1, 5 and 15 minutes. Take them from the text of the uptime command: the three numbers after 'load average:' separated by commas (a decimal comma is not allowed). ValueError('no load average') if the text has none. Return a dict: 'load' (the tuple of the three floats), 'per_core' (the first number divided by cores, rounded to 2 decimals), 'status' ('idle' below 0.3, 'ok' below 0.7, 'busy' below 1.0, otherwise 'overloaded', using the unrounded per-core value) and 'trend' ('rising' if the 1-minute load is more than 25% above the 15-minute load, 'falling' if it is more than 25% below it, otherwise 'steady'; if the 15-minute load is 0, 'rising' when the 1-minute load is above 0, else 'steady')."""
+        import re
+        m = re.search(r"load average:\s*([0-9.]+),\s*([0-9.]+),\s*([0-9.]+)", uptime_text)
+        if not m:
+            raise ValueError("no load average")
+        a, b, c = (float(x) for x in m.groups())
+        per = a / cores
+        status = "idle" if per < 0.3 else "ok" if per < 0.7 else "busy" if per < 1.0 else "overloaded"
+        if c == 0:
+            trend = "rising" if a > 0 else "steady"
+        else:
+            trend = "rising" if a > c * 1.25 else "falling" if a < c * 0.75 else "steady"
+        return {"load": (a, b, c), "per_core": round(per, 2), "status": status, "trend": trend}
+  explanation: 'Rule of thumb: a load equal to the number of cores means the machine is full. Above that, work is waiting in a queue and everything gets slower.'
+commonMistakes:
+- title: Judging by one snapshot
+  explanation: Look at several readings over time.
+- title: Trying to kill a zombie
+  explanation: Fix or restart its parent.
+- title: Ignoring the number of cores
+  explanation: Load 4 means different things on 2 and 16 cores.
+- title: Dividing by the total since boot
+  explanation: CPU counters need two readings and a difference.
+- title: Splitting the command at blanks
+  explanation: The command column can contain blanks.
+summary:
+- 'Linux reports its state as text: ps, /proc, uptime.'
+- Processes form a tree through parent ids.
+- Z, D and a busy CPU are the first things to look for.
+- CPU percent comes from the difference of two counter readings.
+- Load average compared with the number of cores shows saturation.
+next: u33-memory
+quiz:
+- type: mcq
+  question: What is a zombie process?
+  options:
+  - A finished process whose parent has not collected its exit status
+  - A process that uses all the CPU
+  - A process of another user
+  - A hidden process
+  answer: 0
+  explanation: A tiny leftover record.
+- type: mcq
+  question: What does state D mean?
+  options:
+  - Uninterruptible sleep, usually waiting for disk or network storage
+  - Deleted
+  - Daemon
+  - Debugging
+  answer: 0
+  explanation: It cannot be killed until the wait ends.
+- type: mcq
+  question: What is PID 1?
+  options:
+  - The first process, the ancestor of all others
+  - The biggest process
+  - The newest process
+  - The kernel's log
+  answer: 0
+  explanation: systemd or init.
+- type: mcq
+  question: How do tools compute CPU percentage?
+  options:
+  - From the difference of two readings of kernel counters
+  - By asking the CPU its speed
+  - By counting processes
+  - From the temperature
+  answer: 0
+  explanation: Rates come from differences.
+- type: mcq
+  question: 'A load average of 12 on a 4-core machine means:'
+  options:
+  - 'A queue of work is waiting: the machine is overloaded'
+  - The machine is idle
+  - The disk is full
+  - 12 users are logged in
+  answer: 0
+  explanation: Load per core is 3.
+- type: mcq
+  question: Where does Linux show kernel information as files?
+  options:
+  - /proc
+  - /tmp
+  - /home
+  - /boot
+  answer: 0
+  explanation: A pretend file system.
+- type: code
+  question: Write `count_states(procs)` returning a dict that counts the processes by state letter, given the list of dicts of `parse_ps` (each has a 'state' key). An empty list gives an empty dict.
+  starter: |
+    def count_states(procs):
+        pass
+  tests:
+  - name: counting
+    code: |
+      procs = [{"state": "S"}, {"state": "R"}, {"state": "S"}, {"state": "Z"}, {"state": "S"}]
+      assert count_states(procs) == {"S": 3, "R": 1, "Z": 1} and count_states([]) == {}
+  solution: |
+    def count_states(procs):
+        counts = {}
+        for p in procs:
+            counts[p["state"]] = counts.get(p["state"], 0) + 1
+        return counts

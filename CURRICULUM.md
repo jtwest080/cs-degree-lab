@@ -38,8 +38,9 @@ This file tracks which units are written, what each unit teaches, and how each u
 | 30 | Testing and Debugging (Version 2, practice unit) | ✅ Complete (Phase 31) | 6 | 30 | Mini Test Lab (discover tests, fixtures, loading code, line coverage by tracing, mutation scoring, full report with exit code) |
 | 31 | Security Basics (Version 2, practice unit) | ✅ Complete (Phase 32) | 6 | 30 | Mini Security Toolkit (registration and login, token and role checks, safe pages and queries, project scanning, site audit, log alerts, risk summary) |
 | 32 | AI-Assisted Coding (Version 2, practice unit) | ✅ Complete (Phase 33) | 6 | 30 | Mini AI Pair Toolkit (safe requests with redaction, review-then-test judge that never runs risky code, fix loop session, guarded project agent, report) |
+| 33 | Operating Systems in Practice (Version 2, practice unit) | ✅ Complete (Phase 36) | 6 | 30 | Mini System Doctor (CPU, memory, disk and security checks combined into one health report that survives broken input) |
 
-Totals: 254 lessons, 1223 practice exercises, 254 lesson quizzes (1524 multiple-choice questions + 254 coding questions), 32 unit projects, 2336 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
+Totals: 260 lessons, 1253 practice exercises, 260 lesson quizzes (1560 multiple-choice questions + 260 coding questions), 33 unit projects, 2390 glossary terms. Version 1 (Units 1-18) is complete and frozen on branch `v1`; Version 2 (a deeper, degree-style course) is being built on `main`, starting with the math track (Units 19 Linear Algebra, 20 Calculus, 21 Probability & Statistics, 22 Advanced Algorithms, 23 Compilers, 24 Distributed Systems, 25 Database Internals and the Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction electives done, plus a timed Exams page, 8 rubric-graded capstone projects and a 33-item reading list). Every reference solution passes its tests in both desktop Python and Pyodide, and every C solution passes in the same PicoC engine the browser uses (`npm run verify`).
 
 ## Unit 1: How Computers Work ✅
 
@@ -705,6 +706,21 @@ Can assume: hashing and salting, symmetric and public-key basics, injection and 
 
 Can assume: prompts and context limits, reviewing and verifying AI code, the ask-check-repeat loop, agents with tools and guardrails, privacy and injection risks. Next: Python/web refresh with a placement check.
 
+## Unit 33: Operating Systems in Practice (Version 2, practice unit) ✅
+
+| Lesson | ID | Topics |
+|---|---|---|
+| 33.1 Reading the Process Table | `u33-proc` | ps parsing, process trees, zombies and stuck processes, CPU percent from /proc/stat counters, load averages |
+| 33.2 Memory in Practice | `u33-memory` | /proc/meminfo, available vs free, memory maps, OOM killer scores, leak detection |
+| 33.3 Logs and Services | `u33-logs` | syslog parsing, filtering, brute-force detection, systemd unit files, boot order (topological sort) |
+| 33.4 Disks, Files and Quotas | `u33-disk` | df and du, mounts and fstab, blocks and inodes, quotas |
+| 33.5 Containers and Images | `u33-containers` | cgroup limits, namespaces, Dockerfile parsing, build cache, overlay layers |
+| 33.6 Measuring Performance | `u33-perf` | percentiles, Little's law, profiler stacks, USE method, Amdahl's law |
+
+**Project: Mini System Doctor.** Learners write `check_processes`, `check_memory`, `check_disks`, `check_security`, `diagnose` and `format_report` (all lesson parsers are given). Everything works on plain text, so it needs no real machine.
+
+Can assume: reading process, memory, disk and log output, systemd services, containers and layers, latency percentiles and bottleneck hunting. Next: Unit 34 Networking in Practice.
+
 ## Plan for remaining units (to refine before each phase)
 
 Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 Compilers, Unit 24 Distributed Systems, Unit 25 Database Internals, Unit 26 Computer Graphics and Unit 27 Human-Computer Interaction (electives) and the timed exams page are done; next the HCI elective, open-ended rubric projects and reading lists. Version 1 (Units 1-18) is complete. Possible future work: more review-deck coverage, translations, and extra capstone ideas (a compiler to bytecode, a spreadsheet engine, a chat server simulation).
@@ -751,3 +767,4 @@ Version 2 plan: Units 19-21 (math track), Unit 22 Advanced Algorithms, Unit 23 C
 - **Phase 33 (2026-11-16):** Complete Unit 32 AI-Assisted Coding (6 lessons, 30 exercises, 6 quizzes, Mini AI Pair Toolkit project, 27 new glossary terms). No framework changes; all Python with a fake model.
 - **Phase 34 (2026-11-16):** Placement checks (new `#/placement` page, `content/placement.yaml`, `src/components/Placement.jsx`): four 8-question checks (Python basics, Python data structures, HTML and CSS, JavaScript). Scoring 80% or more marks the covered lessons as mastered (`placed: true`, no gating lock-out), enrolls their questions in the Review deck, and a miss lists the lessons to study. Dashboard shows a hint and the heading now counts units dynamically.
 - **Phase 35 (2026-11-16):** Daily review upgrade (`src/components/Review.jsx`, `src/lib/srs.js`): forecast of due cards (now, within a day, this week), reviewed today, streak, session size 10/20/50, bar chart of the Leitner boxes, a missed card is asked again at the end of the session (second try does not change the schedule), and the session summary lists missed cards with answers, explanations and a link to the lesson.
+- **Phase 36 (2026-11-17):** Complete Unit 33 Operating Systems in Practice (6 lessons, 30 exercises, 6 quizzes, Mini System Doctor project, 54 new glossary terms). No framework changes; all Python on plain text.
